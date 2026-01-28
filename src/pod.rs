@@ -384,6 +384,15 @@ impl DevaipodPod {
         // Create the pod with metadata labels
         let mut labels = source.to_labels();
         labels.extend(extra_labels.iter().cloned());
+
+        // Add service-gator config as a label (CLI args format)
+        if let Some(sg_config) = service_gator_config {
+            if sg_config.is_enabled() {
+                let cli_args = crate::service_gator::config_to_cli_args(sg_config);
+                labels.push(("io.devaipod.service-gator".to_string(), cli_args.join(" ")));
+            }
+        }
+
         podman
             .create_pod(pod_name, &labels)
             .await

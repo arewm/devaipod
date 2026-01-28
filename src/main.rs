@@ -1997,8 +1997,15 @@ fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
         bail!("podman pod inspect failed: {}", stderr.trim());
     }
 
-    let pod_json: serde_json::Value =
+    let pod_json_array: serde_json::Value =
         serde_json::from_slice(&pod_output.stdout).context("Failed to parse pod inspect output")?;
+
+    // podman pod inspect returns an array, get the first element
+    let pod_json = pod_json_array
+        .as_array()
+        .and_then(|arr| arr.first())
+        .cloned()
+        .unwrap_or(pod_json_array);
 
     // Get container list using podman container ls
     let containers_output = podman_command()
@@ -2035,6 +2042,9 @@ fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
     // Get ports from pod
     let ports = extract_pod_ports(&pod_json);
 
+    // Extract service-gator config from pod labels
+    let gator_config = extract_service_gator_label(&pod_json);
+
     if json_output {
         // Build JSON output
         let status = serde_json::json!({
@@ -2046,6 +2056,7 @@ fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
             "containers": containers_json,
             "agent_health": agent_health,
             "ports": ports,
+            "service_gator": gator_config,
         });
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
@@ -2114,6 +2125,15 @@ fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
                 println!("  {}", port);
             }
         }
+        println!();
+
+        // Service-gator section
+        println!("Service-Gator:");
+        if let Some(ref config) = gator_config {
+            println!("  {}", config);
+        } else {
+            println!("  (not configured)");
+        }
     }
 
     Ok(())
@@ -2134,6 +2154,15 @@ fn check_agent_health(pod_name: &str) -> Option<bool> {
         Ok(status) => Some(status.success()),
         Err(_) => None,
     }
+}
+
+/// Extract service-gator config from pod labels
+fn extract_service_gator_label(pod_json: &serde_json::Value) -> Option<String> {
+    pod_json
+        .get("Labels")
+        .and_then(|labels| labels.get("io.devaipod.service-gator"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extract exposed ports from pod inspect JSON
