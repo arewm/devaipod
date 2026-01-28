@@ -1227,34 +1227,16 @@ while true; do sleep 86400 & wait $!; done
             format!("{agent_home}/.local/share"),
         );
 
-        // Forward API keys to the agent container for LLM access
+        // Forward env vars to the agent container:
         // 1. DEVAIPOD_AGENT_* vars: strip prefix and forward (e.g., DEVAIPOD_AGENT_FOO=bar -> FOO=bar)
-        // 2. Common API key env vars: forward as-is
-        // 3. Vars from devcontainer.json customizations.devaipod.env_allowlist
-        // 4. Vars from global config env.allowlist and env.vars
-        const API_KEY_VARS: &[&str] = &[
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "GOOGLE_API_KEY",
-            "GEMINI_API_KEY",
-            "AZURE_OPENAI_API_KEY",
-            "AZURE_OPENAI_ENDPOINT",
-            "OPENROUTER_API_KEY",
-            "GROQ_API_KEY",
-            "MISTRAL_API_KEY",
-            "COHERE_API_KEY",
-            "XAI_API_KEY",
-        ];
-
+        // 2. Vars from devcontainer.json customizations.devaipod.env_allowlist
+        // 3. Vars from global config env.allowlist and env.vars
         for (key, value) in std::env::vars() {
             // Handle DEVAIPOD_AGENT_* prefix: strip and forward
             if let Some(stripped) = key.strip_prefix("DEVAIPOD_AGENT_") {
                 if !stripped.is_empty() {
                     env.insert(stripped.to_string(), value);
                 }
-            } else if API_KEY_VARS.contains(&key.as_str()) {
-                // Forward common API key vars directly
-                env.insert(key, value);
             }
         }
 

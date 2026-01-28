@@ -90,8 +90,14 @@ pub fn cmd_init(config_path: Option<&Path>) -> Result<()> {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(config::config_path);
 
+    println!();
+    println!("Welcome to devaipod setup!");
+    println!();
+    println!("This wizard will help you configure devaipod for first-time use.");
+
     // Check if config already exists
     if config_path.exists() {
+        println!();
         let overwrite = Confirm::new()
             .with_prompt(format!(
                 "Configuration file already exists at {}. Overwrite?",
@@ -108,12 +114,6 @@ pub fn cmd_init(config_path: Option<&Path>) -> Result<()> {
 
     // Check that podman is available before starting
     check_podman_available()?;
-
-    println!();
-    println!("Welcome to devaipod setup!");
-    println!();
-    println!("This wizard will help you configure devaipod for first-time use.");
-    println!();
 
     let mut init_config = InitConfig::default();
 
@@ -172,61 +172,75 @@ fn configure_dotfiles(config: &mut InitConfig) -> Result<()> {
 /// Configure forge tokens
 fn configure_forges(config: &mut InitConfig) -> Result<()> {
     println!();
-    println!("--- Forge Token Configuration ---");
+    println!("--- Forge Token Configuration (Optional) ---");
     println!();
-    println!("devaipod uses forge tokens (via podman secrets) to enable");
-    println!("AI agents to interact with GitHub, GitLab, or Forgejo.");
+    println!("Forge tokens (via podman secrets) enable AI agents to interact");
+    println!("with GitHub, GitLab, or Forgejo (e.g., creating PRs).");
+    println!("You can skip this step and configure tokens later.");
     println!();
 
-    let forge_options = ["GitHub", "GitLab", "Forgejo/Gitea", "None / Skip"];
+    let configure_forge = Confirm::new()
+        .with_prompt("Would you like to configure a forge token now?")
+        .default(false)
+        .interact()?;
+
+    if !configure_forge {
+        println!();
+        println!("Skipping forge configuration. You can add tokens later with:");
+        println!("  echo 'your-token' | podman secret create gh_token -");
+        println!();
+        println!("Then add to your devaipod.toml:");
+        println!("  [trusted]");
+        println!("  secrets = [\"GH_TOKEN=gh_token\"]");
+        return Ok(());
+    }
+
+    let forge_options = ["GitHub", "GitLab", "Forgejo/Gitea"];
     let selections = Select::new()
-        .with_prompt("Which forge(s) do you use? (select one, you can add more later)")
+        .with_prompt("Which forge would you like to configure?")
         .items(&forge_options)
         .default(0)
         .interact()?;
 
     let selected_forge = match selections {
-        0 => Some(ForgeType::GitHub),
-        1 => Some(ForgeType::GitLab),
-        2 => Some(ForgeType::Forgejo),
-        _ => None,
+        0 => ForgeType::GitHub,
+        1 => ForgeType::GitLab,
+        _ => ForgeType::Forgejo,
     };
 
-    if let Some(forge) = selected_forge {
+    config.forges.push(selected_forge);
+    setup_forge_token(selected_forge)?;
+
+    // Ask about additional forges
+    loop {
+        let add_more = Confirm::new()
+            .with_prompt("Would you like to configure another forge?")
+            .default(false)
+            .interact()?;
+
+        if !add_more {
+            break;
+        }
+
+        let remaining: Vec<_> = [ForgeType::GitHub, ForgeType::GitLab, ForgeType::Forgejo]
+            .into_iter()
+            .filter(|f| !config.forges.contains(f))
+            .collect();
+
+        if remaining.is_empty() {
+            println!("All forges already configured.");
+            break;
+        }
+
+        let options: Vec<_> = remaining.iter().map(|f| f.name()).collect();
+        let selection = Select::new()
+            .with_prompt("Select forge to configure")
+            .items(&options)
+            .interact()?;
+
+        let forge = remaining[selection];
         config.forges.push(forge);
         setup_forge_token(forge)?;
-
-        // Ask about additional forges
-        loop {
-            let add_more = Confirm::new()
-                .with_prompt("Would you like to configure another forge?")
-                .default(false)
-                .interact()?;
-
-            if !add_more {
-                break;
-            }
-
-            let remaining: Vec<_> = [ForgeType::GitHub, ForgeType::GitLab, ForgeType::Forgejo]
-                .into_iter()
-                .filter(|f| !config.forges.contains(f))
-                .collect();
-
-            if remaining.is_empty() {
-                println!("All forges already configured.");
-                break;
-            }
-
-            let options: Vec<_> = remaining.iter().map(|f| f.name()).collect();
-            let selection = Select::new()
-                .with_prompt("Select forge to configure")
-                .items(&options)
-                .interact()?;
-
-            let forge = remaining[selection];
-            config.forges.push(forge);
-            setup_forge_token(forge)?;
-        }
     }
 
     Ok(())
@@ -415,16 +429,17 @@ fn write_config(path: &Path, config: &InitConfig) -> Result<()> {
     }
 
     // Environment configuration hint
-    content.push_str("# Environment variables for AI agent (forwarded to agent container)\n");
-    content.push_str("# Prefix with DEVAIPOD_AGENT_ in your shell to forward to agent\n");
-    content.push_str("# Example: export DEVAIPOD_AGENT_ANTHROPIC_API_KEY=your-key\n");
+    content.push_str("# Environment variables for containers (workspace + agent)\n");
+    content
+        .push_str("# Configure your LLM API key here. See: https://opencode.ai/docs/providers/\n");
     content.push_str("#\n");
-    content.push_str("# Or configure explicitly:\n");
     content.push_str("# [env]\n");
-    content.push_str("# allowlist = [\"GOOGLE_CLOUD_PROJECT\"]\n");
+    content.push_str("# # Forward from your shell environment\n");
+    content.push_str("# allowlist = [\"ANTHROPIC_API_KEY\"]  # or OPENAI_API_KEY, etc.\n");
     content.push_str("#\n");
+    content.push_str("# # Or set explicitly (less secure - visible in podman inspect)\n");
     content.push_str("# [env.vars]\n");
-    content.push_str("# SOME_VAR = \"value\"\n");
+    content.push_str("# ANTHROPIC_API_KEY = \"your-key\"\n");
 
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
@@ -440,15 +455,18 @@ fn write_config(path: &Path, config: &InitConfig) -> Result<()> {
 
 /// Suggest OpenCode configuration
 fn suggest_opencode_config(config: &InitConfig) {
-    println!("--- OpenCode Configuration Recommendations ---");
+    println!("--- OpenCode Configuration ---");
     println!();
     println!("devaipod uses OpenCode as the AI agent interface.");
     println!();
     println!("Recommended next steps:");
     println!();
-    println!("  1. Set your API key (choose one):");
-    println!("     export DEVAIPOD_AGENT_ANTHROPIC_API_KEY=your-key");
-    println!("     export DEVAIPOD_AGENT_OPENAI_API_KEY=your-key");
+    println!("  1. Configure your LLM provider. See: https://opencode.ai/docs/providers/");
+    println!();
+    println!("     Add your API key to ~/.config/devaipod.toml:");
+    println!();
+    println!("     [env]");
+    println!("     allowlist = [\"ANTHROPIC_API_KEY\"]  # or OPENAI_API_KEY, etc.");
     println!();
 
     if let Some(ref dotfiles_url) = config.dotfiles_url {

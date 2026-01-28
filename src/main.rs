@@ -1133,15 +1133,14 @@ fn check_api_keys_configured() {
         return;
     }
 
+    // Check for DEVAIPOD_AGENT_* env vars (legacy mechanism)
     let agent_env_vars = config::collect_agent_env_vars();
-    let has_common_keys =
-        std::env::var("ANTHROPIC_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok();
 
-    if agent_env_vars.is_empty() && !has_common_keys {
+    if agent_env_vars.is_empty() {
         eprintln!();
-        eprintln!("Warning: No API keys detected for the AI agent.");
-        eprintln!("   Create a config file at ~/.config/devaipod.toml");
-        eprintln!("   See: https://github.com/cgwalters/devaipod#configuration");
+        eprintln!("Warning: No devaipod configuration found.");
+        eprintln!("   Run 'devaipod init' to create a config file.");
+        eprintln!("   See: https://opencode.ai/docs/providers/");
         eprintln!();
     }
 }
