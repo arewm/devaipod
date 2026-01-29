@@ -294,10 +294,10 @@ enum HostCommand {
     /// Run an agent on a repository with a task
     ///
     /// Creates a workspace and starts the agent with a task. This is a convenience
-    /// command that combines 'up' with automatic task execution.
+    /// command that combines 'up' with automatic task execution and SSH.
     ///
-    /// The agent will start working on the task immediately. Use 'devaipod ssh'
-    /// to monitor progress and interact with the agent.
+    /// After setup, automatically SSHs into the workspace to show the monitor
+    /// where you can observe agent progress and interact with it.
     ///
     /// Examples:
     ///   devaipod run https://github.com/org/repo
@@ -309,12 +309,6 @@ enum HostCommand {
         /// Inline command/task for the agent
         #[arg(short = 'c', long = "command", value_name = "TASK")]
         command: Option<String>,
-        /// AI agent to run: goose, claude, opencode (default: from config or goose)
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-        /// DevPod provider to use (default: docker)
-        #[arg(long, value_name = "PROVIDER")]
-        provider: Option<String>,
         /// Use a specific container image instead of building from devcontainer.json
         #[arg(long, value_name = "IMAGE")]
         image: Option<String>,
@@ -518,8 +512,6 @@ async fn run_host(cli: HostCli) -> Result<()> {
         HostCommand::Run {
             source,
             command,
-            agent,
-            provider,
             image,
             name,
             service_gator_scopes,
@@ -529,8 +521,6 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 &config,
                 &source,
                 command.as_deref(),
-                agent.as_deref(),
-                provider.as_deref(),
                 image.as_deref(),
                 name.as_deref(),
                 &service_gator_scopes,
@@ -1193,21 +1183,15 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
 /// This is a convenience command that combines 'up' with automatic task execution.
 /// It creates a workspace, starts the agent with the task, and SSHs into the workspace
 /// so the user can monitor progress.
-#[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     config: &config::Config,
     source: &str,
     command: Option<&str>,
-    _agent: Option<&str>,
-    _provider: Option<&str>,
     image: Option<&str>,
     explicit_name: Option<&str>,
     service_gator_scopes: &[String],
     service_gator_image: Option<&str>,
 ) -> Result<()> {
-    // If no inline command provided, we'll prompt for input after setup
-    // For now, the task will be passed to the agent via the workspace
-
     // Build UpOptions with the task
     let opts = UpOptions {
         task: command.map(|s| s.to_string()),
@@ -1236,8 +1220,12 @@ async fn cmd_run(
 
     // For local paths, delegate to cmd_up
     cmd_up(
-        config, source, _agent, false, // no_agent - we want the agent
-        _provider, None,  // ide
+        config,
+        source,
+        None,  // agent
+        false, // no_agent - we want the agent
+        None,  // provider
+        None,  // ide
         false, // agent_sidecar
         opts,
     )
