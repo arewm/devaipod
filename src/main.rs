@@ -798,8 +798,8 @@ async fn cmd_up_pr(
         pr_ref.repo
     );
 
-    // Fetch PR metadata
-    let pr_info = forge::fetch_pr_info(&pr_ref)
+    // Fetch PR metadata (pass config for GH_TOKEN from podman secrets)
+    let pr_info = forge::fetch_pr_info(&pr_ref, Some(config))
         .await
         .context("Failed to fetch PR information")?;
 
@@ -813,6 +813,11 @@ async fn cmd_up_pr(
 
     tracing::debug!("Cloning PR head to read devcontainer.json...");
 
+    // Use authenticated URL if GH_TOKEN is available (for private repos)
+    // Check env vars first, then podman secrets from config
+    let gh_token = git::get_github_token_with_secret(config);
+    let clone_url = git::authenticated_clone_url(&pr_info.head_clone_url, gh_token.as_deref());
+
     // Clone from the PR's head repository and checkout the specific commit
     let clone_output = tokio::process::Command::new("git")
         .args([
@@ -821,7 +826,7 @@ async fn cmd_up_pr(
             "1",
             "--branch",
             &pr_info.head_ref,
-            &pr_info.head_clone_url,
+            &clone_url,
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -936,13 +941,18 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
 
     tracing::debug!("Cloning repository to read devcontainer.json...");
 
+    // Use authenticated URL if GH_TOKEN is available (for private repos)
+    // Check env vars first, then podman secrets from config
+    let gh_token = git::get_github_token_with_secret(config);
+    let clone_url = git::authenticated_clone_url(remote_url, gh_token.as_deref());
+
     // Clone the repository (shallow clone for speed)
     let clone_output = tokio::process::Command::new("git")
         .args([
             "clone",
             "--depth",
             "1",
-            remote_url,
+            &clone_url,
             temp_path.to_str().unwrap(),
         ])
         .output()

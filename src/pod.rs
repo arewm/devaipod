@@ -345,15 +345,23 @@ impl DevaipodPod {
                     (script, vec![bind])
                 }
                 WorkspaceSource::RemoteRepo(remote_info) => {
+                    // Use GH_TOKEN for cloning private repos if available
+                    // Check env vars first, then podman secrets from config
+                    let gh_token = crate::git::get_github_token_with_secret(global_config);
                     let script = crate::git::clone_remote_script(
                         remote_info,
                         &workspace_folder,
                         effective_user.as_deref(),
+                        gh_token.as_deref(),
                     );
                     (script, vec![])
                 }
                 WorkspaceSource::PullRequest(pr_info) => {
-                    let script = crate::git::clone_pr_script(pr_info, &workspace_folder);
+                    // Use GH_TOKEN for cloning private repos if available
+                    // Check env vars first, then podman secrets from config
+                    let gh_token = crate::git::get_github_token_with_secret(global_config);
+                    let script =
+                        crate::git::clone_pr_script(pr_info, &workspace_folder, gh_token.as_deref());
                     (script, vec![])
                 }
             };

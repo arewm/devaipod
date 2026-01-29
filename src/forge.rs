@@ -246,16 +246,24 @@ fn detect_forge_type(host: &str) -> ForgeType {
 }
 
 /// Fetch PR metadata from the forge API
-pub async fn fetch_pr_info(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
+///
+/// `config` is optional but needed to read GH_TOKEN from podman secrets for private repos.
+pub async fn fetch_pr_info(
+    pr_ref: &PullRequestRef,
+    config: Option<&crate::config::Config>,
+) -> Result<PullRequestInfo> {
     match pr_ref.forge_type {
-        ForgeType::GitHub => fetch_github_pr(pr_ref).await,
+        ForgeType::GitHub => fetch_github_pr(pr_ref, config).await,
         ForgeType::GitLab => fetch_gitlab_mr(pr_ref).await,
         ForgeType::Forgejo | ForgeType::Gitea => fetch_forgejo_pr(pr_ref).await,
     }
 }
 
 /// Fetch GitHub PR metadata
-async fn fetch_github_pr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
+async fn fetch_github_pr(
+    pr_ref: &PullRequestRef,
+    config: Option<&crate::config::Config>,
+) -> Result<PullRequestInfo> {
     let api_url = if pr_ref.host == "github.com" {
         format!(
             "https://api.github.com/repos/{}/{}/pulls/{}",
@@ -275,8 +283,14 @@ async fn fetch_github_pr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
         .header("User-Agent", "devaipod")
         .header("Accept", "application/vnd.github+json");
 
-    // Use GITHUB_TOKEN if available
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+    // Use GH_TOKEN or GITHUB_TOKEN if available (for private repos)
+    // Check env vars first, then podman secrets from config
+    let token = if let Some(cfg) = config {
+        crate::git::get_github_token_with_secret(cfg)
+    } else {
+        crate::git::get_github_token()
+    };
+    if let Some(token) = token {
         request = request.header("Authorization", format!("Bearer {}", token));
     }
 

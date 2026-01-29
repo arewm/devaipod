@@ -18,6 +18,92 @@ use std::process::Command;
 
 use color_eyre::eyre::{bail, Context, Result};
 
+/// Get a GitHub token from the environment (checks GH_TOKEN and GITHUB_TOKEN)
+pub fn get_github_token() -> Option<String> {
+    std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok()
+}
+
+/// Get a GitHub token, checking environment variables first, then podman secrets.
+///
+/// Checks in order:
+/// 1. `GH_TOKEN` environment variable
+/// 2. `GITHUB_TOKEN` environment variable
+/// 3. Podman secret configured in `[trusted]` section for `GH_TOKEN`
+///
+/// Returns `None` if no token is available.
+pub fn get_github_token_with_secret(config: &crate::config::Config) -> Option<String> {
+    // First check environment variables
+    if let Some(token) = get_github_token() {
+        return Some(token);
+    }
+
+    // Then check for a GH_TOKEN secret in the trusted config
+    for (env_var, secret_name) in config.trusted_env.secret_mounts() {
+        if env_var == "GH_TOKEN" || env_var == "GITHUB_TOKEN" {
+            if let Some(token) = read_podman_secret(&secret_name) {
+                return Some(token);
+            }
+        }
+    }
+
+    None
+}
+
+/// Read a podman secret value by name.
+///
+/// Returns `None` if the secret doesn't exist or can't be read.
+fn read_podman_secret(secret_name: &str) -> Option<String> {
+    let output = Command::new("podman")
+        .args(["secret", "inspect", "--showsecret", secret_name])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    // Parse JSON output: [{"SecretData": "token_value\n", ...}]
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let secret_data = json
+        .as_array()?
+        .first()?
+        .get("SecretData")?
+        .as_str()?
+        .trim();
+
+    if secret_data.is_empty() {
+        None
+    } else {
+        Some(secret_data.to_string())
+    }
+}
+
+/// Convert a GitHub HTTPS URL to an authenticated URL using a token.
+///
+/// Takes `https://github.com/owner/repo.git` and returns
+/// `https://x-access-token:TOKEN@github.com/owner/repo.git`
+///
+/// For non-GitHub URLs or SSH URLs, returns the original URL unchanged.
+pub fn authenticated_clone_url(url: &str, token: Option<&str>) -> String {
+    let Some(token) = token else {
+        return url.to_string();
+    };
+
+    // Only modify HTTPS GitHub URLs
+    if !url.starts_with("https://github.com/") {
+        return url.to_string();
+    }
+
+    // Insert the token as x-access-token
+    url.replacen(
+        "https://github.com/",
+        &format!("https://x-access-token:{token}@github.com/"),
+        1,
+    )
+}
+
 /// Information about a git repository's state
 #[derive(Debug, Clone)]
 pub struct GitRepoInfo {
@@ -287,10 +373,32 @@ echo "Repository cloned successfully at commit {short_commit}"
 /// Generate a shell script to clone from a PR/MR
 ///
 /// The script will:
-/// 1. Clone the PR's head repository
+/// 1. Clone the PR's head repository (using authenticated URL if token provided)
 /// 2. Checkout the specific commit
-/// 3. Add the upstream repository as a remote
-pub fn clone_pr_script(pr_info: &crate::forge::PullRequestInfo, workspace_folder: &str) -> String {
+/// 3. Reset the remote URL to the original (unauthenticated) URL
+/// 4. Add the upstream repository as a remote
+///
+/// `gh_token` is an optional GitHub token for cloning private repositories.
+pub fn clone_pr_script(
+    pr_info: &crate::forge::PullRequestInfo,
+    workspace_folder: &str,
+    gh_token: Option<&str>,
+) -> String {
+    // Use authenticated URL for cloning if token is provided
+    let clone_url = authenticated_clone_url(&pr_info.head_clone_url, gh_token);
+    let upstream_url = pr_info.pr_ref.upstream_url();
+
+    // After cloning, reset the remote to the original URL (without token)
+    // so the token isn't stored in .git/config
+    let reset_remote = if gh_token.is_some() {
+        format!(
+            "\n# Reset remote URL to remove embedded token\ngit remote set-url origin \"{}\"\n",
+            pr_info.head_clone_url
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"
 set -e
@@ -298,13 +406,13 @@ echo "Cloning PR #{number}: {title}"
 mkdir -p "$(dirname "{workspace}")"
 
 # Full clone of PR head (fork) repository for complete git history
-git clone --branch "{branch}" "{head_url}" "{workspace}" 2>&1
+git clone --branch "{branch}" "{clone_url}" "{workspace}" 2>&1
 
 cd "{workspace}"
 
 # Checkout the exact commit
 git checkout "{commit}" 2>&1
-
+{reset_remote}
 # Add upstream as a remote for reference
 git remote add upstream "{upstream_url}" 2>/dev/null || true
 
@@ -313,40 +421,61 @@ echo "PR #{number} cloned successfully at commit {short_commit}"
         number = pr_info.pr_ref.number,
         title = pr_info.title.replace('"', r#"\""#),
         workspace = workspace_folder,
-        head_url = pr_info.head_clone_url,
+        clone_url = clone_url,
         branch = pr_info.head_ref,
         commit = pr_info.head_sha,
+        reset_remote = reset_remote,
         short_commit = &pr_info.head_sha[..pr_info.head_sha.len().min(8)],
-        upstream_url = pr_info.pr_ref.upstream_url(),
+        upstream_url = upstream_url,
     )
 }
 
 /// Generate a shell script to clone from a remote git URL
 ///
 /// The script will:
-/// 1. Clone the repository's default branch
-/// 2. Chown to the target user if specified
+/// 1. Clone the repository's default branch (using authenticated URL if token provided)
+/// 2. Reset the remote URL to the original (unauthenticated) URL
+/// 3. Chown to the target user if specified
+///
+/// `gh_token` is an optional GitHub token for cloning private repositories.
 pub fn clone_remote_script(
     remote_info: &RemoteRepoInfo,
     workspace_folder: &str,
     target_user: Option<&str>,
+    gh_token: Option<&str>,
 ) -> String {
+    // Use authenticated URL for cloning if token is provided
+    let clone_url = authenticated_clone_url(&remote_info.remote_url, gh_token);
+
+    // After cloning, reset the remote to the original URL (without token)
+    // so the token isn't stored in .git/config
+    let reset_remote = if gh_token.is_some() {
+        format!(
+            "\n# Reset remote URL to remove embedded token\ngit remote set-url origin \"{}\"\n",
+            remote_info.remote_url
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"
 set -e
-echo "Cloning repository from {url}..."
+echo "Cloning repository from {display_url}..."
 mkdir -p "$(dirname "{workspace}")"
 
 # Full clone for complete git history
-git clone --branch "{branch}" "{url}" "{workspace}" 2>&1
+git clone --branch "{branch}" "{clone_url}" "{workspace}" 2>&1
 
 cd "{workspace}"
-{chown_cmd}
+{reset_remote}{chown_cmd}
 echo "Repository cloned successfully"
 "#,
-        url = remote_info.remote_url,
+        display_url = remote_info.remote_url, // Don't log the token
+        clone_url = clone_url,
         workspace = workspace_folder,
         branch = remote_info.default_branch,
+        reset_remote = reset_remote,
         chown_cmd = target_user
             .map(|u| format!(
                 "# Set ownership to target user\nchown -R {u}:{u} \"{workspace_folder}\""
@@ -624,12 +753,52 @@ mod tests {
             repo_name: "repo".to_string(),
         };
 
-        let script = clone_remote_script(&info, "/workspaces/repo", Some("devenv"));
+        let script = clone_remote_script(&info, "/workspaces/repo", Some("devenv"), None);
 
         assert!(script.contains("git clone"));
         assert!(script.contains("https://github.com/owner/repo.git"));
         assert!(script.contains("/workspaces/repo"));
         assert!(script.contains("--branch \"main\""));
         assert!(script.contains("chown -R devenv:devenv"));
+    }
+
+    #[test]
+    fn test_clone_remote_script_with_token() {
+        let info = RemoteRepoInfo {
+            remote_url: "https://github.com/owner/repo.git".to_string(),
+            default_branch: "main".to_string(),
+            repo_name: "repo".to_string(),
+        };
+
+        let script = clone_remote_script(&info, "/workspaces/repo", None, Some("ghp_secret123"));
+
+        // Should use authenticated URL in clone command
+        assert!(script.contains("x-access-token:ghp_secret123@github.com"));
+        // Should reset remote to original URL after clone
+        assert!(script.contains("git remote set-url origin"));
+        assert!(script.contains("https://github.com/owner/repo.git"));
+        // Display message should NOT contain the token
+        assert!(script.contains("Cloning repository from https://github.com/owner/repo.git"));
+    }
+
+    #[test]
+    fn test_authenticated_clone_url() {
+        // GitHub HTTPS URL should be modified
+        assert_eq!(
+            authenticated_clone_url("https://github.com/owner/repo.git", Some("token123")),
+            "https://x-access-token:token123@github.com/owner/repo.git"
+        );
+
+        // Non-GitHub URL should be unchanged
+        assert_eq!(
+            authenticated_clone_url("https://gitlab.com/owner/repo.git", Some("token123")),
+            "https://gitlab.com/owner/repo.git"
+        );
+
+        // No token should return original URL
+        assert_eq!(
+            authenticated_clone_url("https://github.com/owner/repo.git", None),
+            "https://github.com/owner/repo.git"
+        );
     }
 }
