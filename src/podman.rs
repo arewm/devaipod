@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use bollard::container::{
     LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+    WaitContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::BuildImageOptions;
@@ -1040,6 +1041,27 @@ impl PodmanService {
         Ok(())
     }
 
+    /// Wait for a container to exit and return its exit code
+    ///
+    /// Blocks until the container exits or an error occurs.
+    #[allow(dead_code)] // May be useful for future features
+    pub async fn wait_container(&self, name: &str) -> Result<i64> {
+        let options: WaitContainerOptions<String> = WaitContainerOptions {
+            condition: "not-running".to_string(),
+        };
+        let mut stream = self.client.wait_container(name, Some(options));
+        // The stream returns one result when the container exits
+        if let Some(result) = stream.next().await {
+            let wait_response =
+                result.with_context(|| format!("Failed to wait for container {}", name))?;
+            let exit_code = wait_response.status_code;
+            tracing::debug!("Container {} exited with code {}", name, exit_code);
+            Ok(exit_code)
+        } else {
+            color_eyre::eyre::bail!("Wait stream ended without result for container {}", name);
+        }
+    }
+
     /// Execute a command in a running container
     ///
     /// If `quiet` is true, output is captured and only shown on failure.
@@ -1151,6 +1173,7 @@ impl PodmanService {
     /// Execute a command and return its output
     ///
     /// Returns (exit_code, stdout, stderr)
+    #[allow(dead_code)] // Useful API method for future use
     pub async fn exec_output(
         &self,
         container: &str,

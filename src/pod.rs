@@ -128,6 +128,10 @@ pub const OPENCODE_PORT: u16 = 4096;
 /// Path for the agent's home directory (mounted from a persistent volume)
 const AGENT_HOME_PATH: &str = "/home/agent";
 
+/// Python script for workspace monitor.
+/// Shows agent status and allows seamless handoff to interactive mode.
+const WORKSPACE_MONITOR_SCRIPT: &str = include_str!("../scripts/workspace_monitor.py");
+
 /// Default PATH for containers when we need to synthesize one.
 /// This covers the standard locations where utilities are typically found.
 const DEFAULT_CONTAINER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -250,12 +254,13 @@ impl DevaipodPod {
         service_gator_config: Option<&crate::config::ServiceGatorConfig>,
         image_override: Option<&str>,
         gator_image_override: Option<&str>,
+        task: Option<&str>,
     ) -> Result<Self> {
         // Note: container_home is resolved after we determine the image, since
         // we need to query the image for the user if devcontainer doesn't specify one
 
         // Build workspace bind_home: global bind_home + workspace-specific
-        let mut workspace_paths = global_config.bind_home.clone();
+        let mut workspace_paths = global_config.bind_home.paths.clone();
         if let Some(ref ws_config) = global_config.bind_home_workspace {
             workspace_paths.extend(ws_config.paths.clone());
         }
@@ -264,14 +269,10 @@ impl DevaipodPod {
             readonly: false, // Workspace gets read-write access
         };
 
-        // Build agent bind_home: global bind_home + agent-specific
-        let mut agent_paths = global_config.bind_home.clone();
-        if let Some(ref agent_config) = global_config.bind_home_agent {
-            agent_paths.extend(agent_config.paths.clone());
-        }
+        // Agent bind_home: uses the same global bind_home paths (always read-only for security)
         let agent_bind_home = BindHomeConfig {
-            paths: agent_paths,
-            readonly: true, // Agent gets read-only access for security
+            paths: global_config.bind_home.paths.clone(),
+            readonly: true, // Agent always gets read-only access for security
         };
 
         let config = devcontainer_config;
@@ -394,6 +395,21 @@ impl DevaipodPod {
         let agent_container = format!("{}-agent", pod_name);
         let gator_container_name = format!("{}-gator", pod_name);
 
+        // Create agent home volume for persistent agent state (credentials, config, etc.)
+        let agent_home_volume = format!("{}-agent-home", pod_name);
+        if !podman.volume_exists(&agent_home_volume).await? {
+            podman
+                .create_volume(&agent_home_volume)
+                .await
+                .context("Failed to create agent home volume")?;
+            tracing::debug!("Created agent home volume '{}'", agent_home_volume);
+        } else {
+            tracing::debug!("Using existing agent home volume '{}'", agent_home_volume);
+        }
+
+        // Write scripts to agent home volume (needed by all pods for workspace_monitor.py)
+        Self::write_scripts_to_volume(podman, &image, &agent_home_volume).await?;
+
         // Create workspace container
         let workspace_config = Self::workspace_container_config(
             project_path,
@@ -403,7 +419,9 @@ impl DevaipodPod {
             &workspace_bind_home,
             &container_home,
             &volume_name,
+            &agent_home_volume,
             global_config,
+            task,
         );
         podman
             .create_container(&workspace_container, &image, pod_name, workspace_config)
@@ -446,16 +464,10 @@ impl DevaipodPod {
             None
         };
 
-        // Create agent home volume for persistent agent state (credentials, config, etc.)
-        let agent_home_volume = format!("{}-agent-home", pod_name);
-        if !podman.volume_exists(&agent_home_volume).await? {
-            podman
-                .create_volume(&agent_home_volume)
-                .await
-                .context("Failed to create agent home volume")?;
-            tracing::debug!("Created agent home volume '{}'", agent_home_volume);
-        } else {
-            tracing::debug!("Using existing agent home volume '{}'", agent_home_volume);
+        // If task is provided, write it to the agent home volume before starting the container
+        // This ensures opencode sees the task file when it reads its config at startup
+        if let Some(task_content) = task {
+            Self::write_task_to_volume(podman, &image, &agent_home_volume, task_content).await?;
         }
 
         // Create agent container with restricted security
@@ -846,134 +858,6 @@ echo "Dotfiles installed successfully"
     // at container creation time in agent_container_config(), so we don't need
     // a separate configure_agent_opencode() method.
 
-    /// Write task instructions to the agent's opencode config directory
-    ///
-    /// This writes the task description to a file that opencode will read as
-    /// instructions. The file is written to ~/.config/opencode/devaipod-task.md
-    /// and the opencode config is updated to include it in the instructions array.
-    ///
-    /// This allows the task to persist across agent restarts and be picked up
-    /// automatically when opencode starts.
-    pub async fn write_task_instructions(&self, podman: &PodmanService, task: &str) -> Result<()> {
-        let task_file_path = format!(
-            "{agent_home}/.config/opencode/devaipod-task.md",
-            agent_home = AGENT_HOME_PATH
-        );
-        let config_path = format!(
-            "{agent_home}/.config/opencode/opencode.json",
-            agent_home = AGENT_HOME_PATH
-        );
-
-        // Format the task as a markdown file with clear instructions
-        let task_content = format!(
-            r#"# Task from devaipod
-
-The user has requested the following task be completed:
-
----
-
-{task}
-
----
-
-Please work on this task. When you're done, summarize what you accomplished.
-"#,
-            task = task
-        );
-
-        // Escape the task content for shell heredoc
-        let escaped_task = task_content.replace("'", "'\\''");
-
-        // First, write the task file
-        let write_task_script = format!(
-            r#"
-set -e
-mkdir -p {agent_home}/.config/opencode
-cat > '{task_file_path}' << 'DEVAIPOD_TASK_EOF'
-{escaped_task}
-DEVAIPOD_TASK_EOF
-"#,
-            agent_home = AGENT_HOME_PATH,
-            task_file_path = task_file_path,
-            escaped_task = escaped_task
-        );
-
-        let exit_code = podman
-            .exec(
-                &self.agent_container,
-                &["/bin/sh", "-c", &write_task_script],
-                None,
-                None,
-            )
-            .await
-            .context("Failed to write task file to agent container")?;
-
-        if exit_code != 0 {
-            tracing::warn!("Failed to write task file (exit code {})", exit_code);
-            return Ok(());
-        }
-
-        // Now read existing config (if any), parse with jsonc-parser, add instructions, write back
-        let (exit_code, config_bytes, _) = podman
-            .exec_output(&self.agent_container, &["cat", &config_path])
-            .await
-            .context("Failed to read opencode config")?;
-
-        let new_config = if exit_code == 0 && !config_bytes.is_empty() {
-            // Config exists - parse it (supports JSON5/JSONC with trailing commas, comments, etc.)
-            let config_str = String::from_utf8_lossy(&config_bytes);
-            match jsonc_parser::parse_to_serde_value(&config_str, &Default::default()) {
-                Ok(Some(serde_json::Value::Object(mut obj))) => {
-                    // Add task file to instructions array
-                    let instructions = obj
-                        .entry("instructions")
-                        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-                    if let serde_json::Value::Array(arr) = instructions {
-                        let task_path_value = serde_json::Value::String(task_file_path.clone());
-                        if !arr.contains(&task_path_value) {
-                            arr.push(task_path_value);
-                        }
-                    }
-                    serde_json::to_string_pretty(&serde_json::Value::Object(obj))
-                        .unwrap_or_else(|_| Self::default_config_with_task(&task_file_path))
-                }
-                Ok(_) | Err(_) => {
-                    tracing::warn!("Failed to parse existing opencode config, creating new one");
-                    Self::default_config_with_task(&task_file_path)
-                }
-            }
-        } else {
-            // No config exists - create one
-            Self::default_config_with_task(&task_file_path)
-        };
-
-        // Write the updated config back
-        let escaped_config = new_config.replace("'", "'\\''");
-        let write_config_script = format!(
-            "cat > '{config_path}' << 'OPENCODE_CONFIG_EOF'\n{escaped_config}\nOPENCODE_CONFIG_EOF",
-            config_path = config_path,
-            escaped_config = escaped_config
-        );
-
-        let exit_code = podman
-            .exec(
-                &self.agent_container,
-                &["/bin/sh", "-c", &write_config_script],
-                None,
-                None,
-            )
-            .await
-            .context("Failed to write opencode config")?;
-
-        if exit_code != 0 {
-            tracing::warn!("Failed to write opencode config (exit code {})", exit_code);
-        } else {
-            tracing::debug!("Task instructions written to agent config");
-        }
-
-        Ok(())
-    }
-
     /// Generate a default opencode config with the given task file in instructions
     fn default_config_with_task(task_file_path: &str) -> String {
         serde_json::to_string_pretty(&serde_json::json!({
@@ -986,6 +870,125 @@ DEVAIPOD_TASK_EOF
                 task_file_path
             )
         })
+    }
+
+    /// Write scripts to the agent home volume before containers start
+    ///
+    /// This writes the workspace_monitor.py script which is needed by all pods,
+    /// not just those with tasks. Uses a one-shot init container.
+    async fn write_scripts_to_volume(
+        podman: &PodmanService,
+        image: &str,
+        agent_home_volume: &str,
+    ) -> Result<()> {
+        let script = format!(
+            r#"set -e
+mkdir -p {agent_home}/scripts
+cat > '{agent_home}/scripts/workspace_monitor.py' << 'MONITOR_EOF'
+{monitor_script}
+MONITOR_EOF
+chmod +x {agent_home}/scripts/workspace_monitor.py
+"#,
+            agent_home = AGENT_HOME_PATH,
+            monitor_script = WORKSPACE_MONITOR_SCRIPT,
+        );
+
+        tracing::debug!("Writing scripts to agent home volume...");
+        let exit_code = podman
+            .run_init_container(
+                image,
+                agent_home_volume,
+                AGENT_HOME_PATH,
+                &["/bin/sh", "-c", &script],
+                &[],
+            )
+            .await
+            .context("Failed to write scripts to agent volume")?;
+
+        if exit_code != 0 {
+            tracing::warn!(
+                "Failed to write scripts to volume (exit code {})",
+                exit_code
+            );
+        } else {
+            tracing::debug!("Scripts written to agent home volume");
+        }
+
+        Ok(())
+    }
+
+    /// Write task instructions to the agent home volume before the agent container starts
+    ///
+    /// This uses a one-shot init container to write the task file and opencode config
+    /// to the volume. This ensures opencode sees the task when it reads config at startup.
+    async fn write_task_to_volume(
+        podman: &PodmanService,
+        image: &str,
+        agent_home_volume: &str,
+        task: &str,
+    ) -> Result<()> {
+        let task_file = ".config/opencode/devaipod-task.md";
+        let config_file = ".config/opencode/opencode.json";
+
+        // Format the task as markdown
+        let task_content = format!(
+            r#"# Task from devaipod
+
+The user has requested the following task be completed:
+
+---
+
+{}
+
+---
+
+Please work on this task. When you're done, summarize what you accomplished.
+"#,
+            task
+        );
+
+        // Create opencode config that references the task file
+        let task_file_path = format!("{}/{}", AGENT_HOME_PATH, task_file);
+        let config_content = Self::default_config_with_task(&task_file_path);
+
+        // Using quoted heredoc delimiters ('TASK_EOF') prevents shell expansion,
+        // so we don't need to escape content - it's passed through literally.
+        let script = format!(
+            r#"set -e
+mkdir -p {agent_home}/.config/opencode
+cat > '{agent_home}/{task_file}' << 'TASK_EOF'
+{task_content}
+TASK_EOF
+cat > '{agent_home}/{config_file}' << 'CONFIG_EOF'
+{config_content}
+CONFIG_EOF
+"#,
+            agent_home = AGENT_HOME_PATH,
+            task_file = task_file,
+            config_file = config_file,
+            task_content = task_content,
+            config_content = config_content,
+        );
+
+        tracing::debug!("Writing task to agent home volume...");
+        let exit_code = podman
+            .run_init_container(
+                image,
+                agent_home_volume,
+                AGENT_HOME_PATH,
+                &["/bin/sh", "-c", &script],
+                &[],
+            )
+            .await
+            .context("Failed to write task to agent volume")?;
+
+        if exit_code != 0 {
+            tracing::warn!("Failed to write task to volume (exit code {})", exit_code);
+        } else {
+            tracing::debug!("Task written to agent home volume");
+        }
+
+        Ok(())
     }
 
     /// Stop the pod
@@ -1046,7 +1049,9 @@ DEVAIPOD_TASK_EOF
         _bind_home: &BindHomeConfig,
         _container_home: &str,
         volume_name: &str,
+        agent_home_volume: &str,
         global_config: &crate::config::Config,
+        task: Option<&str>,
     ) -> ContainerConfig {
         let mut env = config.container_env.clone();
         // Merge remote_env (these typically take precedence)
@@ -1100,6 +1105,11 @@ DEVAIPOD_TASK_EOF
             format!("http://localhost:{}", OPENCODE_PORT),
         );
 
+        // Pass task to workspace monitor if provided
+        if let Some(task_content) = task {
+            env.insert("DEVAIPOD_TASK".to_string(), task_content.to_string());
+        }
+
         // No bind mounts - we clone the repo into the container instead
         // This avoids UID mapping issues with rootless podman
         let mounts = vec![];
@@ -1148,23 +1158,54 @@ DEVAIPOD_TASK_EOF
                 format!(
                     r#"
 # Create opencode-connect shim that attaches to the agent container's server
+# This shim auto-detects existing sessions for seamless handoff from autonomous to interactive mode
 # Install to /usr/local/bin so it's in PATH by default
 sudo tee /usr/local/bin/opencode-connect > /dev/null << 'EOF'
 #!/bin/sh
 # Shim to connect to devaipod agent container
-exec opencode attach http://localhost:{port} "$@"
+# Auto-detects existing session for seamless handoff
+
+AGENT_URL="http://localhost:{port}"
+
+# If user explicitly passed -s/--session, use their args as-is
+case "$*" in
+    *-s*|*--session*)
+        exec opencode attach "$AGENT_URL" "$@"
+        ;;
+esac
+
+# Try to find the root session (parentID is null) to continue
+# This enables seamless handoff from autonomous agent to interactive mode
+# Subagent sessions have a parentID, we want the main task session
+# If detection fails (Python unavailable, curl fails, etc.), fall back to no session
+SESSION_ID=$(curl -sf "$AGENT_URL/session" 2>/dev/null | \
+    python3 -c "
+import sys, json
+try:
+    sessions = json.load(sys.stdin)
+    # Find sessions without a parent (root sessions)
+    root_sessions = [s for s in sessions if s.get('parentID') is None]
+    # Sort by creation time (oldest first) and pick the first one
+    if root_sessions:
+        root_sessions.sort(key=lambda s: s.get('time', {{}}).get('created', 0))
+        print(root_sessions[0]['id'])
+except Exception:
+    pass
+" 2>/dev/null || true)
+
+if [ -n "$SESSION_ID" ]; then
+    echo "Continuing session: $SESSION_ID"
+    exec opencode attach "$AGENT_URL" -s "$SESSION_ID" "$@"
+else
+    exec opencode attach "$AGENT_URL" "$@"
+fi
 EOF
 sudo chmod +x /usr/local/bin/opencode-connect
 
-echo "devaipod: opencode agent at http://localhost:{port}"
-echo "devaipod: use 'opencode-connect' to attach to the agent"
-
-# Handle SIGTERM gracefully for clean shutdown
-trap 'exit 0' TERM INT
-# Sleep in background so trap works, wait for it
-while true; do sleep 86400 & wait $!; done
+# Run the monitor from the mounted agent home volume - it handles Ctrl-C to drop to shell
+exec python3 /opt/devaipod/scripts/workspace_monitor.py
 "#,
-                    port = OPENCODE_PORT
+                    port = OPENCODE_PORT,
                 ),
             ]),
             drop_all_caps: false,
@@ -1173,8 +1214,14 @@ while true; do sleep 86400 & wait $!; done
             devices,
             security_opts: config.security_opt.clone(),
             privileged,
-            // Mount the workspace volume (initialized with cloned repo)
-            volume_mounts: vec![(volume_name.to_string(), "/workspaces".to_string())],
+            // Mount the workspace volume (initialized with cloned repo) and agent home (read-only for scripts)
+            volume_mounts: vec![
+                (volume_name.to_string(), "/workspaces".to_string()),
+                (
+                    agent_home_volume.to_string(),
+                    "/opt/devaipod:ro".to_string(),
+                ),
+            ],
             secrets,
             ..Default::default()
         }
@@ -1295,6 +1342,14 @@ while true; do sleep 86400 & wait $!; done
             );
         }
 
+        // Build the startup script. The workspace monitor handles sending any initial task.
+        let startup_script = format!(
+            r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
+exec opencode serve --port {port} --hostname 0.0.0.0"#,
+            home = AGENT_HOME_PATH,
+            port = OPENCODE_PORT
+        );
+
         ContainerConfig {
             mounts,
             env,
@@ -1303,16 +1358,9 @@ while true; do sleep 86400 & wait $!; done
             // Run as a non-root user if possible (agent user)
             user: None, // Let the image decide, or we could set "1000" for a generic user
             command: Some(vec![
-                // Create home dir structure first (including dirs that might be needed for bind mounts),
-                // then run opencode. We use mkdir -p to ensure all XDG dirs exist.
-                // Note: opencode serve doesn't need the workspace folder to exist at startup.
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                format!(
-                    r#"mkdir -p {agent_home}/.config {agent_home}/.local/share {agent_home}/.local/bin {agent_home}/.cache && \
-                       exec opencode serve --port {} --hostname 0.0.0.0"#,
-                    OPENCODE_PORT
-                ),
+                startup_script,
             ]),
             // Security restrictions
             drop_all_caps: true,
@@ -1417,28 +1465,31 @@ mod tests {
             &bind_home,
             container_home,
             volume_name,
+            "test-agent-home",
             &global_config,
+            None, // task
         );
 
-        // Volume mount for workspace
-        assert_eq!(container_config.volume_mounts.len(), 1);
+        // Volume mounts for workspace and agent home
+        assert_eq!(container_config.volume_mounts.len(), 2);
         assert_eq!(container_config.volume_mounts[0].0, "test-volume");
         assert_eq!(container_config.volume_mounts[0].1, "/workspaces");
+        assert_eq!(container_config.volume_mounts[1].0, "test-agent-home");
+        assert_eq!(container_config.volume_mounts[1].1, "/opt/devaipod:ro");
         assert_eq!(container_config.user, Some("vscode".to_string()));
         // workdir is set to the workspace folder
         assert_eq!(
             container_config.workdir,
             Some("/workspaces/myproject".to_string())
         );
-        // Verify command is a shell script that creates shim, prints agent info, and sleeps
+        // Verify command is a shell script that creates shim and runs monitor
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "/bin/sh");
         assert_eq!(cmd[1], "-c");
         assert!(cmd[2].contains("opencode-connect")); // Creates shim
         assert!(cmd[2].contains("opencode attach")); // Shim uses attach
         assert!(cmd[2].contains(&format!("http://localhost:{}", OPENCODE_PORT)));
-        assert!(cmd[2].contains("trap")); // Has SIGTERM trap for graceful shutdown
-        assert!(cmd[2].contains("sleep")); // Sleeps to keep container running
+        assert!(cmd[2].contains("/opt/devaipod/scripts/workspace_monitor.py")); // Runs monitor script from mounted volume
         assert!(!container_config.drop_all_caps);
         assert!(!container_config.no_new_privileges);
     }
@@ -1678,7 +1729,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
 
         // All devices in the config should actually exist on the host
@@ -1724,7 +1777,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
 
         assert_eq!(container_config.env.get("FOO"), Some(&"bar".to_string()));
@@ -1759,7 +1814,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
 
         // Verify secrets are included for workspace container
@@ -1885,7 +1942,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
 
         // PATH should include default PATH plus the suffix from devcontainer.json
@@ -1927,7 +1986,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
 
         // UNRESOLVABLE should be skipped
@@ -1961,7 +2022,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
 
         assert_eq!(container_config.cap_add, vec!["SYS_PTRACE".to_string()]);
@@ -2064,7 +2127,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
 
         // Privileged should be true from runArgs
@@ -2094,7 +2159,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
 
         // Device should be in the devices list
@@ -2126,7 +2193,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
         assert!(
             container_config1.privileged,
@@ -2146,7 +2215,9 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            "test-agent-home",
             &global_config,
+            None, // task
         );
         assert!(
             container_config2.privileged,

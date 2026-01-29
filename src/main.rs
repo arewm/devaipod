@@ -27,13 +27,13 @@ mod service_gator;
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
 
-/// Normalize a workspace name to a full pod name by adding the prefix if missing
+/// Normalize a workspace name to a full pod name by adding the prefix
+///
+/// The user-facing "short name" is what's shown by `devaipod list` and suggested
+/// after `devaipod up` (the pod name with the prefix stripped). This function
+/// always adds the prefix to convert back to the full pod name.
 fn normalize_pod_name(name: &str) -> String {
-    if name.starts_with(POD_NAME_PREFIX) {
-        name.to_string()
-    } else {
-        format!("{}{}", POD_NAME_PREFIX, name)
-    }
+    format!("{}{}", POD_NAME_PREFIX, name)
 }
 
 /// Strip the prefix from a pod name for display
@@ -391,7 +391,10 @@ fn init_tracing(verbose: bool, quiet: bool) {
 
 /// Commands that don't require a config file to exist
 fn command_requires_config(cmd: &HostCommand) -> bool {
-    !matches!(cmd, HostCommand::Init { .. } | HostCommand::Completions { .. })
+    !matches!(
+        cmd,
+        HostCommand::Init { .. } | HostCommand::Completions { .. }
+    )
 }
 
 async fn run_host(cli: HostCli) -> Result<()> {
@@ -408,7 +411,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
             eprintln!("devaipod requires a configuration file to run.");
             eprintln!("Run 'devaipod init' to create one interactively.");
             eprintln!();
-            eprintln!("For more information, see: https://github.com/cgwalters/devaipod#configuration");
+            eprintln!(
+                "For more information, see: https://github.com/cgwalters/devaipod#configuration"
+            );
             std::process::exit(1);
         }
     }
@@ -502,21 +507,18 @@ enum LifecycleMode {
 /// - Copying bind_home files
 /// - Installing dotfiles
 /// - Running lifecycle commands
-/// - Writing task instructions
 /// - Printing success message
 async fn finalize_pod(
     podman: &podman::PodmanService,
     devaipod_pod: &pod::DevaipodPod,
     devcontainer_config: &devcontainer::DevcontainerConfig,
     config: &config::Config,
-    task: Option<&str>,
 ) -> Result<()> {
     finalize_pod_with_mode(
         podman,
         devaipod_pod,
         devcontainer_config,
         config,
-        task,
         LifecycleMode::Full,
     )
     .await
@@ -528,7 +530,6 @@ async fn finalize_pod_with_mode(
     devaipod_pod: &pod::DevaipodPod,
     devcontainer_config: &devcontainer::DevcontainerConfig,
     config: &config::Config,
-    task: Option<&str>,
     lifecycle_mode: LifecycleMode,
 ) -> Result<()> {
     // Start the pod
@@ -580,17 +581,10 @@ async fn finalize_pod_with_mode(
         }
     }
 
-    // Write task instructions if provided
-    if let Some(task_desc) = task {
-        tracing::info!("Writing task instructions to agent...");
-        devaipod_pod
-            .write_task_instructions(podman, task_desc)
-            .await
-            .context("Failed to write task instructions")?;
-    }
-
     // Success message
-    tracing::info!("Pod '{}' ready", devaipod_pod.pod_name);
+    let short_name = strip_pod_prefix(&devaipod_pod.pod_name);
+    tracing::info!("Pod ready: {}", devaipod_pod.pod_name);
+    tracing::info!("  SSH: devaipod ssh {}", short_name);
     tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
 
     Ok(())
@@ -768,11 +762,12 @@ async fn cmd_up(
         Some(&service_gator_config),
         image,
         service_gator_image,
+        task,
     )
     .await
     .context("Failed to create devaipod pod")?;
 
-    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config, task).await?;
+    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
 
     drop(podman);
 
@@ -904,11 +899,12 @@ async fn cmd_up_pr(
         None, // Use config.service_gator for PR workflows
         image,
         None, // gator_image_override not yet supported for PR workflows
+        task,
     )
     .await
     .context("Failed to create devaipod pod")?;
 
-    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config, task).await?;
+    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
 
     drop(podman);
 
@@ -1106,11 +1102,12 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
         Some(&service_gator_config),
         image,
         service_gator_image,
+        task,
     )
     .await
     .context("Failed to create devaipod pod")?;
 
-    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config, task).await?;
+    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
 
     drop(podman);
 
@@ -1175,8 +1172,12 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         cmd.args(["exec", "-i", &container]);
 
         if command.is_empty() {
-            // Default to bash for shell access
-            cmd.arg("bash");
+            // Default to workspace monitor (Ctrl-C drops to shell), with fallback if unavailable
+            cmd.args([
+                "/bin/sh",
+                "-c",
+                "if command -v python3 >/dev/null && [ -f /opt/devaipod/scripts/workspace_monitor.py ]; then exec python3 /opt/devaipod/scripts/workspace_monitor.py; else echo 'Monitor not available, dropping to shell'; exec bash; fi",
+            ]);
         } else {
             cmd.args(command);
         }
@@ -1184,7 +1185,13 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         let status = cmd.status().context("Failed to run podman exec")?;
 
         if !status.success() {
-            bail!("podman exec failed with exit code {:?}", status.code());
+            bail!(
+                "podman exec failed for container '{}' (exit code {:?}). \
+                 The container may not exist or is not running. \
+                 Run 'devaipod list' to see available pods.",
+                container,
+                status.code()
+            );
         }
     } else {
         // Interactive mode with TTY
@@ -1194,7 +1201,12 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         cmd.args(["exec", "-it", &container]);
 
         if command.is_empty() {
-            cmd.arg("bash");
+            // Default to workspace monitor (Ctrl-C drops to shell), with fallback if unavailable
+            cmd.args([
+                "/bin/sh",
+                "-c",
+                "if command -v python3 >/dev/null && [ -f /opt/devaipod/scripts/workspace_monitor.py ]; then exec python3 /opt/devaipod/scripts/workspace_monitor.py; else echo 'Monitor not available, dropping to shell'; exec bash; fi",
+            ]);
         } else {
             cmd.args(command);
         }
@@ -1202,7 +1214,13 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         let status = cmd.status().context("Failed to run podman exec")?;
 
         if !status.success() {
-            bail!("podman exec failed with exit code {:?}", status.code());
+            bail!(
+                "podman exec failed for container '{}' (exit code {:?}). \
+                 The container may not exist or is not running. \
+                 Run 'devaipod list' to see available pods.",
+                container,
+                status.code()
+            );
         }
     }
 
@@ -1822,6 +1840,8 @@ async fn cmd_rebuild(
     }
 
     // Recreate the pod - volumes already exist so they'll be reused
+    // Note: We don't pass the task for rebuilds - the agent home volume persists
+    // and contains the original task file, so it will be picked up on restart.
     tracing::info!("Recreating containers with new image...");
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
@@ -1836,6 +1856,7 @@ async fn cmd_rebuild(
         None,
         image_override,
         None, // gator_image_override not yet supported for rebuild
+        None, // task - agent home volume persists with original task
     )
     .await
     .context("Failed to recreate pod")?;
@@ -1851,7 +1872,6 @@ async fn cmd_rebuild(
         &devaipod_pod,
         &devcontainer_config,
         config,
-        None, // No task for rebuild
         lifecycle_mode,
     )
     .await?;
