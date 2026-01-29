@@ -43,38 +43,40 @@ cargo build --release
 
 # First-time setup (configures API keys, GitHub token, etc.)
 devaipod init
+```
 
-# Start a pod for a local project
+### Example 1: Just init a multi-pod devcontainer with available agent
+
+# Start a pod for a local project; an agent will be spawned as well,
+but will wait for your instructions:
+
+```
 devaipod up /path/to/your/project
+devaipod ssh
+opencode-connect # inside the pod
+```
+
+This allows you complete control.
+
+### Example 2: Start on a repository with a task
+
+But let's say you want more automation. By default
+the service-gator configuration allows creating draft PRs.
 
 # Start from a GitHub repo with a task for the agent
-devaipod up https://github.com/org/repo 'fix the typo in README.md'
 
-# Start from a PR and auto-SSH into workspace
-devaipod up https://github.com/org/repo/pull/123 -S
-
-# SSH into the workspace container (prefix is optional)
-devaipod ssh myproject
-
-# Run opencode (connects to sandboxed agent)
-oc
+```
+devaipod run https://github.com/org/repo
+<prompt input here>
 ```
 
-### Task Kickoff
+You can also pass a quick inline task via `devaipod run https://github.com/org/repo -c 'fix typos in README.md'`
 
-When you provide a task description, the agent automatically receives it as an initial prompt:
+It's just as easy to run multiple of these.
 
-```bash
-# Clone repo and give the agent a task
-devaipod up https://github.com/org/repo 'add unit tests for the parser module'
-
-# The agent will start working on the task immediately
-# Connect to watch progress:
-devaipod attach myrepo
-```
-
-The workspace monitor shows the agent's status and lets you interact with it.
-Press `Ctrl-C` to drop to a shell while the agent continues working.
+When you have a `run` started, when you `devaipod ssh` you
+will see a monitor process with more instructions; you
+can attach to and interrupt the agent for example.
 
 ### Automatic Service-gator for Remote URLs
 

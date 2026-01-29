@@ -115,6 +115,25 @@ struct HostCli {
     command: HostCommand,
 }
 
+/// Mode of workspace creation (run vs up)
+#[derive(Debug, Clone, Copy, Default)]
+enum WorkspaceMode {
+    /// Created with 'devaipod up' - interactive/manual control
+    #[default]
+    Up,
+    /// Created with 'devaipod run' - automated task execution
+    Run,
+}
+
+impl WorkspaceMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            WorkspaceMode::Up => "up",
+            WorkspaceMode::Run => "run",
+        }
+    }
+}
+
 /// Common options for workspace creation commands
 #[derive(Debug, Args)]
 struct UpOptions {
@@ -130,6 +149,9 @@ struct UpOptions {
     /// SSH into workspace after starting
     #[arg(short = 'S', long)]
     ssh: bool,
+    /// Internal: mode of workspace creation (not exposed as CLI arg)
+    #[arg(skip)]
+    mode: WorkspaceMode,
     /// Use a specific container image instead of building from devcontainer.json
     ///
     /// This allows working with git repositories that have no devcontainer.json.
@@ -793,8 +815,12 @@ async fn cmd_up(
     tracing::debug!("Creating pod '{}'...", pod_name);
     let source = pod::WorkspaceSource::LocalRepo(git_info);
 
-    // Build extra labels for task description
+    // Build extra labels for task description and mode
     let mut extra_labels = Vec::new();
+    extra_labels.push((
+        "io.devaipod.mode".to_string(),
+        opts.mode.as_str().to_string(),
+    ));
     if let Some(task_desc) = task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
     }
@@ -932,8 +958,12 @@ async fn cmd_up_pr(
     // Create source from PR info
     let source = pod::WorkspaceSource::PullRequest(pr_info);
 
-    // Build extra labels for task description
+    // Build extra labels for task description and mode
     let mut extra_labels = Vec::new();
+    extra_labels.push((
+        "io.devaipod.mode".to_string(),
+        opts.mode.as_str().to_string(),
+    ));
     if let Some(task_desc) = task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
     }
@@ -1138,8 +1168,12 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
     };
     let source = pod::WorkspaceSource::RemoteRepo(remote_info);
 
-    // Build extra labels for task description
+    // Build extra labels for task description and mode
     let mut extra_labels = Vec::new();
+    extra_labels.push((
+        "io.devaipod.mode".to_string(),
+        opts.mode.as_str().to_string(),
+    ));
     if let Some(task_desc) = task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
     }
@@ -1192,7 +1226,7 @@ async fn cmd_run(
     service_gator_scopes: &[String],
     service_gator_image: Option<&str>,
 ) -> Result<()> {
-    // Build UpOptions with the task
+    // Build UpOptions with the task and mode=Run
     let opts = UpOptions {
         task: command.map(|s| s.to_string()),
         no_prompt: false,
@@ -1202,6 +1236,7 @@ async fn cmd_run(
         name: explicit_name.map(|s| s.to_string()),
         service_gator_scopes: service_gator_scopes.to_vec(),
         service_gator_image: service_gator_image.map(|s| s.to_string()),
+        mode: WorkspaceMode::Run,
     };
 
     // Check if source is a PR/MR URL
@@ -1220,9 +1255,7 @@ async fn cmd_run(
 
     // For local paths, delegate to cmd_up
     cmd_up(
-        config,
-        source,
-        None,  // agent
+        config, source, None,  // agent
         false, // no_agent - we want the agent
         None,  // provider
         None,  // ide
@@ -1503,6 +1536,8 @@ fn cmd_list(json_output: bool) -> Result<()> {
         repo: Option<String>,
         pr: Option<String>,
         task: Option<String>,
+        mode: Option<String>,
+        agent_status: Option<bool>,
     }
 
     let mut pod_infos: Vec<PodInfo> = Vec::new();
@@ -1526,7 +1561,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
             .to_string();
 
         // Get labels from pod inspect (use full name for podman commands)
-        let (repo, pr, task) = if let Some(labels) = get_pod_labels(full_name) {
+        let (repo, pr, task, mode) = if let Some(labels) = get_pod_labels(full_name) {
             let repo = labels
                 .get("io.devaipod.repo")
                 .and_then(|v| v.as_str())
@@ -1539,9 +1574,20 @@ fn cmd_list(json_output: bool) -> Result<()> {
                 .get("io.devaipod.task")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            (repo, pr, task)
+            let mode = labels
+                .get("io.devaipod.mode")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            (repo, pr, task, mode)
         } else {
-            (None, None, None)
+            (None, None, None, None)
+        };
+
+        // Check agent status for running pods
+        let agent_status = if status.to_lowercase() == "running" {
+            check_agent_health(full_name)
+        } else {
+            None
         };
 
         pod_infos.push(PodInfo {
@@ -1552,6 +1598,8 @@ fn cmd_list(json_output: bool) -> Result<()> {
             repo,
             pr,
             task,
+            mode,
+            agent_status,
         });
     }
 
@@ -1574,13 +1622,14 @@ fn cmd_list(json_output: bool) -> Result<()> {
     let has_repo_info = pod_infos.iter().any(|p| p.repo.is_some());
     let has_task_info = pod_infos.iter().any(|p| p.task.is_some());
 
-    // Print header
+    // Print header - include MODE column when there are task-based workspaces
     if has_repo_info {
         if has_task_info {
             println!(
-                "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {:<30}  {}",
+                "{:<name_width$}  {:<18}  {:<4}  {:<repo_width$}  {:<6}  {:<25}  {}",
                 "NAME",
                 "STATUS",
+                "MODE",
                 "REPO",
                 "PR",
                 "TASK",
@@ -1590,7 +1639,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
             );
         } else {
             println!(
-                "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {}",
+                "{:<name_width$}  {:<18}  {:<repo_width$}  {:<6}  {}",
                 "NAME",
                 "STATUS",
                 "REPO",
@@ -1602,16 +1651,17 @@ fn cmd_list(json_output: bool) -> Result<()> {
         }
     } else if has_task_info {
         println!(
-            "{:<name_width$}  {:<10}  {:<30}  {}",
+            "{:<name_width$}  {:<18}  {:<4}  {:<25}  {}",
             "NAME",
             "STATUS",
+            "MODE",
             "TASK",
             "CREATED",
             name_width = name_width
         );
     } else {
         println!(
-            "{:<name_width$}  {:<10}  {:<12}  {}",
+            "{:<name_width$}  {:<18}  {:<12}  {}",
             "NAME",
             "STATUS",
             "CONTAINERS",
@@ -1624,7 +1674,8 @@ fn cmd_list(json_output: bool) -> Result<()> {
     for info in &pod_infos {
         let created_display = format_created_time(&info.created);
 
-        let status_display = match info.status.to_lowercase().as_str() {
+        // Build status display with agent status suffix for running pods
+        let base_status = match info.status.to_lowercase().as_str() {
             "running" => "Running",
             "stopped" => "Stopped",
             "exited" => "Exited",
@@ -1632,13 +1683,27 @@ fn cmd_list(json_output: bool) -> Result<()> {
             _ => &info.status,
         };
 
-        // Truncate task to 30 chars for display
+        // For running pods, append agent status
+        let status_display = if info.status.to_lowercase() == "running" {
+            match info.agent_status {
+                Some(true) => format!("{} [agent:ok]", base_status),
+                Some(false) => format!("{} [agent:--]", base_status),
+                None => base_status.to_string(),
+            }
+        } else {
+            base_status.to_string()
+        };
+
+        // Show mode (run/up) if available
+        let mode_display = info.mode.as_deref().unwrap_or("-");
+
+        // Truncate task to 25 chars for display (shortened to make room for mode)
         let task_display = info
             .task
             .as_ref()
             .map(|t| {
-                if t.len() > 30 {
-                    format!("{}...", &t[..27])
+                if t.len() > 25 {
+                    format!("{}...", &t[..22])
                 } else {
                     t.clone()
                 }
@@ -1655,9 +1720,10 @@ fn cmd_list(json_output: bool) -> Result<()> {
 
             if has_task_info {
                 println!(
-                    "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {:<30}  {}",
+                    "{:<name_width$}  {:<18}  {:<4}  {:<repo_width$}  {:<6}  {:<25}  {}",
                     info.name,
                     status_display,
+                    mode_display,
                     repo_display,
                     pr_display,
                     task_display,
@@ -1667,7 +1733,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
                 );
             } else {
                 println!(
-                    "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {}",
+                    "{:<name_width$}  {:<18}  {:<repo_width$}  {:<6}  {}",
                     info.name,
                     status_display,
                     repo_display,
@@ -1679,16 +1745,17 @@ fn cmd_list(json_output: bool) -> Result<()> {
             }
         } else if has_task_info {
             println!(
-                "{:<name_width$}  {:<10}  {:<30}  {}",
+                "{:<name_width$}  {:<18}  {:<4}  {:<25}  {}",
                 info.name,
                 status_display,
+                mode_display,
                 task_display,
                 created_display,
                 name_width = name_width
             );
         } else {
             println!(
-                "{:<name_width$}  {:<10}  {:<12}  {}",
+                "{:<name_width$}  {:<18}  {:<12}  {}",
                 info.name,
                 status_display,
                 format!(

@@ -360,8 +360,11 @@ impl DevaipodPod {
                     // Use GH_TOKEN for cloning private repos if available
                     // Check env vars first, then podman secrets from config
                     let gh_token = crate::git::get_github_token_with_secret(global_config);
-                    let script =
-                        crate::git::clone_pr_script(pr_info, &workspace_folder, gh_token.as_deref());
+                    let script = crate::git::clone_pr_script(
+                        pr_info,
+                        &workspace_folder,
+                        gh_token.as_deref(),
+                    );
                     (script, vec![])
                 }
             };
