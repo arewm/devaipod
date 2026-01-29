@@ -291,6 +291,43 @@ enum HostCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Run an agent on a repository with a task
+    ///
+    /// Creates a workspace and starts the agent with a task. This is a convenience
+    /// command that combines 'up' with automatic task execution.
+    ///
+    /// The agent will start working on the task immediately. Use 'devaipod ssh'
+    /// to monitor progress and interact with the agent.
+    ///
+    /// Examples:
+    ///   devaipod run https://github.com/org/repo
+    ///   devaipod run https://github.com/org/repo -c 'fix typos in README.md'
+    ///   devaipod run . -c 'add unit tests for the parser module'
+    Run {
+        /// Source: local path, git URL, or PR URL
+        source: String,
+        /// Inline command/task for the agent
+        #[arg(short = 'c', long = "command", value_name = "TASK")]
+        command: Option<String>,
+        /// AI agent to run: goose, claude, opencode (default: from config or goose)
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// DevPod provider to use (default: docker)
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+        /// Use a specific container image instead of building from devcontainer.json
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+        /// Explicit pod name (default: derived from source with unique suffix)
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Configure service-gator scopes for AI agent access to external services
+        #[arg(long = "service-gator", value_name = "SCOPE")]
+        service_gator_scopes: Vec<String>,
+        /// Use a specific image for the service-gator container
+        #[arg(long, value_name = "IMAGE")]
+        service_gator_image: Option<String>,
+    },
     /// Generate shell completions
     ///
     /// Outputs shell completion scripts to stdout for various shells.
@@ -477,6 +514,29 @@ async fn run_host(cli: HostCli) -> Result<()> {
         } => cmd_logs(&normalize_pod_name(&workspace), &container, follow, tail),
         HostCommand::Status { workspace, json } => {
             cmd_status(&normalize_pod_name(&workspace), json)
+        }
+        HostCommand::Run {
+            source,
+            command,
+            agent,
+            provider,
+            image,
+            name,
+            service_gator_scopes,
+            service_gator_image,
+        } => {
+            cmd_run(
+                &config,
+                &source,
+                command.as_deref(),
+                agent.as_deref(),
+                provider.as_deref(),
+                image.as_deref(),
+                name.as_deref(),
+                &service_gator_scopes,
+                service_gator_image.as_deref(),
+            )
+            .await
         }
         HostCommand::Completions { shell } => cmd_completions(shell),
         HostCommand::Init { config } => init::cmd_init(config.as_deref()),
@@ -1126,6 +1186,62 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
     }
 
     Ok(())
+}
+
+/// Run an agent on a repository with a task
+///
+/// This is a convenience command that combines 'up' with automatic task execution.
+/// It creates a workspace, starts the agent with the task, and SSHs into the workspace
+/// so the user can monitor progress.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_run(
+    config: &config::Config,
+    source: &str,
+    command: Option<&str>,
+    _agent: Option<&str>,
+    _provider: Option<&str>,
+    image: Option<&str>,
+    explicit_name: Option<&str>,
+    service_gator_scopes: &[String],
+    service_gator_image: Option<&str>,
+) -> Result<()> {
+    // If no inline command provided, we'll prompt for input after setup
+    // For now, the task will be passed to the agent via the workspace
+
+    // Build UpOptions with the task
+    let opts = UpOptions {
+        task: command.map(|s| s.to_string()),
+        no_prompt: false,
+        dry_run: false,
+        ssh: true, // Always SSH after run to show the monitor
+        image: image.map(|s| s.to_string()),
+        name: explicit_name.map(|s| s.to_string()),
+        service_gator_scopes: service_gator_scopes.to_vec(),
+        service_gator_image: service_gator_image.map(|s| s.to_string()),
+    };
+
+    // Check if source is a PR/MR URL
+    if let Some(pr_ref) = forge::parse_pr_url(source) {
+        return cmd_up_pr(config, pr_ref, &opts).await;
+    }
+
+    // Resolve local paths - if it looks like a URL, treat it as remote
+    let is_remote_url = source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("git@");
+
+    if is_remote_url {
+        return cmd_up_remote(config, source, &opts).await;
+    }
+
+    // For local paths, delegate to cmd_up
+    cmd_up(
+        config, source, _agent, false, // no_agent - we want the agent
+        _provider, None,  // ide
+        false, // agent_sidecar
+        opts,
+    )
+    .await
 }
 
 /// Check if any API keys are configured for the AI agent and warn if not
@@ -2466,6 +2582,7 @@ mod tests {
         let subcommands: Vec<_> = cmd.get_subcommands().map(|c| c.get_name()).collect();
 
         assert!(subcommands.contains(&"up"), "Missing 'up' command");
+        assert!(subcommands.contains(&"run"), "Missing 'run' command");
         assert!(subcommands.contains(&"ssh"), "Missing 'ssh' command");
         assert!(
             subcommands.contains(&"ssh-config"),
