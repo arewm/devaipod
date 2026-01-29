@@ -17,6 +17,7 @@ mod forge;
 mod git;
 #[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
 mod gpu;
+mod init;
 mod pod;
 mod podman;
 mod proxy;
@@ -26,13 +27,13 @@ mod service_gator;
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
 
-/// Normalize a workspace name to a full pod name by adding the prefix if missing
+/// Normalize a workspace name to a full pod name by adding the prefix
+///
+/// The user-facing "short name" is what's shown by `devaipod list` and suggested
+/// after `devaipod up` (the pod name with the prefix stripped). This function
+/// always adds the prefix to convert back to the full pod name.
 fn normalize_pod_name(name: &str) -> String {
-    if name.starts_with(POD_NAME_PREFIX) {
-        name.to_string()
-    } else {
-        format!("{}{}", POD_NAME_PREFIX, name)
-    }
+    format!("{}{}", POD_NAME_PREFIX, name)
 }
 
 /// Strip the prefix from a pod name for display
@@ -303,6 +304,21 @@ enum HostCommand {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Initialize devaipod configuration
+    ///
+    /// Interactive setup wizard for first-time users. Configures:
+    /// - Dotfiles/homegit repository
+    /// - Forge tokens (GitHub, GitLab, Forgejo) via podman secrets
+    /// - OpenCode configuration recommendations
+    ///
+    /// Examples:
+    ///   devaipod init
+    ///   devaipod init --config ~/.config/devaipod-test.toml
+    Init {
+        /// Path to write config file (default: ~/.config/devaipod.toml)
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
 }
 
 // =============================================================================
@@ -373,7 +389,35 @@ fn init_tracing(verbose: bool, quiet: bool) {
         .init();
 }
 
+/// Commands that don't require a config file to exist
+fn command_requires_config(cmd: &HostCommand) -> bool {
+    !matches!(
+        cmd,
+        HostCommand::Init { .. } | HostCommand::Completions { .. }
+    )
+}
+
 async fn run_host(cli: HostCli) -> Result<()> {
+    // Check if config file is required and exists
+    if command_requires_config(&cli.command) {
+        let config_path = cli
+            .config
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(config::config_path);
+        if !config_path.exists() {
+            eprintln!("No configuration file found at {}", config_path.display());
+            eprintln!();
+            eprintln!("devaipod requires a configuration file to run.");
+            eprintln!("Run 'devaipod init' to create one interactively.");
+            eprintln!();
+            eprintln!(
+                "For more information, see: https://github.com/cgwalters/devaipod#configuration"
+            );
+            std::process::exit(1);
+        }
+    }
+
     let config = config::load_config(cli.config.as_deref())?;
 
     match cli.command {
@@ -435,6 +479,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             cmd_status(&normalize_pod_name(&workspace), json)
         }
         HostCommand::Completions { shell } => cmd_completions(shell),
+        HostCommand::Init { config } => init::cmd_init(config.as_deref()),
     }
 }
 
@@ -444,6 +489,105 @@ fn run_container(cli: ContainerCli) -> Result<()> {
     match cli.command {
         ContainerCommand::ConfigureEnv => cmd_configure_env(),
     }
+}
+
+/// Which lifecycle commands to run
+#[derive(Clone, Copy)]
+enum LifecycleMode {
+    /// Run all commands (onCreateCommand, postCreateCommand, postStartCommand)
+    Full,
+    /// Skip onCreateCommand (for rebuild when workspace already exists)
+    Rebuild,
+}
+
+/// Common post-creation steps for all up commands
+///
+/// After creating a pod with DevaipodPod::create(), this function handles:
+/// - Starting the pod
+/// - Copying bind_home files
+/// - Installing dotfiles
+/// - Running lifecycle commands
+/// - Printing success message
+async fn finalize_pod(
+    podman: &podman::PodmanService,
+    devaipod_pod: &pod::DevaipodPod,
+    devcontainer_config: &devcontainer::DevcontainerConfig,
+    config: &config::Config,
+) -> Result<()> {
+    finalize_pod_with_mode(
+        podman,
+        devaipod_pod,
+        devcontainer_config,
+        config,
+        LifecycleMode::Full,
+    )
+    .await
+}
+
+/// Common post-creation steps with configurable lifecycle mode
+async fn finalize_pod_with_mode(
+    podman: &podman::PodmanService,
+    devaipod_pod: &pod::DevaipodPod,
+    devcontainer_config: &devcontainer::DevcontainerConfig,
+    config: &config::Config,
+    lifecycle_mode: LifecycleMode,
+) -> Result<()> {
+    // Start the pod
+    devaipod_pod
+        .start(podman)
+        .await
+        .context("Failed to start pod")?;
+
+    // Copy bind_home files into containers
+    tracing::debug!("Copying bind_home files...");
+    devaipod_pod
+        .copy_bind_home_files(
+            podman,
+            &devaipod_pod.workspace_bind_home,
+            &devaipod_pod.agent_bind_home,
+            &devaipod_pod.container_home,
+            devcontainer_config.effective_user(),
+        )
+        .await
+        .context("Failed to copy bind_home files")?;
+
+    // Install dotfiles before lifecycle commands
+    if let Some(ref dotfiles) = config.dotfiles {
+        devaipod_pod
+            .install_dotfiles(podman, dotfiles, devcontainer_config.effective_user())
+            .await
+            .context("Failed to install dotfiles")?;
+        devaipod_pod
+            .install_dotfiles_agent(podman, dotfiles)
+            .await
+            .context("Failed to install dotfiles in agent")?;
+    }
+
+    // Run lifecycle commands based on mode
+    match lifecycle_mode {
+        LifecycleMode::Full => {
+            tracing::debug!("Running lifecycle commands...");
+            devaipod_pod
+                .run_lifecycle_commands(podman, devcontainer_config)
+                .await
+                .context("Failed to run lifecycle commands")?;
+        }
+        LifecycleMode::Rebuild => {
+            tracing::debug!("Running rebuild lifecycle commands (postCreate + postStart)...");
+            devaipod_pod
+                .run_rebuild_lifecycle_commands(podman, devcontainer_config)
+                .await
+                .context("Failed to run lifecycle commands")?;
+        }
+    }
+
+    // Success message
+    let short_name = strip_pod_prefix(&devaipod_pod.pod_name);
+    tracing::info!("Pod ready: {}", devaipod_pod.pod_name);
+    tracing::info!("  SSH: devaipod ssh {}", short_name);
+    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
+
+    Ok(())
 }
 
 /// Create/start a workspace with AI agent
@@ -618,82 +762,15 @@ async fn cmd_up(
         Some(&service_gator_config),
         image,
         service_gator_image,
+        task,
     )
     .await
     .context("Failed to create devaipod pod")?;
 
-    // Start the pod
-    devaipod_pod
-        .start(&podman)
-        .await
-        .context("Failed to start pod")?;
+    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
 
-    // Wait for the agent to be ready before proceeding
-    devaipod_pod
-        .wait_for_agent_ready(&podman, 60, 500)
-        .await
-        .context("Agent container failed to start")?;
-
-    // Copy bind_home files into containers (using podman cp instead of bind mounts
-    // to avoid permission issues with rootless podman)
-    tracing::debug!("Copying bind_home files...");
-    devaipod_pod
-        .copy_bind_home_files(
-            &podman,
-            &devaipod_pod.workspace_bind_home,
-            &devaipod_pod.agent_bind_home,
-            &devaipod_pod.container_home,
-            devcontainer_config.effective_user(),
-        )
-        .await
-        .context("Failed to copy bind_home files")?;
-
-    // Note: service-gator MCP config is now set via OPENCODE_CONFIG_CONTENT env var
-    // at container creation time, so no need to configure it here.
-
-    // Install dotfiles BEFORE lifecycle commands so bashrc, gitconfig, etc. are available
-    if let Some(ref dotfiles) = config.dotfiles {
-        devaipod_pod
-            .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
-            .await
-            .context("Failed to install dotfiles")?;
-        // Also install in agent container so .gitconfig is available for git operations
-        devaipod_pod
-            .install_dotfiles_agent(&podman, dotfiles)
-            .await
-            .context("Failed to install dotfiles in agent")?;
-    }
-
-    // Run lifecycle commands (onCreateCommand, postCreateCommand, postStartCommand)
-    tracing::debug!("Running lifecycle commands...");
-    devaipod_pod
-        .run_lifecycle_commands(&podman, &devcontainer_config)
-        .await
-        .context("Failed to run lifecycle commands")?;
-
-    // Write task instructions to agent config if provided
-    if let Some(task_desc) = task {
-        tracing::info!("Writing task instructions to agent...");
-        devaipod_pod
-            .write_task_instructions(&podman, task_desc)
-            .await
-            .context("Failed to write task instructions")?;
-    }
-
-    // Success! Print connection info
-    tracing::info!("Pod '{}' ready", pod_name);
-    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
-    tracing::info!(
-        "  SSH: podman exec -it {} bash",
-        devaipod_pod.workspace_container
-    );
-
-    // Drop podman service - this will kill the service process
-    // but the pod/containers will continue running since podman doesn't
-    // require the service to be running for containers to run.
     drop(podman);
 
-    // SSH into workspace if requested
     if ssh {
         return cmd_ssh(&pod_name, false, &[]);
     }
@@ -822,75 +899,15 @@ async fn cmd_up_pr(
         None, // Use config.service_gator for PR workflows
         image,
         None, // gator_image_override not yet supported for PR workflows
+        task,
     )
     .await
     .context("Failed to create devaipod pod")?;
 
-    // Start the pod
-    devaipod_pod
-        .start(&podman)
-        .await
-        .context("Failed to start pod")?;
-
-    // Wait for the agent to be ready
-    devaipod_pod
-        .wait_for_agent_ready(&podman, 120, 500)
-        .await
-        .context("Agent container failed to start")?;
-
-    // Copy bind_home files
-    tracing::debug!("Copying bind_home files...");
-    devaipod_pod
-        .copy_bind_home_files(
-            &podman,
-            &devaipod_pod.workspace_bind_home,
-            &devaipod_pod.agent_bind_home,
-            &devaipod_pod.container_home,
-            devcontainer_config.effective_user(),
-        )
-        .await
-        .context("Failed to copy bind_home files")?;
-
-    // Install dotfiles
-    if let Some(ref dotfiles) = config.dotfiles {
-        devaipod_pod
-            .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
-            .await
-            .context("Failed to install dotfiles")?;
-        // Also install in agent container so .gitconfig is available for git operations
-        devaipod_pod
-            .install_dotfiles_agent(&podman, dotfiles)
-            .await
-            .context("Failed to install dotfiles in agent")?;
-    }
-
-    // Run lifecycle commands
-    tracing::debug!("Running lifecycle commands...");
-    devaipod_pod
-        .run_lifecycle_commands(&podman, &devcontainer_config)
-        .await
-        .context("Failed to run lifecycle commands")?;
-
-    // Write task instructions to agent config if provided
-    if let Some(task_desc) = task {
-        tracing::info!("Writing task instructions to agent...");
-        devaipod_pod
-            .write_task_instructions(&podman, task_desc)
-            .await
-            .context("Failed to write task instructions")?;
-    }
-
-    // Success!
-    tracing::info!("Pod '{}' ready", pod_name);
-    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
-    tracing::info!(
-        "  SSH: podman exec -it {} bash",
-        devaipod_pod.workspace_container
-    );
+    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
 
     drop(podman);
 
-    // SSH into workspace if requested
     if ssh {
         return cmd_ssh(&pod_name, false, &[]);
     }
@@ -1085,73 +1102,15 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
         Some(&service_gator_config),
         image,
         service_gator_image,
+        task,
     )
     .await
     .context("Failed to create devaipod pod")?;
 
-    // Start the pod
-    devaipod_pod
-        .start(&podman)
-        .await
-        .context("Failed to start pod")?;
-
-    // Wait for the agent to be ready
-    devaipod_pod
-        .wait_for_agent_ready(&podman, 120, 500)
-        .await
-        .context("Agent container failed to start")?;
-
-    // Copy bind_home files
-    tracing::debug!("Copying bind_home files...");
-    devaipod_pod
-        .copy_bind_home_files(
-            &podman,
-            &devaipod_pod.workspace_bind_home,
-            &devaipod_pod.agent_bind_home,
-            &devaipod_pod.container_home,
-            devcontainer_config.effective_user(),
-        )
-        .await
-        .context("Failed to copy bind_home files")?;
-
-    // Note: service-gator MCP config is set via OPENCODE_CONFIG_CONTENT env var
-    // at container creation time.
-
-    // Install dotfiles
-    if let Some(ref dotfiles) = config.dotfiles {
-        devaipod_pod
-            .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
-            .await
-            .context("Failed to install dotfiles")?;
-        devaipod_pod
-            .install_dotfiles_agent(&podman, dotfiles)
-            .await
-            .context("Failed to install dotfiles in agent")?;
-    }
-
-    // Run lifecycle commands
-    tracing::debug!("Running lifecycle commands...");
-    devaipod_pod
-        .run_lifecycle_commands(&podman, &devcontainer_config)
-        .await
-        .context("Failed to run lifecycle commands")?;
-
-    // Write task instructions to agent config if provided
-    if let Some(task_desc) = task {
-        tracing::info!("Writing task instructions to agent...");
-        devaipod_pod
-            .write_task_instructions(&podman, task_desc)
-            .await
-            .context("Failed to write task instructions")?;
-    }
-
-    // Success!
-    tracing::info!("Pod '{}' ready", pod_name);
-    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
+    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
 
     drop(podman);
 
-    // SSH into workspace if requested
     if ssh {
         return cmd_ssh(&pod_name, false, &[]);
     }
@@ -1171,15 +1130,14 @@ fn check_api_keys_configured() {
         return;
     }
 
+    // Check for DEVAIPOD_AGENT_* env vars (legacy mechanism)
     let agent_env_vars = config::collect_agent_env_vars();
-    let has_common_keys =
-        std::env::var("ANTHROPIC_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok();
 
-    if agent_env_vars.is_empty() && !has_common_keys {
+    if agent_env_vars.is_empty() {
         eprintln!();
-        eprintln!("Warning: No API keys detected for the AI agent.");
-        eprintln!("   Create a config file at ~/.config/devaipod.toml");
-        eprintln!("   See: https://github.com/cgwalters/devaipod#configuration");
+        eprintln!("Warning: No devaipod configuration found.");
+        eprintln!("   Run 'devaipod init' to create a config file.");
+        eprintln!("   See: https://opencode.ai/docs/providers/");
         eprintln!();
     }
 }
@@ -1214,8 +1172,12 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         cmd.args(["exec", "-i", &container]);
 
         if command.is_empty() {
-            // Default to bash for shell access
-            cmd.arg("bash");
+            // Default to workspace monitor (Ctrl-C drops to shell), with fallback if unavailable
+            cmd.args([
+                "/bin/sh",
+                "-c",
+                "if command -v python3 >/dev/null && [ -f /opt/devaipod/scripts/workspace_monitor.py ]; then exec python3 /opt/devaipod/scripts/workspace_monitor.py; else echo 'Monitor not available, dropping to shell'; exec bash; fi",
+            ]);
         } else {
             cmd.args(command);
         }
@@ -1223,7 +1185,13 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         let status = cmd.status().context("Failed to run podman exec")?;
 
         if !status.success() {
-            bail!("podman exec failed with exit code {:?}", status.code());
+            bail!(
+                "podman exec failed for container '{}' (exit code {:?}). \
+                 The container may not exist or is not running. \
+                 Run 'devaipod list' to see available pods.",
+                container,
+                status.code()
+            );
         }
     } else {
         // Interactive mode with TTY
@@ -1233,7 +1201,12 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         cmd.args(["exec", "-it", &container]);
 
         if command.is_empty() {
-            cmd.arg("bash");
+            // Default to workspace monitor (Ctrl-C drops to shell), with fallback if unavailable
+            cmd.args([
+                "/bin/sh",
+                "-c",
+                "if command -v python3 >/dev/null && [ -f /opt/devaipod/scripts/workspace_monitor.py ]; then exec python3 /opt/devaipod/scripts/workspace_monitor.py; else echo 'Monitor not available, dropping to shell'; exec bash; fi",
+            ]);
         } else {
             cmd.args(command);
         }
@@ -1241,7 +1214,13 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         let status = cmd.status().context("Failed to run podman exec")?;
 
         if !status.success() {
-            bail!("podman exec failed with exit code {:?}", status.code());
+            bail!(
+                "podman exec failed for container '{}' (exit code {:?}). \
+                 The container may not exist or is not running. \
+                 Run 'devaipod list' to see available pods.",
+                container,
+                status.code()
+            );
         }
     }
 
@@ -1861,6 +1840,8 @@ async fn cmd_rebuild(
     }
 
     // Recreate the pod - volumes already exist so they'll be reused
+    // Note: We don't pass the task for rebuilds - the agent home volume persists
+    // and contains the original task file, so it will be picked up on restart.
     tracing::info!("Recreating containers with new image...");
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
@@ -1875,72 +1856,29 @@ async fn cmd_rebuild(
         None,
         image_override,
         None, // gator_image_override not yet supported for rebuild
+        None, // task - agent home volume persists with original task
     )
     .await
     .context("Failed to recreate pod")?;
 
-    // Start the pod
-    devaipod_pod
-        .start(&podman)
-        .await
-        .context("Failed to start pod")?;
-
-    // Wait for the agent to be ready
-    devaipod_pod
-        .wait_for_agent_ready(&podman, 120, 500)
-        .await
-        .context("Agent container failed to start")?;
-
-    // Copy bind_home files
-    tracing::debug!("Copying bind_home files...");
-    devaipod_pod
-        .copy_bind_home_files(
-            &podman,
-            &devaipod_pod.workspace_bind_home,
-            &devaipod_pod.agent_bind_home,
-            &devaipod_pod.container_home,
-            devcontainer_config.effective_user(),
-        )
-        .await
-        .context("Failed to copy bind_home files")?;
-
-    // Install dotfiles
-    if let Some(ref dotfiles) = config.dotfiles {
-        devaipod_pod
-            .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
-            .await
-            .context("Failed to install dotfiles")?;
-        devaipod_pod
-            .install_dotfiles_agent(&podman, dotfiles)
-            .await
-            .context("Failed to install dotfiles in agent")?;
-    }
-
-    // Run lifecycle commands based on --run-create flag
-    if run_create {
-        // Run all commands including onCreateCommand
-        tracing::debug!("Running all lifecycle commands (including onCreateCommand)...");
-        devaipod_pod
-            .run_lifecycle_commands(&podman, &devcontainer_config)
-            .await
-            .context("Failed to run lifecycle commands")?;
+    let lifecycle_mode = if run_create {
+        LifecycleMode::Full
     } else {
-        // Default for rebuild: run postCreateCommand and postStartCommand (skip onCreateCommand)
-        tracing::debug!("Running rebuild lifecycle commands (postCreate + postStart)...");
-        devaipod_pod
-            .run_rebuild_lifecycle_commands(&podman, &devcontainer_config)
-            .await
-            .context("Failed to run lifecycle commands")?;
-    }
+        LifecycleMode::Rebuild
+    };
+
+    finalize_pod_with_mode(
+        &podman,
+        &devaipod_pod,
+        &devcontainer_config,
+        config,
+        lifecycle_mode,
+    )
+    .await?;
 
     tracing::info!(
         "Workspace '{}' rebuilt successfully",
         strip_pod_prefix(pod_name)
-    );
-    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
-    tracing::info!(
-        "  SSH: podman exec -it {} bash",
-        devaipod_pod.workspace_container
     );
 
     Ok(())
@@ -2139,13 +2077,14 @@ fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-/// Check if the agent health endpoint is responding
+/// Check if the agent is listening on its port
 fn check_agent_health(pod_name: &str) -> Option<bool> {
     let workspace_container = format!("{}-workspace", pod_name);
-    let health_url = format!("http://localhost:{}/global/health", pod::OPENCODE_PORT);
 
-    // Try to curl the health endpoint from inside the workspace container
-    let check_cmd = format!("curl -sf '{}' >/dev/null 2>&1", health_url);
+    // Use nc to check if the port is accepting connections.
+    // This is more reliable than HTTP health checks since opencode's
+    // endpoints may return errors during/after initialization.
+    let check_cmd = format!("nc -z localhost {} 2>/dev/null", pod::OPENCODE_PORT);
     let result = podman_command()
         .args(["exec", &workspace_container, "/bin/sh", "-c", &check_cmd])
         .status();

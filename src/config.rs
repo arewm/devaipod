@@ -65,20 +65,19 @@ pub struct Config {
     #[allow(dead_code)]
     pub gpu: GpuPassthroughConfig,
     /// Bind paths from host $HOME to container $HOME (applies to all containers)
-    /// Paths are relative to $HOME on both sides
+    /// Paths are relative to $HOME on both sides.
+    /// For the workspace container, these are read-write.
+    /// For the agent container, these are always read-only for security.
+    #[serde(default, rename = "bind_home")]
+    pub bind_home: BindHomeConfig,
+    /// Bind paths specifically for the workspace container (in addition to bind_home)
     #[serde(default)]
-    pub bind_home: Vec<String>,
-    /// Bind paths specifically for the workspace container
-    #[serde(default)]
-    pub bind_home_workspace: Option<BindHomePaths>,
-    /// Bind paths specifically for the agent container
-    #[serde(default)]
-    pub bind_home_agent: Option<BindHomePaths>,
+    pub bind_home_workspace: Option<BindHomeConfig>,
 }
 
 /// Configuration for binding paths from host home to container home
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct BindHomePaths {
+pub struct BindHomeConfig {
     /// Paths relative to $HOME to bind mount
     #[serde(default)]
     pub paths: Vec<String>,
@@ -1035,18 +1034,19 @@ port = 9000
     #[test]
     fn test_parse_bind_home() {
         let toml = r#"
-bind_home = [
+[bind_home]
+paths = [
     ".config/gcloud/application_default_credentials.json",
     ".gitconfig",
 ]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.bind_home.len(), 2);
+        assert_eq!(config.bind_home.paths.len(), 2);
         assert_eq!(
-            config.bind_home[0],
+            config.bind_home.paths[0],
             ".config/gcloud/application_default_credentials.json"
         );
-        assert_eq!(config.bind_home[1], ".gitconfig");
+        assert_eq!(config.bind_home.paths[1], ".gitconfig");
     }
 
     #[test]
@@ -1065,62 +1065,39 @@ paths = [".config/gcloud", ".ssh"]
     }
 
     #[test]
-    fn test_parse_bind_home_agent() {
-        let toml = r#"
-[bind_home_agent]
-paths = [".config/gcloud/application_default_credentials.json"]
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        let agent = config
-            .bind_home_agent
-            .expect("bind_home_agent should be present");
-        assert_eq!(agent.paths.len(), 1);
-        assert_eq!(
-            agent.paths[0],
-            ".config/gcloud/application_default_credentials.json"
-        );
-    }
-
-    #[test]
     fn test_parse_bind_home_combined() {
         let toml = r#"
 # Global bind_home applies to all containers
-bind_home = [".gitconfig"]
+[bind_home]
+paths = [".gitconfig", ".config/gcloud/application_default_credentials.json"]
 
 # Workspace-specific
 [bind_home_workspace]
 paths = [".config/gcloud", ".ssh"]
-
-# Agent-specific (read-only)
-[bind_home_agent]
-paths = [".config/gcloud/application_default_credentials.json"]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
 
-        // Global
-        assert_eq!(config.bind_home.len(), 1);
-        assert_eq!(config.bind_home[0], ".gitconfig");
+        // Global (applies to both workspace and agent)
+        assert_eq!(config.bind_home.paths.len(), 2);
+        assert_eq!(config.bind_home.paths[0], ".gitconfig");
+        assert_eq!(
+            config.bind_home.paths[1],
+            ".config/gcloud/application_default_credentials.json"
+        );
 
-        // Workspace
+        // Workspace-specific additions
         let ws = config
             .bind_home_workspace
             .expect("bind_home_workspace should be present");
         assert_eq!(ws.paths.len(), 2);
-
-        // Agent
-        let agent = config
-            .bind_home_agent
-            .expect("bind_home_agent should be present");
-        assert_eq!(agent.paths.len(), 1);
     }
 
     #[test]
     fn test_bind_home_default_empty() {
         let toml = "";
         let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.bind_home.is_empty());
+        assert!(config.bind_home.paths.is_empty());
         assert!(config.bind_home_workspace.is_none());
-        assert!(config.bind_home_agent.is_none());
     }
 
     #[test]
