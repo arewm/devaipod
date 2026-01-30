@@ -472,7 +472,11 @@ pub fn generate_compose(
     if gator_config.is_enabled() {
         let gator_service = ComposeService {
             image: Some("ghcr.io/cgwalters/service-gator:latest".to_string()),
-            volumes: vec!["gator-config:/config:ro".to_string()],
+            // Mount workspace read-only so git_push_local can access agent's repo
+            volumes: vec![
+                "gator-config:/config:ro".to_string(),
+                format!("..:{workspace_folder}:ro"),
+            ],
             command: Some(StringOrArray::Array(vec![
                 "service-gator".to_string(),
                 "--mcp-server".to_string(),
