@@ -20,33 +20,24 @@ The agent runs with **multiple layers of isolation**:
 
 ## Architecture
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│  Host (rootless podman)                                            │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  Podman Pod (shared network namespace)                       │  │
-│  │                                                               │  │
-│  │  ┌─────────────────────┐  ┌─────────────────────┐            │  │
-│  │  │ Workspace Container │  │ Agent Container     │            │  │
-│  │  │ • Full dev env      │  │ • opencode serve    │            │  │
-│  │  │ • Your dotfiles     │  │ • Port 4096         │            │  │
-│  │  │ • GH_TOKEN, etc.    │  │ • Dropped caps      │            │  │
-│  │  │ • 'oc' shim         │  │ • no-new-privileges │            │  │
-│  │  └─────────────────────┘  │ • Isolated $HOME    │            │  │
-│  │           │               └─────────────────────┘            │  │
-│  │           │                         │                        │  │
-│  │           └─────────────────────────┘                        │  │
-│  │                   Shared workspace volume                     │  │
-│  │                                                               │  │
-│  │  ┌─────────────────────┐  ┌─────────────────────┐            │  │
-│  │  │ Gator Container     │  │ Proxy Container     │            │  │
-│  │  │ (optional)          │  │ (optional)          │            │  │
-│  │  │ • service-gator MCP │  │ • HTTPS proxy       │            │  │
-│  │  │ • Has GH_TOKEN      │  │ • Domain allowlist  │            │  │
-│  │  │ • Port 8765         │  │ • Network isolation │            │  │
-│  │  └─────────────────────┘  └─────────────────────┘            │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph host[Host - rootless podman]
+        subgraph pod[Podman Pod - shared network]
+            workspace[Workspace Container<br/>Full dev env, GH_TOKEN]
+            agent[Agent Container<br/>Dropped caps, isolated HOME]
+            gator[Gator Container<br/>service-gator MCP]
+            proxy[Proxy Container<br/>Network isolation]
+            volume[(Shared Volume)]
+        end
+    end
+    workspace <-->|mount| volume
+    agent <-->|mount| volume
+    workspace -->|oc :4096| agent
+    agent -->|MCP :8765| gator
+    agent -.->|HTTPS| proxy
+    gator -->|scoped| github[GitHub API]
+    proxy -.->|allowed domains| llm[LLM APIs]
 ```
 
 ## Container Security

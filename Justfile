@@ -124,3 +124,22 @@ allow-repo-e2e repo=default_test_repo workspace=default_test_workspace:
     ssh {{workspace}}.devpod 'sudo mkdir -p /run/devaipod && sudo chown $(id -u):$(id -g) /run/devaipod'
     ssh {{workspace}}.devpod "echo '{\"allowed_repos\":[\"{{repo}}\"],\"allowed_prs\":[]}' > /run/devaipod/state.json"
     echo "Done! The repo {{repo}} is now allowed for PR creation."
+
+# Build the documentation (mdbook) via container
+build-mdbook:
+    podman build -t localhost/devaipod-mdbook -f docs/Dockerfile.mdbook .
+
+# Build docs and extract to DIR
+build-mdbook-to dir: build-mdbook
+    #!/usr/bin/env bash
+    set -xeuo pipefail
+    cid=$(podman create localhost/devaipod-mdbook)
+    podman cp ${cid}:/src/docs/book {{dir}}
+    podman rm -f ${cid}
+
+# Serve docs locally (prints URL)
+mdbook-serve: build-mdbook
+    #!/usr/bin/env bash
+    set -xeuo pipefail
+    podman run --init --replace -d --name devaipod-mdbook --rm --publish 127.0.0.1::8000 localhost/devaipod-mdbook
+    echo http://$(podman port devaipod-mdbook 8000/tcp)

@@ -1,0 +1,28 @@
+FROM ghcr.io/bootc-dev/devenv-debian:latest
+USER root
+# Install mdbook tooling via cargo-binstall
+RUN <<EORUN
+set -xeuo pipefail
+curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+deps=(mdbook@0.4.52 
+      mdbook-mermaid@0.16.0 
+      mdbook-linkcheck@0.7.7)
+cargo binstall --no-confirm --root /usr/local ${deps[@]}
+EORUN
+# And now actually build the docs
+WORKDIR /src
+COPY . /src
+RUN --mount=type=cache,target=/src/target <<EORUN
+set -xeuo pipefail
+# Build rustdoc for internal crates
+cargo doc --workspace --no-deps --document-private-items
+# Build mdbook
+cd docs
+mdbook-mermaid install .
+mdbook build
+# Copy rustdoc into mdbook output
+cp -r /src/target/doc book/internals
+EORUN
+WORKDIR /src/docs/book
+CMD ["python3", "-m", "http.server", "8000", "--bind", "0.0.0.0"]
+EXPOSE 8000

@@ -1,0 +1,45 @@
+# CI runs inside our devcontainer using devcontainers/ci.
+# This dogfoods our own setup and ensures consistency between
+# local development and CI. All commands should go through `just`.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate
+        uses: devcontainers/ci@v0.3
+        with:
+          runCmd: just check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        uses: devcontainers/ci@v0.3
+        with:
+          runCmd: just test
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build docs
+        uses: devcontainers/ci@v0.3
+        with:
+          runCmd: just build-mdbook
