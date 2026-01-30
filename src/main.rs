@@ -4,10 +4,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use clap::{Args, CommandFactory, Parser};
+use dialoguer::Input;
 use color_eyre::eyre::{bail, Context, Result};
 
 mod compose;
@@ -315,11 +317,11 @@ enum HostCommand {
     },
     /// Run an agent on a repository with a task
     ///
-    /// Creates a workspace and starts the agent with a task. This is a convenience
-    /// command that combines 'up' with automatic task execution and SSH.
+    /// Creates a workspace and starts the agent with a task. Returns immediately
+    /// after setup (async by default). Use 'devaipod ssh <workspace>' to monitor
+    /// the agent's progress.
     ///
-    /// After setup, automatically SSHs into the workspace to show the monitor
-    /// where you can observe agent progress and interact with it.
+    /// If no task is provided and stdin is a TTY, prompts interactively.
     ///
     /// Examples:
     ///   devaipod run https://github.com/org/repo
@@ -546,6 +548,32 @@ async fn run_host(cli: HostCli) -> Result<()> {
         } => {
             // Merge task sources: positional arg takes precedence, then -c/--command
             let effective_task = task.or(command);
+
+            // If no task provided and stdin is a TTY, prompt interactively
+            let effective_task = match effective_task {
+                Some(t) => Some(t),
+                None if std::io::stdin().is_terminal() => {
+                    match Input::<String>::new()
+                        .with_prompt("Task for the AI agent (leave empty to skip)")
+                        .allow_empty(true)
+                        .interact_text()
+                    {
+                        Ok(task) if task.trim().is_empty() => None,
+                        Ok(task) => Some(task),
+                        Err(dialoguer::Error::IO(e))
+                            if e.kind() == std::io::ErrorKind::Interrupted =>
+                        {
+                            // User pressed Ctrl-C, exit gracefully
+                            std::process::exit(130)
+                        }
+                        Err(e) => {
+                            return Err(e).context("Failed to read task from terminal")
+                        }
+                    }
+                }
+                None => None,
+            };
+
             cmd_run(
                 &config,
                 &source,
@@ -1222,8 +1250,8 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
 /// Run an agent on a repository with a task
 ///
 /// This is a convenience command that combines 'up' with automatic task execution.
-/// It creates a workspace, starts the agent with the task, and SSHs into the workspace
-/// so the user can monitor progress.
+/// It creates a workspace and starts the agent with the task, then returns
+/// immediately (async by default). Use `devaipod ssh <workspace>` to monitor.
 async fn cmd_run(
     config: &config::Config,
     source: &str,
@@ -1238,7 +1266,7 @@ async fn cmd_run(
         task: command.map(|s| s.to_string()),
         no_prompt: false,
         dry_run: false,
-        ssh: true, // Always SSH after run to show the monitor
+        ssh: false, // Async by default - user can ssh manually to monitor
         image: image.map(|s| s.to_string()),
         name: explicit_name.map(|s| s.to_string()),
         service_gator_scopes: service_gator_scopes.to_vec(),
