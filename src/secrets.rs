@@ -382,7 +382,7 @@ pub fn merge_secrets(
     }
 
     // Add config secrets that weren't already added via CLI
-    for (_, mapping) in config_secrets {
+    for mapping in config_secrets.values() {
         if !seen_names.contains(&mapping.secret) {
             result.push(ResolvedSecret {
                 secret_name: mapping.secret.clone(),

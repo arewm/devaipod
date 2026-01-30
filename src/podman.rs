@@ -652,11 +652,7 @@ impl PodmanService {
             .context("Failed to inspect image")?;
 
         // Get the first repo digest if available
-        let digest = info
-            .repo_digests
-            .as_ref()
-            .and_then(|d| d.first())
-            .cloned();
+        let digest = info.repo_digests.as_ref().and_then(|d| d.first()).cloned();
 
         // Get the first repo tag
         let name = info
@@ -1476,11 +1472,7 @@ impl std::fmt::Display for ImageInfo {
         if let Some(ref digest) = self.digest {
             // Extract just the sha256 digest, truncate for readability
             if let Some(sha) = digest.split('@').nth(1) {
-                let short = if sha.len() > 19 {
-                    &sha[..19]
-                } else {
-                    sha
-                };
+                let short = if sha.len() > 19 { &sha[..19] } else { sha };
                 write!(f, " [{}...]", short)?;
             }
         }
@@ -1546,7 +1538,7 @@ async fn create_tar_archive(path: &Path) -> Result<Vec<u8>> {
             .append_dir_all(".", &path)
             .context("Failed to add directory to tar")?;
         builder.finish().context("Failed to finish tar")?;
-        Ok(builder.into_inner().context("Failed to get tar data")?)
+        builder.into_inner().context("Failed to get tar data")
     })
     .await
     .context("Tar task panicked")?

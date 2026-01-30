@@ -820,13 +820,19 @@ async fn create_workspace_from_local(
         (devcontainer::load(path)?, opts.image.clone())
     } else if opts.image.is_some() {
         tracing::info!("No devcontainer.json found, using defaults with --image override");
-        (devcontainer::DevcontainerConfig::default(), opts.image.clone())
+        (
+            devcontainer::DevcontainerConfig::default(),
+            opts.image.clone(),
+        )
     } else if config.default_image.is_some() {
         tracing::info!(
             "No devcontainer.json found, using default-image from config: {}",
             config.default_image.as_ref().unwrap()
         );
-        (devcontainer::DevcontainerConfig::default(), config.default_image.clone())
+        (
+            devcontainer::DevcontainerConfig::default(),
+            config.default_image.clone(),
+        )
     } else {
         bail!(
             "No devcontainer.json found in {}.\n\
@@ -974,13 +980,19 @@ async fn create_workspace_from_remote(
         tracing::info!(
             "No devcontainer.json found in repository, using defaults with --image override"
         );
-        (devcontainer::DevcontainerConfig::default(), opts.image.clone())
+        (
+            devcontainer::DevcontainerConfig::default(),
+            opts.image.clone(),
+        )
     } else if config.default_image.is_some() {
         tracing::info!(
             "No devcontainer.json found in repository, using default-image from config: {}",
             config.default_image.as_ref().unwrap()
         );
-        (devcontainer::DevcontainerConfig::default(), config.default_image.clone())
+        (
+            devcontainer::DevcontainerConfig::default(),
+            config.default_image.clone(),
+        )
     } else {
         bail!(
             "No devcontainer.json found in {}.\n\
@@ -1147,13 +1159,19 @@ async fn create_workspace_from_pr(
         (devcontainer::load(path)?, opts.image.clone())
     } else if opts.image.is_some() {
         tracing::info!("No devcontainer.json found in PR, using defaults with --image override");
-        (devcontainer::DevcontainerConfig::default(), opts.image.clone())
+        (
+            devcontainer::DevcontainerConfig::default(),
+            opts.image.clone(),
+        )
     } else if config.default_image.is_some() {
         tracing::info!(
             "No devcontainer.json found in PR, using default-image from config: {}",
             config.default_image.as_ref().unwrap()
         );
-        (devcontainer::DevcontainerConfig::default(), config.default_image.clone())
+        (
+            devcontainer::DevcontainerConfig::default(),
+            config.default_image.clone(),
+        )
     } else {
         bail!(
             "No devcontainer.json found in PR.\n\
@@ -1752,46 +1770,42 @@ fn cmd_list(json_output: bool) -> Result<()> {
     if has_repo_info {
         if has_task_info {
             println!(
-                "{:<name_width$}  {:<18}  {:<4}  {:<repo_width$}  {:<6}  {:<25}  {}",
+                "{:<name_width$}  {:<18}  {:<4}  {:<repo_width$}  {:<6}  {:<25}  CREATED",
                 "NAME",
                 "STATUS",
                 "MODE",
                 "REPO",
                 "PR",
                 "TASK",
-                "CREATED",
                 name_width = name_width,
                 repo_width = repo_width
             );
         } else {
             println!(
-                "{:<name_width$}  {:<18}  {:<repo_width$}  {:<6}  {}",
+                "{:<name_width$}  {:<18}  {:<repo_width$}  {:<6}  CREATED",
                 "NAME",
                 "STATUS",
                 "REPO",
                 "PR",
-                "CREATED",
                 name_width = name_width,
                 repo_width = repo_width
             );
         }
     } else if has_task_info {
         println!(
-            "{:<name_width$}  {:<18}  {:<4}  {:<25}  {}",
+            "{:<name_width$}  {:<18}  {:<4}  {:<25}  CREATED",
             "NAME",
             "STATUS",
             "MODE",
             "TASK",
-            "CREATED",
             name_width = name_width
         );
     } else {
         println!(
-            "{:<name_width$}  {:<18}  {:<12}  {}",
+            "{:<name_width$}  {:<18}  {:<12}  CREATED",
             "NAME",
             "STATUS",
             "CONTAINERS",
-            "CREATED",
             name_width = name_width
         );
     }
@@ -2663,14 +2677,13 @@ fn configure_podman_service() -> Result<()> {
     let socket_dir = socket_path.parent().unwrap();
 
     // Check if podman is available
-    if ProcessCommand::new("podman")
+    if !ProcessCommand::new("podman")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-        == false
     {
         tracing::debug!("podman not found, skipping service setup");
         return Ok(());

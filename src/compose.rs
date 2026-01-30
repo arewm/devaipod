@@ -295,17 +295,15 @@ fn remove_json_comments(input: &str) -> String {
             continue;
         }
 
-        if !in_string && c == '/' {
-            if chars.peek() == Some(&'/') {
-                // Skip until end of line
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        result.push('\n');
-                        break;
-                    }
+        if !in_string && c == '/' && chars.peek() == Some(&'/') {
+            // Skip until end of line
+            for c in chars.by_ref() {
+                if c == '\n' {
+                    result.push('\n');
+                    break;
                 }
-                continue;
             }
+            continue;
         }
 
         result.push(c);

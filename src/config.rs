@@ -13,10 +13,11 @@ use color_eyre::eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Target container(s) for a secret or configuration
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ContainerTarget {
     /// Main development container (default)
+    #[default]
     Main,
     /// Sidecar container
     Sidecar,
@@ -25,12 +26,6 @@ pub enum ContainerTarget {
     /// Named container
     #[serde(untagged)]
     Named(String),
-}
-
-impl Default for ContainerTarget {
-    fn default() -> Self {
-        ContainerTarget::Main
-    }
 }
 
 /// Top-level configuration
@@ -264,7 +259,7 @@ pub const DEFAULT_ALLOWED_DOMAINS: &[&str] = &[
 /// Uses an HTTPS forward proxy to restrict agent network access to
 /// only allowed domains (LLM API endpoints). This provides defense-in-depth
 /// security without requiring special privileges.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct NetworkIsolationConfig {
     /// Whether to enable network isolation (default: false)
     /// When enabled, the agent can only access domains in the allowlist.
@@ -276,16 +271,6 @@ pub struct NetworkIsolationConfig {
     /// Proxy image to use (default: docker.io/ubuntu/squid:latest)
     #[serde(default)]
     pub proxy_image: Option<String>,
-}
-
-impl Default for NetworkIsolationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allowed_domains: Vec::new(),
-            proxy_image: None,
-        }
-    }
 }
 
 impl NetworkIsolationConfig {
@@ -400,7 +385,7 @@ pub fn collect_agent_env_vars() -> Vec<(String, String)> {
 /// and receives no secrets unless explicitly configured.
 ///
 /// Note: Sidecar feature is planned but not yet implemented.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct SidecarConfig {
     /// Sidecar image override (default: uses main container's image)
@@ -431,22 +416,6 @@ pub struct SidecarConfig {
     /// Named sidecar profiles for quick switching
     #[serde(default)]
     pub profiles: HashMap<String, SidecarProfile>,
-}
-
-impl Default for SidecarConfig {
-    fn default() -> Self {
-        SidecarConfig {
-            image: None,
-            command: None,
-            network: false,
-            mount_sources_readonly: false,
-            mounts: Vec::new(),
-            dotfiles: Vec::new(),
-            dotfiles_repo: None,
-            dotfiles_install: None,
-            profiles: HashMap::new(),
-        }
-    }
 }
 
 /// A bind mount specification for sidecar containers
@@ -754,16 +723,11 @@ pub fn load_config_from(path: Option<&Path>) -> Result<Config> {
         let legacy_secrets_count = legacy_config.secrets.len();
         for (name, legacy_mapping) in legacy_config.secrets {
             // Only add if not already defined in the new config
-            if !config.secrets.contains_key(&name) {
-                config.secrets.insert(
-                    name,
-                    SecretMapping {
-                        secret: legacy_mapping.secret,
-                        env: legacy_mapping.env,
-                        container: ContainerTarget::Main,
-                    },
-                );
-            }
+            config.secrets.entry(name).or_insert_with(|| SecretMapping {
+                secret: legacy_mapping.secret,
+                env: legacy_mapping.env,
+                container: ContainerTarget::Main,
+            });
         }
 
         tracing::debug!("Merged {} secrets from legacy config", legacy_secrets_count);

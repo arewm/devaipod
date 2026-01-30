@@ -241,6 +241,7 @@ impl DevaipodPod {
     ///
     /// The `gator_image_override` parameter allows specifying a custom service-gator image
     /// instead of the default. This is useful for testing locally-built service-gator images.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         podman: &PodmanService,
         project_path: &Path,
@@ -444,7 +445,14 @@ impl DevaipodPod {
         // Clone dotfiles to agent home volume if configured
         // This happens before containers start, with GH_TOKEN available for private repos
         if let Some(ref dotfiles) = global_config.dotfiles {
-            Self::clone_dotfiles_to_volume(podman, &image, &agent_home_volume, dotfiles, global_config).await?;
+            Self::clone_dotfiles_to_volume(
+                podman,
+                &image,
+                &agent_home_volume,
+                dotfiles,
+                global_config,
+            )
+            .await?;
         }
 
         // Create workspace container
@@ -731,12 +739,7 @@ echo "Dotfiles installed successfully"
         };
 
         let exit_code = podman
-            .exec_quiet(
-                container,
-                &["/bin/sh", "-c", &install_script],
-                None,
-                None,
-            )
+            .exec_quiet(container, &["/bin/sh", "-c", &install_script], None, None)
             .await
             .with_context(|| format!("Failed to install dotfiles in {}", container))?;
 
@@ -990,11 +993,8 @@ chmod +x {agent_home}/scripts/workspace_monitor.py
         // Get GH_TOKEN for private repos
         let gh_token = crate::git::get_github_token_with_secret(global_config);
 
-        let clone_script = crate::git::clone_dotfiles_script(
-            &dotfiles.url,
-            &dotfiles_dir,
-            gh_token.as_deref(),
-        );
+        let clone_script =
+            crate::git::clone_dotfiles_script(&dotfiles.url, &dotfiles_dir, gh_token.as_deref());
 
         tracing::debug!("Cloning dotfiles to agent home volume...");
         let (exit_code, stdout) = podman
@@ -1178,6 +1178,7 @@ CONFIG_EOF
     }
 
     /// Create container config for the workspace container
+    #[allow(clippy::too_many_arguments)]
     fn workspace_container_config(
         _project_path: &Path,
         workspace_folder: &str,
@@ -1379,6 +1380,7 @@ exec python3 /opt/devaipod/scripts/workspace_monitor.py
     ///
     /// If `enable_gator` is true, OPENCODE_CONFIG_CONTENT is set with MCP config
     /// to connect opencode to the service-gator container.
+    #[allow(clippy::too_many_arguments)]
     fn agent_container_config(
         _project_path: &Path,
         workspace_folder: &str,

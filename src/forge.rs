@@ -70,6 +70,7 @@ impl IssueRef {
     }
 
     /// Get the full issue URL
+    #[allow(dead_code)]
     pub fn issue_url(&self) -> String {
         match self.forge_type {
             ForgeType::GitHub => format!(
@@ -88,11 +89,13 @@ impl IssueRef {
     }
 
     /// Get owner/repo string (e.g., "owner/repo")
+    #[allow(dead_code)]
     pub fn owner_repo(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
     }
 
     /// Get a short display string like "owner/repo#123"
+    #[allow(dead_code)]
     pub fn short_display(&self) -> String {
         format!("{}/{}#{}", self.owner, self.repo, self.number)
     }
