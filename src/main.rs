@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use clap::{Args, CommandFactory, Parser};
-use dialoguer::Input;
 use color_eyre::eyre::{bail, Context, Result};
+use dialoguer::Input;
 
 mod compose;
 mod config;
@@ -136,7 +136,7 @@ impl WorkspaceMode {
     }
 }
 
-/// Common options for workspace creation commands
+/// Common CLI options for workspace creation commands
 #[derive(Debug, Args)]
 struct UpOptions {
     /// Task description for the AI agent (also stored as workspace description)
@@ -187,6 +187,41 @@ struct UpOptions {
     ///   --service-gator-image localhost/service-gator:dev
     #[arg(long, value_name = "IMAGE")]
     service_gator_image: Option<String>,
+}
+
+/// Internal options for workspace creation (like `podman create` vs `podman run`)
+///
+/// This struct captures all the options needed to create a workspace pod without
+/// starting it or performing post-setup actions like SSH. It's used by the common
+/// `create_workspace` function that both `up` and `run` commands call.
+#[derive(Debug, Clone)]
+struct CreateOptions {
+    /// Task description for the AI agent
+    task: Option<String>,
+    /// Use a specific container image instead of building from devcontainer.json
+    image: Option<String>,
+    /// Explicit pod name (default: derived from source with unique suffix)
+    name: Option<String>,
+    /// Service-gator scopes for AI agent access to external services
+    service_gator_scopes: Vec<String>,
+    /// Custom service-gator container image
+    service_gator_image: Option<String>,
+    /// Mode of workspace creation (up vs run)
+    mode: WorkspaceMode,
+}
+
+impl CreateOptions {
+    /// Build CreateOptions from UpOptions
+    fn from_up_options(opts: &UpOptions) -> Self {
+        Self {
+            task: opts.task.clone(),
+            image: opts.image.clone(),
+            name: opts.name.clone(),
+            service_gator_scopes: opts.service_gator_scopes.clone(),
+            service_gator_image: opts.service_gator_image.clone(),
+            mode: opts.mode,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -566,9 +601,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                             // User pressed Ctrl-C, exit gracefully
                             std::process::exit(130)
                         }
-                        Err(e) => {
-                            return Err(e).context("Failed to read task from terminal")
-                        }
+                        Err(e) => return Err(e).context("Failed to read task from terminal"),
                     }
                 }
                 None => None,
@@ -697,45 +730,48 @@ async fn finalize_pod_with_mode(
     Ok(())
 }
 
-/// Create/start a workspace with AI agent
+// =============================================================================
+// Workspace Creation (shared by up and run commands)
+// =============================================================================
+
+/// Result of creating a workspace
+struct CreateResult {
+    /// The pod name that was created
+    pod_name: String,
+}
+
+/// Create a workspace from a source (local path, remote URL, or PR)
 ///
-/// Uses podman-native multi-container setup with a pod containing:
-/// - workspace: The user's development environment
-/// - agent: Container running opencode serve with restricted security
-/// - gator (optional): Service-gator MCP server container
-async fn cmd_up(
+/// This is the inner "create" operation that handles all the common pod setup
+/// logic without any SSH or other post-setup behavior. Both `cmd_up` and `cmd_run`
+/// use this function internally.
+///
+/// Like `podman create` vs `podman run`, this function just creates and starts
+/// the pod but doesn't perform any interactive operations afterward.
+async fn create_workspace(
     config: &config::Config,
     source: &str,
-    _agent: Option<&str>,
-    _no_agent: bool,
-    _provider: Option<&str>,
-    _ide: Option<&str>,
-    _agent_sidecar: bool,
-    opts: UpOptions,
-) -> Result<()> {
-    // Check if source is a PR/MR URL
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
+    // Dispatch based on source type
     if let Some(pr_ref) = forge::parse_pr_url(source) {
-        return cmd_up_pr(config, pr_ref, &opts).await;
-    }
-
-    // Resolve local paths - if it looks like a URL, treat it as remote
-    let is_remote_url = source.starts_with("http://")
+        create_workspace_from_pr(config, pr_ref, opts).await
+    } else if source.starts_with("http://")
         || source.starts_with("https://")
-        || source.starts_with("git@");
-
-    if is_remote_url {
-        return cmd_up_remote(config, source, &opts).await;
+        || source.starts_with("git@")
+    {
+        create_workspace_from_remote(config, source, opts).await
+    } else {
+        create_workspace_from_local(config, source, opts).await
     }
+}
 
-    let task = opts.task.as_deref();
-    let _no_prompt = opts.no_prompt;
-    let dry_run = opts.dry_run;
-    let ssh = opts.ssh;
-    let image = opts.image.as_deref();
-    let explicit_name = opts.name.as_deref();
-    let service_gator_scopes = &opts.service_gator_scopes;
-    let service_gator_image = opts.service_gator_image.as_deref();
-
+/// Create a workspace from a local git repository
+async fn create_workspace_from_local(
+    config: &config::Config,
+    source: &str,
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
     let source_path = std::path::Path::new(source).canonicalize().ok();
 
     // Local path is required for non-remote sources
@@ -763,7 +799,7 @@ async fn cmd_up(
     // Warn about dirty working tree
     if git_info.is_dirty {
         eprintln!(
-            "\n⚠️  Warning: Uncommitted changes detected ({} file(s)):",
+            "\n\u{26a0}\u{fe0f}  Warning: Uncommitted changes detected ({} file(s)):",
             git_info.dirty_files.len()
         );
         for file in git_info.dirty_files.iter().take(5) {
@@ -784,7 +820,7 @@ async fn cmd_up(
     let devcontainer_json_path = devcontainer::try_find_devcontainer_json(project_path);
     let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
         devcontainer::load(path)?
-    } else if image.is_some() {
+    } else if opts.image.is_some() {
         tracing::info!("No devcontainer.json found, using defaults with image override");
         devcontainer::DevcontainerConfig::default()
     } else {
@@ -802,7 +838,7 @@ async fn cmd_up(
         .unwrap_or_else(|| "project".to_string());
 
     // Use explicit name if provided, otherwise generate a unique name
-    let pod_name = if let Some(name) = explicit_name {
+    let pod_name = if let Some(ref name) = opts.name {
         normalize_pod_name(name)
     } else {
         make_pod_name(&project_name)
@@ -811,9 +847,9 @@ async fn cmd_up(
     // Check for API keys and warn if none are configured (helps first-run experience)
     check_api_keys_configured();
 
-    // Parse CLI service-gator scopes and merge with file config (do this early for dry-run)
-    let service_gator_config = if !service_gator_scopes.is_empty() {
-        let cli_scopes = service_gator::parse_scopes(service_gator_scopes)
+    // Parse CLI service-gator scopes and merge with file config
+    let service_gator_config = if !opts.service_gator_scopes.is_empty() {
+        let cli_scopes = service_gator::parse_scopes(&opts.service_gator_scopes)
             .context("Failed to parse --service-gator scopes")?;
         service_gator::merge_configs(&config.service_gator, &cli_scopes)
     } else {
@@ -823,26 +859,12 @@ async fn cmd_up(
     // Check if gator should be enabled (from merged config)
     let enable_gator = service_gator_config.is_enabled();
 
-    if dry_run {
-        tracing::info!("Dry run: would create pod '{}'", pod_name);
-        tracing::info!("  project: {}", project_path.display());
-        if let Some(ref path) = devcontainer_json_path {
-            tracing::info!("  devcontainer: {}", path.display());
-        } else {
-            tracing::info!("  devcontainer: (none, using image override)");
-        }
-        tracing::info!("  gator enabled: {}", enable_gator);
-        if let Some(img) = service_gator_image {
-            tracing::info!("  gator image: {}", img);
-        }
-        return Ok(());
-    }
-
     // Start podman service
     tracing::debug!("Starting podman service...");
     let podman = podman::PodmanService::spawn()
         .await
         .context("Failed to start podman service")?;
+
     // Check if network isolation should be enabled
     let enable_network_isolation = config.network_isolation.enabled;
 
@@ -856,8 +878,8 @@ async fn cmd_up(
         "io.devaipod.mode".to_string(),
         opts.mode.as_str().to_string(),
     ));
-    if let Some(task_desc) = task {
-        extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
+    if let Some(ref task_desc) = opts.task {
+        extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
     }
 
     let devaipod_pod = pod::DevaipodPod::create(
@@ -871,9 +893,9 @@ async fn cmd_up(
         &source,
         &extra_labels,
         Some(&service_gator_config),
-        image,
-        service_gator_image,
-        task,
+        opts.image.as_deref(),
+        opts.service_gator_image.as_deref(),
+        opts.task.as_deref(),
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -882,169 +904,15 @@ async fn cmd_up(
 
     drop(podman);
 
-    if ssh {
-        return cmd_ssh(&pod_name, false, &[]);
-    }
-
-    Ok(())
+    Ok(CreateResult { pod_name })
 }
 
-/// Start a development environment from a PR/MR URL
-async fn cmd_up_pr(
+/// Create a workspace from a remote git URL
+async fn create_workspace_from_remote(
     config: &config::Config,
-    pr_ref: forge::PullRequestRef,
-    opts: &UpOptions,
-) -> Result<()> {
-    let task = opts.task.as_deref();
-    let _no_prompt = opts.no_prompt;
-    let dry_run = opts.dry_run;
-    let ssh = opts.ssh;
-    let image = opts.image.as_deref();
-    let explicit_name = opts.name.as_deref();
-
-    tracing::info!(
-        "Setting up PR #{} ({}/{})...",
-        pr_ref.number,
-        pr_ref.owner,
-        pr_ref.repo
-    );
-
-    // Fetch PR metadata (pass config for GH_TOKEN from podman secrets)
-    let pr_info = forge::fetch_pr_info(&pr_ref, Some(config))
-        .await
-        .context("Failed to fetch PR information")?;
-
-    tracing::debug!("PR: {}", pr_info.title);
-    tracing::debug!("Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
-
-    // For PRs, we clone from the PR head to get the devcontainer.json from the PR
-    // (not from upstream main, which may not have the devcontainer.json yet)
-    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-    let temp_path = temp_dir.path();
-
-    tracing::debug!("Cloning PR head to read devcontainer.json...");
-
-    // Use authenticated URL if GH_TOKEN is available (for private repos)
-    // Check env vars first, then podman secrets from config
-    let gh_token = git::get_github_token_with_secret(config);
-    let clone_url = git::authenticated_clone_url(&pr_info.head_clone_url, gh_token.as_deref());
-
-    // Clone from the PR's head repository and checkout the specific commit
-    let clone_output = tokio::process::Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            &pr_info.head_ref,
-            &clone_url,
-            temp_path.to_str().unwrap(),
-        ])
-        .output()
-        .await
-        .context("Failed to clone PR head repository")?;
-
-    if !clone_output.status.success() {
-        let stderr = String::from_utf8_lossy(&clone_output.stderr);
-        bail!("Failed to clone PR head repository: {}", stderr);
-    }
-
-    // Find and load devcontainer.json from the cloned repo (optional when --image is provided)
-    let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
-    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
-        devcontainer::load(path)?
-    } else if image.is_some() {
-        tracing::info!("No devcontainer.json found in PR, using defaults with image override");
-        devcontainer::DevcontainerConfig::default()
-    } else {
-        bail!(
-            "No devcontainer.json found in PR.\n\
-             Either add a devcontainer.json to the PR or use --image to specify a container image."
-        );
-    };
-
-    // Use explicit name if provided, otherwise generate a unique name
-    let pod_name = if let Some(name) = explicit_name {
-        normalize_pod_name(name)
-    } else {
-        make_pr_pod_name(&pr_ref.repo, pr_ref.number)
-    };
-
-    if dry_run {
-        tracing::info!("Dry run mode - would create pod '{}'", pod_name);
-        tracing::info!("  PR: {}", pr_info.pr_ref.short_display());
-        tracing::info!("  Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
-        tracing::info!("  Clone URL: {}", pr_info.head_clone_url);
-        if devcontainer_json_path.is_none() {
-            tracing::info!("  devcontainer: (none, using image override)");
-        }
-        return Ok(());
-    }
-
-    // Start podman service
-    let podman = podman::PodmanService::spawn()
-        .await
-        .context("Failed to start podman service")?;
-
-    // Check for gator and network isolation settings
-    let enable_gator = config.service_gator.is_enabled();
-    let enable_network_isolation = config.network_isolation.enabled;
-
-    // Create source from PR info
-    let source = pod::WorkspaceSource::PullRequest(pr_info);
-
-    // Build extra labels for task description and mode
-    let mut extra_labels = Vec::new();
-    extra_labels.push((
-        "io.devaipod.mode".to_string(),
-        opts.mode.as_str().to_string(),
-    ));
-    if let Some(task_desc) = task {
-        extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
-    }
-
-    // Create the pod
-    // Note: For PR workflows, we use the file-based service_gator config (no CLI override yet)
-    tracing::debug!("Creating pod '{}'...", pod_name);
-    let devaipod_pod = pod::DevaipodPod::create(
-        &podman,
-        temp_path, // Use temp path for image building context
-        &devcontainer_config,
-        &pod_name,
-        enable_gator,
-        enable_network_isolation,
-        config,
-        &source,
-        &extra_labels,
-        None, // Use config.service_gator for PR workflows
-        image,
-        None, // gator_image_override not yet supported for PR workflows
-        task,
-    )
-    .await
-    .context("Failed to create devaipod pod")?;
-
-    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
-
-    drop(podman);
-
-    if ssh {
-        return cmd_ssh(&pod_name, false, &[]);
-    }
-
-    Ok(())
-}
-
-/// Start a development environment from a remote git URL
-async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptions) -> Result<()> {
-    let task = opts.task.as_deref();
-    let _no_prompt = opts.no_prompt;
-    let dry_run = opts.dry_run;
-    let ssh = opts.ssh;
-    let image = opts.image.as_deref();
-    let explicit_name = opts.name.as_deref();
-    let service_gator_scopes = &opts.service_gator_scopes;
-
+    remote_url: &str,
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
     tracing::info!("Setting up {}...", remote_url);
 
     // Extract repo name from URL for naming
@@ -1057,7 +925,6 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
     tracing::debug!("Cloning repository to read devcontainer.json...");
 
     // Use authenticated URL if GH_TOKEN is available (for private repos)
-    // Check env vars first, then podman secrets from config
     let gh_token = git::get_github_token_with_secret(config);
     let clone_url = git::authenticated_clone_url(remote_url, gh_token.as_deref());
 
@@ -1099,7 +966,7 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
     let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
     let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
         devcontainer::load(path)?
-    } else if image.is_some() {
+    } else if opts.image.is_some() {
         tracing::info!(
             "No devcontainer.json found in repository, using defaults with image override"
         );
@@ -1113,7 +980,7 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
     };
 
     // Use explicit name if provided, otherwise generate a unique name
-    let pod_name = if let Some(name) = explicit_name {
+    let pod_name = if let Some(ref name) = opts.name {
         normalize_pod_name(name)
     } else {
         make_pod_name(&repo_name)
@@ -1121,13 +988,10 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
 
     // For remote URLs, auto-enable service-gator with readonly + draft PR access
     // to the target repository (unless user provided explicit scopes)
-    let (service_gator_config, auto_gator_info) = if !service_gator_scopes.is_empty() {
-        let cli_scopes = service_gator::parse_scopes(service_gator_scopes)
+    let service_gator_config = if !opts.service_gator_scopes.is_empty() {
+        let cli_scopes = service_gator::parse_scopes(&opts.service_gator_scopes)
             .context("Failed to parse --service-gator scopes")?;
-        (
-            service_gator::merge_configs(&config.service_gator, &cli_scopes),
-            None,
-        )
+        service_gator::merge_configs(&config.service_gator, &cli_scopes)
     } else if let Some(repo_ref) = forge::parse_repo_url(remote_url) {
         // Auto-configure: read + create-draft for the target repo
         let mut sg_config = config.service_gator.clone();
@@ -1144,10 +1008,13 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
                         write: false,
                     },
                 );
+                tracing::debug!(
+                    "Auto-enabled service-gator for {} (read + draft PRs)",
+                    owner_repo
+                );
             }
             forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
                 // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
-                // For now, just log that we can't auto-configure
                 tracing::debug!(
                     "Auto service-gator not yet supported for {} ({})",
                     repo_ref.forge_type,
@@ -1155,37 +1022,10 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
                 );
             }
         }
-        (sg_config, Some((repo_ref.forge_type, owner_repo)))
+        sg_config
     } else {
-        (config.service_gator.clone(), None)
+        config.service_gator.clone()
     };
-
-    if dry_run {
-        tracing::info!("Dry run mode - would create pod '{}'", pod_name);
-        tracing::info!("  Remote URL: {}", remote_url);
-        tracing::info!("  Default branch: {}", default_branch);
-        if devcontainer_json_path.is_none() {
-            tracing::info!("  devcontainer: (none, using image override)");
-        }
-        if let Some((forge_type, ref owner_repo)) = auto_gator_info {
-            if matches!(forge_type, forge::ForgeType::GitHub) {
-                tracing::info!("  Service-gator: {} (read + draft PRs)", owner_repo);
-            }
-        }
-        if let Some(task_desc) = task {
-            tracing::info!("  Task: {}", task_desc);
-        }
-        return Ok(());
-    }
-
-    if let Some((forge_type, ref owner_repo)) = auto_gator_info {
-        if matches!(forge_type, forge::ForgeType::GitHub) {
-            tracing::debug!(
-                "Auto-enabled service-gator for {} (read + draft PRs)",
-                owner_repo
-            );
-        }
-    }
 
     // Start podman service
     let podman = podman::PodmanService::spawn()
@@ -1209,12 +1049,9 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
         "io.devaipod.mode".to_string(),
         opts.mode.as_str().to_string(),
     ));
-    if let Some(task_desc) = task {
-        extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
+    if let Some(ref task_desc) = opts.task {
+        extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
     }
-
-    // Extract service_gator_image from opts
-    let service_gator_image = opts.service_gator_image.as_deref();
 
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
@@ -1229,9 +1066,9 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
         &source,
         &extra_labels,
         Some(&service_gator_config),
-        image,
-        service_gator_image,
-        task,
+        opts.image.as_deref(),
+        opts.service_gator_image.as_deref(),
+        opts.task.as_deref(),
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -1240,8 +1077,167 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
 
     drop(podman);
 
-    if ssh {
-        return cmd_ssh(&pod_name, false, &[]);
+    Ok(CreateResult { pod_name })
+}
+
+/// Create a workspace from a PR/MR URL
+async fn create_workspace_from_pr(
+    config: &config::Config,
+    pr_ref: forge::PullRequestRef,
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
+    tracing::info!(
+        "Setting up PR #{} ({}/{})...",
+        pr_ref.number,
+        pr_ref.owner,
+        pr_ref.repo
+    );
+
+    // Fetch PR metadata (pass config for GH_TOKEN from podman secrets)
+    let pr_info = forge::fetch_pr_info(&pr_ref, Some(config))
+        .await
+        .context("Failed to fetch PR information")?;
+
+    tracing::debug!("PR: {}", pr_info.title);
+    tracing::debug!("Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
+
+    // Clone PR head to get the devcontainer.json from the PR
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_path = temp_dir.path();
+
+    tracing::debug!("Cloning PR head to read devcontainer.json...");
+
+    // Use authenticated URL if GH_TOKEN is available (for private repos)
+    let gh_token = git::get_github_token_with_secret(config);
+    let clone_url = git::authenticated_clone_url(&pr_info.head_clone_url, gh_token.as_deref());
+
+    // Clone from the PR's head repository and checkout the specific commit
+    let clone_output = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            &pr_info.head_ref,
+            &clone_url,
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .context("Failed to clone PR head repository")?;
+
+    if !clone_output.status.success() {
+        let stderr = String::from_utf8_lossy(&clone_output.stderr);
+        bail!("Failed to clone PR head repository: {}", stderr);
+    }
+
+    // Find and load devcontainer.json from the cloned repo (optional when --image is provided)
+    let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
+    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
+        devcontainer::load(path)?
+    } else if opts.image.is_some() {
+        tracing::info!("No devcontainer.json found in PR, using defaults with image override");
+        devcontainer::DevcontainerConfig::default()
+    } else {
+        bail!(
+            "No devcontainer.json found in PR.\n\
+             Either add a devcontainer.json to the PR or use --image to specify a container image."
+        );
+    };
+
+    // Use explicit name if provided, otherwise generate a unique name
+    let pod_name = if let Some(ref name) = opts.name {
+        normalize_pod_name(name)
+    } else {
+        make_pr_pod_name(&pr_ref.repo, pr_ref.number)
+    };
+
+    // Start podman service
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    // Check for gator and network isolation settings
+    let enable_gator = config.service_gator.is_enabled();
+    let enable_network_isolation = config.network_isolation.enabled;
+
+    // Create source from PR info
+    let source = pod::WorkspaceSource::PullRequest(pr_info);
+
+    // Build extra labels for task description and mode
+    let mut extra_labels = Vec::new();
+    extra_labels.push((
+        "io.devaipod.mode".to_string(),
+        opts.mode.as_str().to_string(),
+    ));
+    if let Some(ref task_desc) = opts.task {
+        extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
+    }
+
+    // Create the pod
+    // Note: For PR workflows, we use the file-based service_gator config (no CLI override yet)
+    tracing::debug!("Creating pod '{}'...", pod_name);
+    let devaipod_pod = pod::DevaipodPod::create(
+        &podman,
+        temp_path, // Use temp path for image building context
+        &devcontainer_config,
+        &pod_name,
+        enable_gator,
+        enable_network_isolation,
+        config,
+        &source,
+        &extra_labels,
+        None, // Use config.service_gator for PR workflows
+        opts.image.as_deref(),
+        opts.service_gator_image.as_deref(),
+        opts.task.as_deref(),
+    )
+    .await
+    .context("Failed to create devaipod pod")?;
+
+    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    drop(podman);
+
+    Ok(CreateResult { pod_name })
+}
+
+// =============================================================================
+// Command Implementations
+// =============================================================================
+
+/// Create/start a workspace with AI agent
+///
+/// This is a thin wrapper around `create_workspace` that handles:
+/// - Dry-run mode (prints what would be created)
+/// - Optional SSH into the workspace after creation
+///
+/// Uses podman-native multi-container setup with a pod containing:
+/// - workspace: The user's development environment
+/// - agent: Container running opencode serve with restricted security
+/// - gator (optional): Service-gator MCP server container
+async fn cmd_up(
+    config: &config::Config,
+    source: &str,
+    _agent: Option<&str>,
+    _no_agent: bool,
+    _provider: Option<&str>,
+    _ide: Option<&str>,
+    _agent_sidecar: bool,
+    opts: UpOptions,
+) -> Result<()> {
+    // Handle dry-run mode
+    if opts.dry_run {
+        return cmd_dry_run(config, source, &opts).await;
+    }
+
+    // Create the workspace using the common create function
+    let create_opts = CreateOptions::from_up_options(&opts);
+    let result = create_workspace(config, source, &create_opts).await?;
+
+    // Optionally SSH into the workspace
+    if opts.ssh {
+        return cmd_ssh(&result.pod_name, false, &[]);
     }
 
     Ok(())
@@ -1249,9 +1245,12 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
 
 /// Run an agent on a repository with a task
 ///
-/// This is a convenience command that combines 'up' with automatic task execution.
+/// This is a thin wrapper around `create_workspace` that:
+/// - Sets mode to Run (for tracking)
+/// - Does not SSH by default (async execution)
+///
 /// It creates a workspace and starts the agent with the task, then returns
-/// immediately (async by default). Use `devaipod ssh <workspace>` to monitor.
+/// immediately. Use `devaipod ssh <workspace>` to monitor the agent's progress.
 async fn cmd_run(
     config: &config::Config,
     source: &str,
@@ -1261,12 +1260,9 @@ async fn cmd_run(
     service_gator_scopes: &[String],
     service_gator_image: Option<&str>,
 ) -> Result<()> {
-    // Build UpOptions with the task and mode=Run
-    let opts = UpOptions {
+    // Build CreateOptions with mode=Run
+    let create_opts = CreateOptions {
         task: command.map(|s| s.to_string()),
-        no_prompt: false,
-        dry_run: false,
-        ssh: false, // Async by default - user can ssh manually to monitor
         image: image.map(|s| s.to_string()),
         name: explicit_name.map(|s| s.to_string()),
         service_gator_scopes: service_gator_scopes.to_vec(),
@@ -1274,30 +1270,117 @@ async fn cmd_run(
         mode: WorkspaceMode::Run,
     };
 
-    // Check if source is a PR/MR URL
+    // Create the workspace - no SSH by default (async execution)
+    let _result = create_workspace(config, source, &create_opts).await?;
+
+    Ok(())
+}
+
+/// Handle dry-run mode for the up command
+///
+/// Prints what would be created without actually creating anything.
+async fn cmd_dry_run(config: &config::Config, source: &str, opts: &UpOptions) -> Result<()> {
+    // Dispatch based on source type for dry-run info
     if let Some(pr_ref) = forge::parse_pr_url(source) {
-        return cmd_up_pr(config, pr_ref, &opts).await;
-    }
+        // PR dry-run
+        let pr_info = forge::fetch_pr_info(&pr_ref, Some(config))
+            .await
+            .context("Failed to fetch PR information")?;
 
-    // Resolve local paths - if it looks like a URL, treat it as remote
-    let is_remote_url = source.starts_with("http://")
+        let pod_name = if let Some(ref name) = opts.name {
+            normalize_pod_name(name)
+        } else {
+            make_pr_pod_name(&pr_ref.repo, pr_ref.number)
+        };
+
+        tracing::info!("Dry run mode - would create pod '{}'", pod_name);
+        tracing::info!("  PR: {}", pr_info.pr_ref.short_display());
+        tracing::info!("  Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
+        tracing::info!("  Clone URL: {}", pr_info.head_clone_url);
+        if opts.image.is_some() {
+            tracing::info!("  devcontainer: (none, using image override)");
+        }
+    } else if source.starts_with("http://")
         || source.starts_with("https://")
-        || source.starts_with("git@");
+        || source.starts_with("git@")
+    {
+        // Remote URL dry-run
+        let repo_name = git::extract_repo_name(source).unwrap_or_else(|| "project".to_string());
+        let pod_name = if let Some(ref name) = opts.name {
+            normalize_pod_name(name)
+        } else {
+            make_pod_name(&repo_name)
+        };
 
-    if is_remote_url {
-        return cmd_up_remote(config, source, &opts).await;
+        // Parse service-gator config for dry-run info
+        let service_gator_config = if !opts.service_gator_scopes.is_empty() {
+            let cli_scopes = service_gator::parse_scopes(&opts.service_gator_scopes)
+                .context("Failed to parse --service-gator scopes")?;
+            service_gator::merge_configs(&config.service_gator, &cli_scopes)
+        } else {
+            config.service_gator.clone()
+        };
+
+        tracing::info!("Dry run mode - would create pod '{}'", pod_name);
+        tracing::info!("  Remote URL: {}", source);
+        if opts.image.is_none() {
+            tracing::info!("  (would clone to read devcontainer.json)");
+        } else {
+            tracing::info!("  devcontainer: (none, using image override)");
+        }
+        tracing::info!("  gator enabled: {}", service_gator_config.is_enabled());
+        if let Some(ref img) = opts.service_gator_image {
+            tracing::info!("  gator image: {}", img);
+        }
+        if let Some(ref task) = opts.task {
+            tracing::info!("  Task: {}", task);
+        }
+    } else {
+        // Local path dry-run
+        let source_path = std::path::Path::new(source).canonicalize().ok();
+        let project_path = match source_path {
+            Some(ref p) => p,
+            None => {
+                bail!("Path '{}' does not exist or is not accessible.", source);
+            }
+        };
+
+        let project_name = project_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
+
+        let pod_name = if let Some(ref name) = opts.name {
+            normalize_pod_name(name)
+        } else {
+            make_pod_name(&project_name)
+        };
+
+        // Parse service-gator config for dry-run info
+        let service_gator_config = if !opts.service_gator_scopes.is_empty() {
+            let cli_scopes = service_gator::parse_scopes(&opts.service_gator_scopes)
+                .context("Failed to parse --service-gator scopes")?;
+            service_gator::merge_configs(&config.service_gator, &cli_scopes)
+        } else {
+            config.service_gator.clone()
+        };
+
+        let devcontainer_json_path = devcontainer::try_find_devcontainer_json(project_path);
+
+        tracing::info!("Dry run: would create pod '{}'", pod_name);
+        tracing::info!("  project: {}", project_path.display());
+        if let Some(ref path) = devcontainer_json_path {
+            tracing::info!("  devcontainer: {}", path.display());
+        } else {
+            tracing::info!("  devcontainer: (none, using image override)");
+        }
+        tracing::info!("  gator enabled: {}", service_gator_config.is_enabled());
+        if let Some(ref img) = opts.service_gator_image {
+            tracing::info!("  gator image: {}", img);
+        }
     }
 
-    // For local paths, delegate to cmd_up
-    cmd_up(
-        config, source, None,  // agent
-        false, // no_agent - we want the agent
-        None,  // provider
-        None,  // ide
-        false, // agent_sidecar
-        opts,
-    )
-    .await
+    Ok(())
 }
 
 /// Check if any API keys are configured for the AI agent and warn if not
