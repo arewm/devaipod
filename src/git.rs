@@ -537,8 +537,15 @@ pub fn extract_repo_name(url: &str) -> Option<String> {
     // Handle SSH format: git@github.com:owner/repo.git
     if url.starts_with("git@") {
         let path = url.rsplit(':').next()?;
-        let repo = path.rsplit('/').next()?;
-        return Some(repo.trim_end_matches(".git").to_string());
+        let repo = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()?
+            .trim_end_matches(".git");
+        if repo.is_empty() {
+            return None;
+        }
+        return Some(repo.to_string());
     }
 
     // Handle HTTPS format: https://github.com/owner/repo.git
@@ -546,8 +553,12 @@ pub fn extract_repo_name(url: &str) -> Option<String> {
         let path = parsed
             .path()
             .trim_start_matches('/')
+            .trim_end_matches('/')
             .trim_end_matches(".git");
         let repo = path.rsplit('/').next()?;
+        if repo.is_empty() {
+            return None;
+        }
         return Some(repo.to_string());
     }
 
@@ -762,31 +773,35 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_repo_name_https() {
-        assert_eq!(
-            extract_repo_name("https://github.com/owner/repo.git"),
-            Some("repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_name("https://github.com/owner/repo"),
-            Some("repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_name("https://gitlab.com/group/subgroup/project.git"),
-            Some("project".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_repo_name_ssh() {
-        assert_eq!(
-            extract_repo_name("git@github.com:owner/repo.git"),
-            Some("repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_name("git@gitlab.com:group/project.git"),
-            Some("project".to_string())
-        );
+    fn test_extract_repo_name() {
+        let cases = [
+            // HTTPS URLs
+            ("https://github.com/owner/repo.git", Some("repo")),
+            ("https://github.com/owner/repo", Some("repo")),
+            (
+                "https://gitlab.com/group/subgroup/project.git",
+                Some("project"),
+            ),
+            // Trailing slashes
+            ("https://github.com/owner/repo/", Some("repo")),
+            ("https://github.com/bootc-dev/bootc/", Some("bootc")),
+            // SSH URLs
+            ("git@github.com:owner/repo.git", Some("repo")),
+            ("git@gitlab.com:group/project.git", Some("project")),
+            ("git@github.com:owner/repo", Some("repo")),
+            ("git@github.com:owner/repo/", Some("repo")),
+            ("git@github.com:owner/repo.git/", Some("repo")),
+            // Invalid/edge cases
+            ("https://github.com/", None),
+            ("not-a-url", None),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(
+                extract_repo_name(url),
+                expected.map(String::from),
+                "failed for URL: {url}"
+            );
+        }
     }
 
     #[test]
