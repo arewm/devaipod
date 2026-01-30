@@ -323,12 +323,16 @@ enum HostCommand {
     ///
     /// Examples:
     ///   devaipod run https://github.com/org/repo
-    ///   devaipod run https://github.com/org/repo -c 'fix typos in README.md'
-    ///   devaipod run . -c 'add unit tests for the parser module'
+    ///   devaipod run https://github.com/org/repo 'fix typos in README.md'
+    ///   devaipod run . 'add unit tests for the parser module'
+    ///   devaipod run . -c 'task via flag'  # -c/--command also works
     Run {
         /// Source: local path, git URL, or PR URL
         source: String,
-        /// Inline command/task for the agent
+        /// Task description for the AI agent
+        #[arg(value_name = "TASK")]
+        task: Option<String>,
+        /// Task for the agent (alternative to positional argument)
         #[arg(short = 'c', long = "command", value_name = "TASK")]
         command: Option<String>,
         /// Use a specific container image instead of building from devcontainer.json
@@ -533,16 +537,19 @@ async fn run_host(cli: HostCli) -> Result<()> {
         }
         HostCommand::Run {
             source,
+            task,
             command,
             image,
             name,
             service_gator_scopes,
             service_gator_image,
         } => {
+            // Merge task sources: positional arg takes precedence, then -c/--command
+            let effective_task = task.or(command);
             cmd_run(
                 &config,
                 &source,
-                command.as_deref(),
+                effective_task.as_deref(),
                 image.as_deref(),
                 name.as_deref(),
                 &service_gator_scopes,

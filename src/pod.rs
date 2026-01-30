@@ -487,7 +487,14 @@ impl DevaipodPod {
         // If task is provided, write it to the agent home volume before starting the container
         // This ensures opencode sees the task file when it reads its config at startup
         if let Some(task_content) = task {
-            Self::write_task_to_volume(podman, &image, &agent_home_volume, task_content).await?;
+            Self::write_task_to_volume(
+                podman,
+                &image,
+                &agent_home_volume,
+                task_content,
+                enable_gator,
+            )
+            .await?;
         }
 
         // Create agent container with restricted security
@@ -941,30 +948,53 @@ chmod +x {agent_home}/scripts/workspace_monitor.py
     ///
     /// This uses a one-shot init container to write the task file and opencode config
     /// to the volume. This ensures opencode sees the task when it reads config at startup.
+    ///
+    /// The task file includes:
+    /// - System context about the devaipod environment
+    /// - Instructions for using service-gator for forge operations
+    /// - The user's task
     async fn write_task_to_volume(
         podman: &PodmanService,
         image: &str,
         agent_home_volume: &str,
         task: &str,
+        enable_gator: bool,
     ) -> Result<()> {
         let task_file = ".config/opencode/devaipod-task.md";
         let config_file = ".config/opencode/opencode.json";
 
-        // Format the task as markdown
+        // Build service-gator instructions if enabled
+        let gator_instructions = if enable_gator {
+            r#"
+## IMPORTANT: GitHub/GitLab Operations
+
+For GitHub/GitLab operations (PRs, issues, etc.), use the **service-gator** MCP tool.
+The `gh` and `glab` CLI tools are NOT available in this environment.
+"#
+            .to_string()
+        } else {
+            String::new()
+        };
+
+        // Format the task as markdown with context
         let task_content = format!(
-            r#"# Task from devaipod
+            r#"# devaipod Task
 
-The user has requested the following task be completed:
+You are running as an AI agent in a **devaipod** sandboxed environment.
 
----
+## Your Task
 
-{}
+{task}
 
----
+## Guidelines
 
-Please work on this task. When you're done, summarize what you accomplished.
+1. Work on the task described above
+2. Make commits with clear, descriptive messages
+3. When done, summarize what you accomplished
+{gator_instructions}
 "#,
-            task
+            task = task,
+            gator_instructions = gator_instructions
         );
 
         // Create opencode config that references the task file
