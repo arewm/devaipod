@@ -228,44 +228,42 @@ impl CreateOptions {
 enum HostCommand {
     /// Create/start a workspace with AI agent
     ///
-    /// Creates a DevPod workspace and optionally starts an AI agent inside.
+    /// Creates a podman pod with workspace and agent containers. The agent runs
+    /// opencode in server mode and can be given tasks to work on.
+    ///
+    /// For remote URLs (GitHub repos/PRs), service-gator is automatically enabled
+    /// with read + draft PR permissions for that repository.
     ///
     /// Examples:
-    ///   devaipod up .
-    ///   devaipod up https://github.com/user/repo
-    ///   devaipod up https://github.com/user/repo --agent goose
-    ///   devaipod up . --service-gator=github:readonly-all
-    ///   devaipod up . --service-gator=github:myorg/myrepo
+    ///   devaipod up .                                      # Local repo
+    ///   devaipod up . -S                                   # Local repo, SSH in after
+    ///   devaipod up https://github.com/user/repo           # Remote repo
+    ///   devaipod up https://github.com/user/repo/pull/123  # PR
+    ///   devaipod up . 'fix the bug'                        # With task for agent
+    ///   devaipod up . --service-gator=github:myorg/*       # Custom permissions
     Up {
         /// Source: local path, git URL, or PR URL
         source: String,
-        /// AI agent to run: goose, claude, opencode (default: from config or goose)
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-        /// Don't start AI agent automatically
-        #[arg(long)]
-        no_agent: bool,
-        /// DevPod provider to use (default: docker)
-        #[arg(long, value_name = "PROVIDER")]
-        provider: Option<String>,
-        /// DevPod IDE to open (default: none)
-        #[arg(long, value_name = "IDE")]
-        ide: Option<String>,
-        /// Enable agent sidecar container (experimental)
-        #[arg(long)]
-        agent_sidecar: bool,
         #[command(flatten)]
         opts: UpOptions,
     },
 
     /// SSH into a workspace
+    ///
+    /// By default, shows the workspace monitor which displays agent status.
+    /// Press Ctrl-C to drop to an interactive shell, or pass a command directly.
+    ///
+    /// Examples:
+    ///   devaipod ssh myworkspace           # Show agent monitor (Ctrl-C for shell)
+    ///   devaipod ssh myworkspace bash      # Go directly to shell
+    ///   devaipod ssh myworkspace -- ls -la # Run a specific command
     Ssh {
         /// Workspace name (devaipod- prefix optional)
         workspace: String,
         /// Stdio mode: pipe stdin/stdout for ProxyCommand use (VSCode/Zed remote dev)
         #[arg(long)]
         stdio: bool,
-        /// Command to run (optional)
+        /// Command to run instead of the monitor (e.g., 'bash' for direct shell)
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -515,27 +513,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
     let config = config::load_config(cli.config.as_deref())?;
 
     match cli.command {
-        HostCommand::Up {
-            source,
-            agent,
-            no_agent,
-            provider,
-            ide,
-            agent_sidecar,
-            opts,
-        } => {
-            cmd_up(
-                &config,
-                &source,
-                agent.as_deref(),
-                no_agent,
-                provider.as_deref(),
-                ide.as_deref(),
-                agent_sidecar,
-                opts,
-            )
-            .await
-        }
+        HostCommand::Up { source, opts } => cmd_up(&config, &source, opts).await,
 
         HostCommand::Ssh {
             workspace,
@@ -1216,16 +1194,7 @@ async fn create_workspace_from_pr(
 /// - workspace: The user's development environment
 /// - agent: Container running opencode serve with restricted security
 /// - gator (optional): Service-gator MCP server container
-async fn cmd_up(
-    config: &config::Config,
-    source: &str,
-    _agent: Option<&str>,
-    _no_agent: bool,
-    _provider: Option<&str>,
-    _ide: Option<&str>,
-    _agent_sidecar: bool,
-    opts: UpOptions,
-) -> Result<()> {
+async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Result<()> {
     // Handle dry-run mode
     if opts.dry_run {
         return cmd_dry_run(config, source, &opts).await;
@@ -1235,9 +1204,10 @@ async fn cmd_up(
     let create_opts = CreateOptions::from_up_options(&opts);
     let result = create_workspace(config, source, &create_opts).await?;
 
-    // Optionally SSH into the workspace
+    // Optionally SSH into the workspace - go directly to bash, not the monitor
+    // (the monitor is for observing a running agent, but `up -S` is for interactive work)
     if opts.ssh {
-        return cmd_ssh(&result.pod_name, false, &[]);
+        return cmd_ssh(&result.pod_name, false, &["bash".to_string()]);
     }
 
     Ok(())

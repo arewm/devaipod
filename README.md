@@ -45,38 +45,36 @@ cargo build --release
 devaipod init
 ```
 
-### Example 1: Just init a multi-pod devcontainer with available agent
+### Example 1: Interactive workspace with agent on standby
 
-# Start a pod for a local project; an agent will be spawned as well,
-but will wait for your instructions:
+Start a pod for a local project. An agent will be available but waits for your instructions:
 
-```
+```bash
 devaipod up /path/to/your/project
-devaipod ssh
-opencode-connect # inside the pod
+# After pod is ready, SSH in:
+devaipod ssh myproject-abc123        # Shows agent monitor
+# Or go straight to shell:
+devaipod ssh myproject-abc123 bash
+opencode-connect                     # Connect to agent from inside the pod
 ```
 
-This allows you complete control.
+This allows you complete control over when and how the agent works.
 
-### Example 2: Start on a repository with a task
+### Example 2: Automated task execution
 
-But let's say you want more automation. By default
-the service-gator configuration allows creating draft PRs.
+For more automation, use `run` which prompts for a task and starts the agent immediately.
+Service-gator is auto-configured with read + draft PR permissions.
 
-# Start from a GitHub repo with a task for the agent
-
-```
+```bash
+# Interactive prompt for task:
 devaipod run https://github.com/org/repo
-<prompt input here>
+
+# Or pass task inline:
+devaipod run https://github.com/org/repo -c 'fix typos in README.md'
 ```
 
-You can also pass a quick inline task via `devaipod run https://github.com/org/repo -c 'fix typos in README.md'`
-
-It's just as easy to run multiple of these.
-
-When you have a `run` started, when you `devaipod ssh` you
-will see a monitor process with more instructions; you
-can attach to and interrupt the agent for example.
+Monitor progress with `devaipod ssh <workspace>` which shows the agent monitor.
+Press Ctrl-C to drop to an interactive shell where you can interrupt or guide the agent.
 
 ### Automatic Service-gator for Remote URLs
 
@@ -115,14 +113,14 @@ devaipod delete myworkspace       # Delete a pod
 devaipod up . --dry-run           # Show what would be created
 
 # Connecting to workspaces
-devaipod ssh myworkspace          # SSH into workspace container
-devaipod attach myworkspace       # Attach to agent's tmux session
-devaipod ssh-config myworkspace   # Output SSH config to stdout
+devaipod ssh myworkspace          # SSH into workspace (shows agent monitor)
+devaipod ssh myworkspace bash     # SSH directly to shell
+devaipod ssh-config myworkspace   # Generate SSH config for editor integration
 
-# Running agents
-devaipod run "find typos"                    # Run agent with task
-devaipod run --git . "fix the bug"           # Run on local repo
-devaipod run --issue https://github.com/org/repo/issues/123
+# Running agents with tasks
+devaipod run . 'fix typos'                          # Run on local repo
+devaipod run https://github.com/org/repo            # Prompts for task interactively
+devaipod run https://github.com/org/repo -c 'task'  # Task via flag
 
 # Shell completions
 devaipod completions bash         # Generate bash completions
