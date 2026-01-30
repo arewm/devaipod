@@ -347,6 +347,21 @@ enum HostCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Debug and diagnose a workspace
+    ///
+    /// Collects diagnostic information to help troubleshoot issues with
+    /// the pod, service-gator, MCP connectivity, and agent health.
+    ///
+    /// Examples:
+    ///   devaipod debug my-workspace
+    ///   devaipod debug my-workspace --json
+    Debug {
+        /// Workspace name (devaipod- prefix optional)
+        workspace: String,
+        /// Output in JSON format for scripting
+        #[arg(long)]
+        json: bool,
+    },
     /// Run an agent on a repository with a task
     ///
     /// Creates a workspace and starts the agent with a task. Returns immediately
@@ -550,6 +565,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
         } => cmd_logs(&normalize_pod_name(&workspace), &container, follow, tail),
         HostCommand::Status { workspace, json } => {
             cmd_status(&normalize_pod_name(&workspace), json)
+        }
+        HostCommand::Debug { workspace, json } => {
+            cmd_debug(&normalize_pod_name(&workspace), json)
         }
         HostCommand::Run {
             source,
@@ -2395,6 +2413,273 @@ fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Debug and diagnose a workspace
+///
+/// Collects diagnostic information about the pod, gator, and agent.
+fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
+    use serde_json::json;
+
+    // Get pod info
+    let pod_output = podman_command()
+        .args(["pod", "inspect", pod_name])
+        .output()
+        .context("Failed to run podman pod inspect")?;
+
+    if !pod_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pod_output.stderr);
+        if stderr.contains("no such pod") || stderr.contains("not found") {
+            bail!(
+                "Pod '{}' not found. Use 'devaipod list' to see available pods.",
+                pod_name
+            );
+        }
+        bail!("podman pod inspect failed: {}", stderr.trim());
+    }
+
+    let pod_json_array: serde_json::Value =
+        serde_json::from_slice(&pod_output.stdout).context("Failed to parse pod inspect output")?;
+    let pod_json = pod_json_array
+        .as_array()
+        .and_then(|arr| arr.first())
+        .cloned()
+        .unwrap_or(pod_json_array);
+
+    let pod_state = pod_json
+        .get("State")
+        .and_then(|s| s.as_str())
+        .unwrap_or("Unknown");
+
+    // Extract project name from labels
+    let project_name = pod_json
+        .get("Labels")
+        .and_then(|l| l.get("io.devaipod.repo"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.rsplit('/').next().unwrap_or(s))
+        .unwrap_or("unknown");
+
+    // Check gator container
+    let gator_container = format!("{}-gator", pod_name);
+    let gator_info = collect_gator_debug(&gator_container, project_name);
+
+    // Check agent container
+    let agent_info = collect_agent_debug(pod_name);
+
+    // Check MCP connectivity
+    let mcp_info = collect_mcp_debug(pod_name);
+
+    if json_output {
+        let debug_info = json!({
+            "pod": {
+                "name": pod_name,
+                "state": pod_state,
+                "project": project_name,
+            },
+            "gator": gator_info,
+            "agent": agent_info,
+            "mcp": mcp_info,
+        });
+        println!("{}", serde_json::to_string_pretty(&debug_info)?);
+    } else {
+        println!("=== Pod Debug: {} ===\n", pod_name);
+        println!("State: {}", format_pod_state(pod_state));
+        println!("Project: {}", project_name);
+        println!();
+
+        // Gator section
+        println!("--- Gator Container ---");
+        if let Some(info) = &gator_info {
+            println!(
+                "  Present: {}",
+                if info.get("present").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            if let Some(version) = info.get("version").and_then(|v| v.as_str()) {
+                println!("  Version: {}", version);
+            }
+            if let Some(mount_type) = info.get("mount_type").and_then(|v| v.as_str()) {
+                let readonly = info
+                    .get("mount_readonly")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                println!(
+                    "  Workspace mount: {} ({})",
+                    mount_type,
+                    if readonly { "read-only" } else { "read-write" }
+                );
+            }
+            if let Some(git_ok) = info.get("git_accessible").and_then(|v| v.as_bool()) {
+                println!(
+                    "  Git accessible: {}",
+                    if git_ok { "yes" } else { "NO - check mount!" }
+                );
+            }
+        } else {
+            println!("  (not present or error inspecting)");
+        }
+        println!();
+
+        // Agent section
+        println!("--- Agent Container ---");
+        if let Some(info) = &agent_info {
+            if let Some(healthy) = info.get("healthy").and_then(|v| v.as_bool()) {
+                println!(
+                    "  Health: {}",
+                    if healthy {
+                        "healthy"
+                    } else {
+                        "NOT responding"
+                    }
+                );
+            }
+            if let Some(mcp_config) = info.get("mcp_configured").and_then(|v| v.as_bool()) {
+                println!(
+                    "  MCP configured: {}",
+                    if mcp_config { "yes" } else { "no" }
+                );
+            }
+        } else {
+            println!("  (error checking agent)");
+        }
+        println!();
+
+        // MCP section
+        println!("--- MCP Connectivity ---");
+        if let Some(info) = &mcp_info {
+            if let Some(reachable) = info.get("gator_reachable").and_then(|v| v.as_bool()) {
+                println!(
+                    "  Gator reachable from agent: {}",
+                    if reachable { "yes" } else { "NO" }
+                );
+            }
+        } else {
+            println!("  (unable to check)");
+        }
+    }
+
+    Ok(())
+}
+
+/// Collect debug info for the gator container
+fn collect_gator_debug(
+    gator_container: &str,
+    project_name: &str,
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+
+    // Check if container exists
+    let inspect_output = podman_command()
+        .args(["inspect", gator_container])
+        .output()
+        .ok()?;
+
+    if !inspect_output.status.success() {
+        return Some(json!({ "present": false }));
+    }
+
+    let container_json: serde_json::Value =
+        serde_json::from_slice(&inspect_output.stdout).ok()?;
+    let container = container_json.as_array()?.first()?;
+
+    // Get version
+    let version_output = podman_command()
+        .args(["exec", gator_container, "service-gator", "--version"])
+        .output()
+        .ok();
+    let version = version_output
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    // Get mount info
+    let mounts = container.get("Mounts")?.as_array()?;
+    let workspace_mount = mounts.iter().find(|m| {
+        m.get("Destination")
+            .and_then(|d| d.as_str())
+            .map(|d| d.starts_with("/workspaces"))
+            .unwrap_or(false)
+    });
+
+    let (mount_type, mount_readonly) = workspace_mount
+        .map(|m| {
+            let t = m
+                .get("Type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let rw = m.get("RW").and_then(|v| v.as_bool()).unwrap_or(true);
+            (t.to_string(), !rw)
+        })
+        .unwrap_or(("none".to_string(), false));
+
+    // Check if .git is accessible
+    let git_path = format!("/workspaces/{}/.git", project_name);
+    let git_check = podman_command()
+        .args(["exec", gator_container, "test", "-d", &git_path])
+        .status()
+        .ok();
+    let git_accessible = git_check.map(|s| s.success()).unwrap_or(false);
+
+    Some(json!({
+        "present": true,
+        "version": version,
+        "mount_type": mount_type,
+        "mount_readonly": mount_readonly,
+        "git_accessible": git_accessible,
+    }))
+}
+
+/// Collect debug info for the agent container
+fn collect_agent_debug(pod_name: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+
+    let agent_container = format!("{}-agent", pod_name);
+
+    // Check health
+    let healthy = check_agent_health(pod_name);
+
+    // Check if MCP is configured (look at OPENCODE_CONFIG_CONTENT env)
+    let env_check = podman_command()
+        .args([
+            "exec",
+            &agent_container,
+            "/bin/sh",
+            "-c",
+            "echo $OPENCODE_CONFIG_CONTENT",
+        ])
+        .output()
+        .ok();
+    let mcp_configured = env_check
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("service-gator"))
+        .unwrap_or(false);
+
+    Some(json!({
+        "healthy": healthy,
+        "mcp_configured": mcp_configured,
+    }))
+}
+
+/// Collect MCP connectivity info
+fn collect_mcp_debug(pod_name: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+
+    let agent_container = format!("{}-agent", pod_name);
+
+    // Test if gator port is reachable from agent
+    let port_check = format!("nc -z localhost {} 2>/dev/null", pod::GATOR_PORT);
+    let gator_reachable = podman_command()
+        .args(["exec", &agent_container, "/bin/sh", "-c", &port_check])
+        .status()
+        .ok()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    Some(json!({
+        "gator_reachable": gator_reachable,
+    }))
 }
 
 /// Check if the agent is listening on its port

@@ -14,6 +14,7 @@ devaipod up . -S                  # Create and SSH into workspace
 devaipod up . "fix the bug"       # Create with task description for agent
 devaipod list                     # List devaipod workspaces
 devaipod status myworkspace       # Show detailed status of a pod
+devaipod debug myworkspace        # Diagnose issues (mounts, connectivity, etc.)
 devaipod logs myworkspace         # View container logs (-c agent for agent logs)
 devaipod stop myworkspace         # Stop a pod
 devaipod delete myworkspace       # Delete a pod

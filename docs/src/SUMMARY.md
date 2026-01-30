@@ -21,6 +21,7 @@
 # Development
 
 - [Contributing](contributing.md)
+- [Debugging](debugging.md)
 - [E2E Testing](e2e-testing.md)
 - [Roadmap](roadmap.md)
 - [Internals](internals.md)
