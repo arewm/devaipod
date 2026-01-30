@@ -641,6 +641,44 @@ impl PodmanService {
         Ok(None)
     }
 
+    /// Get detailed image info (name, creation time, digest)
+    ///
+    /// Returns metadata about the image for display purposes.
+    pub async fn get_image_info(&self, image: &str) -> Result<ImageInfo> {
+        let info = self
+            .client
+            .inspect_image(image)
+            .await
+            .context("Failed to inspect image")?;
+
+        // Get the first repo digest if available
+        let digest = info
+            .repo_digests
+            .as_ref()
+            .and_then(|d| d.first())
+            .cloned();
+
+        // Get the first repo tag
+        let name = info
+            .repo_tags
+            .as_ref()
+            .and_then(|t| t.first())
+            .cloned()
+            .unwrap_or_else(|| image.to_string());
+
+        // Parse creation time - bollard returns it as a string in RFC3339 format
+        let created = info
+            .created
+            .as_ref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+
+        Ok(ImageInfo {
+            name,
+            created,
+            digest,
+        })
+    }
+
     /// Create a pod (containers sharing network namespace)
     ///
     /// Returns the pod ID. Podman implements pods via the API but bollard
@@ -869,6 +907,70 @@ impl PodmanService {
         }
 
         Ok(output.status.code().unwrap_or(1))
+    }
+
+    /// Run an init container and return its output
+    ///
+    /// Same as `run_init_container` but returns (exit_code, stdout) for parsing.
+    pub async fn run_init_container_with_output(
+        &self,
+        image: &str,
+        volume_name: &str,
+        mount_path: &str,
+        command: &[&str],
+        extra_binds: &[String],
+    ) -> Result<(i32, String)> {
+        let container_name = format!("{}-init", volume_name);
+
+        // Remove any existing init container
+        let _ = self
+            .podman_command()
+            .args(["rm", "-f", &container_name])
+            .output()
+            .await;
+
+        // Run the init container
+        let mut args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--name".to_string(),
+            container_name.clone(),
+            "-v".to_string(),
+            format!("{}:{}", volume_name, mount_path),
+        ];
+
+        // Add extra bind mounts (with SELinux label disable and root user if any are present)
+        if !extra_binds.is_empty() {
+            args.push("--security-opt".to_string());
+            args.push("label=disable".to_string());
+            args.push("--user".to_string());
+            args.push("0".to_string());
+        }
+        for bind in extra_binds {
+            args.push("-v".to_string());
+            args.push(bind.clone());
+        }
+
+        args.push(image.to_string());
+        args.extend(command.iter().map(|s| s.to_string()));
+
+        let output = self
+            .podman_command()
+            .args(&args)
+            .output()
+            .await
+            .context("Failed to run init container")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !stderr.is_empty() && !output.status.success() {
+            for line in stderr.lines() {
+                tracing::warn!("init: {}", line);
+            }
+        }
+
+        Ok((output.status.code().unwrap_or(1), stdout))
     }
 
     /// Create a container in a pod
@@ -1351,6 +1453,38 @@ impl Drop for PodmanService {
             // Only clean up socket if we created it
             let _ = std::fs::remove_file(&self.socket_path);
         }
+    }
+}
+
+/// Information about a container image
+#[derive(Debug, Clone)]
+pub struct ImageInfo {
+    /// Image name (from repo tags)
+    pub name: String,
+    /// Creation timestamp
+    pub created: Option<chrono::DateTime<chrono::FixedOffset>>,
+    /// Image digest (from repo digests)
+    pub digest: Option<String>,
+}
+
+impl std::fmt::Display for ImageInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)?;
+        if let Some(created) = self.created {
+            write!(f, " (created {})", created.format("%Y-%m-%d %H:%M:%S %Z"))?;
+        }
+        if let Some(ref digest) = self.digest {
+            // Extract just the sha256 digest, truncate for readability
+            if let Some(sha) = digest.split('@').nth(1) {
+                let short = if sha.len() > 19 {
+                    &sha[..19]
+                } else {
+                    sha
+                };
+                write!(f, " [{}...]", short)?;
+            }
+        }
+        Ok(())
     }
 }
 

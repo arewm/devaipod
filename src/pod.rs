@@ -304,6 +304,17 @@ impl DevaipodPod {
                 .context("Failed to ensure container image")?
         };
 
+        // Display detailed image info (name, creation time, digest)
+        match podman.get_image_info(&image).await {
+            Ok(info) => {
+                tracing::info!("Using image: {}", info);
+            }
+            Err(e) => {
+                tracing::debug!("Could not get image details: {}", e);
+                tracing::info!("Using image: {}", image);
+            }
+        }
+
         // Determine effective user: prefer devcontainer config, fall back to image config
         // This is used for chown in clone, container_home resolution, and running commands
         let effective_user = if let Some(user) = devcontainer_config.effective_user() {
@@ -429,6 +440,12 @@ impl DevaipodPod {
 
         // Write scripts to agent home volume (needed by all pods for workspace_monitor.py)
         Self::write_scripts_to_volume(podman, &image, &agent_home_volume).await?;
+
+        // Clone dotfiles to agent home volume if configured
+        // This happens before containers start, with GH_TOKEN available for private repos
+        if let Some(ref dotfiles) = global_config.dotfiles {
+            Self::clone_dotfiles_to_volume(podman, &image, &agent_home_volume, dotfiles, global_config).await?;
+        }
 
         // Create workspace container
         let workspace_config = Self::workspace_container_config(
@@ -615,10 +632,8 @@ impl DevaipodPod {
 
     /// Install dotfiles in a container
     ///
-    /// The install process:
-    /// 1. Clone the dotfiles repo to a temp directory
-    /// 2. Run the install script (or default behavior)
-    /// 3. Clean up the cloned repo
+    /// The dotfiles repo is already cloned to the agent home volume during pod creation.
+    /// This method runs the install script from that pre-cloned repo.
     ///
     /// Default install behavior (if no script specified):
     /// 1. If `install.sh` exists, run it
@@ -629,29 +644,42 @@ impl DevaipodPod {
         podman: &PodmanService,
         dotfiles: &DotfilesConfig,
         container: &str,
-        user: Option<&str>,
+        _user: Option<&str>,
         home_override: Option<&str>,
     ) -> Result<()> {
         tracing::debug!(
-            "Installing dotfiles in {} from {}...",
-            container,
-            dotfiles.url
+            "Installing dotfiles in {} from pre-cloned repo...",
+            container
         );
+
+        // The dotfiles are cloned to the agent home volume at .dotfiles
+        // For workspace container, this is mounted at /opt/devaipod
+        // For agent container, this is the agent's HOME
+        let dotfiles_src = if home_override.is_some() {
+            // Agent container - dotfiles are in its HOME
+            format!("{}/.dotfiles", AGENT_HOME_PATH)
+        } else {
+            // Workspace container - dotfiles are mounted at /opt/devaipod
+            "/opt/devaipod/.dotfiles".to_string()
+        };
 
         // Optional HOME override (needed for agent container)
         let home_export = home_override
             .map(|h| format!("export HOME={}\n", h))
             .unwrap_or_default();
 
-        // Build the installation script
+        // Build the installation script - runs from pre-cloned dotfiles
         let install_script = if let Some(script) = &dotfiles.script {
             format!(
                 r#"
 set -e
-{home_export}DOTFILES_TMP="$HOME/.dotfiles-install-tmp"
-rm -rf "$DOTFILES_TMP"
-git clone --depth 1 "{url}" "$DOTFILES_TMP"
-cd "$DOTFILES_TMP"
+{home_export}
+DOTFILES_DIR="{dotfiles_src}"
+if [ ! -d "$DOTFILES_DIR" ]; then
+    echo "Dotfiles not found at $DOTFILES_DIR, skipping installation"
+    exit 0
+fi
+cd "$DOTFILES_DIR"
 if [ -x "./{script}" ]; then
     ./{script}
 elif [ -f "./{script}" ]; then
@@ -660,21 +688,23 @@ else
     echo "Error: Install script '{script}' not found in dotfiles repo"
     exit 1
 fi
-rm -rf "$DOTFILES_TMP"
 echo "Dotfiles installed successfully"
 "#,
                 home_export = home_export,
-                url = dotfiles.url,
+                dotfiles_src = dotfiles_src,
                 script = script
             )
         } else {
             format!(
                 r#"
 set -e
-{home_export}DOTFILES_TMP="$HOME/.dotfiles-install-tmp"
-rm -rf "$DOTFILES_TMP"
-git clone --depth 1 "{url}" "$DOTFILES_TMP"
-cd "$DOTFILES_TMP"
+{home_export}
+DOTFILES_DIR="{dotfiles_src}"
+if [ ! -d "$DOTFILES_DIR" ]; then
+    echo "Dotfiles not found at $DOTFILES_DIR, skipping installation"
+    exit 0
+fi
+cd "$DOTFILES_DIR"
 if [ -x "./install.sh" ]; then
     ./install.sh
 elif [ -f "./install.sh" ]; then
@@ -693,11 +723,10 @@ elif [ -d "./dotfiles" ]; then
 else
     echo "Warning: No install script or dotfiles/ directory found, skipping"
 fi
-rm -rf "$DOTFILES_TMP"
 echo "Dotfiles installed successfully"
 "#,
                 home_export = home_export,
-                url = dotfiles.url
+                dotfiles_src = dotfiles_src,
             )
         };
 
@@ -705,8 +734,8 @@ echo "Dotfiles installed successfully"
             .exec_quiet(
                 container,
                 &["/bin/sh", "-c", &install_script],
-                user,
-                Some(&self.workspace_folder),
+                None,
+                None,
             )
             .await
             .with_context(|| format!("Failed to install dotfiles in {}", container))?;
@@ -939,6 +968,64 @@ chmod +x {agent_home}/scripts/workspace_monitor.py
             );
         } else {
             tracing::debug!("Scripts written to agent home volume");
+        }
+
+        Ok(())
+    }
+
+    /// Clone dotfiles repository to the agent home volume before containers start
+    ///
+    /// This uses a one-shot init container with access to GH_TOKEN for private repos.
+    /// The dotfiles are cloned to a staging directory, and the install script is run
+    /// after the container starts.
+    async fn clone_dotfiles_to_volume(
+        podman: &PodmanService,
+        image: &str,
+        agent_home_volume: &str,
+        dotfiles: &DotfilesConfig,
+        global_config: &Config,
+    ) -> Result<()> {
+        let dotfiles_dir = format!("{}/.dotfiles", AGENT_HOME_PATH);
+
+        // Get GH_TOKEN for private repos
+        let gh_token = crate::git::get_github_token_with_secret(global_config);
+
+        let clone_script = crate::git::clone_dotfiles_script(
+            &dotfiles.url,
+            &dotfiles_dir,
+            gh_token.as_deref(),
+        );
+
+        tracing::debug!("Cloning dotfiles to agent home volume...");
+        let (exit_code, stdout) = podman
+            .run_init_container_with_output(
+                image,
+                agent_home_volume,
+                AGENT_HOME_PATH,
+                &["/bin/sh", "-c", &clone_script],
+                &[],
+            )
+            .await
+            .context("Failed to clone dotfiles to agent volume")?;
+
+        if exit_code != 0 {
+            tracing::warn!(
+                "Failed to clone dotfiles (exit code {}). Continuing anyway.",
+                exit_code
+            );
+        } else {
+            // Extract and log the SHA from the output (format: "DOTFILES_SHA:<sha>")
+            let mut sha_logged = false;
+            for line in stdout.lines() {
+                if let Some(sha) = line.strip_prefix("DOTFILES_SHA:") {
+                    tracing::info!("Cloned dotfiles from {} at {}", dotfiles.url, sha);
+                    sha_logged = true;
+                    break;
+                }
+            }
+            if !sha_logged {
+                tracing::info!("Cloned dotfiles from {}", dotfiles.url);
+            }
         }
 
         Ok(())

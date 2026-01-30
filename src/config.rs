@@ -47,6 +47,11 @@ pub struct Config {
     /// Dotfiles configuration
     #[serde(default)]
     pub dotfiles: Option<DotfilesConfig>,
+    /// Default container image to use when no devcontainer.json is found.
+    /// This allows working with repositories that don't have a devcontainer
+    /// configuration without needing to specify --image on every command.
+    #[serde(default, rename = "default-image")]
+    pub default_image: Option<String>,
     /// Sidecar container configuration (planned feature, not yet implemented)
     #[serde(default)]
     #[allow(dead_code)]
@@ -788,6 +793,19 @@ mod tests {
         assert_eq!(config.sidecar.profiles.len(), 0);
         assert_eq!(config.secrets.len(), 0);
         assert!(config.dotfiles.is_none());
+        assert!(config.default_image.is_none());
+    }
+
+    #[test]
+    fn test_parse_default_image() {
+        let toml = r#"
+default-image = "ghcr.io/devcontainers/base:ubuntu"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.default_image,
+            Some("ghcr.io/devcontainers/base:ubuntu".to_string())
+        );
     }
 
     #[test]

@@ -814,17 +814,23 @@ async fn create_workspace_from_local(
         eprintln!("   Consider committing or stashing your changes first.\n");
     }
 
-    // Find and load devcontainer.json (optional when --image is provided)
+    // Find and load devcontainer.json (optional when --image or default-image is provided)
     let devcontainer_json_path = devcontainer::try_find_devcontainer_json(project_path);
-    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
-        devcontainer::load(path)?
+    let (devcontainer_config, effective_image) = if let Some(ref path) = devcontainer_json_path {
+        (devcontainer::load(path)?, opts.image.clone())
     } else if opts.image.is_some() {
-        tracing::info!("No devcontainer.json found, using defaults with image override");
-        devcontainer::DevcontainerConfig::default()
+        tracing::info!("No devcontainer.json found, using defaults with --image override");
+        (devcontainer::DevcontainerConfig::default(), opts.image.clone())
+    } else if config.default_image.is_some() {
+        tracing::info!(
+            "No devcontainer.json found, using default-image from config: {}",
+            config.default_image.as_ref().unwrap()
+        );
+        (devcontainer::DevcontainerConfig::default(), config.default_image.clone())
     } else {
         bail!(
             "No devcontainer.json found in {}.\n\
-             Either add a devcontainer.json or use --image to specify a container image.",
+             Either add a devcontainer.json, use --image, or set default-image in config.",
             project_path.display()
         );
     };
@@ -891,7 +897,7 @@ async fn create_workspace_from_local(
         &source,
         &extra_labels,
         Some(&service_gator_config),
-        opts.image.as_deref(),
+        effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),
     )
@@ -960,19 +966,25 @@ async fn create_workspace_from_remote(
         "main".to_string() // Fallback
     };
 
-    // Find and load devcontainer.json from the cloned repo (optional when --image is provided)
+    // Find and load devcontainer.json from the cloned repo (optional when --image or default-image is provided)
     let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
-    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
-        devcontainer::load(path)?
+    let (devcontainer_config, effective_image) = if let Some(ref path) = devcontainer_json_path {
+        (devcontainer::load(path)?, opts.image.clone())
     } else if opts.image.is_some() {
         tracing::info!(
-            "No devcontainer.json found in repository, using defaults with image override"
+            "No devcontainer.json found in repository, using defaults with --image override"
         );
-        devcontainer::DevcontainerConfig::default()
+        (devcontainer::DevcontainerConfig::default(), opts.image.clone())
+    } else if config.default_image.is_some() {
+        tracing::info!(
+            "No devcontainer.json found in repository, using default-image from config: {}",
+            config.default_image.as_ref().unwrap()
+        );
+        (devcontainer::DevcontainerConfig::default(), config.default_image.clone())
     } else {
         bail!(
             "No devcontainer.json found in {}.\n\
-             Either add a devcontainer.json to the repository or use --image to specify a container image.",
+             Either add a devcontainer.json to the repository, use --image, or set default-image in config.",
             remote_url
         );
     };
@@ -1064,7 +1076,7 @@ async fn create_workspace_from_remote(
         &source,
         &extra_labels,
         Some(&service_gator_config),
-        opts.image.as_deref(),
+        effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),
     )
@@ -1129,17 +1141,23 @@ async fn create_workspace_from_pr(
         bail!("Failed to clone PR head repository: {}", stderr);
     }
 
-    // Find and load devcontainer.json from the cloned repo (optional when --image is provided)
+    // Find and load devcontainer.json from the cloned repo (optional when --image or default-image is provided)
     let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
-    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
-        devcontainer::load(path)?
+    let (devcontainer_config, effective_image) = if let Some(ref path) = devcontainer_json_path {
+        (devcontainer::load(path)?, opts.image.clone())
     } else if opts.image.is_some() {
-        tracing::info!("No devcontainer.json found in PR, using defaults with image override");
-        devcontainer::DevcontainerConfig::default()
+        tracing::info!("No devcontainer.json found in PR, using defaults with --image override");
+        (devcontainer::DevcontainerConfig::default(), opts.image.clone())
+    } else if config.default_image.is_some() {
+        tracing::info!(
+            "No devcontainer.json found in PR, using default-image from config: {}",
+            config.default_image.as_ref().unwrap()
+        );
+        (devcontainer::DevcontainerConfig::default(), config.default_image.clone())
     } else {
         bail!(
             "No devcontainer.json found in PR.\n\
-             Either add a devcontainer.json to the PR or use --image to specify a container image."
+             Either add a devcontainer.json to the PR, use --image, or set default-image in config."
         );
     };
 
@@ -1186,7 +1204,7 @@ async fn create_workspace_from_pr(
         &source,
         &extra_labels,
         None, // Use config.service_gator for PR workflows
-        opts.image.as_deref(),
+        effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),
     )
