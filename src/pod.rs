@@ -1259,15 +1259,12 @@ CONFIG_EOF
             .map(|path| path.to_string())
             .collect();
 
-        // Add devices from runArgs (e.g., --device=/dev/kvm)
-        for device_arg in config.device_args() {
-            // Parse --device=/dev/foo format (--device /dev/foo is two separate args)
-            if let Some(device_spec) = device_arg.strip_prefix("--device=") {
-                // Handle potential :options suffix (e.g., /dev/kvm:rwm)
-                let path = device_spec.split(':').next().unwrap_or(device_spec);
-                if !path.is_empty() && !devices.contains(&path.to_string()) {
-                    devices.push(path.to_string());
-                }
+        // Add devices from runArgs (e.g., --device=/dev/kvm or --device /dev/kvm)
+        for device_spec in config.device_args() {
+            // Handle potential :options suffix (e.g., /dev/kvm:rwm)
+            let path = device_spec.split(':').next().unwrap_or(&device_spec);
+            if !path.is_empty() && !devices.contains(&path.to_string()) {
+                devices.push(path.to_string());
             }
         }
 
@@ -1350,7 +1347,16 @@ exec python3 /opt/devaipod/scripts/workspace_monitor.py
             cap_add: config.cap_add.clone(),
             no_new_privileges: false,
             devices,
-            security_opts: config.security_opt.clone(),
+            // Merge security options from both securityOpt field and runArgs
+            security_opts: {
+                let mut opts = config.security_opt.clone();
+                for opt in config.security_opt_args() {
+                    if !opts.contains(&opt) {
+                        opts.push(opt);
+                    }
+                }
+                opts
+            },
             privileged,
             // Mount the workspace volume (initialized with cloned repo) and agent home (read-only for scripts)
             volume_mounts: vec![

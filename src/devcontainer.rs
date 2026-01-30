@@ -335,13 +335,56 @@ impl DevcontainerConfig {
         self.run_args.iter().any(|arg| arg == "--privileged")
     }
 
-    /// Get device passthrough args from runArgs (e.g., --device=/dev/kvm)
+    /// Get device paths from runArgs (e.g., --device=/dev/kvm or --device /dev/kvm)
+    ///
+    /// Handles both `--device=/dev/foo` and `--device /dev/foo` formats.
+    /// Returns the device paths (e.g., "/dev/kvm"), not the flag itself.
     pub fn device_args(&self) -> Vec<String> {
-        self.run_args
-            .iter()
-            .filter(|arg| arg.starts_with("--device"))
-            .cloned()
-            .collect()
+        let mut devices = Vec::new();
+        let mut iter = self.run_args.iter().peekable();
+
+        while let Some(arg) = iter.next() {
+            if let Some(value) = arg.strip_prefix("--device=") {
+                // Format: --device=/dev/foo or --device=/dev/foo:rwm
+                if !value.is_empty() {
+                    devices.push(value.to_string());
+                }
+            } else if arg == "--device" {
+                // Format: --device /dev/foo
+                if let Some(value) = iter.next() {
+                    if !value.starts_with('-') {
+                        devices.push(value.to_string());
+                    }
+                }
+            }
+        }
+        devices
+    }
+
+    /// Get security options from runArgs (e.g., --security-opt label=disable)
+    ///
+    /// Handles both `--security-opt=value` and `--security-opt value` formats.
+    /// Returns just the values (e.g., "label=disable"), not the flag itself.
+    pub fn security_opt_args(&self) -> Vec<String> {
+        let mut opts = Vec::new();
+        let mut iter = self.run_args.iter().peekable();
+
+        while let Some(arg) = iter.next() {
+            if let Some(value) = arg.strip_prefix("--security-opt=") {
+                // Format: --security-opt=value
+                if !value.is_empty() {
+                    opts.push(value.to_string());
+                }
+            } else if arg == "--security-opt" {
+                // Format: --security-opt value
+                if let Some(value) = iter.next() {
+                    if !value.starts_with('-') {
+                        opts.push(value.to_string());
+                    }
+                }
+            }
+        }
+        opts
     }
 }
 
@@ -659,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_args_with_devices() {
+    fn test_run_args_with_devices_equals_format() {
         let json = r#"{
             "image": "foo",
             "runArgs": ["--privileged", "--device=/dev/kvm", "--device=/dev/fuse:rwm"]
@@ -669,8 +712,23 @@ mod tests {
 
         let device_args = config.device_args();
         assert_eq!(device_args.len(), 2);
-        assert!(device_args.contains(&"--device=/dev/kvm".to_string()));
-        assert!(device_args.contains(&"--device=/dev/fuse:rwm".to_string()));
+        // Now returns just the device paths, not the full --device=... string
+        assert!(device_args.contains(&"/dev/kvm".to_string()));
+        assert!(device_args.contains(&"/dev/fuse:rwm".to_string()));
+    }
+
+    #[test]
+    fn test_run_args_with_devices_space_format() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--device", "/dev/net/tun", "--device", "/dev/kvm"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+
+        let device_args = config.device_args();
+        assert_eq!(device_args.len(), 2);
+        assert!(device_args.contains(&"/dev/net/tun".to_string()));
+        assert!(device_args.contains(&"/dev/kvm".to_string()));
     }
 
     #[test]
@@ -689,6 +747,53 @@ mod tests {
         }"#;
         let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
         assert!(!config.has_privileged_run_arg());
-        assert_eq!(config.device_args(), vec!["--device=/dev/kvm"]);
+        assert_eq!(config.device_args(), vec!["/dev/kvm"]);
+    }
+
+    #[test]
+    fn test_security_opt_args_equals_format() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--security-opt=label=disable", "--security-opt=unmask=/proc/*"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let opts = config.security_opt_args();
+        assert_eq!(opts.len(), 2);
+        assert!(opts.contains(&"label=disable".to_string()));
+        assert!(opts.contains(&"unmask=/proc/*".to_string()));
+    }
+
+    #[test]
+    fn test_security_opt_args_space_format() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--security-opt", "label=disable", "--security-opt", "unmask=/proc/*"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let opts = config.security_opt_args();
+        assert_eq!(opts.len(), 2);
+        assert!(opts.contains(&"label=disable".to_string()));
+        assert!(opts.contains(&"unmask=/proc/*".to_string()));
+    }
+
+    #[test]
+    fn test_security_opt_args_mixed_format() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--security-opt=label=disable", "--security-opt", "unmask=/proc/*", "--device=/dev/kvm"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let opts = config.security_opt_args();
+        assert_eq!(opts.len(), 2);
+        assert!(opts.contains(&"label=disable".to_string()));
+        assert!(opts.contains(&"unmask=/proc/*".to_string()));
+        // Device args should still work (now returns just the device path)
+        assert_eq!(config.device_args(), vec!["/dev/kvm"]);
+    }
+
+    #[test]
+    fn test_security_opt_args_empty() {
+        let config = DevcontainerConfig::default();
+        assert!(config.security_opt_args().is_empty());
     }
 }
