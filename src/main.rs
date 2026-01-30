@@ -427,6 +427,96 @@ enum HostCommand {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
+    /// Interact with the opencode agent programmatically
+    ///
+    /// Provides CLI access to the opencode server API for scripting and automation.
+    /// Commands are executed by connecting to the agent container's API.
+    ///
+    /// Examples:
+    ///   devaipod opencode myworkspace mcp list          # List MCP servers
+    ///   devaipod opencode myworkspace mcp tools         # List available tools
+    ///   devaipod opencode myworkspace session list      # List sessions
+    ///   devaipod opencode myworkspace send "fix bug"    # Send message to agent
+    Opencode {
+        /// Workspace name (devaipod- prefix optional)
+        workspace: String,
+        #[command(subcommand)]
+        action: OpencodeAction,
+    },
+}
+
+/// Actions for interacting with the opencode agent
+#[derive(Debug, Parser)]
+enum OpencodeAction {
+    /// MCP server operations
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+    /// Session operations
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+    /// Send a message to the agent
+    ///
+    /// Creates a new session (or uses existing) and sends the message.
+    /// Waits for and prints the response.
+    Send {
+        /// Message to send to the agent
+        message: String,
+        /// Session ID to use (creates new if not specified)
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Output raw JSON response
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show agent status and health
+    Status {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// MCP-related actions
+#[derive(Debug, Parser)]
+enum McpAction {
+    /// List MCP servers and their connection status
+    List {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// List available tools from MCP servers
+    Tools {
+        /// Filter by server name
+        #[arg(short, long)]
+        server: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Session-related actions
+#[derive(Debug, Parser)]
+enum SessionAction {
+    /// List all sessions
+    List {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show session details
+    Show {
+        /// Session ID
+        id: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // =============================================================================
@@ -635,6 +725,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
         }
         HostCommand::Completions { shell } => cmd_completions(shell),
         HostCommand::Init { config } => init::cmd_init(config.as_deref()),
+        HostCommand::Opencode { workspace, action } => {
+            cmd_opencode(&normalize_pod_name(&workspace), action).await
+        }
     }
 }
 
@@ -2680,6 +2773,292 @@ fn collect_mcp_debug(pod_name: &str) -> Option<serde_json::Value> {
     Some(json!({
         "gator_reachable": gator_reachable,
     }))
+}
+
+/// Interact with the opencode agent programmatically
+async fn cmd_opencode(pod_name: &str, action: OpencodeAction) -> Result<()> {
+    // Verify pod exists and is running
+    // Check if the agent is healthy first
+    if check_agent_health(pod_name) != Some(true) {
+        bail!(
+            "Agent is not responding in pod '{}'. Is the pod running?",
+            pod_name
+        );
+    }
+
+    match action {
+        OpencodeAction::Mcp { action } => cmd_opencode_mcp(pod_name, action),
+        OpencodeAction::Session { action } => cmd_opencode_session(pod_name, action),
+        OpencodeAction::Send {
+            message,
+            session,
+            json,
+        } => cmd_opencode_send(pod_name, &message, session.as_deref(), json),
+        OpencodeAction::Status { json } => cmd_opencode_status(pod_name, json),
+    }
+}
+
+/// Execute a curl command in the workspace container and return the output
+fn opencode_api_get(pod_name: &str, path: &str) -> Result<serde_json::Value> {
+    let workspace_container = format!("{}-workspace", pod_name);
+    let url = format!("http://localhost:{}{}", pod::OPENCODE_PORT, path);
+
+    let output = podman_command()
+        .args([
+            "exec",
+            &workspace_container,
+            "curl",
+            "-sf",
+            &url,
+        ])
+        .output()
+        .context("Failed to execute curl in workspace container")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("API request to {} failed: {}", path, stderr.trim());
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("Failed to parse JSON response from {}", path))
+}
+
+/// Execute a POST request to the opencode API
+fn opencode_api_post(pod_name: &str, path: &str, body: &str) -> Result<serde_json::Value> {
+    let workspace_container = format!("{}-workspace", pod_name);
+    let url = format!("http://localhost:{}{}", pod::OPENCODE_PORT, path);
+
+    let output = podman_command()
+        .args([
+            "exec",
+            &workspace_container,
+            "curl",
+            "-sf",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            body,
+            &url,
+        ])
+        .output()
+        .context("Failed to execute curl in workspace container")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("API POST to {} failed: {}", path, stderr.trim());
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("Failed to parse JSON response from {}", path))
+}
+
+/// Handle MCP subcommands
+fn cmd_opencode_mcp(pod_name: &str, action: McpAction) -> Result<()> {
+    match action {
+        McpAction::List { json } => {
+            let mcp_status = opencode_api_get(pod_name, "/mcp")?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&mcp_status)?);
+            } else {
+                println!("MCP Servers:");
+                if let Some(obj) = mcp_status.as_object() {
+                    if obj.is_empty() {
+                        println!("  (none configured)");
+                    } else {
+                        for (name, info) in obj {
+                            let status = info
+                                .get("status")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("unknown");
+                            let icon = if status == "connected" { "✓" } else { "✗" };
+                            println!("  {} {} ({})", icon, name, status);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        McpAction::Tools { server, json } => {
+            let tools = opencode_api_get(pod_name, "/experimental/tool/ids")?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tools)?);
+            } else {
+                println!("Available Tools:");
+                if let Some(arr) = tools.as_array() {
+                    let filtered: Vec<_> = arr
+                        .iter()
+                        .filter_map(|t| t.as_str())
+                        .filter(|t| {
+                            server
+                                .as_ref()
+                                .map(|s| t.starts_with(s))
+                                .unwrap_or(true)
+                        })
+                        .collect();
+
+                    if filtered.is_empty() {
+                        println!("  (none)");
+                    } else {
+                        for tool in filtered {
+                            println!("  {}", tool);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Handle session subcommands
+fn cmd_opencode_session(pod_name: &str, action: SessionAction) -> Result<()> {
+    match action {
+        SessionAction::List { json } => {
+            let sessions = opencode_api_get(pod_name, "/session")?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else {
+                println!("Sessions:");
+                if let Some(arr) = sessions.as_array() {
+                    if arr.is_empty() {
+                        println!("  (none)");
+                    } else {
+                        for session in arr {
+                            let id = session.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                            let title = session
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Untitled");
+                            // Truncate long titles
+                            let title_display = if title.len() > 50 {
+                                format!("{}...", &title[..47])
+                            } else {
+                                title.to_string()
+                            };
+                            println!("  {} - {}", &id[..12.min(id.len())], title_display);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        SessionAction::Show { id, json } => {
+            let session = opencode_api_get(pod_name, &format!("/session/{}", id))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&session)?);
+            } else {
+                println!("Session: {}", id);
+                if let Some(title) = session.get("title").and_then(|v| v.as_str()) {
+                    println!("Title: {}", title);
+                }
+                if let Some(dir) = session.get("directory").and_then(|v| v.as_str()) {
+                    println!("Directory: {}", dir);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Send a message to the agent
+fn cmd_opencode_send(
+    pod_name: &str,
+    message: &str,
+    session_id: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    // Create or use existing session
+    let session_id = match session_id {
+        Some(id) => id.to_string(),
+        None => {
+            // Create a new session
+            let session = opencode_api_post(pod_name, "/session", "{}")?;
+            session
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| color_eyre::eyre::eyre!("Failed to get session ID from response"))?
+        }
+    };
+
+    // Build message payload
+    let payload = serde_json::json!({
+        "parts": [{"type": "text", "text": message}]
+    });
+
+    // Send message
+    let response = opencode_api_post(
+        pod_name,
+        &format!("/session/{}/message", session_id),
+        &payload.to_string(),
+    )?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        // Extract and print the text response
+        if let Some(parts) = response.get("parts").and_then(|p| p.as_array()) {
+            for part in parts {
+                if let Some("text") = part.get("type").and_then(|t| t.as_str()) {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        println!("{}", text);
+                    }
+                }
+            }
+        }
+        // Show session ID for follow-up
+        eprintln!("\n(session: {})", session_id);
+    }
+
+    Ok(())
+}
+
+/// Show agent status
+fn cmd_opencode_status(pod_name: &str, json_output: bool) -> Result<()> {
+    let health = opencode_api_get(pod_name, "/global/health")?;
+    let mcp = opencode_api_get(pod_name, "/mcp")?;
+    let sessions = opencode_api_get(pod_name, "/session")?;
+
+    if json_output {
+        let status = serde_json::json!({
+            "health": health,
+            "mcp": mcp,
+            "session_count": sessions.as_array().map(|a| a.len()).unwrap_or(0),
+        });
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        println!("Agent Status:");
+        if let Some(version) = health.get("version").and_then(|v| v.as_str()) {
+            println!("  Version: {}", version);
+        }
+        println!("  Health: OK");
+
+        println!("\nMCP Servers:");
+        if let Some(obj) = mcp.as_object() {
+            if obj.is_empty() {
+                println!("  (none)");
+            } else {
+                for (name, info) in obj {
+                    let status = info
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    println!("  {} - {}", name, status);
+                }
+            }
+        }
+
+        let session_count = sessions.as_array().map(|a| a.len()).unwrap_or(0);
+        println!("\nSessions: {}", session_count);
+    }
+
+    Ok(())
 }
 
 /// Check if the agent is listening on its port

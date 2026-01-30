@@ -38,6 +38,23 @@ devaipod run https://github.com/org/repo -c 'task'  # Task via flag
 devaipod run https://github.com/org/repo/issues/42  # Issue URL: default task "Fix <url>"
 ```
 
+## Programmatic agent interaction
+
+```bash
+devaipod opencode myworkspace status              # Agent status and health
+devaipod opencode myworkspace mcp list            # List MCP servers
+devaipod opencode myworkspace mcp tools           # List available tools
+devaipod opencode myworkspace session list        # List sessions
+devaipod opencode myworkspace send "fix the bug"  # Send message to agent
+```
+
+The `send` command creates a session and returns the agent's response, useful for scripting:
+
+```bash
+# Send a task and get the response
+devaipod opencode myworkspace send "list the files in src/" --json
+```
+
 ## Shell completions
 
 ```bash
