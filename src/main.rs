@@ -12,7 +12,6 @@ use clap::{Args, CommandFactory, Parser};
 use color_eyre::eyre::{bail, Context, Result};
 use dialoguer::Input;
 
-mod compose;
 mod config;
 mod devcontainer;
 mod forge;

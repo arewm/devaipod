@@ -564,7 +564,12 @@ impl DevaipodPod {
 
             // Use provided service_gator_config or fall back to global_config.service_gator
             let sg_config = service_gator_config.unwrap_or(&global_config.service_gator);
-            let gator_config = Self::gator_container_config(Some(sg_config), global_config);
+            let gator_config = Self::gator_container_config(
+                project_path,
+                &workspace_folder,
+                Some(sg_config),
+                global_config,
+            );
             podman
                 .create_container(&gator_container_name, gator_image, pod_name, gator_config)
                 .await
@@ -1541,7 +1546,12 @@ exec opencode serve --port {port} --hostname 0.0.0.0"#,
     /// 2. Podman secrets via `[trusted.secrets]` - set directly as env vars using type=env
     ///
     /// Podman secrets are more secure as they avoid credentials in environment variables.
+    ///
+    /// The workspace is mounted read-only so tools like `git_push_local` can access
+    /// the git repository to read commits for pushing.
     fn gator_container_config(
+        project_path: &Path,
+        workspace_folder: &str,
         sg_config: Option<&crate::config::ServiceGatorConfig>,
         global_config: &Config,
     ) -> ContainerConfig {
@@ -1568,8 +1578,15 @@ exec opencode serve --port {port} --hostname 0.0.0.0"#,
             command.extend(scope_args);
         }
 
+        // Mount the workspace read-only so git_push_local can access the repository
+        let workspace_mount = crate::podman::MountConfig {
+            source: project_path.display().to_string(),
+            target: workspace_folder.to_string(),
+            readonly: true,
+        };
+
         ContainerConfig {
-            mounts: vec![],
+            mounts: vec![workspace_mount],
             env,
             workdir: None,
             user: None,
@@ -1735,11 +1752,17 @@ mod tests {
 
     #[test]
     fn test_gator_container_config() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
         let global_config = crate::config::Config::default();
-        let container_config = DevaipodPod::gator_container_config(None, &global_config);
+        let container_config =
+            DevaipodPod::gator_container_config(project_path, workspace_folder, None, &global_config);
 
-        // Verify no mounts (gator doesn't need project access)
-        assert!(container_config.mounts.is_empty());
+        // Verify workspace is mounted read-only (for git_push_local access)
+        assert_eq!(container_config.mounts.len(), 1);
+        assert_eq!(container_config.mounts[0].source, "/home/user/myproject");
+        assert_eq!(container_config.mounts[0].target, "/workspaces/myproject");
+        assert!(container_config.mounts[0].readonly);
 
         // Verify command includes args (binary name not included since image has ENTRYPOINT)
         let cmd = container_config.command.as_ref().unwrap();
@@ -1757,6 +1780,8 @@ mod tests {
 
     #[test]
     fn test_gator_container_config_with_scopes() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
         let mut sg_config = crate::config::ServiceGatorConfig::default();
         sg_config.gh.repos.insert(
             "myorg/myrepo".to_string(),
@@ -1768,8 +1793,12 @@ mod tests {
         );
 
         let global_config = crate::config::Config::default();
-        let container_config =
-            DevaipodPod::gator_container_config(Some(&sg_config), &global_config);
+        let container_config = DevaipodPod::gator_container_config(
+            project_path,
+            workspace_folder,
+            Some(&sg_config),
+            &global_config,
+        );
 
         // Verify command includes scope arguments
         let cmd = container_config.command.as_ref().unwrap();
@@ -1780,13 +1809,20 @@ mod tests {
 
     #[test]
     fn test_gator_container_config_with_secrets() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
         let mut global_config = crate::config::Config::default();
         global_config.trusted_env.secrets = vec![
             "GH_TOKEN=gh_token".to_string(),
             "GITLAB_TOKEN=gitlab_token".to_string(),
         ];
 
-        let container_config = DevaipodPod::gator_container_config(None, &global_config);
+        let container_config = DevaipodPod::gator_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &global_config,
+        );
 
         // Verify secrets are listed for mounting as (env_var, secret_name) tuples
         assert_eq!(container_config.secrets.len(), 2);
@@ -1805,6 +1841,8 @@ mod tests {
     #[test]
     fn test_gator_container_config_with_secrets_and_env() {
         // Test that both secrets and regular env vars work together
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
         let mut global_config = crate::config::Config::default();
 
         // Add a secret
@@ -1817,7 +1855,12 @@ mod tests {
             .vars
             .insert("JIRA_API_TOKEN".to_string(), "jira_value".to_string());
 
-        let container_config = DevaipodPod::gator_container_config(None, &global_config);
+        let container_config = DevaipodPod::gator_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &global_config,
+        );
 
         // Verify secret is listed as (env_var, secret_name) tuple
         assert_eq!(container_config.secrets.len(), 1);
