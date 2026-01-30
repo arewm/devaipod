@@ -551,6 +551,17 @@ impl DevaipodPod {
                 .await
                 .context("Failed to ensure service-gator image")?;
 
+            // Display detailed gator image info (name, creation time, digest)
+            match podman.get_image_info(gator_image).await {
+                Ok(info) => {
+                    tracing::info!("Using service-gator image: {}", info);
+                }
+                Err(e) => {
+                    tracing::debug!("Could not get service-gator image details: {}", e);
+                    tracing::info!("Using service-gator image: {}", gator_image);
+                }
+            }
+
             // Use provided service_gator_config or fall back to global_config.service_gator
             let sg_config = service_gator_config.unwrap_or(&global_config.service_gator);
             let gator_config = Self::gator_container_config(Some(sg_config), global_config);
