@@ -48,6 +48,56 @@ impl std::fmt::Display for ForgeType {
     }
 }
 
+/// A parsed issue reference
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueRef {
+    /// The forge type (github, gitlab, etc.)
+    pub forge_type: ForgeType,
+    /// The forge host (e.g., "github.com", "gitlab.com", "codeberg.org")
+    pub host: String,
+    /// Repository owner/organization
+    pub owner: String,
+    /// Repository name
+    pub repo: String,
+    /// Issue number
+    pub number: u64,
+}
+
+impl IssueRef {
+    /// Get the repository clone URL (HTTPS)
+    pub fn repo_url(&self) -> String {
+        format!("https://{}/{}/{}", self.host, self.owner, self.repo)
+    }
+
+    /// Get the full issue URL
+    pub fn issue_url(&self) -> String {
+        match self.forge_type {
+            ForgeType::GitHub => format!(
+                "https://{}/{}/{}/issues/{}",
+                self.host, self.owner, self.repo, self.number
+            ),
+            ForgeType::GitLab => format!(
+                "https://{}/{}/{}/-/issues/{}",
+                self.host, self.owner, self.repo, self.number
+            ),
+            ForgeType::Forgejo | ForgeType::Gitea => format!(
+                "https://{}/{}/{}/issues/{}",
+                self.host, self.owner, self.repo, self.number
+            ),
+        }
+    }
+
+    /// Get owner/repo string (e.g., "owner/repo")
+    pub fn owner_repo(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+
+    /// Get a short display string like "owner/repo#123"
+    pub fn short_display(&self) -> String {
+        format!("{}/{}#{}", self.owner, self.repo, self.number)
+    }
+}
+
 /// A parsed pull/merge request reference
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestRef {
@@ -167,6 +217,50 @@ pub fn parse_pr_url(url: &str) -> Option<PullRequestRef> {
                 // Default to Forgejo for unknown hosts with /pulls/ pattern
                 ForgeType::Forgejo
             },
+            host,
+            owner: path_segments[0].to_string(),
+            repo: path_segments[1].to_string(),
+            number,
+        });
+    }
+
+    None
+}
+
+/// Parse a URL to extract issue information
+///
+/// Supports:
+/// - GitHub: https://github.com/owner/repo/issues/123
+/// - GitLab: https://gitlab.com/owner/repo/-/issues/123
+/// - Forgejo/Gitea: https://codeberg.org/owner/repo/issues/123
+///
+/// Returns None if the URL doesn't match a known issue pattern.
+pub fn parse_issue_url(url: &str) -> Option<IssueRef> {
+    let url = url.trim().trim_end_matches('/');
+
+    // Try to parse as URL
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let path_segments: Vec<&str> = parsed.path().trim_start_matches('/').split('/').collect();
+
+    // GitHub/Forgejo/Gitea: /owner/repo/issues/123
+    if path_segments.len() >= 4 && path_segments[2] == "issues" {
+        let number: u64 = path_segments[3].parse().ok()?;
+        let forge_type = detect_forge_type(&host);
+        return Some(IssueRef {
+            forge_type,
+            host,
+            owner: path_segments[0].to_string(),
+            repo: path_segments[1].to_string(),
+            number,
+        });
+    }
+
+    // GitLab: /owner/repo/-/issues/123
+    if path_segments.len() >= 5 && path_segments[2] == "-" && path_segments[3] == "issues" {
+        let number: u64 = path_segments[4].parse().ok()?;
+        return Some(IssueRef {
+            forge_type: ForgeType::GitLab,
             host,
             owner: path_segments[0].to_string(),
             repo: path_segments[1].to_string(),
@@ -636,5 +730,56 @@ mod tests {
     fn test_parse_repo_url_trailing_slash() {
         let repo = parse_repo_url("https://github.com/owner/repo/").unwrap();
         assert_eq!(repo.owner_repo(), "owner/repo");
+    }
+
+    #[test]
+    fn test_parse_github_issue_url() {
+        let issue = parse_issue_url("https://github.com/bootc-dev/bootc/issues/1957").unwrap();
+        assert_eq!(issue.forge_type, ForgeType::GitHub);
+        assert_eq!(issue.host, "github.com");
+        assert_eq!(issue.owner, "bootc-dev");
+        assert_eq!(issue.repo, "bootc");
+        assert_eq!(issue.number, 1957);
+        assert_eq!(issue.repo_url(), "https://github.com/bootc-dev/bootc");
+        assert_eq!(
+            issue.issue_url(),
+            "https://github.com/bootc-dev/bootc/issues/1957"
+        );
+    }
+
+    #[test]
+    fn test_parse_gitlab_issue_url() {
+        let issue = parse_issue_url("https://gitlab.com/owner/repo/-/issues/123").unwrap();
+        assert_eq!(issue.forge_type, ForgeType::GitLab);
+        assert_eq!(issue.owner, "owner");
+        assert_eq!(issue.repo, "repo");
+        assert_eq!(issue.number, 123);
+    }
+
+    #[test]
+    fn test_parse_forgejo_issue_url() {
+        let issue = parse_issue_url("https://codeberg.org/owner/repo/issues/456").unwrap();
+        assert_eq!(issue.forge_type, ForgeType::Forgejo);
+        assert_eq!(issue.number, 456);
+    }
+
+    #[test]
+    fn test_issue_ref_methods() {
+        let issue = IssueRef {
+            forge_type: ForgeType::GitHub,
+            host: "github.com".to_string(),
+            owner: "bootc-dev".to_string(),
+            repo: "bootc".to_string(),
+            number: 1957,
+        };
+        assert_eq!(issue.owner_repo(), "bootc-dev/bootc");
+        assert_eq!(issue.short_display(), "bootc-dev/bootc#1957");
+    }
+
+    #[test]
+    fn test_parse_non_issue_url() {
+        assert!(parse_issue_url("https://github.com/owner/repo").is_none());
+        assert!(parse_issue_url("https://github.com/owner/repo/pull/123").is_none());
+        assert!(parse_issue_url("not a url").is_none());
     }
 }

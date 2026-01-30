@@ -354,15 +354,17 @@ enum HostCommand {
     /// after setup (async by default). Use 'devaipod ssh <workspace>' to monitor
     /// the agent's progress.
     ///
-    /// If no task is provided and stdin is a TTY, prompts interactively.
+    /// For issue URLs, the source repo is extracted and the default task is
+    /// "Fix <issue_url>". If no task is provided and stdin is a TTY, prompts
+    /// interactively with the default pre-filled.
     ///
     /// Examples:
     ///   devaipod run https://github.com/org/repo
     ///   devaipod run https://github.com/org/repo 'fix typos in README.md'
+    ///   devaipod run https://github.com/org/repo/issues/123  # Default: "Fix <url>"
     ///   devaipod run . 'add unit tests for the parser module'
-    ///   devaipod run . -c 'task via flag'  # -c/--command also works
     Run {
-        /// Source: local path, git URL, or PR URL
+        /// Source: local path, git URL, issue URL, or PR URL
         source: String,
         /// Task description for the AI agent
         #[arg(value_name = "TASK")]
@@ -559,18 +561,35 @@ async fn run_host(cli: HostCli) -> Result<()> {
             service_gator_scopes,
             service_gator_image,
         } => {
-            // Merge task sources: positional arg takes precedence, then -c/--command
-            let effective_task = task.or(command);
+            // Check if source is an issue URL - if so, extract repo and set default task
+            let (effective_source, default_task) =
+                if let Some(issue_ref) = forge::parse_issue_url(&source) {
+                    let issue_url = issue_ref.issue_url();
+                    let repo_url = issue_ref.repo_url();
+                    tracing::info!("Issue URL detected: {}", issue_ref.short_display());
+                    (repo_url, Some(format!("Fix {}", issue_url)))
+                } else {
+                    (source.clone(), None)
+                };
 
-            // If no task provided and stdin is a TTY, prompt interactively
-            let effective_task = match effective_task {
+            // Merge task sources: positional arg takes precedence, then -c/--command
+            // Note: default_task from issue URL is NOT merged here - it's used as
+            // the pre-filled text in the interactive prompt instead
+            let explicit_task = task.or(command);
+
+            // Determine final task: explicit task, or prompt interactively
+            let effective_task = match explicit_task {
                 Some(t) => Some(t),
                 None if std::io::stdin().is_terminal() => {
-                    match Input::<String>::new()
-                        .with_prompt("Task for the AI agent (leave empty to skip)")
-                        .allow_empty(true)
-                        .interact_text()
-                    {
+                    let prompt = Input::<String>::new()
+                        .with_prompt("Task for the AI agent (leave empty to skip)");
+                    // If we have a default from issue URL, pre-fill it
+                    let prompt = if let Some(ref default) = default_task {
+                        prompt.with_initial_text(default)
+                    } else {
+                        prompt
+                    };
+                    match prompt.allow_empty(true).interact_text() {
                         Ok(task) if task.trim().is_empty() => None,
                         Ok(task) => Some(task),
                         Err(dialoguer::Error::IO(e))
@@ -582,12 +601,13 @@ async fn run_host(cli: HostCli) -> Result<()> {
                         Err(e) => return Err(e).context("Failed to read task from terminal"),
                     }
                 }
-                None => None,
+                // Non-interactive: use the default task from issue URL if available
+                None => default_task,
             };
 
             cmd_run(
                 &config,
-                &source,
+                &effective_source,
                 effective_task.as_deref(),
                 image.as_deref(),
                 name.as_deref(),

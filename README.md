@@ -71,6 +71,9 @@ devaipod run https://github.com/org/repo
 
 # Or pass task inline:
 devaipod run https://github.com/org/repo -c 'fix typos in README.md'
+
+# From an issue URL (extracts repo, default task is "Fix <issue_url>"):
+devaipod run https://github.com/org/repo/issues/123
 ```
 
 Monitor progress with `devaipod ssh <workspace>` which shows the agent monitor.
@@ -121,6 +124,7 @@ devaipod ssh-config myworkspace   # Generate SSH config for editor integration
 devaipod run . 'fix typos'                          # Run on local repo
 devaipod run https://github.com/org/repo            # Prompts for task interactively
 devaipod run https://github.com/org/repo -c 'task'  # Task via flag
+devaipod run https://github.com/org/repo/issues/42  # Issue URL: default task "Fix <url>"
 
 # Shell completions
 devaipod completions bash         # Generate bash completions
