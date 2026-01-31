@@ -16,6 +16,7 @@ mod config;
 mod devcontainer;
 mod forge;
 mod git;
+mod tui;
 #[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
 mod gpu;
 mod init;
@@ -389,6 +390,16 @@ enum HostCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Interactive TUI dashboard
+    ///
+    /// Opens a terminal UI for managing devaipod instances. Shows real-time
+    /// status of all instances with agent health, tasks, and repository info.
+    ///
+    /// Keybindings:
+    ///   j/k or arrows: Navigate
+    ///   r: Refresh
+    ///   q: Quit
+    Tui,
     /// Stop a workspace
     Stop {
         /// Workspace name (devaipod- prefix optional)
@@ -769,6 +780,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             cmd_ssh_config(&normalize_pod_name(&workspace), user.as_deref())
         }
         HostCommand::List { json } => cmd_list(json),
+        HostCommand::Tui => tui::run().await,
         HostCommand::Stop { workspace } => cmd_stop(&normalize_pod_name(&workspace)),
         HostCommand::Delete { workspace, force } => {
             cmd_delete(&normalize_pod_name(&workspace), force)

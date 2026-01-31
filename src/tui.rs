@@ -1,0 +1,1192 @@
+//! TUI (Text User Interface) for devaipod
+//!
+//! Provides a real-time dashboard for managing devaipod instances using async Rust
+//! with ratatui for rendering and bollard for container API access.
+
+use std::collections::HashMap;
+use std::io::{self, IsTerminal, Stdout};
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+
+use bollard::Docker;
+use bollard::container::ListContainersOptions;
+use bollard::models::ContainerSummary;
+use color_eyre::eyre::{Context, Result};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use futures_util::StreamExt;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::Terminal;
+use tokio::time::interval;
+
+/// Prefix for all devaipod pod names
+const POD_NAME_PREFIX: &str = "devaipod-";
+
+/// Minimum interval between git state refreshes for a single instance.
+/// Prevents excessive git command execution when multiple refresh triggers occur.
+const GIT_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(10);
+
+/// Git repository state
+#[derive(Debug, Clone, Default)]
+pub struct GitState {
+    /// Current branch name
+    pub branch: Option<String>,
+    /// Whether there are uncommitted changes
+    pub dirty: bool,
+    /// Number of commits ahead of remote
+    pub ahead: u32,
+    /// Number of commits behind remote
+    pub behind: u32,
+    /// Short summary (e.g., "main ✓" or "feature-x *+2-1")
+    pub summary: String,
+}
+
+impl GitState {
+    /// Create a summary string for display
+    fn compute_summary(&mut self) {
+        let branch = self.branch.as_deref().unwrap_or("detached");
+        let dirty_indicator = if self.dirty { "*" } else { "" };
+
+        let ahead_behind = match (self.ahead, self.behind) {
+            (0, 0) => String::new(),
+            (a, 0) => format!(" ↑{}", a),
+            (0, b) => format!(" ↓{}", b),
+            (a, b) => format!(" ↑{}↓{}", a, b),
+        };
+
+        self.summary = format!("{}{}{}", branch, dirty_indicator, ahead_behind);
+    }
+}
+
+/// Information about a devaipod instance gathered from bollard
+#[derive(Debug, Clone)]
+pub struct InstanceInfo {
+    /// Short name (without devaipod- prefix)
+    pub name: String,
+    /// Full pod name
+    pub full_name: String,
+    /// Pod status (Running, Exited, Degraded)
+    pub status: String,
+    /// Repository URL from labels
+    pub repo: Option<String>,
+    /// Current task description from labels
+    pub task: Option<String>,
+    /// Mode (up, run, etc.)
+    pub mode: Option<String>,
+    /// Whether the agent is healthy
+    pub agent_healthy: Option<bool>,
+    /// Created timestamp
+    pub created: Option<String>,
+    /// Git repository state (fetched async)
+    pub git_state: Option<GitState>,
+    /// Workspace directory path inside container
+    pub workspace_path: Option<String>,
+    /// Last time git state was refreshed for this instance (for rate-limiting)
+    pub last_git_refresh: Option<std::time::Instant>,
+}
+
+/// Action to perform after exiting TUI
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Just quit, no further action
+    Quit,
+    /// Attach to the specified instance
+    Attach(String),
+    /// SSH into the specified instance
+    Ssh(String),
+    /// Trigger a refresh
+    Refresh,
+}
+
+/// Application state for the TUI
+pub struct App {
+    /// Docker/Podman client
+    docker: Docker,
+    /// List of instances
+    instances: Vec<InstanceInfo>,
+    /// Table selection state
+    table_state: TableState,
+    /// Last refresh time
+    last_refresh: std::time::Instant,
+    /// Status message
+    status_message: Option<String>,
+}
+
+impl App {
+    /// Create a new App instance
+    pub async fn new() -> Result<Self> {
+        // Connect to podman socket using XDG_RUNTIME_DIR or uid-based path
+        let uid = rustix::process::getuid().as_raw();
+        let socket_path = std::env::var("XDG_RUNTIME_DIR")
+            .map(|dir| format!("{}/podman/podman.sock", dir))
+            .unwrap_or_else(|_| format!("/run/user/{}/podman/podman.sock", uid));
+
+        let docker = Docker::connect_with_unix(
+            &format!("unix://{}", socket_path),
+            120,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .or_else(|_| {
+            // Try default docker socket as fallback
+            Docker::connect_with_local_defaults()
+        })
+        .context("Failed to connect to podman/docker")?;
+
+        let mut app = Self {
+            docker,
+            instances: Vec::new(),
+            table_state: TableState::default(),
+            last_refresh: std::time::Instant::now(),
+            status_message: None,
+        };
+
+        // Initial data fetch
+        app.refresh_instances().await?;
+
+        Ok(app)
+    }
+
+    /// Refresh the list of instances from podman
+    pub async fn refresh_instances(&mut self) -> Result<()> {
+        let filter = format!("{}*", POD_NAME_PREFIX);
+        let mut filters = HashMap::new();
+        filters.insert("name", vec![filter.as_str()]);
+
+        let options = ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        };
+
+        let containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .context("Failed to list containers")?;
+
+        // Group containers by pod (using the pod label or name prefix)
+        let mut pod_containers: HashMap<String, Vec<ContainerSummary>> = HashMap::new();
+
+        for container in containers {
+            // Extract pod name from container name
+            // Container names look like: /devaipod-foo-workspace, /devaipod-foo-agent
+            if let Some(names) = &container.names {
+                for name in names {
+                    let name = name.trim_start_matches('/');
+                    if name.starts_with(POD_NAME_PREFIX) {
+                        // Extract the pod name (everything before -workspace, -agent, -infra)
+                        let pod_name = extract_pod_name(name);
+                        pod_containers
+                            .entry(pod_name.to_string())
+                            .or_default()
+                            .push(container.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Build instance info from grouped containers
+        let mut instances: Vec<InstanceInfo> = Vec::new();
+
+        for (full_name, containers) in pod_containers {
+            // Skip if this doesn't have a workspace container (e.g., orphaned gator containers)
+            if !is_valid_instance(&containers) {
+                continue;
+            }
+
+            let short_name = full_name
+                .strip_prefix(POD_NAME_PREFIX)
+                .unwrap_or(&full_name)
+                .to_string();
+
+            // Find the workspace container to extract labels
+            let workspace = containers
+                .iter()
+                .find(|c| {
+                    c.names
+                        .as_ref()
+                        .is_some_and(|n| n.iter().any(|name| name.ends_with("-workspace")))
+                });
+
+            // Extract labels from workspace container
+            let labels = workspace.and_then(|w| w.labels.as_ref());
+
+            let repo = labels
+                .and_then(|l| l.get("io.devaipod.repo"))
+                .cloned();
+            let task = labels
+                .and_then(|l| l.get("io.devaipod.task"))
+                .cloned();
+            let mode = labels
+                .and_then(|l| l.get("io.devaipod.mode"))
+                .cloned();
+
+            // Determine overall status
+            let running_count = containers
+                .iter()
+                .filter(|c| c.state.as_deref() == Some("running"))
+                .count();
+            let total = containers.len();
+
+            let status = if running_count == total && total > 0 {
+                "Running".to_string()
+            } else if running_count == 0 {
+                "Exited".to_string()
+            } else {
+                "Degraded".to_string()
+            };
+
+            // Check agent health (simplified - just check if agent container is running)
+            let agent_healthy = containers.iter().any(|c| {
+                c.names
+                    .as_ref()
+                    .is_some_and(|n| n.iter().any(|name| name.contains("-agent")))
+                    && c.state.as_deref() == Some("running")
+            });
+
+            // Get created time from workspace container
+            let created = workspace.and_then(|w| w.created).map(|ts| {
+                chrono::DateTime::from_timestamp(ts, 0)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            });
+
+            // Extract workspace path from labels
+            let workspace_path = labels
+                .and_then(|l| l.get("io.devaipod.workspace"))
+                .cloned();
+
+            instances.push(InstanceInfo {
+                name: short_name,
+                full_name,
+                status,
+                repo,
+                task,
+                mode,
+                agent_healthy: Some(agent_healthy),
+                created,
+                git_state: None, // Will be fetched async
+                workspace_path,
+                last_git_refresh: None,
+            });
+        }
+
+        // Sort by name
+        instances.sort_by(|a, b| a.name.cmp(&b.name));
+
+        self.instances = instances;
+        self.last_refresh = std::time::Instant::now();
+
+        // NOTE: Git state is fetched separately via refresh_git_states_background()
+        // to avoid blocking the initial display
+
+        // Ensure selection is valid
+        if !self.instances.is_empty() && self.table_state.selected().is_none() {
+            self.table_state.select(Some(0));
+        }
+
+        Ok(())
+    }
+
+    /// Move selection up
+    pub fn previous(&mut self) {
+        if self.instances.is_empty() {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.instances.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    /// Move selection down
+    pub fn next(&mut self) {
+        if self.instances.is_empty() {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => {
+                if i >= self.instances.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    /// Get the currently selected instance
+    pub fn selected_instance(&self) -> Option<&InstanceInfo> {
+        self.table_state
+            .selected()
+            .and_then(|i| self.instances.get(i))
+    }
+}
+
+/// Fetch git state from a container by exec'ing git commands
+async fn fetch_git_state(
+    docker: &Docker,
+    container_name: &str,
+    workspace_path: &str,
+) -> Option<GitState> {
+    use bollard::exec::{CreateExecOptions, StartExecResults};
+    use futures_util::TryStreamExt;
+
+    // Helper to run a git command and get stdout
+    async fn git_exec(
+        docker: &Docker,
+        container: &str,
+        workdir: &str,
+        args: &[&str],
+    ) -> Option<String> {
+        let mut cmd = vec!["git", "-C", workdir];
+        cmd.extend(args);
+
+        let exec = docker
+            .create_exec(
+                container,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(cmd.iter().map(|s| s.to_string()).collect()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()?;
+
+        let output = docker.start_exec(&exec.id, None).await.ok()?;
+
+        if let StartExecResults::Attached { mut output, .. } = output {
+            let mut stdout = String::new();
+            while let Ok(Some(msg)) = output.try_next().await {
+                stdout.push_str(&msg.to_string());
+            }
+            Some(stdout.trim().to_string())
+        } else {
+            None
+        }
+    }
+
+    // Find the actual repo directory
+    // First, try to find directories in /workspaces
+    let repo_dir = {
+        // List directories in /workspaces
+        let ls_exec = docker
+            .create_exec(
+                container_name,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    cmd: Some(vec!["ls".to_string(), "-1".to_string(), "/workspaces".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok();
+
+        let dirs: Vec<String> = if let Some(exec) = ls_exec {
+            if let Ok(StartExecResults::Attached { mut output, .. }) =
+                docker.start_exec(&exec.id, None).await
+            {
+                let mut stdout = String::new();
+                while let Ok(Some(msg)) = output.try_next().await {
+                    stdout.push_str(&msg.to_string());
+                }
+                stdout
+                    .lines()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        // Use the first directory found, or fall back to workspace_path
+        if let Some(first_dir) = dirs.first() {
+            format!("/workspaces/{}", first_dir)
+        } else if workspace_path != "/workspaces" {
+            workspace_path.to_string()
+        } else {
+            return None; // No workspace found
+        }
+    };
+
+    // Get current branch
+    let branch = git_exec(
+        docker,
+        container_name,
+        &repo_dir,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+    )
+    .await
+    .filter(|s| !s.is_empty() && s != "HEAD");
+
+    // Check for uncommitted changes (dirty state)
+    let status_output = git_exec(
+        docker,
+        container_name,
+        &repo_dir,
+        &["status", "--porcelain"],
+    )
+    .await;
+    let dirty = status_output.as_ref().is_some_and(|s| !s.is_empty());
+
+    // Get ahead/behind counts
+    let (ahead, behind) = if let Some(ref branch_name) = branch {
+        let upstream = format!("origin/{}", branch_name);
+        let rev_list = git_exec(
+            docker,
+            container_name,
+            &repo_dir,
+            &["rev-list", "--left-right", "--count", &format!("{}...{}", branch_name, upstream)],
+        )
+        .await;
+
+        if let Some(counts) = rev_list {
+            let parts: Vec<&str> = counts.split_whitespace().collect();
+            if parts.len() == 2 {
+                let a = parts[0].parse().unwrap_or(0);
+                let b = parts[1].parse().unwrap_or(0);
+                (a, b)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+
+    let mut state = GitState {
+        branch,
+        dirty,
+        ahead,
+        behind,
+        summary: String::new(),
+    };
+    state.compute_summary();
+
+    Some(state)
+}
+
+/// Extract the pod name from a container name
+/// e.g., "devaipod-foo-workspace" -> "devaipod-foo"
+fn extract_pod_name(container_name: &str) -> &str {
+    // Order matters - check longer suffixes first
+    for suffix in &["-service-gator", "-workspace", "-agent", "-infra", "-gator", "-proxy"] {
+        if let Some(prefix) = container_name.strip_suffix(suffix) {
+            return prefix;
+        }
+    }
+    container_name
+}
+
+/// Check if this is a valid devaipod instance (has workspace container)
+fn is_valid_instance(containers: &[ContainerSummary]) -> bool {
+    containers.iter().any(|c| {
+        c.names
+            .as_ref()
+            .is_some_and(|n| n.iter().any(|name| name.ends_with("-workspace")))
+    })
+}
+
+/// Run the TUI application
+pub async fn run() -> Result<()> {
+    // Check if we're running in a terminal
+    if !std::io::stdout().is_terminal() {
+        color_eyre::eyre::bail!("TUI requires a terminal. Use 'devaipod list' for non-interactive output.");
+    }
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create app and run
+    let app = App::new().await?;
+    let result = run_app(&mut terminal, app).await;
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+/// Message for git state updates from background task
+struct GitStateUpdate {
+    instance_name: String,
+    git_state: Option<GitState>,
+}
+
+/// Spawn background tasks to fetch git state for all running instances.
+/// Rate-limited per instance: only spawns a refresh if >GIT_REFRESH_RATE_LIMIT
+/// has passed since the last successful refresh for that instance.
+fn spawn_git_refresh(
+    docker: &Docker,
+    instances: &[InstanceInfo],
+    tx: mpsc::Sender<GitStateUpdate>,
+) {
+    let now = std::time::Instant::now();
+
+    for instance in instances {
+        if instance.status != "Running" {
+            continue;
+        }
+
+        // Rate-limit: skip if we refreshed this instance recently
+        if let Some(last_refresh) = instance.last_git_refresh {
+            if now.duration_since(last_refresh) < GIT_REFRESH_RATE_LIMIT {
+                continue;
+            }
+        }
+
+        let docker = docker.clone();
+        let tx = tx.clone();
+        let instance_name = instance.name.clone();
+        let full_name = instance.full_name.clone();
+        let workspace_path = instance
+            .workspace_path
+            .clone()
+            .unwrap_or_else(|| "/workspaces".to_string());
+
+        tokio::spawn(async move {
+            let container_name = format!("{}-workspace", full_name);
+            let git_state = fetch_git_state(&docker, &container_name, &workspace_path).await;
+            let _ = tx
+                .send(GitStateUpdate {
+                    instance_name,
+                    git_state,
+                })
+                .await;
+        });
+    }
+}
+
+/// Main event loop
+async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> Result<()> {
+    let mut refresh_interval = interval(Duration::from_secs(10));
+
+    // Channel for receiving git state updates from background tasks
+    let (git_tx, mut git_rx) = mpsc::channel::<GitStateUpdate>(32);
+
+    // Spawn initial git state fetch
+    spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+
+    // Use async event stream instead of blocking poll
+    let mut event_stream = EventStream::new();
+
+    loop {
+        // Draw the UI
+        terminal.draw(|f| ui(f, &mut app))?;
+
+        // Handle events with proper async - no blocking!
+        tokio::select! {
+            // Receive git state updates from background
+            Some(update) = git_rx.recv() => {
+                if let Some(instance) = app.instances.iter_mut().find(|i| i.name == update.instance_name) {
+                    instance.git_state = update.git_state;
+                    // Update timestamp to enforce rate-limiting on subsequent refresh attempts
+                    instance.last_git_refresh = Some(std::time::Instant::now());
+                }
+            }
+            _ = refresh_interval.tick() => {
+                if let Err(e) = app.refresh_instances().await {
+                    app.status_message = Some(format!("Refresh error: {}", e));
+                } else {
+                    // Spawn background git refresh after instance refresh
+                    spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                }
+            }
+            // Async event stream - truly non-blocking
+            maybe_event = event_stream.next() => {
+                if let Some(Ok(event)) = maybe_event {
+                    if let Some(action) = handle_event(&mut app, event) {
+                        match action {
+                            Action::Quit => return Ok(()),
+                            Action::Refresh => {
+                                app.status_message = Some("Refreshing...".to_string());
+                                if let Err(e) = app.refresh_instances().await {
+                                    app.status_message = Some(format!("Refresh error: {}", e));
+                                } else {
+                                    spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                    app.status_message = Some("Refreshed".to_string());
+                                }
+                            }
+                            Action::Attach(name) => {
+                                // Run attach in subprocess, then resume TUI
+                                run_subprocess(terminal, &["attach", &name]).await?;
+                                // Refresh after returning from subprocess
+                                let _ = app.refresh_instances().await;
+                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                            }
+                            Action::Ssh(name) => {
+                                // Run ssh in subprocess, then resume TUI
+                                run_subprocess(terminal, &["ssh", &name]).await?;
+                                // Refresh after returning from subprocess
+                                let _ = app.refresh_instances().await;
+                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle a terminal event, returning an action if the TUI should exit
+fn handle_event(app: &mut App, event: Event) -> Option<Action> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.next();
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.previous();
+                None
+            }
+            KeyCode::Char('r') => {
+                // Trigger refresh
+                Some(Action::Refresh)
+            }
+            KeyCode::Enter | KeyCode::Char('a') => {
+                // Attach to selected instance
+                if let Some(instance) = app.selected_instance() {
+                    Some(Action::Attach(instance.name.clone()))
+                } else {
+                    app.status_message = Some("No instance selected".to_string());
+                    None
+                }
+            }
+            KeyCode::Char('s') => {
+                // SSH into selected instance
+                if let Some(instance) = app.selected_instance() {
+                    Some(Action::Ssh(instance.name.clone()))
+                } else {
+                    app.status_message = Some("No instance selected".to_string());
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Run a subprocess with terminal properly suspended, then resume TUI
+async fn run_subprocess(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    args: &[&str],
+) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    // Restore terminal for the subprocess
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    // Get the path to ourselves
+    let exe = std::env::current_exe().context("Failed to get current executable")?;
+
+    // Spawn subprocess and wait
+    let status = Command::new(&exe)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .context("Failed to run subprocess")?;
+
+    if !status.success() {
+        tracing::warn!("Subprocess exited with status: {:?}", status.code());
+    }
+
+    // Restore TUI terminal state
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+
+    Ok(())
+}
+
+/// Render the UI
+fn ui(frame: &mut ratatui::Frame, app: &mut App) {
+    let area = frame.area();
+
+    // Layout: header, main table, footer
+    let chunks = Layout::vertical([
+        Constraint::Length(3), // Header
+        Constraint::Min(5),    // Table
+        Constraint::Length(3), // Footer
+    ])
+    .split(area);
+
+    // Header
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(" devaipod ", Style::default().fg(Color::Cyan).bold()),
+        Span::raw("│ "),
+        Span::styled(
+            format!("{} instances", app.instances.len()),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(" │ Last refresh: "),
+        Span::styled(
+            format!("{}s ago", app.last_refresh.elapsed().as_secs()),
+            Style::default().fg(Color::Yellow),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(" Dashboard "));
+    frame.render_widget(header, chunks[0]);
+
+    // Instance table
+    render_table(frame, app, chunks[1]);
+
+    // Footer with help and status
+    let status = app
+        .status_message
+        .as_deref()
+        .map(|s| format!(" │ {}", s))
+        .unwrap_or_default();
+    let help_text = format!(
+        " q: Quit │ j/k: Navigate │ Enter/a: Attach │ s: SSH │ r: Refresh{}",
+        status
+    );
+    let footer = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(footer, chunks[2]);
+}
+
+/// Render the instances table
+fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let header_cells = ["NAME", "STATUS", "CREATED", "GIT", "MODE", "REPO", "TASK"]
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).bold()));
+    let header = Row::new(header_cells).height(1);
+
+    let rows = app.instances.iter().map(|instance| {
+        // Status with color and agent indicator
+        let status_style = match instance.status.as_str() {
+            "Running" => Style::default().fg(Color::Green),
+            "Exited" => Style::default().fg(Color::Red),
+            "Degraded" => Style::default().fg(Color::Yellow),
+            _ => Style::default(),
+        };
+
+        let agent_indicator = match instance.agent_healthy {
+            Some(true) => " [ok]",
+            Some(false) => " [!]",
+            None => "",
+        };
+
+        let status_text = format!("{}{}", instance.status, agent_indicator);
+
+        // Git state with color coding
+        let (git_text, git_style) = match &instance.git_state {
+            Some(state) => {
+                let style = if state.dirty {
+                    Style::default().fg(Color::Yellow)
+                } else if state.ahead > 0 || state.behind > 0 {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                (state.summary.clone(), style)
+            }
+            None if instance.status == "Running" => {
+                // Still loading
+                ("...".to_string(), Style::default().fg(Color::DarkGray))
+            }
+            None => ("-".to_string(), Style::default().fg(Color::DarkGray)),
+        };
+
+        // Truncate task to fit
+        let task = instance
+            .task
+            .as_deref()
+            .unwrap_or("-")
+            .chars()
+            .take(25)
+            .collect::<String>();
+
+        let task = if instance.task.as_ref().is_some_and(|t| t.len() > 25) {
+            format!("{}...", task)
+        } else {
+            task
+        };
+
+        // Truncate repo (remove common prefixes)
+        let repo = instance
+            .repo
+            .as_deref()
+            .map(|r| {
+                r.strip_prefix("https://")
+                    .or_else(|| r.strip_prefix("git@"))
+                    .unwrap_or(r)
+            })
+            .unwrap_or("-");
+
+        Row::new(vec![
+            Cell::from(instance.name.clone()),
+            Cell::from(status_text).style(status_style),
+            Cell::from(instance.created.as_deref().unwrap_or("-")),
+            Cell::from(git_text).style(git_style),
+            Cell::from(instance.mode.as_deref().unwrap_or("-")),
+            Cell::from(repo),
+            Cell::from(task),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(18),        // NAME
+            Constraint::Length(15),     // STATUS
+            Constraint::Length(10),     // CREATED
+            Constraint::Length(18),     // GIT
+            Constraint::Length(5),      // MODE
+            Constraint::Percentage(18), // REPO
+            Constraint::Percentage(22), // TASK
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title(" Instances "))
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyEventState, KeyModifiers};
+
+    /// Create a test app for UI testing (no Docker connection needed)
+    fn create_test_app_for_ui() -> TestApp {
+        TestApp {
+            instances: Vec::new(),
+            table_state: TableState::default(),
+            last_refresh: std::time::Instant::now(),
+            status_message: None,
+        }
+    }
+
+    /// Minimal app struct for testing without Docker
+    struct TestApp {
+        instances: Vec<InstanceInfo>,
+        table_state: TableState,
+        #[allow(dead_code)]
+        last_refresh: std::time::Instant,
+        status_message: Option<String>,
+    }
+
+    impl TestApp {
+        fn next(&mut self) {
+            if self.instances.is_empty() {
+                return;
+            }
+            let i = match self.table_state.selected() {
+                Some(i) => {
+                    if i >= self.instances.len() - 1 {
+                        0
+                    } else {
+                        i + 1
+                    }
+                }
+                None => 0,
+            };
+            self.table_state.select(Some(i));
+        }
+
+        fn previous(&mut self) {
+            if self.instances.is_empty() {
+                return;
+            }
+            let i = match self.table_state.selected() {
+                Some(i) => {
+                    if i == 0 {
+                        self.instances.len() - 1
+                    } else {
+                        i - 1
+                    }
+                }
+                None => 0,
+            };
+            self.table_state.select(Some(i));
+        }
+
+        fn selected_instance(&self) -> Option<&InstanceInfo> {
+            self.table_state
+                .selected()
+                .and_then(|i| self.instances.get(i))
+        }
+    }
+
+    /// Create a key event for testing
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    /// Handle event for TestApp (mirrors real handle_event)
+    fn handle_test_event(app: &mut TestApp, event: Event) -> Option<Action> {
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.next();
+                    None
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.previous();
+                    None
+                }
+                KeyCode::Enter | KeyCode::Char('a') => {
+                    if let Some(instance) = app.selected_instance() {
+                        Some(Action::Attach(instance.name.clone()))
+                    } else {
+                        app.status_message = Some("No instance selected".to_string());
+                        None
+                    }
+                }
+                KeyCode::Char('s') => {
+                    if let Some(instance) = app.selected_instance() {
+                        Some(Action::Ssh(instance.name.clone()))
+                    } else {
+                        app.status_message = Some("No instance selected".to_string());
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Create sample instances for testing
+    fn sample_instances() -> Vec<InstanceInfo> {
+        vec![
+            InstanceInfo {
+                name: "myproject-abc123".to_string(),
+                full_name: "devaipod-myproject-abc123".to_string(),
+                status: "Running".to_string(),
+                repo: Some("github.com/user/myproject".to_string()),
+                task: Some("Implement new feature".to_string()),
+                mode: Some("up".to_string()),
+                agent_healthy: Some(true),
+                created: Some("2024-01-15".to_string()),
+                git_state: Some(GitState {
+                    branch: Some("main".to_string()),
+                    dirty: false,
+                    ahead: 0,
+                    behind: 0,
+                    summary: "main".to_string(),
+                }),
+                workspace_path: Some("/workspaces/myproject".to_string()),
+                last_git_refresh: None,
+            },
+            InstanceInfo {
+                name: "otherrepo-def456".to_string(),
+                full_name: "devaipod-otherrepo-def456".to_string(),
+                status: "Exited".to_string(),
+                repo: Some("github.com/org/otherrepo".to_string()),
+                task: None,
+                mode: Some("run".to_string()),
+                agent_healthy: Some(false),
+                created: Some("2024-01-14".to_string()),
+                git_state: None,
+                workspace_path: Some("/workspaces/otherrepo".to_string()),
+                last_git_refresh: None,
+            },
+            InstanceInfo {
+                name: "degraded-pod".to_string(),
+                full_name: "devaipod-degraded-pod".to_string(),
+                status: "Degraded".to_string(),
+                repo: None,
+                task: Some("Fix bug in authentication".to_string()),
+                mode: None,
+                agent_healthy: None,
+                created: None,
+                git_state: Some(GitState {
+                    branch: Some("feature-x".to_string()),
+                    dirty: true,
+                    ahead: 2,
+                    behind: 1,
+                    summary: "feature-x* ↑2↓1".to_string(),
+                }),
+                workspace_path: None,
+                last_git_refresh: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_extract_pod_name() {
+        assert_eq!(
+            extract_pod_name("devaipod-foo-workspace"),
+            "devaipod-foo"
+        );
+        assert_eq!(extract_pod_name("devaipod-foo-agent"), "devaipod-foo");
+        assert_eq!(
+            extract_pod_name("devaipod-foo-bar-workspace"),
+            "devaipod-foo-bar"
+        );
+        assert_eq!(
+            extract_pod_name("devaipod-foo-service-gator"),
+            "devaipod-foo"
+        );
+        assert_eq!(extract_pod_name("unknown-container"), "unknown-container");
+    }
+
+    #[test]
+    fn test_navigation_next() {
+        let mut app = create_test_app_for_ui();
+        app.instances = sample_instances();
+        app.table_state.select(Some(0));
+
+        app.next();
+        assert_eq!(app.table_state.selected(), Some(1));
+
+        app.next();
+        assert_eq!(app.table_state.selected(), Some(2));
+
+        // Wrap around
+        app.next();
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_navigation_previous() {
+        let mut app = create_test_app_for_ui();
+        app.instances = sample_instances();
+        app.table_state.select(Some(0));
+
+        // Wrap around to end
+        app.previous();
+        assert_eq!(app.table_state.selected(), Some(2));
+
+        app.previous();
+        assert_eq!(app.table_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn test_navigation_empty_list() {
+        let mut app = create_test_app_for_ui();
+        app.instances = vec![];
+
+        app.next();
+        assert_eq!(app.table_state.selected(), None);
+
+        app.previous();
+        assert_eq!(app.table_state.selected(), None);
+    }
+
+    #[test]
+    fn test_handle_event_quit() {
+        let mut app = create_test_app_for_ui();
+
+        let action = handle_test_event(&mut app, key_event(KeyCode::Char('q')));
+        assert_eq!(action, Some(Action::Quit));
+
+        let action = handle_test_event(&mut app, key_event(KeyCode::Esc));
+        assert_eq!(action, Some(Action::Quit));
+    }
+
+    #[test]
+    fn test_handle_event_navigation() {
+        let mut app = create_test_app_for_ui();
+        app.instances = sample_instances();
+        app.table_state.select(Some(0));
+
+        let action = handle_test_event(&mut app, key_event(KeyCode::Char('j')));
+        assert_eq!(action, None);
+        assert_eq!(app.table_state.selected(), Some(1));
+
+        let action = handle_test_event(&mut app, key_event(KeyCode::Char('k')));
+        assert_eq!(action, None);
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_handle_event_attach() {
+        let mut app = create_test_app_for_ui();
+        app.instances = sample_instances();
+        app.table_state.select(Some(0));
+
+        let action = handle_test_event(&mut app, key_event(KeyCode::Enter));
+        assert_eq!(action, Some(Action::Attach("myproject-abc123".to_string())));
+    }
+
+    #[test]
+    fn test_handle_event_ssh() {
+        let mut app = create_test_app_for_ui();
+        app.instances = sample_instances();
+        app.table_state.select(Some(1));
+
+        let action = handle_test_event(&mut app, key_event(KeyCode::Char('s')));
+        assert_eq!(action, Some(Action::Ssh("otherrepo-def456".to_string())));
+    }
+
+    #[test]
+    fn test_handle_event_no_selection() {
+        let mut app = create_test_app_for_ui();
+        app.instances = sample_instances();
+        // No selection
+
+        let action = handle_test_event(&mut app, key_event(KeyCode::Enter));
+        assert_eq!(action, None);
+        assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn test_selected_instance() {
+        let mut app = create_test_app_for_ui();
+        app.instances = sample_instances();
+
+        assert!(app.selected_instance().is_none());
+
+        app.table_state.select(Some(1));
+        let selected = app.selected_instance().unwrap();
+        assert_eq!(selected.name, "otherrepo-def456");
+    }
+}
