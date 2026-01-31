@@ -568,6 +568,7 @@ impl DevaipodPod {
             &agent_home_volume,
             global_config,
             task,
+            &labels,
         );
         podman
             .create_container(&workspace_container, &image, pod_name, workspace_config)
@@ -1310,6 +1311,7 @@ CONFIG_EOF
         agent_home_volume: &str,
         global_config: &crate::config::Config,
         task: Option<&str>,
+        labels: &[(String, String)],
     ) -> ContainerConfig {
         let mut env = config.container_env.clone();
         // Merge remote_env (these typically take precedence)
@@ -1487,6 +1489,7 @@ exec python3 /opt/devaipod/scripts/workspace_monitor.py
                 ),
             ],
             secrets,
+            labels: labels.iter().cloned().collect(),
             ..Default::default()
         }
     }
@@ -1750,6 +1753,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
 
         // Volume mounts for workspace and agent home
@@ -1774,6 +1778,53 @@ mod tests {
         assert!(cmd[2].contains("/opt/devaipod/scripts/workspace_monitor.py")); // Runs monitor script from mounted volume
         assert!(!container_config.drop_all_caps);
         assert!(!container_config.no_new_privileges);
+    }
+
+    #[test]
+    fn test_workspace_container_config_with_labels() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let config = DevcontainerConfig::default();
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+        let volume_name = "test-volume";
+        let global_config = crate::config::Config::default();
+
+        // Test with labels
+        let labels = vec![
+            ("io.devaipod.repo".to_string(), "github.com/owner/repo".to_string()),
+            ("io.devaipod.task".to_string(), "Fix the bug".to_string()),
+            ("io.devaipod.mode".to_string(), "run".to_string()),
+        ];
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            Some("vscode"),
+            &config,
+            &bind_home,
+            container_home,
+            volume_name,
+            "test-agent-home",
+            &global_config,
+            None, // task
+            &labels,
+        );
+
+        // Verify labels are propagated to the container config
+        assert_eq!(container_config.labels.len(), 3);
+        assert_eq!(
+            container_config.labels.get("io.devaipod.repo"),
+            Some(&"github.com/owner/repo".to_string())
+        );
+        assert_eq!(
+            container_config.labels.get("io.devaipod.task"),
+            Some(&"Fix the bug".to_string())
+        );
+        assert_eq!(
+            container_config.labels.get("io.devaipod.mode"),
+            Some(&"run".to_string())
+        );
     }
 
     #[test]
@@ -2051,6 +2102,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
 
         // All devices in the config should actually exist on the host
@@ -2099,6 +2151,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
 
         assert_eq!(container_config.env.get("FOO"), Some(&"bar".to_string()));
@@ -2136,6 +2189,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
 
         // Verify secrets are included for workspace container
@@ -2265,6 +2319,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
 
         // PATH should include default PATH plus the suffix from devcontainer.json
@@ -2309,6 +2364,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
 
         // UNRESOLVABLE should be skipped
@@ -2345,6 +2401,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
 
         assert_eq!(container_config.cap_add, vec!["SYS_PTRACE".to_string()]);
@@ -2452,6 +2509,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
 
         // Privileged should be true from runArgs
@@ -2484,6 +2542,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
 
         // Device should be in the devices list
@@ -2518,6 +2577,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
         assert!(
             container_config1.privileged,
@@ -2540,6 +2600,7 @@ mod tests {
             "test-agent-home",
             &global_config,
             None, // task
+            &[],  // labels
         );
         assert!(
             container_config2.privileged,

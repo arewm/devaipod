@@ -1086,6 +1086,12 @@ impl PodmanService {
             args.push(format!("{},type=env,target={}", secret_name, env_var));
         }
 
+        // Labels
+        for (key, value) in &config.labels {
+            args.push("--label".to_string());
+            args.push(format!("{}={}", key, value));
+        }
+
         // Image
         args.push(image.to_string());
 
@@ -1531,6 +1537,8 @@ pub struct ContainerConfig {
     /// Each tuple is (env_var_name, secret_name).
     /// Generates: --secret secret_name,type=env,target=ENV_VAR_NAME
     pub secrets: Vec<(String, String)>,
+    /// Labels to attach to the container (key -> value)
+    pub labels: HashMap<String, String>,
 }
 
 /// Mount configuration

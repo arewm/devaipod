@@ -27,6 +27,99 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Terminal;
 use tokio::time::interval;
 
+/// Cache file name for TUI state
+const CACHE_FILE_NAME: &str = "devaipod.json";
+
+/// Cache for TUI state, versioned for compatibility
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TuiStateCache {
+    /// Application version for compatibility check
+    version: String,
+    /// Cached state per instance (keyed by instance name)
+    instances: HashMap<String, CachedInstanceState>,
+}
+
+/// Cached state for a single instance
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedInstanceState {
+    /// Cached git repository state
+    git_state: Option<GitState>,
+    /// Cached agent activity state
+    agent_state: Option<AgentState>,
+    /// Unix timestamp when this cache entry was last updated
+    updated_at: i64,
+}
+
+/// Get the runtime state file path.
+///
+/// Uses XDG_RUNTIME_DIR (typically /run/user/$UID), falling back to /tmp.
+/// The file is placed directly in the runtime dir (no subdirectory needed
+/// since the filename is already unique).
+fn cache_file_path() -> std::path::PathBuf {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    runtime_dir.join(CACHE_FILE_NAME)
+}
+
+/// Load the TUI state cache from disk.
+/// Returns None if cache doesn't exist, is corrupt, or has a version mismatch.
+fn load_cache() -> Option<TuiStateCache> {
+    let path = cache_file_path();
+
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let cache: TuiStateCache = serde_json::from_str(&contents).ok()?;
+
+    // Version mismatch - ignore cache
+    if cache.version != env!("CARGO_PKG_VERSION") {
+        return None;
+    }
+
+    Some(cache)
+}
+
+/// Save the TUI state cache to disk.
+/// Silently ignores any errors (cache is best-effort).
+fn save_cache(cache: &TuiStateCache) {
+    let path = cache_file_path();
+
+    // Write atomically via temp file
+    let tmp_path = path.with_extension("tmp");
+    if let Ok(contents) = serde_json::to_string(cache) {
+        if std::fs::write(&tmp_path, contents).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &path);
+        }
+    }
+}
+
+/// Build a cache from current instance state
+fn build_cache(instances: &[InstanceInfo]) -> TuiStateCache {
+    let now = chrono::Utc::now().timestamp();
+    let entries: HashMap<String, CachedInstanceState> = instances
+        .iter()
+        .filter_map(|i| {
+            // Only cache instances that have some fetched state
+            if i.git_state.is_some() || i.agent_state != AgentState::default() {
+                Some((
+                    i.name.clone(),
+                    CachedInstanceState {
+                        git_state: i.git_state.clone(),
+                        agent_state: Some(i.agent_state.clone()),
+                        updated_at: now,
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    TuiStateCache {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        instances: entries,
+    }
+}
+
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
 
@@ -34,8 +127,22 @@ const POD_NAME_PREFIX: &str = "devaipod-";
 /// Prevents excessive git command execution when multiple refresh triggers occur.
 const GIT_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(10);
 
+/// Agent activity state (idle, working, etc.)
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AgentState {
+    /// Agent is running but waiting for input
+    Idle,
+    /// Agent is actively processing a task
+    Working,
+    /// Agent container is not running
+    #[default]
+    Stopped,
+    /// Could not determine agent state (API error, etc.)
+    Unknown,
+}
+
 /// Git repository state
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GitState {
     /// Current branch name
     pub branch: Option<String>,
@@ -91,6 +198,14 @@ pub struct InstanceInfo {
     pub workspace_path: Option<String>,
     /// Last time git state was refreshed for this instance (for rate-limiting)
     pub last_git_refresh: Option<std::time::Instant>,
+    /// Agent activity state (fetched async)
+    pub agent_state: AgentState,
+    /// Last time agent state was refreshed for this instance
+    pub last_agent_refresh: Option<std::time::Instant>,
+    /// API password for the opencode server (from pod labels)
+    pub api_password: Option<String>,
+    /// Published host port for the opencode API
+    pub api_port: Option<u16>,
 }
 
 /// Action to perform after exiting TUI
@@ -118,6 +233,8 @@ pub struct App {
     last_refresh: std::time::Instant,
     /// Status message
     status_message: Option<String>,
+    /// Cached TUI state (loaded on startup, updated on refreshes)
+    cache: Option<TuiStateCache>,
 }
 
 impl App {
@@ -140,12 +257,16 @@ impl App {
         })
         .context("Failed to connect to podman/docker")?;
 
+        // Load cached state for instant display
+        let cache = load_cache();
+
         let mut app = Self {
             docker,
             instances: Vec::new(),
             table_state: TableState::default(),
             last_refresh: std::time::Instant::now(),
             status_message: None,
+            cache,
         };
 
         // Initial data fetch
@@ -156,6 +277,30 @@ impl App {
 
     /// Refresh the list of instances from podman
     pub async fn refresh_instances(&mut self) -> Result<()> {
+        // Preserve git state and rate-limit timestamps from existing instances
+        let old_git_data: HashMap<String, (Option<GitState>, Option<std::time::Instant>)> = self
+            .instances
+            .iter()
+            .map(|i| {
+                (
+                    i.name.clone(),
+                    (i.git_state.clone(), i.last_git_refresh),
+                )
+            })
+            .collect();
+
+        // Preserve agent state and rate-limit timestamps
+        let old_agent_data: HashMap<String, (AgentState, Option<std::time::Instant>)> = self
+            .instances
+            .iter()
+            .map(|i| {
+                (
+                    i.name.clone(),
+                    (i.agent_state.clone(), i.last_agent_refresh),
+                )
+            })
+            .collect();
+
         let filter = format!("{}*", POD_NAME_PREFIX);
         let mut filters = HashMap::new();
         filters.insert("name", vec![filter.as_str()]);
@@ -265,6 +410,63 @@ impl App {
                 .and_then(|l| l.get("io.devaipod.workspace"))
                 .cloned();
 
+            // Restore git state and rate-limit timestamp from previous instance data
+            // Fall back to cache if no in-memory state exists
+            let (git_state, last_git_refresh) = old_git_data
+                .get(&short_name)
+                .cloned()
+                .or_else(|| {
+                    // Try loading from cache
+                    self.cache
+                        .as_ref()
+                        .and_then(|c| c.instances.get(&short_name))
+                        .map(|cached| (cached.git_state.clone(), None))
+                })
+                .unwrap_or((None, None));
+
+            // Restore agent state and rate-limit timestamp from previous instance data
+            // Default to Stopped if agent is not running, otherwise preserve or set Unknown
+            // Fall back to cache if no in-memory state exists
+            let (agent_state, last_agent_refresh) = if agent_healthy {
+                old_agent_data
+                    .get(&short_name)
+                    .cloned()
+                    .or_else(|| {
+                        // Try loading from cache
+                        self.cache
+                            .as_ref()
+                            .and_then(|c| c.instances.get(&short_name))
+                            .and_then(|cached| cached.agent_state.clone().map(|s| (s, None)))
+                    })
+                    .unwrap_or((AgentState::Unknown, None))
+            } else {
+                (AgentState::Stopped, None)
+            };
+
+            // Extract API password from labels (stored on workspace container)
+            let api_password = labels
+                .and_then(|l| l.get("io.devaipod.api-password"))
+                .cloned();
+
+            // Get published port from agent container's port mappings
+            let agent_container = containers.iter().find(|c| {
+                c.names
+                    .as_ref()
+                    .is_some_and(|n| n.iter().any(|name| name.ends_with("-agent")))
+            });
+            let api_port = agent_container.and_then(|c| {
+                c.ports.as_ref().and_then(|ports| {
+                    ports.iter().find_map(|p| {
+                        // Looking for the port mapped from container port 4096
+                        if p.private_port == 4096 {
+                            p.public_port
+                        } else {
+                            None
+                        }
+                    })
+                })
+            });
+
             instances.push(InstanceInfo {
                 name: short_name,
                 full_name,
@@ -274,9 +476,13 @@ impl App {
                 mode,
                 agent_healthy: Some(agent_healthy),
                 created,
-                git_state: None, // Will be fetched async
+                git_state,
                 workspace_path,
-                last_git_refresh: None,
+                last_git_refresh,
+                agent_state,
+                last_agent_refresh,
+                api_password,
+                api_port,
             });
         }
 
@@ -338,6 +544,13 @@ impl App {
         self.table_state
             .selected()
             .and_then(|i| self.instances.get(i))
+    }
+
+    /// Update and persist the cache with current instance state
+    fn update_cache(&mut self) {
+        let new_cache = build_cache(&self.instances);
+        save_cache(&new_cache);
+        self.cache = Some(new_cache);
     }
 }
 
@@ -491,6 +704,144 @@ async fn fetch_git_state(
     Some(state)
 }
 
+/// Minimum interval between agent state refreshes for a single instance.
+const AGENT_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(3);
+
+/// Derive agent status (busy/idle) from session messages.
+///
+/// This mirrors the logic from workspace_monitor.py's derive_status_from_messages().
+/// We check the last assistant message for:
+/// - time.completed: if absent, agent is still processing
+/// - finish: if "tool-calls", agent will continue (but may be between calls)
+/// - parts with type="tool" and state.status != "completed": tool in progress
+fn derive_agent_state_from_messages(messages: &[serde_json::Value]) -> AgentState {
+    if messages.is_empty() {
+        return AgentState::Unknown;
+    }
+
+    // Find the last assistant message
+    let last_assistant = messages.iter().rev().find(|msg| {
+        msg.get("info")
+            .and_then(|i| i.get("role"))
+            .and_then(|r| r.as_str())
+            == Some("assistant")
+    });
+
+    let Some(last_assistant) = last_assistant else {
+        return AgentState::Unknown;
+    };
+
+    let info = match last_assistant.get("info") {
+        Some(i) => i,
+        None => return AgentState::Unknown,
+    };
+
+    // Check if message is still being processed (no completed time)
+    if info
+        .get("time")
+        .and_then(|t| t.get("completed"))
+        .is_none()
+    {
+        return AgentState::Working;
+    }
+
+    // Check if there are any incomplete tool calls in parts
+    if let Some(parts) = last_assistant.get("parts").and_then(|p| p.as_array()) {
+        for part in parts {
+            if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
+                let status = part
+                    .get("state")
+                    .and_then(|s| s.get("status"))
+                    .and_then(|s| s.as_str());
+                if status != Some("completed") && status != Some("error") {
+                    return AgentState::Working;
+                }
+            }
+        }
+    }
+
+    // Message completed - check finish reason
+    let finish = info.get("finish").and_then(|f| f.as_str()).unwrap_or("");
+    if finish == "stop" {
+        AgentState::Idle
+    } else if finish == "tool-calls" {
+        // Agent made tool calls but those are done; waiting for next turn
+        // This is a brief transitional state
+        AgentState::Working
+    } else {
+        AgentState::Idle
+    }
+}
+
+/// Fetch agent state by querying the opencode API
+async fn fetch_agent_state(api_port: u16, api_password: &str) -> AgentState {
+    // Build HTTP client with timeout
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return AgentState::Unknown,
+    };
+
+    let base_url = format!("http://127.0.0.1:{}", api_port);
+
+    // First, get the list of sessions
+    let sessions_url = format!("{}/session", base_url);
+    let sessions_resp = match client
+        .get(&sessions_url)
+        .basic_auth("opencode", Some(api_password))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return AgentState::Unknown,
+    };
+
+    let sessions: Vec<serde_json::Value> = match sessions_resp.json().await {
+        Ok(s) => s,
+        Err(_) => return AgentState::Unknown,
+    };
+
+    if sessions.is_empty() {
+        // No sessions yet - agent is idle/waiting for input
+        return AgentState::Idle;
+    }
+
+    // Find the root session (no parent)
+    let root_session = sessions.iter().find(|s| {
+        s.get("parentID").is_none() || s.get("parentID").map(|p| p.is_null()).unwrap_or(false)
+    });
+
+    let Some(root_session) = root_session else {
+        return AgentState::Unknown;
+    };
+
+    let session_id = match root_session.get("id").and_then(|id| id.as_str()) {
+        Some(id) => id,
+        None => return AgentState::Unknown,
+    };
+
+    // Fetch recent messages from the session
+    let messages_url = format!("{}/session/{}/message?limit=3", base_url, session_id);
+    let messages_resp = match client
+        .get(&messages_url)
+        .basic_auth("opencode", Some(api_password))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return AgentState::Unknown,
+    };
+
+    let messages: Vec<serde_json::Value> = match messages_resp.json().await {
+        Ok(m) => m,
+        Err(_) => return AgentState::Unknown,
+    };
+
+    derive_agent_state_from_messages(&messages)
+}
+
 /// Extract the pod name from a container name
 /// e.g., "devaipod-foo-workspace" -> "devaipod-foo"
 fn extract_pod_name(container_name: &str) -> &str {
@@ -588,6 +939,58 @@ fn spawn_git_refresh(
     }
 }
 
+/// Message for agent state updates from background task
+struct AgentStateUpdate {
+    instance_name: String,
+    agent_state: AgentState,
+}
+
+/// Spawn background tasks to fetch agent state for all running instances.
+/// Rate-limited per instance: only spawns a refresh if >AGENT_REFRESH_RATE_LIMIT
+/// has passed since the last successful refresh for that instance.
+fn spawn_agent_refresh(instances: &[InstanceInfo], tx: mpsc::Sender<AgentStateUpdate>) {
+    let now = std::time::Instant::now();
+
+    for instance in instances {
+        // Only fetch for running instances with valid API credentials
+        if instance.status != "Running" {
+            continue;
+        }
+
+        // Skip if agent is not healthy (not running)
+        if instance.agent_healthy != Some(true) {
+            continue;
+        }
+
+        // Need both port and password to query the API
+        let (Some(api_port), Some(ref api_password)) = (instance.api_port, &instance.api_password)
+        else {
+            continue;
+        };
+
+        // Rate-limit: skip if we refreshed this instance recently
+        if let Some(last_refresh) = instance.last_agent_refresh {
+            if now.duration_since(last_refresh) < AGENT_REFRESH_RATE_LIMIT {
+                continue;
+            }
+        }
+
+        let tx = tx.clone();
+        let instance_name = instance.name.clone();
+        let api_password = api_password.clone();
+
+        tokio::spawn(async move {
+            let agent_state = fetch_agent_state(api_port, &api_password).await;
+            let _ = tx
+                .send(AgentStateUpdate {
+                    instance_name,
+                    agent_state,
+                })
+                .await;
+        });
+    }
+}
+
 /// Main event loop
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> Result<()> {
     let mut refresh_interval = interval(Duration::from_secs(10));
@@ -595,11 +998,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
     // Channel for receiving git state updates from background tasks
     let (git_tx, mut git_rx) = mpsc::channel::<GitStateUpdate>(32);
 
+    // Channel for receiving agent state updates from background tasks
+    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentStateUpdate>(32);
+
     // Spawn initial git state fetch
     spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
 
+    // Spawn initial agent state fetch
+    spawn_agent_refresh(&app.instances, agent_tx.clone());
+
     // Use async event stream instead of blocking poll
     let mut event_stream = EventStream::new();
+
+    // Agent state refresh runs more frequently than git state
+    let mut agent_refresh_interval = interval(Duration::from_secs(3));
 
     loop {
         // Draw the UI
@@ -614,6 +1026,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                     // Update timestamp to enforce rate-limiting on subsequent refresh attempts
                     instance.last_git_refresh = Some(std::time::Instant::now());
                 }
+                // Persist updated state to cache
+                app.update_cache();
+            }
+            // Receive agent state updates from background
+            Some(update) = agent_rx.recv() => {
+                if let Some(instance) = app.instances.iter_mut().find(|i| i.name == update.instance_name) {
+                    instance.agent_state = update.agent_state;
+                    // Update timestamp to enforce rate-limiting on subsequent refresh attempts
+                    instance.last_agent_refresh = Some(std::time::Instant::now());
+                }
+                // Persist updated state to cache
+                app.update_cache();
+            }
+            // Periodic agent state refresh (more frequent)
+            _ = agent_refresh_interval.tick() => {
+                spawn_agent_refresh(&app.instances, agent_tx.clone());
             }
             _ = refresh_interval.tick() => {
                 if let Err(e) = app.refresh_instances().await {
@@ -621,6 +1049,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                 } else {
                     // Spawn background git refresh after instance refresh
                     spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                    // Also refresh agent state
+                    spawn_agent_refresh(&app.instances, agent_tx.clone());
                 }
             }
             // Async event stream - truly non-blocking
@@ -635,6 +1065,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                     app.status_message = Some(format!("Refresh error: {}", e));
                                 } else {
                                     spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                    spawn_agent_refresh(&app.instances, agent_tx.clone());
                                     app.status_message = Some("Refreshed".to_string());
                                 }
                             }
@@ -644,6 +1075,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 // Refresh after returning from subprocess
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                spawn_agent_refresh(&app.instances, agent_tx.clone());
                             }
                             Action::Ssh(name) => {
                                 // Run ssh in subprocess, then resume TUI
@@ -651,6 +1083,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 // Refresh after returning from subprocess
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                spawn_agent_refresh(&app.instances, agent_tx.clone());
                             }
                         }
                     }
@@ -790,13 +1223,13 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 
 /// Render the instances table
 fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let header_cells = ["NAME", "STATUS", "CREATED", "GIT", "MODE", "REPO", "TASK"]
+    let header_cells = ["NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).bold()));
     let header = Row::new(header_cells).height(1);
 
     let rows = app.instances.iter().map(|instance| {
-        // Status with color and agent indicator
+        // Status with color
         let status_style = match instance.status.as_str() {
             "Running" => Style::default().fg(Color::Green),
             "Exited" => Style::default().fg(Color::Red),
@@ -804,13 +1237,22 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             _ => Style::default(),
         };
 
-        let agent_indicator = match instance.agent_healthy {
-            Some(true) => " [ok]",
-            Some(false) => " [!]",
-            None => "",
-        };
+        let status_text = instance.status.clone();
 
-        let status_text = format!("{}{}", instance.status, agent_indicator);
+        // Agent state with color coding
+        let (agent_text, agent_style) = match &instance.agent_state {
+            AgentState::Working => ("working", Style::default().fg(Color::Green)),
+            AgentState::Idle => ("idle", Style::default().fg(Color::Blue)),
+            AgentState::Stopped => ("stopped", Style::default().fg(Color::DarkGray)),
+            AgentState::Unknown => {
+                if instance.status == "Running" && instance.agent_healthy == Some(true) {
+                    // Still loading
+                    ("...", Style::default().fg(Color::DarkGray))
+                } else {
+                    ("-", Style::default().fg(Color::DarkGray))
+                }
+            }
+        };
 
         // Git state with color coding
         let (git_text, git_style) = match &instance.git_state {
@@ -860,6 +1302,7 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Row::new(vec![
             Cell::from(instance.name.clone()),
             Cell::from(status_text).style(status_style),
+            Cell::from(agent_text).style(agent_style),
             Cell::from(instance.created.as_deref().unwrap_or("-")),
             Cell::from(git_text).style(git_style),
             Cell::from(instance.mode.as_deref().unwrap_or("-")),
@@ -871,13 +1314,14 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Min(18),        // NAME
-            Constraint::Length(15),     // STATUS
+            Constraint::Min(16),        // NAME
+            Constraint::Length(10),     // STATUS
+            Constraint::Length(8),      // AGENT
             Constraint::Length(10),     // CREATED
             Constraint::Length(18),     // GIT
             Constraint::Length(5),      // MODE
-            Constraint::Percentage(18), // REPO
-            Constraint::Percentage(22), // TASK
+            Constraint::Percentage(16), // REPO
+            Constraint::Percentage(20), // TASK
         ],
     )
     .header(header)
@@ -1024,6 +1468,10 @@ mod tests {
                 }),
                 workspace_path: Some("/workspaces/myproject".to_string()),
                 last_git_refresh: None,
+                agent_state: AgentState::Working,
+                last_agent_refresh: None,
+                api_password: None,
+                api_port: None,
             },
             InstanceInfo {
                 name: "otherrepo-def456".to_string(),
@@ -1037,6 +1485,10 @@ mod tests {
                 git_state: None,
                 workspace_path: Some("/workspaces/otherrepo".to_string()),
                 last_git_refresh: None,
+                agent_state: AgentState::Stopped,
+                last_agent_refresh: None,
+                api_password: None,
+                api_port: None,
             },
             InstanceInfo {
                 name: "degraded-pod".to_string(),
@@ -1056,6 +1508,10 @@ mod tests {
                 }),
                 workspace_path: None,
                 last_git_refresh: None,
+                agent_state: AgentState::Idle,
+                last_agent_refresh: None,
+                api_password: None,
+                api_port: None,
             },
         ]
     }
@@ -1188,5 +1644,93 @@ mod tests {
         app.table_state.select(Some(1));
         let selected = app.selected_instance().unwrap();
         assert_eq!(selected.name, "otherrepo-def456");
+    }
+
+    #[test]
+    fn test_derive_agent_state_empty_messages() {
+        let messages: Vec<serde_json::Value> = vec![];
+        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Unknown);
+    }
+
+    #[test]
+    fn test_derive_agent_state_no_assistant_message() {
+        let messages = vec![serde_json::json!({
+            "info": {"role": "user"},
+            "parts": [{"type": "text", "text": "Hello"}]
+        })];
+        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Unknown);
+    }
+
+    #[test]
+    fn test_derive_agent_state_working_no_completed_time() {
+        // Message without completed time indicates agent is still working
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890}
+            },
+            "parts": [{"type": "text", "text": "Working on it..."}]
+        })];
+        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Working);
+    }
+
+    #[test]
+    fn test_derive_agent_state_idle_with_stop_finish() {
+        // Completed message with finish=stop indicates idle
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890, "completed": 1234567891},
+                "finish": "stop"
+            },
+            "parts": [{"type": "text", "text": "Done!"}]
+        })];
+        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Idle);
+    }
+
+    #[test]
+    fn test_derive_agent_state_working_with_tool_calls_finish() {
+        // Completed message with finish=tool-calls indicates still working
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890, "completed": 1234567891},
+                "finish": "tool-calls"
+            },
+            "parts": [{"type": "text", "text": "Making tool call..."}]
+        })];
+        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Working);
+    }
+
+    #[test]
+    fn test_derive_agent_state_working_with_incomplete_tool() {
+        // Message with tool part that's not completed
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890, "completed": 1234567891}
+            },
+            "parts": [
+                {"type": "text", "text": "Running a tool..."},
+                {"type": "tool", "state": {"status": "running"}}
+            ]
+        })];
+        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Working);
+    }
+
+    #[test]
+    fn test_derive_agent_state_idle_with_completed_tool() {
+        // Message with completed tool part
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890, "completed": 1234567891}
+            },
+            "parts": [
+                {"type": "text", "text": "Tool result..."},
+                {"type": "tool", "state": {"status": "completed"}}
+            ]
+        })];
+        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Idle);
     }
 }
