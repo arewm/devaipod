@@ -1,0 +1,39 @@
+#!/bin/sh
+# Pre-commit hook: warn if 'just check' wasn't run on current tree state
+#
+# This is a soft check - it warns but doesn't block commits.
+# CI is the enforcement point for actual failures.
+
+# Skip during rebases/cherry-picks - not useful to warn on each replayed commit
+if [ -d "$(git rev-parse --git-dir)/rebase-merge" ] || \
+   [ -d "$(git rev-parse --git-dir)/rebase-apply" ]; then
+    exit 0
+fi
+
+STAMP_FILE="target/checks-run"
+
+# Get current tree hash (includes staged changes)
+current_tree=$(git write-tree 2>/dev/null) || exit 0
+
+if [ ! -f "$STAMP_FILE" ]; then
+    echo ""
+    echo "Warning: 'just check' has not been run"
+    echo "Consider running: just check"
+    echo ""
+    sleep 2
+    exit 0
+fi
+
+checked_tree=$(cat "$STAMP_FILE" 2>/dev/null)
+
+if [ "$current_tree" != "$checked_tree" ]; then
+    echo ""
+    echo "Warning: tree has changed since 'just check' was run"
+    echo "  Current: ${current_tree%${current_tree#????????????}}"
+    echo "  Checked: ${checked_tree%${checked_tree#????????????}}"
+    echo "Consider running: just check"
+    echo ""
+    sleep 2
+fi
+
+exit 0

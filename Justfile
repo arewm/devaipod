@@ -12,9 +12,12 @@ build:
 build-release:
     cargo build --release
 
+# Run format and type checks, record tree hash for pre-commit hook
 check:
     cargo fmt -- --check
     cargo check
+    @mkdir -p target
+    @git write-tree > target/checks-run
 
 # Run unit tests (no container runtime required)
 test:
@@ -144,3 +147,9 @@ mdbook-serve: build-mdbook
     set -xeuo pipefail
     podman run --init --replace -d --name devaipod-mdbook --rm --publish 127.0.0.1::8000 localhost/devaipod-mdbook
     echo http://$(podman port devaipod-mdbook 8000/tcp)
+
+# Install git hooks for development
+install-hooks:
+    cp scripts/pre-commit .git/hooks/pre-commit
+    chmod +x .git/hooks/pre-commit
+    @echo "Installed pre-commit hook"
