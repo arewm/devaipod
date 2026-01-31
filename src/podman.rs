@@ -998,6 +998,8 @@ impl PodmanService {
             pod_name.to_string(),
             "--name".to_string(),
             name.to_string(),
+            // Use init process to reap zombie processes
+            "--init".to_string(),
         ];
 
         // Add mounts
