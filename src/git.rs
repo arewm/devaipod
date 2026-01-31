@@ -484,12 +484,13 @@ echo "Repository cloned successfully"
     )
 }
 
-/// Generate a shell script to clone dotfiles into a volume
+/// Generate a shell script to clone or update dotfiles in a volume
 ///
 /// The script will:
-/// 1. Clone the dotfiles repository to a staging directory
-/// 2. Print the git SHA for logging
-/// 3. Reset the remote URL to remove any embedded token
+/// 1. If the target directory already exists with a git repo, update it
+/// 2. Otherwise, clone the dotfiles repository fresh
+/// 3. Print the git SHA for logging
+/// 4. Reset the remote URL to remove any embedded token
 ///
 /// Returns (script, commit_sha_will_be_echoed_with_prefix)
 /// The caller should look for lines starting with "DOTFILES_SHA:" to extract the SHA.
@@ -503,9 +504,9 @@ pub fn clone_dotfiles_script(
     // Use authenticated URL for cloning if token is provided
     let clone_url = authenticated_clone_url(dotfiles_url, gh_token);
 
-    // After cloning, reset the remote to the original URL (without token)
+    // After cloning/updating, reset the remote to the original URL (without token)
     let reset_remote = if gh_token.is_some() {
-        format!("\ngit remote set-url origin \"{}\"\n", dotfiles_url)
+        format!("git remote set-url origin \"{}\"", dotfiles_url)
     } else {
         String::new()
     };
@@ -513,13 +514,24 @@ pub fn clone_dotfiles_script(
     format!(
         r#"
 set -e
-echo "Cloning dotfiles from {display_url}..."
-mkdir -p "{target_dir}"
-git clone --depth 1 "{clone_url}" "{target_dir}"
-cd "{target_dir}"
+if [ -d "{target_dir}/.git" ]; then
+    echo "Dotfiles already cloned, updating from {display_url}..."
+    cd "{target_dir}"
+    # Set authenticated URL for fetch if token provided
+    git remote set-url origin "{clone_url}"
+    git fetch --depth 1 origin
+    git reset --hard origin/HEAD
+    {reset_remote}
+else
+    echo "Cloning dotfiles from {display_url}..."
+    rm -rf "{target_dir}"
+    git clone --depth 1 "{clone_url}" "{target_dir}"
+    cd "{target_dir}"
+    {reset_remote}
+fi
 DOTFILES_SHA=$(git rev-parse HEAD)
 echo "DOTFILES_SHA:$DOTFILES_SHA"
-{reset_remote}echo "Dotfiles cloned successfully"
+echo "Dotfiles ready"
 "#,
         display_url = dotfiles_url, // Don't log the token
         clone_url = clone_url,
@@ -869,12 +881,15 @@ mod tests {
             None,
         );
 
+        // Should handle both fresh clone and update cases
+        assert!(script.contains("if [ -d \"/home/agent/.dotfiles/.git\" ]"));
         assert!(script.contains("git clone"));
+        assert!(script.contains("git fetch --depth 1"));
         assert!(script.contains("https://github.com/user/dotfiles.git"));
         assert!(script.contains("/home/agent/.dotfiles"));
         assert!(script.contains("DOTFILES_SHA:"));
-        // No token, so no remote reset
-        assert!(!script.contains("git remote set-url"));
+        // No token means no x-access-token in URL
+        assert!(!script.contains("x-access-token"));
     }
 
     #[test]
@@ -887,11 +902,14 @@ mod tests {
 
         // Should use authenticated URL in clone command
         assert!(script.contains("x-access-token:ghp_secret123@github.com"));
-        // Should reset remote to original URL after clone
+        // Should reset remote to original URL after clone (both in update and clone paths)
         assert!(script.contains("git remote set-url origin"));
         assert!(script.contains("https://github.com/user/dotfiles.git"));
-        // Display message should NOT contain the token
+        // Display messages should NOT contain the token
         assert!(script.contains("Cloning dotfiles from https://github.com/user/dotfiles.git"));
+        assert!(script.contains(
+            "Dotfiles already cloned, updating from https://github.com/user/dotfiles.git"
+        ));
         // Should output SHA with prefix for parsing
         assert!(script.contains("DOTFILES_SHA:$DOTFILES_SHA"));
     }
