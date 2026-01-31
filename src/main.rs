@@ -42,6 +42,65 @@ fn strip_pod_prefix(name: &str) -> &str {
     name.strip_prefix(POD_NAME_PREFIX).unwrap_or(name)
 }
 
+/// Resolve a workspace name, handling the --latest flag
+///
+/// If a workspace name is provided, normalizes it. If --latest is set,
+/// finds the most recently created running workspace.
+fn resolve_workspace(workspace: Option<&str>, latest: bool) -> Result<String> {
+    match (workspace, latest) {
+        (Some(name), false) => Ok(normalize_pod_name(name)),
+        (None, true) | (Some(_), true) => {
+            // Find the most recent workspace
+            let pod_name = get_latest_workspace()?;
+            tracing::info!("Using latest workspace: {}", strip_pod_prefix(&pod_name));
+            Ok(pod_name)
+        }
+        (None, false) => {
+            bail!(
+                "No workspace specified. Use a workspace name or --latest (-l) for the most recent."
+            );
+        }
+    }
+}
+
+/// Get the most recently created devaipod workspace
+fn get_latest_workspace() -> Result<String> {
+    let filter = format!("name={}*", POD_NAME_PREFIX);
+    let output = std::process::Command::new(if is_toolbox() {
+        "flatpak-spawn"
+    } else {
+        "podman"
+    })
+    .args(if is_toolbox() {
+        vec!["--host", "podman", "pod", "ps", "--filter", &filter, "--format=json"]
+    } else {
+        vec!["pod", "ps", "--filter", &filter, "--format=json"]
+    })
+    .output()
+    .context("Failed to run podman pod ps")?;
+
+    if !output.status.success() {
+        bail!("Failed to list workspaces");
+    }
+
+    let pods: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).context("Failed to parse pod list")?;
+
+    if pods.is_empty() {
+        bail!("No devaipod workspaces found. Create one with 'devaipod up' or 'devaipod run'.");
+    }
+
+    // Pods are returned in creation order (newest last), so take the last one
+    // Actually podman returns them in reverse order (newest first), so take first
+    let latest = pods
+        .first()
+        .and_then(|p| p.get("Name"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to get workspace name"))?;
+
+    Ok(latest.to_string())
+}
+
 /// Sanitize a name for use in pod names (alphanumeric and hyphens only)
 fn sanitize_name(name: &str) -> String {
     name.chars()
@@ -255,10 +314,14 @@ enum HostCommand {
     ///
     /// Examples:
     ///   devaipod attach myworkspace              # Connect to agent
+    ///   devaipod attach -l                       # Connect to most recent workspace
     ///   devaipod attach myworkspace -s abc123    # Connect to specific session
     Attach {
         /// Workspace name (devaipod- prefix optional)
-        workspace: String,
+        workspace: Option<String>,
+        /// Attach to the most recently created workspace
+        #[arg(short = 'l', long)]
+        latest: bool,
         /// Session ID to attach to (default: auto-detect existing session)
         #[arg(short, long)]
         session: Option<String>,
@@ -636,8 +699,13 @@ async fn run_host(cli: HostCli) -> Result<()> {
     match cli.command {
         HostCommand::Up { source, opts } => cmd_up(&config, &source, opts).await,
 
-        HostCommand::Attach { workspace, session } => {
-            cmd_attach(&normalize_pod_name(&workspace), session.as_deref())
+        HostCommand::Attach {
+            workspace,
+            latest,
+            session,
+        } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), latest)?;
+            cmd_attach(&pod_name, session.as_deref())
         }
         HostCommand::Ssh {
             workspace,

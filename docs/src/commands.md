@@ -30,6 +30,7 @@ devaipod up . --dry-run           # Show what would be created
 
 ```bash
 devaipod attach myworkspace       # Connect to the AI agent (auto-continues session)
+devaipod attach -l                # Connect to most recently created workspace
 devaipod attach myworkspace -s ID # Connect to specific session
 devaipod ssh myworkspace          # Open shell in workspace container
 devaipod ssh myworkspace -- ls -la  # Run a specific command
