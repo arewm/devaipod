@@ -84,14 +84,14 @@ fn test_readonly_api_responds(fixture: &SharedFixture) -> Result<()> {
     let password = password.trim();
     assert!(!password.is_empty(), "Pod should have API password label");
 
-    // Get the published port
+    // Get the published port (4097 is the auth proxy port)
     let agent_container = fixture.agent_container();
-    let port_output = cmd!(sh, "podman port {agent_container} 4096")
+    let port_output = cmd!(sh, "podman port {agent_container} 4097")
         .ignore_status()
         .read()?;
     assert!(
         port_output.contains("127.0.0.1:"),
-        "Port 4096 should be published: {}",
+        "Port 4097 (auth proxy) should be published: {}",
         port_output
     );
 
@@ -499,14 +499,14 @@ fn test_pod_has_api_credentials() -> Result<()> {
         password.len()
     );
 
-    // Verify port is published
+    // Verify auth proxy port is published (4097 is the auth proxy, 4096 is internal)
     let agent_container = format!("{}-agent", pod_name);
-    let port_output = cmd!(sh, "podman port {agent_container} 4096")
+    let port_output = cmd!(sh, "podman port {agent_container} 4097")
         .ignore_status()
         .read()?;
     assert!(
         port_output.contains("127.0.0.1:"),
-        "Port 4096 should be published to localhost: {}",
+        "Port 4097 (auth proxy) should be published to localhost: {}",
         port_output
     );
 
@@ -549,8 +549,9 @@ fn test_api_authentication_works() -> Result<()> {
     let password = cmd!(sh, "podman pod inspect {pod_name} --format {format_label}").read()?;
     let password = password.trim();
 
+    // Get the published auth proxy port (4097)
     let agent_container = format!("{}-agent", pod_name);
-    let port_output = cmd!(sh, "podman port {agent_container} 4096").read()?;
+    let port_output = cmd!(sh, "podman port {agent_container} 4097").read()?;
     let port: u16 = port_output
         .trim()
         .split(':')
@@ -558,7 +559,7 @@ fn test_api_authentication_works() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
 
-    // Test that authenticated request works
+    // Test that authenticated request works (via auth proxy)
     let url = format!("http://127.0.0.1:{}/session", port);
     let auth_response = cmd!(sh, "curl -sf -u opencode:{password} {url}")
         .ignore_status()

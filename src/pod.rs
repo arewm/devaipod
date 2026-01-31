@@ -138,13 +138,13 @@ fn generate_api_password() -> String {
 /// Get the published host port for the opencode API
 ///
 /// The pod publishes the agent's port 4096 to a random localhost port.
-/// This function queries podman to find the assigned port.
+/// This function queries podman to find the assigned port for the auth proxy.
 pub fn get_published_port(pod_name: &str) -> Result<u16> {
     use std::process::Command;
 
     let container = format!("{}-agent", pod_name);
     let output = Command::new("podman")
-        .args(["port", &container, &OPENCODE_PORT.to_string()])
+        .args(["port", &container, &AUTH_PROXY_PORT.to_string()])
         .output()
         .context("Failed to run podman port")?;
 
@@ -220,6 +220,15 @@ const AGENT_HOME_PATH: &str = "/home/agent";
 /// Python script for workspace monitor.
 /// Shows agent status and allows seamless handoff to interactive mode.
 const WORKSPACE_MONITOR_SCRIPT: &str = include_str!("../scripts/workspace_monitor.py");
+
+/// Python script for auth proxy.
+/// Provides authenticated HTTP access to the opencode API from the host.
+/// This is a workaround for https://github.com/anomalyco/opencode/issues/8458
+/// where `opencode attach` doesn't support OPENCODE_SERVER_PASSWORD.
+const AUTH_PROXY_SCRIPT: &str = include_str!("../scripts/auth_proxy.py");
+
+/// Port for the auth proxy (published to host for authenticated access)
+pub const AUTH_PROXY_PORT: u16 = 4097;
 
 /// Default PATH for containers when we need to synthesize one.
 /// This covers the standard locations where utilities are typically found.
@@ -520,9 +529,11 @@ impl DevaipodPod {
             api_password.clone(),
         ));
 
-        // Publish the opencode API port to a random localhost port
-        // Format: "127.0.0.1::4096" means random host port -> container port 4096
-        let publish_ports = vec![format!("127.0.0.1::{}", OPENCODE_PORT)];
+        // Publish the auth proxy port to a random localhost port for host access.
+        // The proxy handles Basic Auth and forwards to the opencode server.
+        // This is a workaround for https://github.com/anomalyco/opencode/issues/8458
+        // where `opencode attach` doesn't use OPENCODE_SERVER_PASSWORD.
+        let publish_ports = vec![format!("127.0.0.1::{}", AUTH_PROXY_PORT)];
 
         podman
             .create_pod(pod_name, &labels, &publish_ports)
@@ -1074,9 +1085,15 @@ cat > '{agent_home}/scripts/workspace_monitor.py' << 'MONITOR_EOF'
 {monitor_script}
 MONITOR_EOF
 chmod +x {agent_home}/scripts/workspace_monitor.py
+
+cat > '{agent_home}/scripts/auth_proxy.py' << 'PROXY_EOF'
+{proxy_script}
+PROXY_EOF
+chmod +x {agent_home}/scripts/auth_proxy.py
 "#,
             agent_home = AGENT_HOME_PATH,
             monitor_script = WORKSPACE_MONITOR_SCRIPT,
+            proxy_script = AUTH_PROXY_SCRIPT,
         );
 
         tracing::debug!("Writing scripts to agent home volume...");
@@ -1624,12 +1641,26 @@ exec python3 /opt/devaipod/scripts/workspace_monitor.py
             );
         }
 
-        // Build the startup script. The workspace monitor handles sending any initial task.
+        // Build the startup script that runs both opencode serve and the auth proxy.
+        // The auth proxy provides authenticated access from the host, working around
+        // https://github.com/anomalyco/opencode/issues/8458 where `opencode attach`
+        // doesn't use OPENCODE_SERVER_PASSWORD.
+        //
+        // Architecture:
+        // - opencode serve: listens on localhost:4096 (no auth, internal only)
+        // - auth_proxy.py: listens on 0.0.0.0:4097, requires Basic Auth, forwards to :4096
+        // - Host access: published port -> 4097 -> auth checked -> 4096
+        // - Internal access: opencode attach -> localhost:4096 (no auth needed)
         let startup_script = format!(
             r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
-exec opencode serve --port {port} --hostname 0.0.0.0"#,
+
+# Start auth proxy in background (provides authenticated host access)
+python3 {home}/scripts/auth_proxy.py &
+
+# Run opencode serve in foreground (internal access, no auth)
+exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             home = AGENT_HOME_PATH,
-            port = OPENCODE_PORT
+            opencode_port = OPENCODE_PORT
         );
 
         ContainerConfig {

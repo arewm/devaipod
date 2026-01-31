@@ -1764,8 +1764,9 @@ fn podman_command() -> ProcessCommand {
 
 /// Attach to the AI agent in a workspace
 ///
-/// Detects existing sessions from the host via API, then execs into the agent
-/// container to run `opencode attach`. No injected scripts needed.
+/// Detects existing sessions from the host via authenticated API (through the auth proxy),
+/// then execs into the agent container to run `opencode attach` against the local
+/// opencode server (no auth required for internal access).
 async fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
     let agent_container = format!("{}-agent", pod_name);
 
@@ -1795,8 +1796,10 @@ async fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
         }
     };
 
-    // Exec into agent container and run opencode attach
-    // The agent container has opencode installed and can reach localhost:4096
+    // Exec into agent container and run opencode attach.
+    // The opencode server listens on localhost:4096 without auth (internal only).
+    // This works around https://github.com/anomalyco/opencode/issues/8458 where
+    // `opencode attach` doesn't support OPENCODE_SERVER_PASSWORD.
     let mut cmd = podman_command();
     cmd.args(["exec", "-it", &agent_container]);
 
