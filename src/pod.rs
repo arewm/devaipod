@@ -498,6 +498,12 @@ impl DevaipodPod {
         let mut labels = source.to_labels();
         labels.extend(extra_labels.iter().cloned());
 
+        // Record which version of devaipod created this pod
+        labels.push((
+            "io.devaipod.version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ));
+
         // Add service-gator config as a label (CLI args format)
         if let Some(sg_config) = service_gator_config {
             if sg_config.is_enabled() {
