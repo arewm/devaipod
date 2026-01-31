@@ -215,6 +215,18 @@ pub struct InstanceInfo {
     pub api_port: Option<u16>,
 }
 
+/// Mode of the TUI (normal browsing vs delete selection)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TuiMode {
+    /// Normal browsing mode
+    #[default]
+    Normal,
+    /// Delete selection mode - allows selecting multiple instances
+    DeleteSelect,
+    /// Confirming deletion of selected instances
+    DeleteConfirm,
+}
+
 /// Action to perform after exiting TUI
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -226,6 +238,8 @@ pub enum Action {
     Ssh(String),
     /// Trigger a refresh
     Refresh,
+    /// Delete selected instances
+    Delete(Vec<String>),
 }
 
 /// Application state for the TUI
@@ -242,6 +256,10 @@ pub struct App {
     status_message: Option<String>,
     /// Cached TUI state (loaded on startup, updated on refreshes)
     cache: Option<TuiStateCache>,
+    /// Current TUI mode (normal, delete select, etc.)
+    mode: TuiMode,
+    /// Instances selected for deletion (by name)
+    selected_for_delete: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -274,6 +292,8 @@ impl App {
             last_refresh: std::time::Instant::now(),
             status_message: None,
             cache,
+            mode: TuiMode::Normal,
+            selected_for_delete: std::collections::HashSet::new(),
         };
 
         // Initial data fetch
@@ -1109,6 +1129,38 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
                                 spawn_agent_refresh(&app.instances, agent_tx.clone());
                             }
+                            Action::Delete(names) => {
+                                // Delete instances synchronously for now
+                                let count = names.len();
+                                app.status_message = Some(format!(
+                                    "Deleting {} instance{}...",
+                                    count,
+                                    if count == 1 { "" } else { "s" }
+                                ));
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                
+                                let mut errors = Vec::new();
+                                for name in &names {
+                                    if let Err(e) = run_subprocess_silent(&["delete", "--force", name]).await {
+                                        errors.push(format!("{}: {}", name, e));
+                                    }
+                                }
+                                
+                                // Refresh after deletions
+                                let _ = app.refresh_instances().await;
+                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                                
+                                if errors.is_empty() {
+                                    app.status_message = Some(format!(
+                                        "Deleted {} instance{}",
+                                        count,
+                                        if count == 1 { "" } else { "s" }
+                                    ));
+                                } else {
+                                    app.status_message = Some(format!("Errors: {}", errors.join(", ")));
+                                }
+                            }
                         }
                     }
                 }
@@ -1120,40 +1172,131 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
 /// Handle a terminal event, returning an action if the TUI should exit
 fn handle_event(app: &mut App, event: Event) -> Option<Action> {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
-            KeyCode::Char('j') | KeyCode::Down => {
-                app.next();
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            match app.mode {
+                TuiMode::Normal => handle_normal_mode(app, key.code),
+                TuiMode::DeleteSelect => handle_delete_select_mode(app, key.code),
+                TuiMode::DeleteConfirm => handle_delete_confirm_mode(app, key.code),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Handle key events in normal mode
+fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.next();
+            None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.previous();
+            None
+        }
+        KeyCode::Char('r') => Some(Action::Refresh),
+        KeyCode::Enter | KeyCode::Char('a') => {
+            if let Some(instance) = app.selected_instance() {
+                Some(Action::Attach(instance.name.clone()))
+            } else {
+                app.status_message = Some("No instance selected".to_string());
                 None
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                app.previous();
+        }
+        KeyCode::Char('s') => {
+            if let Some(instance) = app.selected_instance() {
+                Some(Action::Ssh(instance.name.clone()))
+            } else {
+                app.status_message = Some("No instance selected".to_string());
                 None
             }
-            KeyCode::Char('r') => {
-                // Trigger refresh
-                Some(Action::Refresh)
-            }
-            KeyCode::Enter | KeyCode::Char('a') => {
-                // Attach to selected instance
-                if let Some(instance) = app.selected_instance() {
-                    Some(Action::Attach(instance.name.clone()))
+        }
+        KeyCode::Char('d') => {
+            // Enter delete select mode
+            app.mode = TuiMode::DeleteSelect;
+            app.selected_for_delete.clear();
+            app.status_message = Some("Delete mode: Space to select, Enter to confirm, Esc to cancel".to_string());
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Handle key events in delete select mode
+fn handle_delete_select_mode(app: &mut App, code: KeyCode) -> Option<Action> {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            // Cancel delete mode
+            app.mode = TuiMode::Normal;
+            app.selected_for_delete.clear();
+            app.status_message = None;
+            None
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.next();
+            None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.previous();
+            None
+        }
+        KeyCode::Char(' ') => {
+            // Toggle selection of current instance
+            if let Some(instance) = app.selected_instance() {
+                let name = instance.name.clone();
+                if app.selected_for_delete.contains(&name) {
+                    app.selected_for_delete.remove(&name);
                 } else {
-                    app.status_message = Some("No instance selected".to_string());
-                    None
+                    app.selected_for_delete.insert(name);
                 }
+                let count = app.selected_for_delete.len();
+                app.status_message = Some(format!(
+                    "Delete mode: {} selected. Space to toggle, Enter to confirm, Esc to cancel",
+                    count
+                ));
             }
-            KeyCode::Char('s') => {
-                // SSH into selected instance
-                if let Some(instance) = app.selected_instance() {
-                    Some(Action::Ssh(instance.name.clone()))
-                } else {
-                    app.status_message = Some("No instance selected".to_string());
-                    None
-                }
+            None
+        }
+        KeyCode::Enter => {
+            if app.selected_for_delete.is_empty() {
+                app.status_message = Some("No instances selected for deletion".to_string());
+                None
+            } else {
+                // Enter confirmation mode
+                app.mode = TuiMode::DeleteConfirm;
+                let count = app.selected_for_delete.len();
+                app.status_message = Some(format!(
+                    "Delete {} instance{}? y to confirm, n/Esc to cancel",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ));
+                None
             }
-            _ => None,
-        },
+        }
+        _ => None,
+    }
+}
+
+/// Handle key events in delete confirm mode
+fn handle_delete_confirm_mode(app: &mut App, code: KeyCode) -> Option<Action> {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            // Confirm deletion
+            let names: Vec<String> = app.selected_for_delete.drain().collect();
+            app.mode = TuiMode::Normal;
+            Some(Action::Delete(names))
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            // Cancel - go back to delete select mode
+            app.mode = TuiMode::DeleteSelect;
+            let count = app.selected_for_delete.len();
+            app.status_message = Some(format!(
+                "Delete mode: {} selected. Space to toggle, Enter to confirm, Esc to cancel",
+                count
+            ));
+            None
+        }
         _ => None,
     }
 }
@@ -1197,6 +1340,35 @@ async fn run_subprocess(
     Ok(())
 }
 
+/// Run a subprocess silently (no terminal restore needed), capturing stderr for errors
+async fn run_subprocess_silent(args: &[&str]) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let exe = std::env::current_exe().context("Failed to get current executable")?;
+
+    let output = Command::new(&exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("Failed to run subprocess")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = stderr.trim();
+        if msg.is_empty() {
+            color_eyre::eyre::bail!("exit code {:?}", output.status.code());
+        } else {
+            color_eyre::eyre::bail!("{}", msg);
+        }
+    }
+
+    Ok(())
+}
+
 /// Render the UI
 fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
@@ -1235,24 +1407,47 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         .as_deref()
         .map(|s| format!(" │ {}", s))
         .unwrap_or_default();
-    let help_text = format!(
-        " q: Quit │ j/k: Navigate │ Enter/a: Attach │ s: SSH │ r: Refresh{}",
-        status
-    );
+    
+    // Footer with help and status (mode-dependent)
+    let (help_base, footer_style) = match app.mode {
+        TuiMode::Normal => (
+            " q: Quit │ j/k: Navigate │ Enter/a: Attach │ s: SSH │ d: Delete │ r: Refresh",
+            Style::default().fg(Color::DarkGray),
+        ),
+        TuiMode::DeleteSelect => (
+            " Esc: Cancel │ j/k: Navigate │ Space: Toggle selection │ Enter: Confirm delete",
+            Style::default().fg(Color::Yellow),
+        ),
+        TuiMode::DeleteConfirm => (
+            " y: Confirm delete │ n/Esc: Cancel",
+            Style::default().fg(Color::Red),
+        ),
+    };
+    let help_text = format!("{}{}", help_base, status);
     let footer = Paragraph::new(help_text)
-        .style(Style::default().fg(Color::DarkGray))
+        .style(footer_style)
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 }
 
 /// Render the instances table
 fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let header_cells = ["NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK"]
+    // In delete mode, add a selection column
+    let in_delete_mode = matches!(app.mode, TuiMode::DeleteSelect | TuiMode::DeleteConfirm);
+    
+    let header_labels: Vec<&str> = if in_delete_mode {
+        vec!["SEL", "NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK"]
+    } else {
+        vec!["NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK"]
+    };
+    let header_cells = header_labels
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).bold()));
     let header = Row::new(header_cells).height(1);
 
+    let selected_for_delete = &app.selected_for_delete;
     let rows = app.instances.iter().map(|instance| {
+        let is_selected = selected_for_delete.contains(&instance.name);
         // Status with color
         let status_style = match instance.status.as_str() {
             "Running" => Style::default().fg(Color::Green),
@@ -1323,21 +1518,47 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             })
             .unwrap_or("-");
 
-        Row::new(vec![
+        let mut cells = Vec::new();
+        
+        // Selection column in delete mode
+        if in_delete_mode {
+            let sel_text = if is_selected { "[x]" } else { "[ ]" };
+            let sel_style = if is_selected {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            cells.push(Cell::from(sel_text).style(sel_style));
+        }
+        
+        cells.extend(vec![
             Cell::from(instance.name.clone()),
             Cell::from(status_text).style(status_style),
             Cell::from(agent_text).style(agent_style),
             Cell::from(instance.created.as_deref().unwrap_or("-")),
             Cell::from(git_text).style(git_style),
             Cell::from(instance.mode.as_deref().unwrap_or("-")),
-            Cell::from(repo),
+            Cell::from(repo.to_string()),
             Cell::from(task),
-        ])
+        ]);
+        
+        Row::new(cells)
     });
 
-    let table = Table::new(
-        rows,
-        [
+    let constraints: Vec<Constraint> = if in_delete_mode {
+        vec![
+            Constraint::Length(4),      // SEL
+            Constraint::Min(14),        // NAME
+            Constraint::Length(10),     // STATUS
+            Constraint::Length(8),      // AGENT
+            Constraint::Length(16),     // CREATED (YYYY-MM-DD HH:MM)
+            Constraint::Length(18),     // GIT
+            Constraint::Length(5),      // MODE
+            Constraint::Percentage(12), // REPO
+            Constraint::Percentage(16), // TASK
+        ]
+    } else {
+        vec![
             Constraint::Min(16),        // NAME
             Constraint::Length(10),     // STATUS
             Constraint::Length(8),      // AGENT
@@ -1346,8 +1567,9 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Constraint::Length(5),      // MODE
             Constraint::Percentage(14), // REPO
             Constraint::Percentage(18), // TASK
-        ],
-    )
+        ]
+    };
+    let table = Table::new(rows, constraints)
     .header(header)
     .block(Block::default().borders(Borders::ALL).title(" Instances "))
     .row_highlight_style(
