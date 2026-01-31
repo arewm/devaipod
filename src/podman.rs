@@ -724,7 +724,7 @@ impl PodmanService {
     pub async fn start_pod(&self, name: &str) -> Result<()> {
         let output = self
             .podman_command()
-            .args(["pod", "start", name])
+            .args(["pod", "start", "--", name])
             .output()
             .await
             .context("Failed to start pod")?;
@@ -743,7 +743,7 @@ impl PodmanService {
     pub async fn stop_pod(&self, name: &str) -> Result<()> {
         let output = self
             .podman_command()
-            .args(["pod", "stop", name])
+            .args(["pod", "stop", "--", name])
             .output()
             .await
             .context("Failed to stop pod")?;
@@ -767,6 +767,7 @@ impl PodmanService {
         if force {
             args.push("--force");
         }
+        args.push("--");
         args.push(name);
 
         let output = self

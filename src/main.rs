@@ -2279,7 +2279,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
 /// Get labels for a pod using podman pod inspect
 fn get_pod_labels(pod_name: &str) -> Option<serde_json::Value> {
     let output = podman_command()
-        .args(["pod", "inspect", "--format", "{{json .Labels}}", pod_name])
+        .args(["pod", "inspect", "--format", "{{json .Labels}}", "--", pod_name])
         .output()
         .ok()?;
 
@@ -2308,7 +2308,7 @@ fn cmd_stop(pod_name: &str) -> Result<()> {
     tracing::info!("Stopping pod '{}'...", pod_name);
 
     let output = podman_command()
-        .args(["pod", "stop", pod_name])
+        .args(["pod", "stop", "--", pod_name])
         .output()
         .context("Failed to run podman pod stop")?;
 
@@ -2339,7 +2339,7 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
     // Stop the pod first (graceful shutdown)
     // This gives containers time to handle SIGTERM before we remove them
     let stop_output = podman_command()
-        .args(["pod", "stop", pod_name])
+        .args(["pod", "stop", "--", pod_name])
         .output()
         .context("Failed to run podman pod stop")?;
 
@@ -2358,7 +2358,7 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
         cmd.arg("--force");
     }
 
-    cmd.arg(pod_name);
+    cmd.args(["--", pod_name]);
 
     let output = cmd.output().context("Failed to run podman pod rm")?;
 
@@ -2424,7 +2424,7 @@ async fn cmd_rebuild(
     // Stop the pod first
     tracing::info!("Stopping containers...");
     let stop_output = podman_command()
-        .args(["pod", "stop", pod_name])
+        .args(["pod", "stop", "--", pod_name])
         .output()
         .context("Failed to stop pod")?;
 
@@ -2438,7 +2438,7 @@ async fn cmd_rebuild(
     // Remove the pod but keep volumes
     tracing::info!("Removing containers (keeping volumes)...");
     let rm_output = podman_command()
-        .args(["pod", "rm", "--force", pod_name])
+        .args(["pod", "rm", "--force", "--", pod_name])
         .output()
         .context("Failed to remove pod")?;
 
@@ -2605,7 +2605,7 @@ fn cmd_logs(pod_name: &str, container: &str, follow: bool, tail: Option<u32>) ->
 fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
     // Get pod info using podman pod inspect
     let pod_output = podman_command()
-        .args(["pod", "inspect", pod_name])
+        .args(["pod", "inspect", "--", pod_name])
         .output()
         .context("Failed to run podman pod inspect")?;
 
@@ -2770,7 +2770,7 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
 
     // Get pod info
     let pod_output = podman_command()
-        .args(["pod", "inspect", pod_name])
+        .args(["pod", "inspect", "--", pod_name])
         .output()
         .context("Failed to run podman pod inspect")?;
 
