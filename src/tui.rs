@@ -195,8 +195,10 @@ pub struct InstanceInfo {
     pub mode: Option<String>,
     /// Whether the agent is healthy
     pub agent_healthy: Option<bool>,
-    /// Created timestamp
+    /// Created timestamp (formatted for display)
     pub created: Option<String>,
+    /// Raw creation timestamp (Unix seconds) for sorting
+    pub created_ts: Option<i64>,
     /// Git repository state (fetched async)
     pub git_state: Option<GitState>,
     /// Workspace directory path inside container
@@ -404,9 +406,10 @@ impl App {
             });
 
             // Get created time from workspace container
-            let created = workspace.and_then(|w| w.created).map(|ts| {
+            let created_ts = workspace.and_then(|w| w.created);
+            let created = created_ts.map(|ts| {
                 chrono::DateTime::from_timestamp(ts, 0)
-                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "-".to_string())
             });
 
@@ -481,6 +484,7 @@ impl App {
                 mode,
                 agent_healthy: Some(agent_healthy),
                 created,
+                created_ts,
                 git_state,
                 workspace_path,
                 last_git_refresh,
@@ -491,8 +495,15 @@ impl App {
             });
         }
 
-        // Sort by name
-        instances.sort_by(|a, b| a.name.cmp(&b.name));
+        // Sort by creation time (newest first), with fallback to name for ties
+        instances.sort_by(|a, b| {
+            match (b.created_ts, a.created_ts) {
+                (Some(b_ts), Some(a_ts)) => b_ts.cmp(&a_ts),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.cmp(&b.name),
+            }
+        });
 
         self.instances = instances;
         self.last_refresh = std::time::Instant::now();
@@ -500,8 +511,16 @@ impl App {
         // NOTE: Git state is fetched separately via refresh_git_states_background()
         // to avoid blocking the initial display
 
-        // Ensure selection is valid
-        if !self.instances.is_empty() && self.table_state.selected().is_none() {
+        // Ensure selection is valid and within bounds
+        if let Some(selected) = self.table_state.selected() {
+            if selected >= self.instances.len() {
+                self.table_state.select(if self.instances.is_empty() {
+                    None
+                } else {
+                    Some(self.instances.len() - 1)
+                });
+            }
+        } else if !self.instances.is_empty() {
             self.table_state.select(Some(0));
         }
 
@@ -1322,11 +1341,11 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Constraint::Min(16),        // NAME
             Constraint::Length(10),     // STATUS
             Constraint::Length(8),      // AGENT
-            Constraint::Length(10),     // CREATED
+            Constraint::Length(16),     // CREATED (YYYY-MM-DD HH:MM)
             Constraint::Length(18),     // GIT
             Constraint::Length(5),      // MODE
-            Constraint::Percentage(16), // REPO
-            Constraint::Percentage(20), // TASK
+            Constraint::Percentage(14), // REPO
+            Constraint::Percentage(18), // TASK
         ],
     )
     .header(header)
@@ -1463,7 +1482,8 @@ mod tests {
                 task: Some("Implement new feature".to_string()),
                 mode: Some("up".to_string()),
                 agent_healthy: Some(true),
-                created: Some("2024-01-15".to_string()),
+                created: Some("2024-01-15 10:30".to_string()),
+                created_ts: Some(1705315800), // 2024-01-15 10:30
                 git_state: Some(GitState {
                     branch: Some("main".to_string()),
                     dirty: false,
@@ -1486,7 +1506,8 @@ mod tests {
                 task: None,
                 mode: Some("run".to_string()),
                 agent_healthy: Some(false),
-                created: Some("2024-01-14".to_string()),
+                created: Some("2024-01-14 14:00".to_string()),
+                created_ts: Some(1705240800), // 2024-01-14 14:00
                 git_state: None,
                 workspace_path: Some("/workspaces/otherrepo".to_string()),
                 last_git_refresh: None,
@@ -1504,6 +1525,7 @@ mod tests {
                 mode: None,
                 agent_healthy: None,
                 created: None,
+                created_ts: None,
                 git_state: Some(GitState {
                     branch: Some("feature-x".to_string()),
                     dirty: true,
