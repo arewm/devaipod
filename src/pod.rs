@@ -135,91 +135,8 @@ fn generate_api_password() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Get the published host port for the opencode API
-///
-/// The pod publishes the agent's port 4096 to a random localhost port.
-/// This function queries podman to find the assigned port for the auth proxy.
-pub fn get_published_port(pod_name: &str) -> Result<u16> {
-    use std::process::Command;
-
-    let container = format!("{}-agent", pod_name);
-    let output = Command::new("podman")
-        .args(["port", &container, &AUTH_PROXY_PORT.to_string()])
-        .output()
-        .context("Failed to run podman port")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        color_eyre::eyre::bail!("Failed to get published port: {}", stderr);
-    }
-
-    // Output format: "127.0.0.1:54321" or "0.0.0.0:54321"
-    let port_str = String::from_utf8_lossy(&output.stdout);
-    let port = port_str
-        .trim()
-        .split(':')
-        .last()
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to parse port from podman output"))?;
-
-    Ok(port)
-}
-
-/// Get the API password for a pod from its labels
-///
-/// The password is stored in the `io.devaipod.api-password` label during pod creation.
-pub fn get_api_password(pod_name: &str) -> Result<String> {
-    use std::process::Command;
-
-    let output = Command::new("podman")
-        .args([
-            "pod",
-            "inspect",
-            pod_name,
-            "--format",
-            "{{index .Labels \"io.devaipod.api-password\"}}",
-        ])
-        .output()
-        .context("Failed to run podman pod inspect")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        color_eyre::eyre::bail!("Failed to get pod labels: {}", stderr);
-    }
-
-    let password = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if password.is_empty() {
-        color_eyre::eyre::bail!(
-            "No API password found in pod labels. \
-             This pod may have been created with an older version of devaipod."
-        );
-    }
-
-    Ok(password)
-}
-
-/// API credentials for connecting to the opencode server
-pub struct ApiCredentials {
-    /// The host port where the API is published
-    pub port: u16,
-    /// The password for HTTP Basic Auth
-    pub password: String,
-}
-
-/// Get API credentials (port and password) for a pod
-pub fn get_api_credentials(pod_name: &str) -> Result<ApiCredentials> {
-    Ok(ApiCredentials {
-        port: get_published_port(pod_name)?,
-        password: get_api_password(pod_name)?,
-    })
-}
-
 /// Path for the agent's home directory (mounted from a persistent volume)
 const AGENT_HOME_PATH: &str = "/home/agent";
-
-/// Python script for workspace monitor.
-/// Shows agent status and allows seamless handoff to interactive mode.
-const WORKSPACE_MONITOR_SCRIPT: &str = include_str!("../scripts/workspace_monitor.py");
 
 /// Python script for auth proxy.
 /// Provides authenticated HTTP access to the opencode API from the host.
@@ -524,10 +441,7 @@ impl DevaipodPod {
         // Generate random password for opencode API authentication
         // This enables secure host-to-container API access
         let api_password = generate_api_password();
-        labels.push((
-            "io.devaipod.api-password".to_string(),
-            api_password.clone(),
-        ));
+        labels.push(("io.devaipod.api-password".to_string(), api_password.clone()));
 
         // Publish the auth proxy port to a random localhost port for host access.
         // The proxy handles Basic Auth and forwards to the opencode server.
@@ -557,7 +471,7 @@ impl DevaipodPod {
             tracing::debug!("Using existing agent home volume '{}'", agent_home_volume);
         }
 
-        // Write scripts to agent home volume (needed by all pods for workspace_monitor.py)
+        // Write scripts to agent home volume (auth_proxy.py for authenticated API access)
         Self::write_scripts_to_volume(podman, &image, &agent_home_volume).await?;
 
         // Clone dotfiles to agent home volume if configured
@@ -584,7 +498,6 @@ impl DevaipodPod {
             &volume_name,
             &agent_home_volume,
             global_config,
-            task,
             &labels,
         );
         podman
@@ -1091,8 +1004,8 @@ echo "Dotfiles installed successfully"
 
     /// Write scripts to the agent home volume before containers start
     ///
-    /// This writes the workspace_monitor.py script which is needed by all pods,
-    /// not just those with tasks. Uses a one-shot init container.
+    /// This writes the auth_proxy.py script which provides authenticated HTTP access
+    /// to the opencode API from the host. Uses a one-shot init container.
     async fn write_scripts_to_volume(
         podman: &PodmanService,
         image: &str,
@@ -1101,10 +1014,6 @@ echo "Dotfiles installed successfully"
         let script = format!(
             r#"set -e
 mkdir -p {agent_home}/scripts
-cat > '{agent_home}/scripts/workspace_monitor.py' << 'MONITOR_EOF'
-{monitor_script}
-MONITOR_EOF
-chmod +x {agent_home}/scripts/workspace_monitor.py
 
 cat > '{agent_home}/scripts/auth_proxy.py' << 'PROXY_EOF'
 {proxy_script}
@@ -1112,7 +1021,6 @@ PROXY_EOF
 chmod +x {agent_home}/scripts/auth_proxy.py
 "#,
             agent_home = AGENT_HOME_PATH,
-            monitor_script = WORKSPACE_MONITOR_SCRIPT,
             proxy_script = AUTH_PROXY_SCRIPT,
         );
 
@@ -1349,7 +1257,6 @@ CONFIG_EOF
         volume_name: &str,
         agent_home_volume: &str,
         global_config: &crate::config::Config,
-        task: Option<&str>,
         labels: &[(String, String)],
     ) -> ContainerConfig {
         let mut env = config.container_env.clone();
@@ -1404,11 +1311,6 @@ CONFIG_EOF
             format!("http://localhost:{}", OPENCODE_PORT),
         );
 
-        // Pass task to workspace monitor if provided
-        if let Some(task_content) = task {
-            env.insert("DEVAIPOD_TASK".to_string(), task_content.to_string());
-        }
-
         // No bind mounts - we clone the repo into the container instead
         // This avoids UID mapping issues with rootless podman
         let mounts = vec![];
@@ -1447,7 +1349,8 @@ CONFIG_EOF
             // Set workdir to the workspace folder - where the cloned repo lives
             workdir: Some(workspace_folder.to_string()),
             user: user.map(|u| u.to_string()),
-            // Keep the container running, create opencode shim in /usr/local/bin, print agent connection info
+            // Keep the container running, create opencode shim in /usr/local/bin
+            // The container just sleeps; users attach via tmux with `devaipod attach`
             command: Some(vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -1498,8 +1401,8 @@ fi
 EOF
 sudo chmod +x /usr/local/bin/opencode-connect
 
-# Run the monitor from the mounted agent home volume - it handles Ctrl-C to drop to shell
-exec python3 /opt/devaipod/scripts/workspace_monitor.py
+# Keep container running - users attach via tmux with `devaipod attach`
+exec sleep infinity
 "#,
                     port = OPENCODE_PORT,
                 ),
@@ -1846,8 +1749,7 @@ mod tests {
             volume_name,
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
 
         // Volume mounts for workspace and agent home
@@ -1869,7 +1771,7 @@ mod tests {
         assert!(cmd[2].contains("opencode-connect")); // Creates shim
         assert!(cmd[2].contains("opencode attach")); // Shim uses attach
         assert!(cmd[2].contains(&format!("http://localhost:{}", OPENCODE_PORT)));
-        assert!(cmd[2].contains("/opt/devaipod/scripts/workspace_monitor.py")); // Runs monitor script from mounted volume
+        assert!(cmd[2].contains("sleep infinity")); // Keeps container running
         assert!(!container_config.drop_all_caps);
         assert!(!container_config.no_new_privileges);
     }
@@ -1886,7 +1788,10 @@ mod tests {
 
         // Test with labels
         let labels = vec![
-            ("io.devaipod.repo".to_string(), "github.com/owner/repo".to_string()),
+            (
+                "io.devaipod.repo".to_string(),
+                "github.com/owner/repo".to_string(),
+            ),
             ("io.devaipod.task".to_string(), "Fix the bug".to_string()),
             ("io.devaipod.mode".to_string(), "run".to_string()),
         ];
@@ -1901,7 +1806,6 @@ mod tests {
             volume_name,
             "test-agent-home",
             &global_config,
-            None, // task
             &labels,
         );
 
@@ -2195,8 +2099,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
 
         // All devices in the config should actually exist on the host
@@ -2244,8 +2147,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
 
         assert_eq!(container_config.env.get("FOO"), Some(&"bar".to_string()));
@@ -2282,8 +2184,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
 
         // Verify secrets are included for workspace container
@@ -2412,8 +2313,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
 
         // PATH should include default PATH plus the suffix from devcontainer.json
@@ -2457,8 +2357,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
 
         // UNRESOLVABLE should be skipped
@@ -2494,8 +2393,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
 
         assert_eq!(container_config.cap_add, vec!["SYS_PTRACE".to_string()]);
@@ -2602,8 +2500,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
 
         // Privileged should be true from runArgs
@@ -2635,8 +2532,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
 
         // Device should be in the devices list
@@ -2670,8 +2566,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
         assert!(
             container_config1.privileged,
@@ -2693,8 +2588,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
-            None, // task
-            &[],  // labels
+            &[], // labels
         );
         assert!(
             container_config2.privileged,

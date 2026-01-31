@@ -16,7 +16,6 @@ mod config;
 mod devcontainer;
 mod forge;
 mod git;
-mod tui;
 #[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
 mod gpu;
 mod init;
@@ -25,6 +24,7 @@ mod podman;
 mod proxy;
 mod secrets;
 mod service_gator;
+mod tui;
 
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
@@ -334,13 +334,16 @@ enum HostCommand {
 
     /// Attach to the AI agent in a workspace
     ///
-    /// Connects to the running opencode agent, automatically continuing any
-    /// existing session. This is the primary way to interact with an agent
-    /// started via `devaipod run`.
+    /// Opens a tmux session with two panes:
+    /// - Left pane: AI agent (opencode attach)
+    /// - Right pane: Shell for manual work
+    ///
+    /// This is the primary way to interact with a workspace. Use tmux keys
+    /// (Ctrl-b + arrow keys) to switch panes, or Ctrl-b d to detach.
     ///
     /// Examples:
-    ///   devaipod attach myworkspace              # Connect to agent
-    ///   devaipod attach -l                       # Connect to most recent workspace
+    ///   devaipod attach myworkspace              # Attach to workspace
+    ///   devaipod attach -l                       # Attach to most recent workspace
     ///   devaipod attach myworkspace -s abc123    # Connect to specific session
     Attach {
         /// Workspace name (devaipod- prefix optional)
@@ -1772,60 +1775,64 @@ fn podman_command() -> ProcessCommand {
     }
 }
 
-/// Attach to the AI agent in a workspace
+/// Attach to a workspace with tmux split panes (agent + shell)
 ///
-/// Detects existing sessions from the host via authenticated API (through the auth proxy),
-/// then execs into the agent container to run `opencode attach` against the local
-/// opencode server (no auth required for internal access).
+/// Opens a tmux session inside the workspace container with two panes:
+/// - Left pane: opencode-connect (AI agent interface)
+/// - Right pane: bash shell for manual work
+///
+/// If a tmux session already exists for this workspace, it attaches to it.
 async fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
-    let agent_container = format!("{}-agent", pod_name);
+    let workspace_container = format!("{}-workspace", pod_name);
+    let tmux_session = strip_pod_prefix(pod_name).replace(['.', ':'], "-");
 
-    tracing::info!("Attaching to agent in '{}'...", strip_pod_prefix(pod_name));
+    tracing::info!(
+        "Attaching to workspace '{}' with tmux...",
+        strip_pod_prefix(pod_name)
+    );
 
-    // Determine session ID: use provided, or auto-detect root session
-    let session_id = match session {
-        Some(s) => Some(s.to_string()),
-        None => {
-            // Try to find root session via API
-            match find_root_session(pod_name).await {
-                Ok(Some(id)) => {
-                    tracing::info!("Continuing session: {}", &id[..id.len().min(20)]);
-                    Some(id)
-                }
-                Ok(None) => {
-                    tracing::debug!("No existing session found, starting fresh");
-                    None
-                }
-                Err(e) => {
-                    // API access failed, proceed without session
-                    // This handles older pods without published API
-                    tracing::debug!("Could not query sessions: {}", e);
-                    None
-                }
-            }
-        }
+    // Build the opencode-connect command with optional session
+    let agent_cmd = match session {
+        Some(sid) => format!("opencode-connect -s {}", sid),
+        None => "opencode-connect".to_string(),
     };
 
-    // Exec into agent container and run opencode attach.
-    // The opencode server listens on localhost:4096 without auth (internal only).
-    // This works around https://github.com/anomalyco/opencode/issues/8458 where
-    // `opencode attach` doesn't support password-based auth.
-    let mut cmd = podman_command();
-    cmd.args(["exec", "-it", &agent_container]);
+    // Script to run inside the workspace container:
+    // 1. Check if tmux session exists
+    // 2. If not, create it with two panes (agent left, shell right)
+    // 3. Attach to the session
+    let tmux_script = format!(
+        r#"
+if ! tmux has-session -t {session} 2>/dev/null; then
+    # Create new session with agent in left pane
+    tmux new-session -d -s {session} '{agent_cmd}'
+    # Split horizontally and start shell in right pane
+    tmux split-window -h -t {session} 'bash'
+    # Focus left pane (agent)
+    tmux select-pane -t {session}:0.0
+fi
+# Attach to the session
+exec tmux attach -t {session}
+"#,
+        session = tmux_session,
+        agent_cmd = agent_cmd,
+    );
 
-    // Build opencode attach command
-    let agent_url = format!("http://localhost:{}", pod::OPENCODE_PORT);
-    if let Some(ref sid) = session_id {
-        cmd.args(["opencode", "attach", &agent_url, "-s", sid]);
-    } else {
-        cmd.args(["opencode", "attach", &agent_url]);
-    }
+    let mut cmd = podman_command();
+    cmd.args([
+        "exec",
+        "-it",
+        &workspace_container,
+        "bash",
+        "-c",
+        &tmux_script,
+    ]);
 
     let status = cmd.status().context("Failed to run podman exec")?;
 
     if !status.success() {
         bail!(
-            "Failed to attach to agent in '{}' (exit code {:?}). \
+            "Failed to attach to workspace '{}' (exit code {:?}). \
              The container may not exist or is not running. \
              Run 'devaipod list' to see available pods.",
             pod_name,
@@ -2289,7 +2296,14 @@ fn cmd_list(json_output: bool) -> Result<()> {
 /// Get labels for a pod using podman pod inspect
 fn get_pod_labels(pod_name: &str) -> Option<serde_json::Value> {
     let output = podman_command()
-        .args(["pod", "inspect", "--format", "{{json .Labels}}", "--", pod_name])
+        .args([
+            "pod",
+            "inspect",
+            "--format",
+            "{{json .Labels}}",
+            "--",
+            pod_name,
+        ])
         .output()
         .ok()?;
 
@@ -3052,84 +3066,6 @@ async fn cmd_opencode(pod_name: &str, action: OpencodeAction) -> Result<()> {
             json,
         } => cmd_opencode_send(pod_name, &message, session.as_deref(), json),
         OpencodeAction::Status { json } => cmd_opencode_status(pod_name, json),
-    }
-}
-
-/// Find the root session ID for a pod
-///
-/// The root session is the main task session (no parent).
-/// This is used for seamless handoff from autonomous to interactive mode.
-async fn find_root_session(pod_name: &str) -> Result<Option<String>> {
-    let sessions = opencode_api_get_authenticated(pod_name, "/session").await?;
-
-    let sessions = sessions
-        .as_array()
-        .ok_or_else(|| color_eyre::eyre::eyre!("Expected array of sessions"))?;
-
-    // Find sessions without a parent (root sessions)
-    let root_sessions: Vec<_> = sessions
-        .iter()
-        .filter(|s| s.get("parentID").is_none() || s["parentID"].is_null())
-        .collect();
-
-    if root_sessions.is_empty() {
-        return Ok(None);
-    }
-
-    // Sort by creation time and pick the oldest
-    let root = root_sessions
-        .iter()
-        .min_by_key(|s| {
-            s.get("time")
-                .and_then(|t| t.get("created"))
-                .and_then(|c| c.as_i64())
-                .unwrap_or(i64::MAX)
-        })
-        .and_then(|s| s.get("id"))
-        .and_then(|id| id.as_str())
-        .map(|s| s.to_string());
-
-    Ok(root)
-}
-
-/// Call the opencode API from the host using HTTP with Basic Auth
-///
-/// This uses the published port and password stored in pod labels.
-/// Falls back to exec-based approach if credentials aren't available
-/// (for pods created before this feature was added).
-async fn opencode_api_get_authenticated(
-    pod_name: &str,
-    path: &str,
-) -> Result<serde_json::Value> {
-    // Try to get credentials for authenticated access
-    match pod::get_api_credentials(pod_name) {
-        Ok(creds) => {
-            let url = format!("http://127.0.0.1:{}{}", creds.port, path);
-            let client = reqwest::Client::new();
-            let resp = client
-                .get(&url)
-                .basic_auth("opencode", Some(&creds.password))
-                .send()
-                .await
-                .with_context(|| format!("Failed to connect to opencode API at {}", url))?;
-
-            if !resp.status().is_success() {
-                bail!(
-                    "API request to {} failed with status {}",
-                    path,
-                    resp.status()
-                );
-            }
-
-            resp.json()
-                .await
-                .with_context(|| format!("Failed to parse JSON response from {}", path))
-        }
-        Err(_) => {
-            // Fall back to exec-based approach for older pods
-            tracing::debug!("Falling back to exec-based API access (no credentials found)");
-            opencode_api_get(pod_name, path)
-        }
     }
 }
 

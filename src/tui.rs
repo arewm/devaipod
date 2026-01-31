@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::models::ContainerSummary;
+use bollard::Docker;
 use color_eyre::eyre::{Context, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -57,13 +57,15 @@ struct CachedInstanceState {
 fn state_file_path() -> std::path::PathBuf {
     let data_dir = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))
+        .or_else(|_| {
+            std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+        })
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
         .join("devaipod");
-    
+
     // Ensure directory exists
     let _ = std::fs::create_dir_all(&data_dir);
-    
+
     data_dir.join(STATE_FILE_NAME)
 }
 
@@ -232,10 +234,8 @@ pub enum TuiMode {
 pub enum Action {
     /// Just quit, no further action
     Quit,
-    /// Attach to the specified instance
+    /// Attach to the specified instance (opens tmux with agent + shell)
     Attach(String),
-    /// SSH into the specified instance
-    Ssh(String),
     /// Trigger a refresh
     Refresh,
     /// Delete selected instances
@@ -308,12 +308,7 @@ impl App {
         let old_git_data: HashMap<String, (Option<GitState>, Option<std::time::Instant>)> = self
             .instances
             .iter()
-            .map(|i| {
-                (
-                    i.name.clone(),
-                    (i.git_state.clone(), i.last_git_refresh),
-                )
-            })
+            .map(|i| (i.name.clone(), (i.git_state.clone(), i.last_git_refresh)))
             .collect();
 
         // Preserve agent state and rate-limit timestamps
@@ -381,26 +376,18 @@ impl App {
                 .to_string();
 
             // Find the workspace container to extract labels
-            let workspace = containers
-                .iter()
-                .find(|c| {
-                    c.names
-                        .as_ref()
-                        .is_some_and(|n| n.iter().any(|name| name.ends_with("-workspace")))
-                });
+            let workspace = containers.iter().find(|c| {
+                c.names
+                    .as_ref()
+                    .is_some_and(|n| n.iter().any(|name| name.ends_with("-workspace")))
+            });
 
             // Extract labels from workspace container
             let labels = workspace.and_then(|w| w.labels.as_ref());
 
-            let repo = labels
-                .and_then(|l| l.get("io.devaipod.repo"))
-                .cloned();
-            let task = labels
-                .and_then(|l| l.get("io.devaipod.task"))
-                .cloned();
-            let mode = labels
-                .and_then(|l| l.get("io.devaipod.mode"))
-                .cloned();
+            let repo = labels.and_then(|l| l.get("io.devaipod.repo")).cloned();
+            let task = labels.and_then(|l| l.get("io.devaipod.task")).cloned();
+            let mode = labels.and_then(|l| l.get("io.devaipod.mode")).cloned();
 
             // Determine overall status
             let running_count = containers
@@ -434,9 +421,7 @@ impl App {
             });
 
             // Extract workspace path from labels
-            let workspace_path = labels
-                .and_then(|l| l.get("io.devaipod.workspace"))
-                .cloned();
+            let workspace_path = labels.and_then(|l| l.get("io.devaipod.workspace")).cloned();
 
             // Restore git state and rate-limit timestamp from previous instance data
             // Fall back to cache if no in-memory state exists
@@ -516,13 +501,11 @@ impl App {
         }
 
         // Sort by creation time (newest first), with fallback to name for ties
-        instances.sort_by(|a, b| {
-            match (b.created_ts, a.created_ts) {
-                (Some(b_ts), Some(a_ts)) => b_ts.cmp(&a_ts),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.name.cmp(&b.name),
-            }
+        instances.sort_by(|a, b| match (b.created_ts, a.created_ts) {
+            (Some(b_ts), Some(a_ts)) => b_ts.cmp(&a_ts),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name),
         });
 
         self.instances = instances;
@@ -652,7 +635,11 @@ async fn fetch_git_state(
                 container_name,
                 CreateExecOptions {
                     attach_stdout: Some(true),
-                    cmd: Some(vec!["ls".to_string(), "-1".to_string(), "/workspaces".to_string()]),
+                    cmd: Some(vec![
+                        "ls".to_string(),
+                        "-1".to_string(),
+                        "/workspaces".to_string(),
+                    ]),
                     ..Default::default()
                 },
             )
@@ -716,7 +703,12 @@ async fn fetch_git_state(
             docker,
             container_name,
             &repo_dir,
-            &["rev-list", "--left-right", "--count", &format!("{}...{}", branch_name, upstream)],
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{}...{}", branch_name, upstream),
+            ],
         )
         .await;
 
@@ -781,11 +773,7 @@ fn derive_agent_state_from_messages(messages: &[serde_json::Value]) -> AgentStat
     };
 
     // Check if message is still being processed (no completed time)
-    if info
-        .get("time")
-        .and_then(|t| t.get("completed"))
-        .is_none()
-    {
+    if info.get("time").and_then(|t| t.get("completed")).is_none() {
         return AgentState::Working;
     }
 
@@ -890,7 +878,14 @@ async fn fetch_agent_state(api_port: u16, api_password: &str) -> AgentState {
 /// e.g., "devaipod-foo-workspace" -> "devaipod-foo"
 fn extract_pod_name(container_name: &str) -> &str {
     // Order matters - check longer suffixes first
-    for suffix in &["-service-gator", "-workspace", "-agent", "-infra", "-gator", "-proxy"] {
+    for suffix in &[
+        "-service-gator",
+        "-workspace",
+        "-agent",
+        "-infra",
+        "-gator",
+        "-proxy",
+    ] {
         if let Some(prefix) = container_name.strip_suffix(suffix) {
             return prefix;
         }
@@ -911,7 +906,9 @@ fn is_valid_instance(containers: &[ContainerSummary]) -> bool {
 pub async fn run() -> Result<()> {
     // Check if we're running in a terminal
     if !std::io::stdout().is_terminal() {
-        color_eyre::eyre::bail!("TUI requires a terminal. Use 'devaipod list' for non-interactive output.");
+        color_eyre::eyre::bail!(
+            "TUI requires a terminal. Use 'devaipod list' for non-interactive output."
+        );
     }
 
     // Setup terminal
@@ -1114,16 +1111,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 }
                             }
                             Action::Attach(name) => {
-                                // Run attach in subprocess, then resume TUI
+                                // Run attach in subprocess (opens tmux with agent + shell)
                                 run_subprocess(terminal, &["attach", &name]).await?;
-                                // Refresh after returning from subprocess
-                                let _ = app.refresh_instances().await;
-                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                spawn_agent_refresh(&app.instances, agent_tx.clone());
-                            }
-                            Action::Ssh(name) => {
-                                // Run ssh in subprocess, then resume TUI
-                                run_subprocess(terminal, &["ssh", &name]).await?;
                                 // Refresh after returning from subprocess
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
@@ -1138,19 +1127,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                     if count == 1 { "" } else { "s" }
                                 ));
                                 terminal.draw(|f| ui(f, &mut app))?;
-                                
+
                                 let mut errors = Vec::new();
                                 for name in &names {
                                     if let Err(e) = run_subprocess_silent(&["delete", "--force", name]).await {
                                         errors.push(format!("{}: {}", name, e));
                                     }
                                 }
-                                
+
                                 // Refresh after deletions
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
                                 spawn_agent_refresh(&app.instances, agent_tx.clone());
-                                
+
                                 if errors.is_empty() {
                                     app.status_message = Some(format!(
                                         "Deleted {} instance{}",
@@ -1172,13 +1161,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
 /// Handle a terminal event, returning an action if the TUI should exit
 fn handle_event(app: &mut App, event: Event) -> Option<Action> {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => {
-            match app.mode {
-                TuiMode::Normal => handle_normal_mode(app, key.code),
-                TuiMode::DeleteSelect => handle_delete_select_mode(app, key.code),
-                TuiMode::DeleteConfirm => handle_delete_confirm_mode(app, key.code),
-            }
-        }
+        Event::Key(key) if key.kind == KeyEventKind::Press => match app.mode {
+            TuiMode::Normal => handle_normal_mode(app, key.code),
+            TuiMode::DeleteSelect => handle_delete_select_mode(app, key.code),
+            TuiMode::DeleteConfirm => handle_delete_confirm_mode(app, key.code),
+        },
         _ => None,
     }
 }
@@ -1204,19 +1191,12 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
                 None
             }
         }
-        KeyCode::Char('s') => {
-            if let Some(instance) = app.selected_instance() {
-                Some(Action::Ssh(instance.name.clone()))
-            } else {
-                app.status_message = Some("No instance selected".to_string());
-                None
-            }
-        }
         KeyCode::Char('d') => {
             // Enter delete select mode
             app.mode = TuiMode::DeleteSelect;
             app.selected_for_delete.clear();
-            app.status_message = Some("Delete mode: Space to select, Enter to confirm, Esc to cancel".to_string());
+            app.status_message =
+                Some("Delete mode: Space to select, Enter to confirm, Esc to cancel".to_string());
             None
         }
         _ => None,
@@ -1407,11 +1387,11 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         .as_deref()
         .map(|s| format!(" │ {}", s))
         .unwrap_or_default();
-    
+
     // Footer with help and status (mode-dependent)
     let (help_base, footer_style) = match app.mode {
         TuiMode::Normal => (
-            " q: Quit │ j/k: Navigate │ Enter/a: Attach │ s: SSH │ d: Delete │ r: Refresh",
+            " q: Quit │ j/k: Navigate │ Enter/a: Attach (tmux) │ d: Delete │ r: Refresh",
             Style::default().fg(Color::DarkGray),
         ),
         TuiMode::DeleteSelect => (
@@ -1434,11 +1414,15 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
 fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // In delete mode, add a selection column
     let in_delete_mode = matches!(app.mode, TuiMode::DeleteSelect | TuiMode::DeleteConfirm);
-    
+
     let header_labels: Vec<&str> = if in_delete_mode {
-        vec!["SEL", "NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK"]
+        vec![
+            "SEL", "NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK",
+        ]
     } else {
-        vec!["NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK"]
+        vec![
+            "NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK",
+        ]
     };
     let header_cells = header_labels
         .iter()
@@ -1519,7 +1503,7 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .unwrap_or("-");
 
         let mut cells = Vec::new();
-        
+
         // Selection column in delete mode
         if in_delete_mode {
             let sel_text = if is_selected { "[x]" } else { "[ ]" };
@@ -1530,7 +1514,7 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             };
             cells.push(Cell::from(sel_text).style(sel_style));
         }
-        
+
         cells.extend(vec![
             Cell::from(instance.name.clone()),
             Cell::from(status_text).style(status_style),
@@ -1541,7 +1525,7 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Cell::from(repo.to_string()),
             Cell::from(task),
         ]);
-        
+
         Row::new(cells)
     });
 
@@ -1570,14 +1554,14 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         ]
     };
     let table = Table::new(rows, constraints)
-    .header(header)
-    .block(Block::default().borders(Borders::ALL).title(" Instances "))
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("▶ ");
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(" Instances "))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(table, area, &mut app.table_state);
 }
@@ -1679,14 +1663,6 @@ mod tests {
                         None
                     }
                 }
-                KeyCode::Char('s') => {
-                    if let Some(instance) = app.selected_instance() {
-                        Some(Action::Ssh(instance.name.clone()))
-                    } else {
-                        app.status_message = Some("No instance selected".to_string());
-                        None
-                    }
-                }
                 _ => None,
             },
             _ => None,
@@ -1767,10 +1743,7 @@ mod tests {
 
     #[test]
     fn test_extract_pod_name() {
-        assert_eq!(
-            extract_pod_name("devaipod-foo-workspace"),
-            "devaipod-foo"
-        );
+        assert_eq!(extract_pod_name("devaipod-foo-workspace"), "devaipod-foo");
         assert_eq!(extract_pod_name("devaipod-foo-agent"), "devaipod-foo");
         assert_eq!(
             extract_pod_name("devaipod-foo-bar-workspace"),
@@ -1863,16 +1836,6 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_event_ssh() {
-        let mut app = create_test_app_for_ui();
-        app.instances = sample_instances();
-        app.table_state.select(Some(1));
-
-        let action = handle_test_event(&mut app, key_event(KeyCode::Char('s')));
-        assert_eq!(action, Some(Action::Ssh("otherrepo-def456".to_string())));
-    }
-
-    #[test]
     fn test_handle_event_no_selection() {
         let mut app = create_test_app_for_ui();
         app.instances = sample_instances();
@@ -1898,7 +1861,10 @@ mod tests {
     #[test]
     fn test_derive_agent_state_empty_messages() {
         let messages: Vec<serde_json::Value> = vec![];
-        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Unknown);
+        assert_eq!(
+            derive_agent_state_from_messages(&messages),
+            AgentState::Unknown
+        );
     }
 
     #[test]
@@ -1907,7 +1873,10 @@ mod tests {
             "info": {"role": "user"},
             "parts": [{"type": "text", "text": "Hello"}]
         })];
-        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Unknown);
+        assert_eq!(
+            derive_agent_state_from_messages(&messages),
+            AgentState::Unknown
+        );
     }
 
     #[test]
@@ -1920,7 +1889,10 @@ mod tests {
             },
             "parts": [{"type": "text", "text": "Working on it..."}]
         })];
-        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Working);
+        assert_eq!(
+            derive_agent_state_from_messages(&messages),
+            AgentState::Working
+        );
     }
 
     #[test]
@@ -1934,7 +1906,10 @@ mod tests {
             },
             "parts": [{"type": "text", "text": "Done!"}]
         })];
-        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Idle);
+        assert_eq!(
+            derive_agent_state_from_messages(&messages),
+            AgentState::Idle
+        );
     }
 
     #[test]
@@ -1948,7 +1923,10 @@ mod tests {
             },
             "parts": [{"type": "text", "text": "Making tool call..."}]
         })];
-        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Working);
+        assert_eq!(
+            derive_agent_state_from_messages(&messages),
+            AgentState::Working
+        );
     }
 
     #[test]
@@ -1964,7 +1942,10 @@ mod tests {
                 {"type": "tool", "state": {"status": "running"}}
             ]
         })];
-        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Working);
+        assert_eq!(
+            derive_agent_state_from_messages(&messages),
+            AgentState::Working
+        );
     }
 
     #[test]
@@ -1980,6 +1961,9 @@ mod tests {
                 {"type": "tool", "state": {"status": "completed"}}
             ]
         })];
-        assert_eq!(derive_agent_state_from_messages(&messages), AgentState::Idle);
+        assert_eq!(
+            derive_agent_state_from_messages(&messages),
+            AgentState::Idle
+        );
     }
 }
