@@ -1754,8 +1754,12 @@ mod tests {
         let workspace_volume = "test-workspace-volume";
         let workspace_folder = "/workspaces";
         let global_config = crate::config::Config::default();
-        let container_config =
-            DevaipodPod::gator_container_config(workspace_volume, workspace_folder, None, &global_config);
+        let container_config = DevaipodPod::gator_container_config(
+            workspace_volume,
+            workspace_folder,
+            None,
+            &global_config,
+        );
 
         // Verify workspace volume is mounted read-only (for git_push_local access)
         assert_eq!(container_config.volume_mounts.len(), 1);

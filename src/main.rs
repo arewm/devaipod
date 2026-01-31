@@ -72,7 +72,15 @@ fn get_latest_workspace() -> Result<String> {
         "podman"
     })
     .args(if is_toolbox() {
-        vec!["--host", "podman", "pod", "ps", "--filter", &filter, "--format=json"]
+        vec![
+            "--host",
+            "podman",
+            "pod",
+            "ps",
+            "--filter",
+            &filter,
+            "--format=json",
+        ]
     } else {
         vec!["pod", "ps", "--filter", &filter, "--format=json"]
     })
@@ -157,7 +165,24 @@ fn make_pr_pod_name(repo: &str, pr_number: u64) -> String {
 
 #[derive(Debug, Parser)]
 #[command(name = "devaipod")]
-#[command(about = "Sandboxed AI coding agents in reproducible dev environments", long_about = None)]
+#[command(about = "Sandboxed AI coding agents in reproducible dev environments")]
+#[command(after_help = "\
+QUICK START:
+  devaipod run https://github.com/org/repo    Start agent with interactive task prompt
+  devaipod run <url> -c 'fix the bug'         Start agent with inline task
+  devaipod attach -l                          Attach to most recent workspace
+
+COMMON WORKFLOWS:
+  devaipod list                               See all workspaces
+  devaipod attach <workspace>                 Connect to agent in workspace
+  devaipod ssh <workspace>                    Get a shell in workspace
+  devaipod logs <workspace> -f                Follow agent logs
+  devaipod delete <workspace>                 Clean up when done
+
+FIRST TIME SETUP:
+  devaipod init                               Configure API keys and tokens
+
+DOCS: https://github.com/cgwalters/devaipod")]
 struct HostCli {
     /// Path to config file (default: ~/.config/devaipod.toml)
     #[arg(long, global = true, value_name = "PATH")]
@@ -742,9 +767,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
         HostCommand::Status { workspace, json } => {
             cmd_status(&normalize_pod_name(&workspace), json)
         }
-        HostCommand::Debug { workspace, json } => {
-            cmd_debug(&normalize_pod_name(&workspace), json)
-        }
+        HostCommand::Debug { workspace, json } => cmd_debug(&normalize_pod_name(&workspace), json),
         HostCommand::Run {
             source,
             task,
@@ -2695,7 +2718,11 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
         if let Some(info) = &gator_info {
             println!(
                 "  Present: {}",
-                if info.get("present").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if info
+                    .get("present")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     "yes"
                 } else {
                     "no"
@@ -2732,11 +2759,7 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
             if let Some(healthy) = info.get("healthy").and_then(|v| v.as_bool()) {
                 println!(
                     "  Health: {}",
-                    if healthy {
-                        "healthy"
-                    } else {
-                        "NOT responding"
-                    }
+                    if healthy { "healthy" } else { "NOT responding" }
                 );
             }
             if let Some(mcp_config) = info.get("mcp_configured").and_then(|v| v.as_bool()) {
@@ -2768,10 +2791,7 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
 }
 
 /// Collect debug info for the gator container
-fn collect_gator_debug(
-    gator_container: &str,
-    project_name: &str,
-) -> Option<serde_json::Value> {
+fn collect_gator_debug(gator_container: &str, project_name: &str) -> Option<serde_json::Value> {
     use serde_json::json;
 
     // Check if container exists
@@ -2784,8 +2804,7 @@ fn collect_gator_debug(
         return Some(json!({ "present": false }));
     }
 
-    let container_json: serde_json::Value =
-        serde_json::from_slice(&inspect_output.stdout).ok()?;
+    let container_json: serde_json::Value = serde_json::from_slice(&inspect_output.stdout).ok()?;
     let container = container_json.as_array()?.first()?;
 
     // Get version
@@ -2808,10 +2827,7 @@ fn collect_gator_debug(
 
     let (mount_type, mount_readonly) = workspace_mount
         .map(|m| {
-            let t = m
-                .get("Type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
+            let t = m.get("Type").and_then(|v| v.as_str()).unwrap_or("unknown");
             let rw = m.get("RW").and_then(|v| v.as_bool()).unwrap_or(true);
             (t.to_string(), !rw)
         })
@@ -2914,13 +2930,7 @@ fn opencode_api_get(pod_name: &str, path: &str) -> Result<serde_json::Value> {
     let url = format!("http://localhost:{}{}", pod::OPENCODE_PORT, path);
 
     let output = podman_command()
-        .args([
-            "exec",
-            &workspace_container,
-            "curl",
-            "-sf",
-            &url,
-        ])
+        .args(["exec", &workspace_container, "curl", "-sf", &url])
         .output()
         .context("Failed to execute curl in workspace container")?;
 
@@ -3002,12 +3012,7 @@ fn cmd_opencode_mcp(pod_name: &str, action: McpAction) -> Result<()> {
                     let filtered: Vec<_> = arr
                         .iter()
                         .filter_map(|t| t.as_str())
-                        .filter(|t| {
-                            server
-                                .as_ref()
-                                .map(|s| t.starts_with(s))
-                                .unwrap_or(true)
-                        })
+                        .filter(|t| server.as_ref().map(|s| t.starts_with(s)).unwrap_or(true))
                         .collect();
 
                     if filtered.is_empty() {
