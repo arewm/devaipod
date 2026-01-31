@@ -27,8 +27,8 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Terminal;
 use tokio::time::interval;
 
-/// Cache file name for TUI state
-const CACHE_FILE_NAME: &str = "devaipod.json";
+/// State file name for persistent TUI/instance state
+const STATE_FILE_NAME: &str = "state.json";
 
 /// Cache for TUI state, versioned for compatibility
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -50,22 +50,27 @@ struct CachedInstanceState {
     updated_at: i64,
 }
 
-/// Get the runtime state file path.
+/// Get the persistent state file path.
 ///
-/// Uses XDG_RUNTIME_DIR (typically /run/user/$UID), falling back to /tmp.
-/// The file is placed directly in the runtime dir (no subdirectory needed
-/// since the filename is already unique).
-fn cache_file_path() -> std::path::PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+/// Uses XDG_DATA_HOME (typically ~/.local/share), falling back to ~/.local/share.
+/// Creates the directory if it doesn't exist.
+fn state_file_path() -> std::path::PathBuf {
+    let data_dir = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-    runtime_dir.join(CACHE_FILE_NAME)
+        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        .join("devaipod");
+    
+    // Ensure directory exists
+    let _ = std::fs::create_dir_all(&data_dir);
+    
+    data_dir.join(STATE_FILE_NAME)
 }
 
-/// Load the TUI state cache from disk.
-/// Returns None if cache doesn't exist, is corrupt, or has a version mismatch.
-fn load_cache() -> Option<TuiStateCache> {
-    let path = cache_file_path();
+/// Load the TUI state from disk.
+/// Returns None if state doesn't exist, is corrupt, or has a version mismatch.
+fn load_state() -> Option<TuiStateCache> {
+    let path = state_file_path();
 
     let contents = std::fs::read_to_string(&path).ok()?;
     let cache: TuiStateCache = serde_json::from_str(&contents).ok()?;
@@ -78,14 +83,14 @@ fn load_cache() -> Option<TuiStateCache> {
     Some(cache)
 }
 
-/// Save the TUI state cache to disk.
-/// Silently ignores any errors (cache is best-effort).
-fn save_cache(cache: &TuiStateCache) {
-    let path = cache_file_path();
+/// Save the TUI state to disk.
+/// Silently ignores any errors (state persistence is best-effort).
+fn save_state(state: &TuiStateCache) {
+    let path = state_file_path();
 
     // Write atomically via temp file
     let tmp_path = path.with_extension("tmp");
-    if let Ok(contents) = serde_json::to_string(cache) {
+    if let Ok(contents) = serde_json::to_string_pretty(state) {
         if std::fs::write(&tmp_path, contents).is_ok() {
             let _ = std::fs::rename(&tmp_path, &path);
         }
@@ -258,7 +263,7 @@ impl App {
         .context("Failed to connect to podman/docker")?;
 
         // Load cached state for instant display
-        let cache = load_cache();
+        let cache = load_state();
 
         let mut app = Self {
             docker,
@@ -549,7 +554,7 @@ impl App {
     /// Update and persist the cache with current instance state
     fn update_cache(&mut self) {
         let new_cache = build_cache(&self.instances);
-        save_cache(&new_cache);
+        save_state(&new_cache);
         self.cache = Some(new_cache);
     }
 }
