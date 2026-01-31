@@ -6,10 +6,10 @@ Listens on PROXY_PORT (default 4097), requires Basic Auth, and forwards
 requests to UPSTREAM_URL (default http://localhost:4096).
 
 This is a workaround for https://github.com/anomalyco/opencode/issues/8458
-where `opencode attach` doesn't support OPENCODE_SERVER_PASSWORD for auth.
+where `opencode attach` doesn't support password-based auth.
 
 Environment variables:
-  OPENCODE_SERVER_PASSWORD - Required password for Basic Auth (username: opencode)
+  DEVAIPOD_PROXY_PASSWORD - Required password for Basic Auth (username: opencode)
   AUTH_PROXY_PORT - Port to listen on (default: 4097)
   AUTH_PROXY_UPSTREAM - Upstream URL (default: http://localhost:4096)
 """
@@ -21,7 +21,7 @@ import sys
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-PASSWORD = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
+PASSWORD = os.environ.get("DEVAIPOD_PROXY_PASSWORD", "")
 PROXY_PORT = int(os.environ.get("AUTH_PROXY_PORT", "4097"))
 UPSTREAM = os.environ.get("AUTH_PROXY_UPSTREAM", "http://localhost:4096")
 
@@ -125,11 +125,12 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
 
 def main():
     if not PASSWORD:
-        print("Warning: OPENCODE_SERVER_PASSWORD not set, proxy will allow all requests",
+        print("Warning: DEVAIPOD_PROXY_PASSWORD not set, proxy will allow all requests",
               file=sys.stderr)
 
-    server = HTTPServer(("127.0.0.1", PROXY_PORT), AuthProxyHandler)
-    print(f"Auth proxy listening on 127.0.0.1:{PROXY_PORT} -> {UPSTREAM}", file=sys.stderr)
+    # Listen on all interfaces so podman port publishing can route traffic to us
+    server = HTTPServer(("0.0.0.0", PROXY_PORT), AuthProxyHandler)
+    print(f"Auth proxy listening on 0.0.0.0:{PROXY_PORT} -> {UPSTREAM}", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

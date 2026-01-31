@@ -559,21 +559,34 @@ fn test_api_authentication_works() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
 
-    // Test that authenticated request works (via auth proxy)
+    // Test that authenticated request works (via auth proxy on published port)
     let url = format!("http://127.0.0.1:{}/session", port);
     let auth_response = cmd!(sh, "curl -sf -u opencode:{password} {url}")
         .ignore_status()
         .output()?;
     assert!(
         auth_response.status.success(),
-        "Authenticated API request should succeed"
+        "Authenticated API request to proxy should succeed"
     );
 
-    // Test that unauthenticated request fails (401)
+    // Test that unauthenticated request to proxy fails (401)
     let unauth_response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
     assert!(
         !unauth_response.status.success(),
-        "Unauthenticated API request should fail"
+        "Unauthenticated API request to proxy should fail"
+    );
+
+    // Test that internal access (inside container) works without auth
+    // This verifies opencode serve is running without OPENCODE_SERVER_PASSWORD
+    let internal_response = cmd!(
+        sh,
+        "podman exec {agent_container} curl -sf http://localhost:4096/session"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        internal_response.status.success(),
+        "Internal API request (no auth) should succeed"
     );
 
     Ok(())

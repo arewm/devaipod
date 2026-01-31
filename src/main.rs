@@ -1799,7 +1799,7 @@ async fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
     // Exec into agent container and run opencode attach.
     // The opencode server listens on localhost:4096 without auth (internal only).
     // This works around https://github.com/anomalyco/opencode/issues/8458 where
-    // `opencode attach` doesn't support OPENCODE_SERVER_PASSWORD.
+    // `opencode attach` doesn't support password-based auth.
     let mut cmd = podman_command();
     cmd.args(["exec", "-it", &agent_container]);
 

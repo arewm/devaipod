@@ -224,7 +224,7 @@ const WORKSPACE_MONITOR_SCRIPT: &str = include_str!("../scripts/workspace_monito
 /// Python script for auth proxy.
 /// Provides authenticated HTTP access to the opencode API from the host.
 /// This is a workaround for https://github.com/anomalyco/opencode/issues/8458
-/// where `opencode attach` doesn't support OPENCODE_SERVER_PASSWORD.
+/// where `opencode attach` doesn't support password-based auth.
 const AUTH_PROXY_SCRIPT: &str = include_str!("../scripts/auth_proxy.py");
 
 /// Port for the auth proxy (published to host for authenticated access)
@@ -532,7 +532,7 @@ impl DevaipodPod {
         // Publish the auth proxy port to a random localhost port for host access.
         // The proxy handles Basic Auth and forwards to the opencode server.
         // This is a workaround for https://github.com/anomalyco/opencode/issues/8458
-        // where `opencode attach` doesn't use OPENCODE_SERVER_PASSWORD.
+        // where `opencode attach` doesn't support password-based auth.
         let publish_ports = vec![format!("127.0.0.1::{}", AUTH_PROXY_PORT)];
 
         podman
@@ -1552,10 +1552,9 @@ exec python3 /opt/devaipod/scripts/workspace_monitor.py
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), agent_home.clone());
 
-        // Set opencode server password for API authentication
-        // This enables secure host-to-container API access
+        // Set proxy password for authenticated host access via auth_proxy.py
         env.insert(
-            "OPENCODE_SERVER_PASSWORD".to_string(),
+            "DEVAIPOD_PROXY_PASSWORD".to_string(),
             api_password.to_string(),
         );
         // Ensure agent can find opencode in PATH
@@ -1644,7 +1643,7 @@ exec python3 /opt/devaipod/scripts/workspace_monitor.py
         // Build the startup script that runs both opencode serve and the auth proxy.
         // The auth proxy provides authenticated access from the host, working around
         // https://github.com/anomalyco/opencode/issues/8458 where `opencode attach`
-        // doesn't use OPENCODE_SERVER_PASSWORD.
+        // doesn't support password-based auth.
         //
         // Architecture:
         // - opencode serve: listens on localhost:4096 (no auth, internal only)
@@ -1655,9 +1654,10 @@ exec python3 /opt/devaipod/scripts/workspace_monitor.py
             r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
 
 # Start auth proxy in background (provides authenticated host access)
+# The proxy reads DEVAIPOD_PROXY_PASSWORD for its Basic Auth check
 python3 {home}/scripts/auth_proxy.py &
 
-# Run opencode serve in foreground (internal access, no auth)
+# Run opencode serve in foreground (no auth, internal access only)
 exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             home = AGENT_HOME_PATH,
             opencode_port = OPENCODE_PORT
@@ -1912,9 +1912,9 @@ mod tests {
             Some(&AGENT_HOME_PATH.to_string())
         );
 
-        // Verify API password is set for authentication
+        // Verify proxy password is set for authenticated host access
         assert_eq!(
-            container_config.env.get("OPENCODE_SERVER_PASSWORD"),
+            container_config.env.get("DEVAIPOD_PROXY_PASSWORD"),
             Some(&"test-password".to_string())
         );
     }
