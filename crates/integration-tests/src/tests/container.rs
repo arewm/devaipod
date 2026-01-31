@@ -814,23 +814,25 @@ fn test_lifecycle_commands_run_in_both_containers() -> Result<()> {
     let agent_container = format!("{}-agent", pod_name);
     let workspace_container = format!("{}-workspace", pod_name);
 
-    // Give containers time to finish lifecycle commands
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    let timeout = Duration::from_secs(60);
 
-    // Verify marker file exists in workspace container
-    let workspace_marker = cmd!(sh, "podman exec {workspace_container} cat {marker_path}")
-        .ignore_status()
-        .read()?;
+    // Poll for marker file in workspace container
+    let workspace_marker = wait_for_file_content(
+        &sh,
+        &workspace_container,
+        marker_path,
+        "lifecycle-ran",
+        timeout,
+    )?;
     assert!(
         workspace_marker.contains("lifecycle-ran"),
         "Workspace should have marker file from postCreateCommand: {}",
         workspace_marker
     );
 
-    // Verify marker file exists in agent container
-    let agent_marker = cmd!(sh, "podman exec {agent_container} cat {marker_path}")
-        .ignore_status()
-        .read()?;
+    // Poll for marker file in agent container
+    let agent_marker =
+        wait_for_file_content(&sh, &agent_container, marker_path, "lifecycle-ran", timeout)?;
     assert!(
         agent_marker.contains("lifecycle-ran"),
         "Agent should have marker file from postCreateCommand: {}",
@@ -876,23 +878,30 @@ fn test_init_script_configures_both_containers() -> Result<()> {
     let agent_container = format!("{}-agent", pod_name);
     let workspace_container = format!("{}-workspace", pod_name);
 
-    // Give containers time to finish lifecycle commands
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    let timeout = Duration::from_secs(60);
 
-    // Verify config file exists and has correct content in workspace
-    let workspace_config = cmd!(sh, "podman exec {workspace_container} cat {config_path}")
-        .ignore_status()
-        .read()?;
+    // Poll for config file in workspace container
+    let workspace_config = wait_for_file_content(
+        &sh,
+        &workspace_container,
+        config_path,
+        "subuid_configured=true",
+        timeout,
+    )?;
     assert!(
         workspace_config.contains("subuid_configured=true"),
         "Workspace should have config from init script: {}",
         workspace_config
     );
 
-    // Verify config file exists and has correct content in agent
-    let agent_config = cmd!(sh, "podman exec {agent_container} cat {config_path}")
-        .ignore_status()
-        .read()?;
+    // Poll for config file in agent container
+    let agent_config = wait_for_file_content(
+        &sh,
+        &agent_container,
+        config_path,
+        "subuid_configured=true",
+        timeout,
+    )?;
     assert!(
         agent_config.contains("subuid_configured=true"),
         "Agent should have config from init script: {}",
