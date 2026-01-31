@@ -299,3 +299,114 @@ fn test_ssh_nonexistent_pod_fails() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_ssh_nonexistent_pod_fails);
+
+fn test_pod_has_api_credentials() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = unique_test_name("test-api-creds");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    let sh = shell()?;
+
+    // Verify pod has API password label
+    let format_label = "{{index .Labels \"io.devaipod.api-password\"}}";
+    let password = cmd!(sh, "podman pod inspect {pod_name} --format {format_label}").read()?;
+    assert!(
+        !password.trim().is_empty(),
+        "Pod should have io.devaipod.api-password label"
+    );
+    assert!(
+        password.trim().len() >= 32,
+        "API password should be at least 32 chars, got: {}",
+        password.len()
+    );
+
+    // Verify port is published
+    let agent_container = format!("{}-agent", pod_name);
+    let port_output = cmd!(sh, "podman port {agent_container} 4096")
+        .ignore_status()
+        .read()?;
+    assert!(
+        port_output.contains("127.0.0.1:"),
+        "Port 4096 should be published to localhost: {}",
+        port_output
+    );
+
+    // Extract the port number
+    let port: u16 = port_output
+        .trim()
+        .split(':')
+        .last()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    assert!(port > 0, "Should have a valid port number");
+
+    Ok(())
+}
+podman_integration_test!(test_pod_has_api_credentials);
+
+fn test_api_authentication_works() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = unique_test_name("test-api-auth");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    // Give agent time to start
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    let sh = shell()?;
+
+    // Get API credentials
+    let format_label = "{{index .Labels \"io.devaipod.api-password\"}}";
+    let password = cmd!(sh, "podman pod inspect {pod_name} --format {format_label}").read()?;
+    let password = password.trim();
+
+    let agent_container = format!("{}-agent", pod_name);
+    let port_output = cmd!(sh, "podman port {agent_container} 4096").read()?;
+    let port: u16 = port_output
+        .trim()
+        .split(':')
+        .last()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+
+    // Test that authenticated request works
+    let url = format!("http://127.0.0.1:{}/session", port);
+    let auth_response = cmd!(sh, "curl -sf -u opencode:{password} {url}")
+        .ignore_status()
+        .output()?;
+    assert!(
+        auth_response.status.success(),
+        "Authenticated API request should succeed"
+    );
+
+    // Test that unauthenticated request fails (401)
+    let unauth_response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
+    assert!(
+        !unauth_response.status.success(),
+        "Unauthenticated API request should fail"
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_api_authentication_works);

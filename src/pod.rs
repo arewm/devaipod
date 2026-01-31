@@ -125,6 +125,95 @@ use crate::podman::{ContainerConfig, PodmanService};
 /// Port for the opencode server in the agent container
 pub const OPENCODE_PORT: u16 = 4096;
 
+/// Generate a random password for API authentication
+///
+/// Returns a 32-character hex string (128 bits of entropy)
+fn generate_api_password() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let bytes: [u8; 16] = rng.random();
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Get the published host port for the opencode API
+///
+/// The pod publishes the agent's port 4096 to a random localhost port.
+/// This function queries podman to find the assigned port.
+pub fn get_published_port(pod_name: &str) -> Result<u16> {
+    use std::process::Command;
+
+    let container = format!("{}-agent", pod_name);
+    let output = Command::new("podman")
+        .args(["port", &container, &OPENCODE_PORT.to_string()])
+        .output()
+        .context("Failed to run podman port")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        color_eyre::eyre::bail!("Failed to get published port: {}", stderr);
+    }
+
+    // Output format: "127.0.0.1:54321" or "0.0.0.0:54321"
+    let port_str = String::from_utf8_lossy(&output.stdout);
+    let port = port_str
+        .trim()
+        .split(':')
+        .last()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to parse port from podman output"))?;
+
+    Ok(port)
+}
+
+/// Get the API password for a pod from its labels
+///
+/// The password is stored in the `io.devaipod.api-password` label during pod creation.
+pub fn get_api_password(pod_name: &str) -> Result<String> {
+    use std::process::Command;
+
+    let output = Command::new("podman")
+        .args([
+            "pod",
+            "inspect",
+            pod_name,
+            "--format",
+            "{{index .Labels \"io.devaipod.api-password\"}}",
+        ])
+        .output()
+        .context("Failed to run podman pod inspect")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        color_eyre::eyre::bail!("Failed to get pod labels: {}", stderr);
+    }
+
+    let password = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if password.is_empty() {
+        color_eyre::eyre::bail!(
+            "No API password found in pod labels. \
+             This pod may have been created with an older version of devaipod."
+        );
+    }
+
+    Ok(password)
+}
+
+/// API credentials for connecting to the opencode server
+pub struct ApiCredentials {
+    /// The host port where the API is published
+    pub port: u16,
+    /// The password for HTTP Basic Auth
+    pub password: String,
+}
+
+/// Get API credentials (port and password) for a pod
+pub fn get_api_credentials(pod_name: &str) -> Result<ApiCredentials> {
+    Ok(ApiCredentials {
+        port: get_published_port(pod_name)?,
+        password: get_api_password(pod_name)?,
+    })
+}
+
 /// Path for the agent's home directory (mounted from a persistent volume)
 const AGENT_HOME_PATH: &str = "/home/agent";
 
@@ -417,8 +506,20 @@ impl DevaipodPod {
             }
         }
 
+        // Generate random password for opencode API authentication
+        // This enables secure host-to-container API access
+        let api_password = generate_api_password();
+        labels.push((
+            "io.devaipod.api-password".to_string(),
+            api_password.clone(),
+        ));
+
+        // Publish the opencode API port to a random localhost port
+        // Format: "127.0.0.1::4096" means random host port -> container port 4096
+        let publish_ports = vec![format!("127.0.0.1::{}", OPENCODE_PORT)];
+
         podman
-            .create_pod(pod_name, &labels)
+            .create_pod(pod_name, &labels, &publish_ports)
             .await
             .context("Failed to create pod")?;
 
@@ -534,6 +635,7 @@ impl DevaipodPod {
             &volume_name,
             &agent_home_volume,
             global_config,
+            &api_password,
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -1416,12 +1518,20 @@ exec python3 /opt/devaipod/scripts/workspace_monitor.py
         workspace_volume: &str,
         agent_home_volume: &str,
         global_config: &crate::config::Config,
+        api_password: &str,
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
         let agent_home = AGENT_HOME_PATH.to_string();
 
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), agent_home.clone());
+
+        // Set opencode server password for API authentication
+        // This enables secure host-to-container API access
+        env.insert(
+            "OPENCODE_SERVER_PASSWORD".to_string(),
+            api_password.to_string(),
+        );
         // Ensure agent can find opencode in PATH
         env.insert(
             "PATH".to_string(),
@@ -1685,6 +1795,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
+            "test-password",
         );
 
         // Volume mounts for workspace and agent home
@@ -1712,6 +1823,12 @@ mod tests {
             container_config.env.get("HOME"),
             Some(&AGENT_HOME_PATH.to_string())
         );
+
+        // Verify API password is set for authentication
+        assert_eq!(
+            container_config.env.get("OPENCODE_SERVER_PASSWORD"),
+            Some(&"test-password".to_string())
+        );
     }
 
     #[test]
@@ -1738,6 +1855,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
+            "test-password",
         );
 
         // No bind mounts - we clone the repo into the container instead
@@ -2052,6 +2170,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
+            "test-password",
         );
 
         // Agent should have no secrets
@@ -2269,6 +2388,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
+            "test-password",
         );
 
         // Should have proxy env vars set
@@ -2301,6 +2421,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             &global_config,
+            "test-password",
         );
 
         // Should NOT have proxy env vars set

@@ -546,6 +546,34 @@ enum HostCommand {
         #[command(subcommand)]
         action: OpencodeAction,
     },
+    /// Control plane for managing and reviewing agent workspaces
+    ///
+    /// Provides a unified view of all running devaipod pods with the ability to:
+    /// - Monitor pod status and agent health
+    /// - Review git commits before they're pushed
+    /// - Accept, reject, or comment on agent changes
+    ///
+    /// By default, launches an interactive TUI. Use --serve for HTTP API mode.
+    ///
+    /// Examples:
+    ///   devaipod controlplane              # Launch TUI
+    ///   devaipod controlplane --serve      # Start HTTP server
+    ///   devaipod controlplane --list       # One-shot: list pods and exit
+    #[command(alias = "cp")]
+    Controlplane {
+        /// Start as HTTP server instead of TUI
+        #[arg(long)]
+        serve: bool,
+        /// Port for HTTP server (default: 8080)
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// One-shot: list all pods and exit
+        #[arg(long)]
+        list: bool,
+        /// Output in JSON format (for --list)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Actions for interacting with the opencode agent
@@ -730,7 +758,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             session,
         } => {
             let pod_name = resolve_workspace(workspace.as_deref(), latest)?;
-            cmd_attach(&pod_name, session.as_deref())
+            cmd_attach(&pod_name, session.as_deref()).await
         }
         HostCommand::Ssh {
             workspace,
@@ -837,6 +865,12 @@ async fn run_host(cli: HostCli) -> Result<()> {
         HostCommand::Opencode { workspace, action } => {
             cmd_opencode(&normalize_pod_name(&workspace), action).await
         }
+        HostCommand::Controlplane {
+            serve,
+            port,
+            list,
+            json,
+        } => cmd_controlplane(serve, port, list, json).await,
     }
 }
 
@@ -1628,6 +1662,51 @@ async fn cmd_dry_run(config: &config::Config, source: &str, opts: &UpOptions) ->
     Ok(())
 }
 
+/// Control plane for managing and reviewing agent workspaces
+///
+/// Provides a unified view of all running devaipod pods with the ability to
+/// monitor status, review git commits, and accept/reject changes.
+async fn cmd_controlplane(serve: bool, _port: u16, list: bool, json: bool) -> Result<()> {
+    if list {
+        // One-shot mode: list pods and exit
+        // Reuse the existing list logic
+        return cmd_list(json);
+    }
+
+    if serve {
+        // HTTP server mode (future: axum server)
+        eprintln!("Control plane HTTP server mode is not yet implemented.");
+        eprintln!();
+        eprintln!("This feature is planned for a future release. See:");
+        eprintln!("  https://github.com/cgwalters/devaipod/blob/main/docs/todo/controlplane.md");
+        eprintln!();
+        eprintln!("For now, use 'devaipod list' and 'devaipod attach' to manage pods.");
+        std::process::exit(1);
+    }
+
+    // TUI mode (future: ratatui TUI)
+    eprintln!("Control plane TUI mode is not yet implemented.");
+    eprintln!();
+    eprintln!("This feature is planned for a future release. See:");
+    eprintln!("  https://github.com/cgwalters/devaipod/blob/main/docs/todo/controlplane.md");
+    eprintln!();
+    eprintln!("For now, use these commands to manage pods:");
+    eprintln!("  devaipod list              # List all workspaces");
+    eprintln!("  devaipod attach <name>     # Attach to agent");
+    eprintln!("  devaipod logs <name> -f    # Follow agent logs");
+    eprintln!("  devaipod status <name>     # Detailed pod status");
+    eprintln!();
+    eprintln!("The control plane will provide:");
+    eprintln!("  - Unified view of all running pods");
+    eprintln!("  - Git commit review before pushing");
+    eprintln!("  - Accept/reject/comment on agent changes");
+    eprintln!();
+
+    // For now, fall back to list as a useful default
+    tracing::info!("Falling back to pod list:");
+    cmd_list(json)
+}
+
 /// Check if any API keys are configured for the AI agent and warn if not
 ///
 /// This helps users on first run understand that they need to configure
@@ -1673,21 +1752,48 @@ fn podman_command() -> ProcessCommand {
 
 /// Attach to the AI agent in a workspace
 ///
-/// Runs `opencode-connect` inside the workspace container to connect to the agent.
-/// This auto-detects existing sessions for seamless handoff from autonomous to interactive mode.
-fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
-    let container = format!("{}-workspace", pod_name);
+/// Detects existing sessions from the host via API, then execs into the agent
+/// container to run `opencode attach`. No injected scripts needed.
+async fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
+    let agent_container = format!("{}-agent", pod_name);
 
     tracing::info!("Attaching to agent in '{}'...", strip_pod_prefix(pod_name));
 
-    let mut cmd = podman_command();
-    cmd.args(["exec", "-it", &container]);
+    // Determine session ID: use provided, or auto-detect root session
+    let session_id = match session {
+        Some(s) => Some(s.to_string()),
+        None => {
+            // Try to find root session via API
+            match find_root_session(pod_name).await {
+                Ok(Some(id)) => {
+                    tracing::info!("Continuing session: {}", &id[..id.len().min(20)]);
+                    Some(id)
+                }
+                Ok(None) => {
+                    tracing::debug!("No existing session found, starting fresh");
+                    None
+                }
+                Err(e) => {
+                    // API access failed, proceed without session
+                    // This handles older pods without published API
+                    tracing::debug!("Could not query sessions: {}", e);
+                    None
+                }
+            }
+        }
+    };
 
-    // Build the opencode-connect command with optional session
-    if let Some(session_id) = session {
-        cmd.args(["opencode-connect", "-s", session_id]);
+    // Exec into agent container and run opencode attach
+    // The agent container has opencode installed and can reach localhost:4096
+    let mut cmd = podman_command();
+    cmd.args(["exec", "-it", &agent_container]);
+
+    // Build opencode attach command
+    let agent_url = format!("http://localhost:{}", pod::OPENCODE_PORT);
+    if let Some(ref sid) = session_id {
+        cmd.args(["opencode", "attach", &agent_url, "-s", sid]);
     } else {
-        cmd.arg("opencode-connect");
+        cmd.args(["opencode", "attach", &agent_url]);
     }
 
     let status = cmd.status().context("Failed to run podman exec")?;
@@ -2924,7 +3030,86 @@ async fn cmd_opencode(pod_name: &str, action: OpencodeAction) -> Result<()> {
     }
 }
 
+/// Find the root session ID for a pod
+///
+/// The root session is the main task session (no parent).
+/// This is used for seamless handoff from autonomous to interactive mode.
+async fn find_root_session(pod_name: &str) -> Result<Option<String>> {
+    let sessions = opencode_api_get_authenticated(pod_name, "/session").await?;
+
+    let sessions = sessions
+        .as_array()
+        .ok_or_else(|| color_eyre::eyre::eyre!("Expected array of sessions"))?;
+
+    // Find sessions without a parent (root sessions)
+    let root_sessions: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.get("parentID").is_none() || s["parentID"].is_null())
+        .collect();
+
+    if root_sessions.is_empty() {
+        return Ok(None);
+    }
+
+    // Sort by creation time and pick the oldest
+    let root = root_sessions
+        .iter()
+        .min_by_key(|s| {
+            s.get("time")
+                .and_then(|t| t.get("created"))
+                .and_then(|c| c.as_i64())
+                .unwrap_or(i64::MAX)
+        })
+        .and_then(|s| s.get("id"))
+        .and_then(|id| id.as_str())
+        .map(|s| s.to_string());
+
+    Ok(root)
+}
+
+/// Call the opencode API from the host using HTTP with Basic Auth
+///
+/// This uses the published port and password stored in pod labels.
+/// Falls back to exec-based approach if credentials aren't available
+/// (for pods created before this feature was added).
+async fn opencode_api_get_authenticated(
+    pod_name: &str,
+    path: &str,
+) -> Result<serde_json::Value> {
+    // Try to get credentials for authenticated access
+    match pod::get_api_credentials(pod_name) {
+        Ok(creds) => {
+            let url = format!("http://127.0.0.1:{}{}", creds.port, path);
+            let client = reqwest::Client::new();
+            let resp = client
+                .get(&url)
+                .basic_auth("opencode", Some(&creds.password))
+                .send()
+                .await
+                .with_context(|| format!("Failed to connect to opencode API at {}", url))?;
+
+            if !resp.status().is_success() {
+                bail!(
+                    "API request to {} failed with status {}",
+                    path,
+                    resp.status()
+                );
+            }
+
+            resp.json()
+                .await
+                .with_context(|| format!("Failed to parse JSON response from {}", path))
+        }
+        Err(_) => {
+            // Fall back to exec-based approach for older pods
+            tracing::debug!("Falling back to exec-based API access (no credentials found)");
+            opencode_api_get(pod_name, path)
+        }
+    }
+}
+
 /// Execute a curl command in the workspace container and return the output
+/// (Legacy approach for pods without published API)
 fn opencode_api_get(pod_name: &str, path: &str) -> Result<serde_json::Value> {
     let workspace_container = format!("{}-workspace", pod_name);
     let url = format!("http://localhost:{}{}", pod::OPENCODE_PORT, path);

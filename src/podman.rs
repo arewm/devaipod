@@ -681,13 +681,27 @@ impl PodmanService {
     /// doesn't have native support, so we shell out for pod operations.
     ///
     /// Labels can be provided as key-value pairs to attach metadata to the pod.
-    pub async fn create_pod(&self, name: &str, labels: &[(String, String)]) -> Result<String> {
+    ///
+    /// The `publish_ports` parameter allows publishing container ports to the host.
+    /// Format: "host_ip:host_port:container_port" or "host_ip::container_port" for random host port.
+    /// Example: "127.0.0.1::4096" publishes container port 4096 to a random localhost port.
+    pub async fn create_pod(
+        &self,
+        name: &str,
+        labels: &[(String, String)],
+        publish_ports: &[String],
+    ) -> Result<String> {
         let mut cmd = self.podman_command();
         cmd.args(["pod", "create", "--name", name]);
 
         // Add labels
         for (key, value) in labels {
             cmd.args(["--label", &format!("{}={}", key, value)]);
+        }
+
+        // Add port publishing
+        for port in publish_ports {
+            cmd.args(["-p", port]);
         }
 
         let output = cmd.output().await.context("Failed to create pod")?;
