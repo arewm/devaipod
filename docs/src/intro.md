@@ -17,7 +17,7 @@ devaipod uses podman pods to create a multi-container environment:
 1. Parses your project's `devcontainer.json` to determine the image
 2. Creates a podman pod with shared network namespace
 3. Starts containers:
-   - **workspace**: Your development environment with `oc` and `opencode-agent` shims
+   - **workspace**: Your development environment with `opencode-connect` shim
    - **agent**: Runs `opencode serve` with security restrictions (dropped capabilities, no-new-privileges)
    - **gator**: The [service-gator](https://github.com/cgwalters/service-gator) MCP server for controlled access to GitHub/JIRA
 
@@ -30,7 +30,7 @@ flowchart LR
         agent[Agent]
         gator[Gator]
     end
-    workspace -->|oc :4096| agent
+    workspace -->|attach :4096| agent
     agent -->|MCP :8765| gator
     gator -->|scoped| github[GitHub API]
 ```
@@ -41,7 +41,7 @@ flowchart LR
 - **Sandboxed agent** - agent container runs with dropped capabilities, no-new-privileges
 - **Task kickoff** - give the agent a task and it starts working immediately
 - **Auto service-gator** - remote URLs automatically get read + draft PR permissions
-- **Workspace shims** - `oc` and `opencode-agent` commands run `opencode attach http://localhost:4096`
+- **Workspace shim** - `opencode-connect` runs `opencode attach` to connect to the agent
 - **API keys from environment** - agent receives `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.
 - **Network isolation** - optionally restrict agent to allowed LLM API domains via proxy
 - **Env allowlist** - per-project env vars in devcontainer.json customizations

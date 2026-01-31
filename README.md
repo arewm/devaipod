@@ -48,7 +48,7 @@ devaipod uses podman pods to create a multi-container environment:
 │  │ Workspace Container │  │ Agent Container     │                 │
 │  │ • Full dev env      │  │ • opencode serve    │                 │
 │  │ • Has GH_TOKEN      │  │ • Dropped caps      │                 │
-│  │ • 'oc' shim         │  │ • No GH_TOKEN       │                 │
+│  │ • opencode-connect  │  │ • No GH_TOKEN       │                 │
 │  └─────────────────────┘  └─────────────────────┘                 │
 │           │                         │                              │
 │           └─────────────────────────┘                              │

@@ -46,7 +46,7 @@ flowchart TB
 - Runs your devcontainer image with full privileges
 - Has access to your dotfiles, credentials, and environment
 - Can run privileged operations (build, test, deploy)
-- Contains `oc` and `opencode-agent` shims that connect to the agent
+- Contains `opencode-connect` shim that connects to the agent
 
 ### Agent Container
 - Same devcontainer image, but with restrictions:

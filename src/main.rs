@@ -247,22 +247,37 @@ enum HostCommand {
         opts: UpOptions,
     },
 
-    /// SSH into a workspace
+    /// Attach to the AI agent in a workspace
     ///
-    /// By default, shows the workspace monitor which displays agent status.
-    /// Press Ctrl-C to drop to an interactive shell, or pass a command directly.
+    /// Connects to the running opencode agent, automatically continuing any
+    /// existing session. This is the primary way to interact with an agent
+    /// started via `devaipod run`.
     ///
     /// Examples:
-    ///   devaipod ssh myworkspace           # Show agent monitor (Ctrl-C for shell)
-    ///   devaipod ssh myworkspace bash      # Go directly to shell
+    ///   devaipod attach myworkspace              # Connect to agent
+    ///   devaipod attach myworkspace -s abc123    # Connect to specific session
+    Attach {
+        /// Workspace name (devaipod- prefix optional)
+        workspace: String,
+        /// Session ID to attach to (default: auto-detect existing session)
+        #[arg(short, long)]
+        session: Option<String>,
+    },
+    /// SSH into a workspace shell
+    ///
+    /// Opens an interactive shell in the workspace container. Use this for
+    /// manual development work or to run commands directly.
+    ///
+    /// Examples:
+    ///   devaipod ssh myworkspace           # Interactive shell
     ///   devaipod ssh myworkspace -- ls -la # Run a specific command
     Ssh {
         /// Workspace name (devaipod- prefix optional)
         workspace: String,
         /// Stdio mode: pipe stdin/stdout for ProxyCommand use (VSCode/Zed remote dev)
-        #[arg(long)]
+        #[arg(long, hide = true)]
         stdio: bool,
-        /// Command to run instead of the monitor (e.g., 'bash' for direct shell)
+        /// Command to run (default: bash)
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -621,6 +636,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
     match cli.command {
         HostCommand::Up { source, opts } => cmd_up(&config, &source, opts).await,
 
+        HostCommand::Attach { workspace, session } => {
+            cmd_attach(&normalize_pod_name(&workspace), session.as_deref())
+        }
         HostCommand::Ssh {
             workspace,
             stdio,
@@ -1562,6 +1580,40 @@ fn podman_command() -> ProcessCommand {
     }
 }
 
+/// Attach to the AI agent in a workspace
+///
+/// Runs `opencode-connect` inside the workspace container to connect to the agent.
+/// This auto-detects existing sessions for seamless handoff from autonomous to interactive mode.
+fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
+    let container = format!("{}-workspace", pod_name);
+
+    tracing::info!("Attaching to agent in '{}'...", strip_pod_prefix(pod_name));
+
+    let mut cmd = podman_command();
+    cmd.args(["exec", "-it", &container]);
+
+    // Build the opencode-connect command with optional session
+    if let Some(session_id) = session {
+        cmd.args(["opencode-connect", "-s", session_id]);
+    } else {
+        cmd.arg("opencode-connect");
+    }
+
+    let status = cmd.status().context("Failed to run podman exec")?;
+
+    if !status.success() {
+        bail!(
+            "Failed to attach to agent in '{}' (exit code {:?}). \
+             The container may not exist or is not running. \
+             Run 'devaipod list' to see available pods.",
+            pod_name,
+            status.code()
+        );
+    }
+
+    Ok(())
+}
+
 /// SSH into workspace using podman exec
 fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
     let container = format!("{}-workspace", pod_name);
@@ -1573,12 +1625,7 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         cmd.args(["exec", "-i", &container]);
 
         if command.is_empty() {
-            // Default to workspace monitor (Ctrl-C drops to shell), with fallback if unavailable
-            cmd.args([
-                "/bin/sh",
-                "-c",
-                "if command -v python3 >/dev/null && [ -f /opt/devaipod/scripts/workspace_monitor.py ]; then exec python3 /opt/devaipod/scripts/workspace_monitor.py; else echo 'Monitor not available, dropping to shell'; exec bash; fi",
-            ]);
+            cmd.arg("bash");
         } else {
             cmd.args(command);
         }
@@ -1602,12 +1649,7 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         cmd.args(["exec", "-it", &container]);
 
         if command.is_empty() {
-            // Default to workspace monitor (Ctrl-C drops to shell), with fallback if unavailable
-            cmd.args([
-                "/bin/sh",
-                "-c",
-                "if command -v python3 >/dev/null && [ -f /opt/devaipod/scripts/workspace_monitor.py ]; then exec python3 /opt/devaipod/scripts/workspace_monitor.py; else echo 'Monitor not available, dropping to shell'; exec bash; fi",
-            ]);
+            cmd.arg("bash");
         } else {
             cmd.args(command);
         }

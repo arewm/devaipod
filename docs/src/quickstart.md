@@ -14,24 +14,9 @@ cargo install --path .
 devaipod init
 ```
 
-## Example 1: Interactive workspace with agent on standby
+## Example 1: Automated task execution
 
-Start a pod for a local project. An agent will be available but waits for your instructions:
-
-```bash
-devaipod up /path/to/your/project
-# After pod is ready, SSH in:
-devaipod ssh myproject-abc123        # Shows agent monitor
-# Or go straight to shell:
-devaipod ssh myproject-abc123 bash
-opencode-connect                     # Connect to agent from inside the pod
-```
-
-This allows you complete control over when and how the agent works.
-
-## Example 2: Automated task execution
-
-For more automation, use `run` which prompts for a task and starts the agent immediately. Service-gator is auto-configured with read + draft PR permissions.
+The recommended default is to use `run` which prompts for a task and starts the agent immediately. Service-gator is auto-configured with read + draft PR permissions.
 
 ```bash
 # Interactive prompt for task:
@@ -44,14 +29,16 @@ devaipod run https://github.com/org/repo -c 'fix typos in README.md'
 devaipod run https://github.com/org/repo/issues/123
 ```
 
-Monitor progress with `devaipod ssh <workspace>` which shows the agent monitor. Press Ctrl-C to drop to an interactive shell where you can interrupt or guide the agent.
+Monitor progress with `devaipod attach <workspace>` which connects to the agent.
+
+See below for other verbs.
 
 ## Automatic Service-gator for Remote URLs
 
 When you start a pod from a remote URL (GitHub repo or PR), devaipod automatically enables [service-gator](https://github.com/cgwalters/service-gator) with **read + draft PR** permissions for that repository. This means the agent can:
 
 - Read repository contents, issues, and PRs
-- Create **draft** pull requests (not regular PRs)
+- Create **draft** pull requests
 
 This is a safe default: the agent can propose changes via draft PRs, but a human must review and mark them ready before they can be merged. No additional configuration needed.
 
@@ -61,6 +48,19 @@ devaipod up https://github.com/org/repo 'implement feature X'
 ```
 
 To grant additional permissions or configure for local repos, see the [Security](sandboxing.md) section.
+
+## Example 2: Manual control
+
+You can also use `devaipod` as a basic wrapper for a devcontainer with an attached
+agent that is idle by default.
+
+```bash
+devaipod up https://github.com/org/repo
+# Attach to the agent when ready
+devaipod attach <workspace>
+# Or get a shell for manual work
+devaipod ssh <workspace>
+```
 
 ## Next Steps
 

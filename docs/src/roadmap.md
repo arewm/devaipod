@@ -12,8 +12,8 @@ Complete native podman implementation:
   core workflow
 - **Podman-native multi-container pods**: Workspace, agent, and gator containers
   share a pod with localhost networking between them
-- **Workspace shims**: `oc` and `opencode-agent` commands in workspace run
-  `opencode attach http://localhost:4096` to connect to sandboxed agent
+- **Workspace shim**: `opencode-connect` in workspace runs `opencode attach`
+  to connect to sandboxed agent
 - **API key passthrough**: Agent container receives LLM API keys from host
   environment (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.)
 - **Devcontainer.json parsing**: Image/build config, lifecycle commands
@@ -39,6 +39,11 @@ Complete native podman implementation:
 
 Making devaipod reliable for daily use:
 
+- **Agent completion detection**: For `run` mode, detect when the agent reaches
+  idle state and has completed its task. Options include MCP tool callback,
+  ping-on-idle pattern, or automatic pod stop on completion.
+- **Git state awareness**: Detect and warn about unpushed commits in the
+  workspace. Make it clear when local work hasn't been pushed to remote.
 - **SSH server for editor connections**: VSCode/Zed Remote SSH needs an actual
   SSH server in the container. Current `ssh-config` generates ProxyCommand but
   containers lack sshd. Options:
@@ -76,6 +81,11 @@ Running devaipod workloads on Kubernetes clusters:
 
 Nice-to-have functionality:
 
+- **Dynamic service-gator control**: CLI command to add/modify service-gator
+  scopes at runtime: `devaipod service-gator add <pod> <url>` with fine-grained
+  permission controls.
+- **Nested devaipods**: MCP tool allowing agents to spawn additional sandboxed
+  devaipod environments for complex multi-step tasks.
 - **Devcontainer features support**: Install devcontainer features into the
   workspace image. This is complex - features are essentially scripts that
   modify the image at build time.
@@ -86,6 +96,8 @@ Nice-to-have functionality:
 - **Full service-gator integration**: Tighter integration with service-gator
   for scoped external access - automatically configure MCP based on repository
   and user permissions.
+- **Local caching**: Forgejo instance as local git cache, container image
+  caching with reflinks for nested devenv scenarios.
 
 ## Known Limitations
 

@@ -31,17 +31,17 @@ OpenCode is configured via `~/.config/opencode/opencode.json`. Set this up in yo
 ## Usage with devaipod
 
 ```bash
-# Create workspace and SSH in
+# Create workspace and get a shell
 devaipod up /path/to/project -S
-# Then run 'oc' inside the workspace to connect to the agent
+# Then run 'opencode-connect' inside the workspace to connect to the agent
 
 # Create workspace with a task for the agent
 devaipod up . "fix the type errors in main.rs"
 
-# Run agent on a GitHub issue
-devaipod run --issue https://github.com/org/repo/issues/123
+# Run agent on a GitHub issue (issue URL is parsed, default task: "Fix <url>")
+devaipod run https://github.com/org/repo/issues/123
 
-# Attach to a running agent's tmux session
+# Attach to the agent in a running workspace
 devaipod attach myworkspace
 ```
 
@@ -56,16 +56,16 @@ devaipod uses a podman pod with multiple containers:
 │  ┌─────────────────────┐  ┌─────────────────────┐                 │
 │  │ Workspace Container │  │ Agent Container     │                 │
 │  │ • Full dev env      │  │ • opencode serve    │                 │
-│  │ • 'oc' shim         │  │ • Port 4096         │                 │
+│  │ • opencode-connect  │  │ • Port 4096         │                 │
 │  │ • Your dotfiles     │  │ • Isolated $HOME    │                 │
 │  └─────────────────────┘  └─────────────────────┘                 │
 │                                      │                             │
-│         'oc' ──────────────────────→ │ (localhost:4096)            │
+│      attach ──────────────────────→ │ (localhost:4096)            │
 │                                                                    │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-The workspace container has an `oc` shim that runs `opencode attach http://localhost:4096` to connect to the sandboxed agent. All containers share the same network namespace via the pod.
+The workspace container has an `opencode-connect` shim that runs `opencode attach` to connect to the sandboxed agent, automatically continuing any existing session. All containers share the same network namespace via the pod.
 
 ## Agent Support
 

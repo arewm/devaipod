@@ -10,22 +10,29 @@ devaipod init                     # Interactive setup wizard for API keys & toke
 
 ```bash
 devaipod up .                     # Create pod with workspace + agent containers
-devaipod up . -S                  # Create and SSH into workspace
+devaipod up . -S                  # Create and SSH into workspace shell
 devaipod up . "fix the bug"       # Create with task description for agent
 devaipod list                     # List devaipod workspaces
 devaipod status myworkspace       # Show detailed status of a pod
 devaipod debug myworkspace        # Diagnose issues (mounts, connectivity, etc.)
-devaipod logs myworkspace         # View container logs (-c agent for agent logs)
+devaipod logs myworkspace         # View agent logs (default container)
+devaipod logs myworkspace -c workspace  # View workspace container logs
+devaipod logs myworkspace -f      # Follow log output
 devaipod stop myworkspace         # Stop a pod
 devaipod delete myworkspace       # Delete a pod
+devaipod delete myworkspace -f    # Force delete (stops first)
+devaipod rebuild myworkspace      # Rebuild with new/updated image
+devaipod rebuild myworkspace --image ghcr.io/org/dev:latest  # Use specific image
 devaipod up . --dry-run           # Show what would be created
 ```
 
 ## Connecting to workspaces
 
 ```bash
-devaipod ssh myworkspace          # SSH into workspace (shows agent monitor)
-devaipod ssh myworkspace bash     # SSH directly to shell
+devaipod attach myworkspace       # Connect to the AI agent (auto-continues session)
+devaipod attach myworkspace -s ID # Connect to specific session
+devaipod ssh myworkspace          # Open shell in workspace container
+devaipod ssh myworkspace -- ls -la  # Run a specific command
 devaipod ssh-config myworkspace   # Generate SSH config for editor integration
 ```
 
@@ -64,6 +71,27 @@ devaipod completions fish         # Generate fish completions
 ```
 
 Note: The `devaipod-` prefix is optional for workspace names.
+
+## Global flags
+
+```bash
+devaipod -v ...                   # Verbose output (debug logging)
+devaipod -q ...                   # Quiet mode (warnings and errors only)
+devaipod --config /path/to/config.toml ...  # Use custom config file
+```
+
+## Additional options
+
+```bash
+# Explicit pod naming (useful for CI/CD)
+devaipod up . --name my-ci-run
+devaipod run https://github.com/org/repo --name pr-123-fix
+
+# JSON output for scripting
+devaipod list --json
+devaipod status myworkspace --json
+devaipod debug myworkspace --json
+```
 
 ## Editor Integration (WIP)
 
