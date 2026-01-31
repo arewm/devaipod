@@ -21,9 +21,9 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Paragraph, TableState};
 use ratatui::Terminal;
 use tokio::time::interval;
 
@@ -106,7 +106,7 @@ fn build_cache(instances: &[InstanceInfo]) -> TuiStateCache {
         .iter()
         .filter_map(|i| {
             // Only cache instances that have some fetched state
-            if i.git_state.is_some() || i.agent_state != AgentState::default() {
+            if i.git_state.is_some() || i.agent_state.activity != AgentActivity::default() {
                 Some((
                     i.name.clone(),
                     CachedInstanceState {
@@ -136,7 +136,7 @@ const GIT_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(10);
 
 /// Agent activity state (idle, working, etc.)
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum AgentState {
+pub enum AgentActivity {
     /// Agent is running but waiting for input
     Idle,
     /// Agent is actively processing a task
@@ -146,6 +146,19 @@ pub enum AgentState {
     Stopped,
     /// Could not determine agent state (API error, etc.)
     Unknown,
+}
+
+/// Rich agent state including activity and recent output
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AgentState {
+    /// Current activity level
+    pub activity: AgentActivity,
+    /// Recent output lines from the agent (last 3-4 lines)
+    pub recent_output: Vec<String>,
+    /// Current tool being used (if any)
+    pub current_tool: Option<String>,
+    /// Brief summary of what agent is doing
+    pub status_line: Option<String>,
 }
 
 /// Git repository state
@@ -215,6 +228,10 @@ pub struct InstanceInfo {
     pub api_password: Option<String>,
     /// Published host port for the opencode API
     pub api_port: Option<u16>,
+    /// Whether service-gator container is running
+    pub gator_healthy: Option<bool>,
+    /// Service-gator scopes (from pod labels)
+    pub gator_scopes: Option<String>,
 }
 
 /// Mode of the TUI (normal browsing vs delete selection)
@@ -451,9 +468,21 @@ impl App {
                             .and_then(|c| c.instances.get(&short_name))
                             .and_then(|cached| cached.agent_state.clone().map(|s| (s, None)))
                     })
-                    .unwrap_or((AgentState::Unknown, None))
+                    .unwrap_or((
+                        AgentState {
+                            activity: AgentActivity::Unknown,
+                            ..Default::default()
+                        },
+                        None,
+                    ))
             } else {
-                (AgentState::Stopped, None)
+                (
+                    AgentState {
+                        activity: AgentActivity::Stopped,
+                        ..Default::default()
+                    },
+                    None,
+                )
             };
 
             // Extract API password from labels (stored on workspace container)
@@ -470,8 +499,8 @@ impl App {
             let api_port = agent_container.and_then(|c| {
                 c.ports.as_ref().and_then(|ports| {
                     ports.iter().find_map(|p| {
-                        // Looking for the port mapped from container port 4096
-                        if p.private_port == 4096 {
+                        // Looking for the auth proxy port (4097) which is published to host
+                        if p.private_port == crate::pod::OPENCODE_AUTH_PROXY_PORT {
                             p.public_port
                         } else {
                             None
@@ -479,6 +508,19 @@ impl App {
                     })
                 })
             });
+
+            // Check service-gator health
+            let gator_healthy = containers.iter().any(|c| {
+                c.names.as_ref().is_some_and(|n| {
+                    n.iter()
+                        .any(|name| name.ends_with("-gator") || name.ends_with("-service-gator"))
+                }) && c.state.as_deref() == Some("running")
+            });
+
+            // Get service-gator scopes from labels
+            let gator_scopes = labels
+                .and_then(|l| l.get("io.devaipod.service-gator"))
+                .cloned();
 
             instances.push(InstanceInfo {
                 name: short_name,
@@ -497,6 +539,8 @@ impl App {
                 last_agent_refresh,
                 api_password,
                 api_port,
+                gator_healthy: Some(gator_healthy),
+                gator_scopes,
             });
         }
 
@@ -696,23 +740,38 @@ async fn fetch_git_state(
     .await;
     let dirty = status_output.as_ref().is_some_and(|s| !s.is_empty());
 
-    // Get ahead/behind counts
+    // Get ahead/behind counts - use tracking branch or fall back to origin/main
     let (ahead, behind) = if let Some(ref branch_name) = branch {
-        let upstream = format!("origin/{}", branch_name);
+        // Use @{upstream} which git resolves to the tracking branch, or try origin/main
         let rev_list = git_exec(
             docker,
             container_name,
             &repo_dir,
-            &[
-                "rev-list",
-                "--left-right",
-                "--count",
-                &format!("{}...{}", branch_name, upstream),
-            ],
+            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
         )
-        .await;
+        .await
+        .filter(|s| !s.contains("fatal") && !s.contains("error"));
 
-        if let Some(counts) = rev_list {
+        // Fall back to origin/main if no upstream configured
+        let counts = if rev_list.is_some() {
+            rev_list
+        } else {
+            git_exec(
+                docker,
+                container_name,
+                &repo_dir,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{}...origin/main", branch_name),
+                ],
+            )
+            .await
+            .filter(|s| !s.contains("fatal") && !s.contains("error"))
+        };
+
+        if let Some(counts) = counts {
             let parts: Vec<&str> = counts.split_whitespace().collect();
             if parts.len() == 2 {
                 let a = parts[0].parse().unwrap_or(0);
@@ -743,6 +802,58 @@ async fn fetch_git_state(
 /// Minimum interval between agent state refreshes for a single instance.
 const AGENT_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(3);
 
+/// Maximum number of output lines to keep per instance
+const MAX_OUTPUT_LINES: usize = 3;
+
+/// Extract text content from message parts, truncating long lines
+fn extract_text_from_parts(parts: &[serde_json::Value], max_lines: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for part in parts {
+        let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match part_type {
+            "text" => {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    // Take last few lines of text, truncate each line
+                    for line in text.lines().rev().take(max_lines) {
+                        let truncated = if line.len() > 80 {
+                            format!("{}...", &line[..77])
+                        } else {
+                            line.to_string()
+                        };
+                        if !truncated.trim().is_empty() {
+                            lines.push(truncated);
+                        }
+                        if lines.len() >= max_lines {
+                            break;
+                        }
+                    }
+                }
+            }
+            "tool" => {
+                // Extract tool name and status
+                if let Some(tool_name) = part.get("name").and_then(|n| n.as_str()) {
+                    let status = part
+                        .get("state")
+                        .and_then(|s| s.get("status"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("running");
+                    lines.push(format!("→ {}: {}", tool_name, status));
+                }
+            }
+            _ => {}
+        }
+
+        if lines.len() >= max_lines {
+            break;
+        }
+    }
+
+    lines.reverse(); // Put in chronological order
+    lines
+}
+
 /// Derive agent status (busy/idle) from session messages.
 ///
 /// This mirrors the logic from workspace_monitor.py's derive_status_from_messages().
@@ -752,7 +863,10 @@ const AGENT_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(3);
 /// - parts with type="tool" and state.status != "completed": tool in progress
 fn derive_agent_state_from_messages(messages: &[serde_json::Value]) -> AgentState {
     if messages.is_empty() {
-        return AgentState::Unknown;
+        return AgentState {
+            activity: AgentActivity::Unknown,
+            ..Default::default()
+        };
     }
 
     // Find the last assistant message
@@ -764,56 +878,111 @@ fn derive_agent_state_from_messages(messages: &[serde_json::Value]) -> AgentStat
     });
 
     let Some(last_assistant) = last_assistant else {
-        return AgentState::Unknown;
+        return AgentState {
+            activity: AgentActivity::Unknown,
+            ..Default::default()
+        };
     };
 
     let info = match last_assistant.get("info") {
         Some(i) => i,
-        None => return AgentState::Unknown,
+        None => {
+            return AgentState {
+                activity: AgentActivity::Unknown,
+                ..Default::default()
+            }
+        }
     };
 
-    // Check if message is still being processed (no completed time)
-    if info.get("time").and_then(|t| t.get("completed")).is_none() {
-        return AgentState::Working;
-    }
+    // Extract recent output from parts
+    let parts = last_assistant
+        .get("parts")
+        .and_then(|p| p.as_array())
+        .map(|arr| arr.as_slice())
+        .unwrap_or(&[]);
+    let recent_output = extract_text_from_parts(parts, MAX_OUTPUT_LINES);
 
-    // Check if there are any incomplete tool calls in parts
-    if let Some(parts) = last_assistant.get("parts").and_then(|p| p.as_array()) {
-        for part in parts {
+    // Extract current tool if any is running
+    let current_tool = parts.iter().find_map(|part| {
+        if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
+            let status = part
+                .get("state")
+                .and_then(|s| s.get("status"))
+                .and_then(|s| s.as_str());
+            if status != Some("completed") && status != Some("error") {
+                return part.get("name").and_then(|n| n.as_str()).map(String::from);
+            }
+        }
+        None
+    });
+
+    // Build status line from first text part
+    let status_line = parts.iter().find_map(|part| {
+        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+            part.get("text").and_then(|t| t.as_str()).map(|text| {
+                let first_line = text.lines().next().unwrap_or("");
+                if first_line.len() > 60 {
+                    format!("{}...", &first_line[..57])
+                } else {
+                    first_line.to_string()
+                }
+            })
+        } else {
+            None
+        }
+    });
+
+    // Determine activity level
+    let activity = if info.get("time").and_then(|t| t.get("completed")).is_none() {
+        AgentActivity::Working
+    } else {
+        // Check if there are any incomplete tool calls
+        let has_incomplete_tool = parts.iter().any(|part| {
             if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
                 let status = part
                     .get("state")
                     .and_then(|s| s.get("status"))
                     .and_then(|s| s.as_str());
-                if status != Some("completed") && status != Some("error") {
-                    return AgentState::Working;
-                }
+                status != Some("completed") && status != Some("error")
+            } else {
+                false
+            }
+        });
+
+        if has_incomplete_tool {
+            AgentActivity::Working
+        } else {
+            let finish = info.get("finish").and_then(|f| f.as_str()).unwrap_or("");
+            if finish == "tool-calls" {
+                AgentActivity::Working
+            } else {
+                AgentActivity::Idle
             }
         }
-    }
+    };
 
-    // Message completed - check finish reason
-    let finish = info.get("finish").and_then(|f| f.as_str()).unwrap_or("");
-    if finish == "stop" {
-        AgentState::Idle
-    } else if finish == "tool-calls" {
-        // Agent made tool calls but those are done; waiting for next turn
-        // This is a brief transitional state
-        AgentState::Working
-    } else {
-        AgentState::Idle
+    AgentState {
+        activity,
+        recent_output,
+        current_tool,
+        status_line,
     }
 }
 
 /// Fetch agent state by querying the opencode API
 async fn fetch_agent_state(api_port: u16, api_password: &str) -> AgentState {
+    let unknown = AgentState {
+        activity: AgentActivity::Unknown,
+        ..Default::default()
+    };
+
     // Build HTTP client with timeout
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return AgentState::Unknown,
+        Err(_) => return unknown,
     };
 
     let base_url = format!("http://127.0.0.1:{}", api_port);
@@ -827,17 +996,21 @@ async fn fetch_agent_state(api_port: u16, api_password: &str) -> AgentState {
         .await
     {
         Ok(r) if r.status().is_success() => r,
-        _ => return AgentState::Unknown,
+        _ => return unknown,
     };
 
     let sessions: Vec<serde_json::Value> = match sessions_resp.json().await {
         Ok(s) => s,
-        Err(_) => return AgentState::Unknown,
+        Err(_) => return unknown,
     };
 
     if sessions.is_empty() {
         // No sessions yet - agent is idle/waiting for input
-        return AgentState::Idle;
+        return AgentState {
+            activity: AgentActivity::Idle,
+            status_line: Some("Waiting for input...".to_string()),
+            ..Default::default()
+        };
     }
 
     // Find the root session (no parent)
@@ -846,16 +1019,16 @@ async fn fetch_agent_state(api_port: u16, api_password: &str) -> AgentState {
     });
 
     let Some(root_session) = root_session else {
-        return AgentState::Unknown;
+        return unknown;
     };
 
     let session_id = match root_session.get("id").and_then(|id| id.as_str()) {
         Some(id) => id,
-        None => return AgentState::Unknown,
+        None => return unknown,
     };
 
-    // Fetch recent messages from the session
-    let messages_url = format!("{}/session/{}/message?limit=3", base_url, session_id);
+    // Fetch recent messages from the session (more messages for richer output)
+    let messages_url = format!("{}/session/{}/message?limit=5", base_url, session_id);
     let messages_resp = match client
         .get(&messages_url)
         .basic_auth("opencode", Some(api_password))
@@ -863,12 +1036,12 @@ async fn fetch_agent_state(api_port: u16, api_password: &str) -> AgentState {
         .await
     {
         Ok(r) if r.status().is_success() => r,
-        _ => return AgentState::Unknown,
+        _ => return unknown,
     };
 
     let messages: Vec<serde_json::Value> = match messages_resp.json().await {
         Ok(m) => m,
-        Err(_) => return AgentState::Unknown,
+        Err(_) => return unknown,
     };
 
     derive_agent_state_from_messages(&messages)
@@ -1410,160 +1583,294 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(footer, chunks[2]);
 }
 
-/// Render the instances table
-fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    // In delete mode, add a selection column
-    let in_delete_mode = matches!(app.mode, TuiMode::DeleteSelect | TuiMode::DeleteConfirm);
+/// Height of each instance card (lines)
+const CARD_HEIGHT: u16 = 5;
 
-    let header_labels: Vec<&str> = if in_delete_mode {
-        vec![
-            "SEL", "NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK",
-        ]
-    } else {
-        vec![
-            "NAME", "STATUS", "AGENT", "CREATED", "GIT", "MODE", "REPO", "TASK",
-        ]
+/// Render a single instance as a card
+fn render_instance_card(
+    instance: &InstanceInfo,
+    is_selected: bool,
+    is_marked_for_delete: bool,
+    in_delete_mode: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Line 1: Name and metadata bar
+    let status_style = match instance.status.as_str() {
+        "Running" => Style::default().fg(Color::Green),
+        "Exited" => Style::default().fg(Color::Red),
+        "Degraded" => Style::default().fg(Color::Yellow),
+        _ => Style::default(),
     };
-    let header_cells = header_labels
-        .iter()
-        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).bold()));
-    let header = Row::new(header_cells).height(1);
 
-    let selected_for_delete = &app.selected_for_delete;
-    let rows = app.instances.iter().map(|instance| {
-        let is_selected = selected_for_delete.contains(&instance.name);
-        // Status with color
-        let status_style = match instance.status.as_str() {
-            "Running" => Style::default().fg(Color::Green),
-            "Exited" => Style::default().fg(Color::Red),
-            "Degraded" => Style::default().fg(Color::Yellow),
-            _ => Style::default(),
-        };
+    let mode = instance.mode.clone().unwrap_or_else(|| "-".to_string());
+    let mode_style = match mode.as_str() {
+        "run" => Style::default().fg(Color::Magenta).bold(),
+        "up" => Style::default().fg(Color::Blue),
+        _ => Style::default().fg(Color::DarkGray),
+    };
 
-        let status_text = instance.status.clone();
+    // Git state
+    let git_text = match &instance.git_state {
+        Some(state) => state.summary.clone(),
+        None if instance.status == "Running" => "...".to_string(),
+        None => "-".to_string(),
+    };
+    let git_style = match &instance.git_state {
+        Some(state) if state.dirty => Style::default().fg(Color::Yellow),
+        Some(state) if state.ahead > 0 || state.behind > 0 => Style::default().fg(Color::Cyan),
+        Some(_) => Style::default().fg(Color::Green),
+        None => Style::default().fg(Color::DarkGray),
+    };
 
-        // Agent state with color coding
-        let (agent_text, agent_style) = match &instance.agent_state {
-            AgentState::Working => ("working", Style::default().fg(Color::Green)),
-            AgentState::Idle => ("idle", Style::default().fg(Color::Blue)),
-            AgentState::Stopped => ("stopped", Style::default().fg(Color::DarkGray)),
-            AgentState::Unknown => {
-                if instance.status == "Running" && instance.agent_healthy == Some(true) {
-                    // Still loading
-                    ("...", Style::default().fg(Color::DarkGray))
-                } else {
-                    ("-", Style::default().fg(Color::DarkGray))
-                }
-            }
-        };
-
-        // Git state with color coding
-        let (git_text, git_style) = match &instance.git_state {
-            Some(state) => {
-                let style = if state.dirty {
-                    Style::default().fg(Color::Yellow)
-                } else if state.ahead > 0 || state.behind > 0 {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default().fg(Color::Green)
-                };
-                (state.summary.clone(), style)
-            }
-            None if instance.status == "Running" => {
-                // Still loading
-                ("...".to_string(), Style::default().fg(Color::DarkGray))
-            }
-            None => ("-".to_string(), Style::default().fg(Color::DarkGray)),
-        };
-
-        // Truncate task to fit
-        let task = instance
-            .task
-            .as_deref()
-            .unwrap_or("-")
-            .chars()
-            .take(25)
-            .collect::<String>();
-
-        let task = if instance.task.as_ref().is_some_and(|t| t.len() > 25) {
-            format!("{}...", task)
+    // Selection indicator for delete mode
+    let prefix: Span<'static> = if in_delete_mode {
+        if is_marked_for_delete {
+            Span::styled("[x] ".to_string(), Style::default().fg(Color::Red).bold())
         } else {
-            task
-        };
+            Span::styled("[ ] ".to_string(), Style::default().fg(Color::DarkGray))
+        }
+    } else if is_selected {
+        Span::styled("▶ ".to_string(), Style::default().fg(Color::Cyan).bold())
+    } else {
+        Span::raw("  ".to_string())
+    };
 
-        // Truncate repo (remove common prefixes)
-        let repo = instance
-            .repo
-            .as_deref()
-            .map(|r| {
-                r.strip_prefix("https://")
-                    .or_else(|| r.strip_prefix("git@"))
-                    .unwrap_or(r)
-            })
-            .unwrap_or("-");
+    // Truncate repo
+    let repo = instance
+        .repo
+        .as_deref()
+        .map(|r| {
+            r.strip_prefix("https://")
+                .or_else(|| r.strip_prefix("git@"))
+                .unwrap_or(r)
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_string());
 
-        let mut cells = Vec::new();
+    // Created timestamp (short format)
+    let created = instance.created.as_deref().unwrap_or("-").to_string();
 
-        // Selection column in delete mode
-        if in_delete_mode {
-            let sel_text = if is_selected { "[x]" } else { "[ ]" };
-            let sel_style = if is_selected {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    lines.push(Line::from(vec![
+        prefix,
+        Span::styled(
+            instance.name.clone(),
+            Style::default().bold().fg(if is_selected {
+                Color::White
             } else {
-                Style::default().fg(Color::DarkGray)
+                Color::Reset
+            }),
+        ),
+        Span::raw(" │ ".to_string()),
+        Span::styled(instance.status.clone(), status_style),
+        Span::raw(" │ ".to_string()),
+        Span::styled(mode, mode_style),
+        Span::raw(" │ ".to_string()),
+        Span::styled(git_text, git_style),
+        Span::raw(" │ ".to_string()),
+        Span::styled(created, Style::default().fg(Color::DarkGray)),
+    ]));
+
+    // Line 2-4: Agent output (varies by mode)
+    let is_run_mode = instance.mode.as_deref() == Some("run");
+    let show_active_output =
+        is_run_mode && matches!(instance.agent_state.activity, AgentActivity::Working);
+
+    // Activity indicator
+    let (activity_icon, activity_style): (String, Style) = match instance.agent_state.activity {
+        AgentActivity::Working => ("●".to_string(), Style::default().fg(Color::Green)),
+        AgentActivity::Idle => ("○".to_string(), Style::default().fg(Color::Blue)),
+        AgentActivity::Stopped => ("◌".to_string(), Style::default().fg(Color::DarkGray)),
+        AgentActivity::Unknown => {
+            if instance.status == "Running" && instance.agent_healthy == Some(true) {
+                ("…".to_string(), Style::default().fg(Color::DarkGray))
+            } else {
+                ("◌".to_string(), Style::default().fg(Color::DarkGray))
+            }
+        }
+    };
+
+    let activity_label: String = match instance.agent_state.activity {
+        AgentActivity::Working => "working".to_string(),
+        AgentActivity::Idle => "idle".to_string(),
+        AgentActivity::Stopped => "stopped".to_string(),
+        AgentActivity::Unknown => {
+            if instance.status == "Running" {
+                "loading".to_string()
+            } else {
+                "stopped".to_string()
+            }
+        }
+    };
+
+    // Line 2: Agent activity status - prefer task description, then agent status
+    let status_line = instance
+        .agent_state
+        .status_line
+        .clone()
+        .or_else(|| instance.task.clone())
+        .unwrap_or_else(|| {
+            if is_run_mode {
+                match instance.agent_state.activity {
+                    AgentActivity::Working => "Processing...".to_string(),
+                    AgentActivity::Idle => "Waiting for next task".to_string(),
+                    AgentActivity::Stopped => "Agent stopped".to_string(),
+                    AgentActivity::Unknown => String::new(),
+                }
+            } else {
+                // 'up' mode - show as available for attach
+                "Ready for attach".to_string()
+            }
+        });
+
+    // Truncate status line to available width
+    let max_status_len = width.saturating_sub(20) as usize;
+    let truncated_status = if status_line.len() > max_status_len && max_status_len > 3 {
+        format!("{}...", &status_line[..max_status_len.saturating_sub(3)])
+    } else {
+        status_line
+    };
+
+    lines.push(Line::from(vec![
+        Span::raw("  ".to_string()),
+        Span::styled(activity_icon, activity_style),
+        Span::raw(" ".to_string()),
+        Span::styled(activity_label, activity_style),
+        Span::raw(": ".to_string()),
+        Span::styled(truncated_status, Style::default().fg(Color::White)),
+    ]));
+
+    // Line 3: Repo + gator info
+    let gator_indicator = match instance.gator_healthy {
+        Some(true) => "🔐".to_string(),
+        Some(false) => "⚠".to_string(),
+        None => String::new(),
+    };
+    let gator_scopes_short = instance
+        .gator_scopes
+        .as_ref()
+        .map(|s| {
+            // Parse scopes like "--gh-repo user/repo:read" -> "gh:user/repo"
+            s.split_whitespace()
+                .filter_map(|part| {
+                    if part.starts_with("--gh-repo") || part.starts_with("--github-repo") {
+                        None // skip the flag itself
+                    } else if part.contains(':') {
+                        // This is a repo:perms spec
+                        let repo_part = part.split(':').next().unwrap_or(part);
+                        Some(format!("gh:{}", repo_part))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|s| !s.is_empty());
+
+    if !repo.is_empty() && repo != "-" {
+        let mut spans = vec![
+            Span::raw("    ".to_string()),
+            Span::styled(repo, Style::default().fg(Color::DarkGray)),
+        ];
+        if !gator_indicator.is_empty() {
+            spans.push(Span::raw(" ".to_string()));
+            spans.push(Span::styled(
+                gator_indicator,
+                if instance.gator_healthy == Some(true) {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
+            ));
+            if let Some(ref scopes) = gator_scopes_short {
+                spans.push(Span::raw(" ".to_string()));
+                spans.push(Span::styled(
+                    scopes.clone(),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Lines 4-5: Recent output or tool info (only for active run mode)
+    if show_active_output && !instance.agent_state.recent_output.is_empty() {
+        for output_line in instance.agent_state.recent_output.iter().take(2) {
+            let max_len = width.saturating_sub(6) as usize;
+            let truncated = if output_line.len() > max_len && max_len > 3 {
+                format!("{}...", &output_line[..max_len.saturating_sub(3)])
+            } else {
+                output_line.clone()
             };
-            cells.push(Cell::from(sel_text).style(sel_style));
+            lines.push(Line::from(vec![
+                Span::raw("    ".to_string()),
+                Span::styled(truncated, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    } else if let Some(ref tool) = instance.agent_state.current_tool {
+        lines.push(Line::from(vec![
+            Span::raw("    ".to_string()),
+            Span::styled("→ ".to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(tool.clone(), Style::default().fg(Color::Yellow)),
+        ]));
+    }
+
+    // Pad to consistent height
+    while lines.len() < CARD_HEIGHT as usize {
+        lines.push(Line::from(String::new()));
+    }
+
+    lines
+}
+
+/// Render instances as cards (multi-line per instance)
+fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let in_delete_mode = matches!(app.mode, TuiMode::DeleteSelect | TuiMode::DeleteConfirm);
+    let selected_idx = app.table_state.selected();
+    let selected_for_delete = &app.selected_for_delete;
+
+    // Build card content for all instances
+    let mut all_lines: Vec<Line> = Vec::new();
+
+    for (idx, instance) in app.instances.iter().enumerate() {
+        let is_selected = selected_idx == Some(idx);
+        let is_marked = selected_for_delete.contains(&instance.name);
+
+        let card_lines =
+            render_instance_card(instance, is_selected, is_marked, in_delete_mode, area.width);
+
+        // Add separator before card (except first)
+        if idx > 0 {
+            all_lines.push(Line::from(Span::styled(
+                "─".repeat(area.width.saturating_sub(2) as usize),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
 
-        cells.extend(vec![
-            Cell::from(instance.name.clone()),
-            Cell::from(status_text).style(status_style),
-            Cell::from(agent_text).style(agent_style),
-            Cell::from(instance.created.as_deref().unwrap_or("-")),
-            Cell::from(git_text).style(git_style),
-            Cell::from(instance.mode.as_deref().unwrap_or("-")),
-            Cell::from(repo.to_string()),
-            Cell::from(task),
-        ]);
+        all_lines.extend(card_lines);
+    }
 
-        Row::new(cells)
-    });
+    // Calculate scroll offset to keep selected item visible
+    let visible_height = area.height.saturating_sub(2) as usize; // Account for borders
+    let lines_per_card = CARD_HEIGHT as usize + 1; // +1 for separator
+    let selected_card_start = selected_idx.unwrap_or(0) * lines_per_card;
 
-    let constraints: Vec<Constraint> = if in_delete_mode {
-        vec![
-            Constraint::Length(4),      // SEL
-            Constraint::Min(14),        // NAME
-            Constraint::Length(10),     // STATUS
-            Constraint::Length(8),      // AGENT
-            Constraint::Length(16),     // CREATED (YYYY-MM-DD HH:MM)
-            Constraint::Length(18),     // GIT
-            Constraint::Length(5),      // MODE
-            Constraint::Percentage(12), // REPO
-            Constraint::Percentage(16), // TASK
-        ]
+    // Simple scroll: show from selected card if it would be off-screen
+    let scroll_offset = if selected_card_start >= visible_height {
+        selected_card_start.saturating_sub(visible_height / 2)
     } else {
-        vec![
-            Constraint::Min(16),        // NAME
-            Constraint::Length(10),     // STATUS
-            Constraint::Length(8),      // AGENT
-            Constraint::Length(16),     // CREATED (YYYY-MM-DD HH:MM)
-            Constraint::Length(18),     // GIT
-            Constraint::Length(5),      // MODE
-            Constraint::Percentage(14), // REPO
-            Constraint::Percentage(18), // TASK
-        ]
+        0
     };
-    let table = Table::new(rows, constraints)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" Instances "))
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(table, area, &mut app.table_state);
+    // Apply scroll offset
+    let visible_lines: Vec<Line> = all_lines.into_iter().skip(scroll_offset).collect();
+
+    let paragraph = Paragraph::new(visible_lines)
+        .block(Block::default().borders(Borders::ALL).title(" Instances "));
+
+    frame.render_widget(paragraph, area);
 }
 
 #[cfg(test)]
@@ -1691,10 +1998,16 @@ mod tests {
                 }),
                 workspace_path: Some("/workspaces/myproject".to_string()),
                 last_git_refresh: None,
-                agent_state: AgentState::Working,
+                agent_state: AgentState {
+                    activity: AgentActivity::Working,
+                    status_line: Some("Processing request...".to_string()),
+                    ..Default::default()
+                },
                 last_agent_refresh: None,
                 api_password: None,
                 api_port: None,
+                gator_healthy: Some(true),
+                gator_scopes: Some("--gh-repo user/myproject:read".to_string()),
             },
             InstanceInfo {
                 name: "otherrepo-def456".to_string(),
@@ -1709,10 +2022,15 @@ mod tests {
                 git_state: None,
                 workspace_path: Some("/workspaces/otherrepo".to_string()),
                 last_git_refresh: None,
-                agent_state: AgentState::Stopped,
+                agent_state: AgentState {
+                    activity: AgentActivity::Stopped,
+                    ..Default::default()
+                },
                 last_agent_refresh: None,
                 api_password: None,
                 api_port: None,
+                gator_healthy: Some(false),
+                gator_scopes: None,
             },
             InstanceInfo {
                 name: "degraded-pod".to_string(),
@@ -1733,10 +2051,15 @@ mod tests {
                 }),
                 workspace_path: None,
                 last_git_refresh: None,
-                agent_state: AgentState::Idle,
+                agent_state: AgentState {
+                    activity: AgentActivity::Idle,
+                    ..Default::default()
+                },
                 last_agent_refresh: None,
                 api_password: None,
                 api_port: None,
+                gator_healthy: None,
+                gator_scopes: Some("--gh-repo org/repo:read,write".to_string()),
             },
         ]
     }
@@ -1861,10 +2184,8 @@ mod tests {
     #[test]
     fn test_derive_agent_state_empty_messages() {
         let messages: Vec<serde_json::Value> = vec![];
-        assert_eq!(
-            derive_agent_state_from_messages(&messages),
-            AgentState::Unknown
-        );
+        let state = derive_agent_state_from_messages(&messages);
+        assert_eq!(state.activity, AgentActivity::Unknown);
     }
 
     #[test]
@@ -1873,10 +2194,8 @@ mod tests {
             "info": {"role": "user"},
             "parts": [{"type": "text", "text": "Hello"}]
         })];
-        assert_eq!(
-            derive_agent_state_from_messages(&messages),
-            AgentState::Unknown
-        );
+        let state = derive_agent_state_from_messages(&messages);
+        assert_eq!(state.activity, AgentActivity::Unknown);
     }
 
     #[test]
@@ -1889,10 +2208,9 @@ mod tests {
             },
             "parts": [{"type": "text", "text": "Working on it..."}]
         })];
-        assert_eq!(
-            derive_agent_state_from_messages(&messages),
-            AgentState::Working
-        );
+        let state = derive_agent_state_from_messages(&messages);
+        assert_eq!(state.activity, AgentActivity::Working);
+        assert!(state.status_line.is_some());
     }
 
     #[test]
@@ -1906,10 +2224,8 @@ mod tests {
             },
             "parts": [{"type": "text", "text": "Done!"}]
         })];
-        assert_eq!(
-            derive_agent_state_from_messages(&messages),
-            AgentState::Idle
-        );
+        let state = derive_agent_state_from_messages(&messages);
+        assert_eq!(state.activity, AgentActivity::Idle);
     }
 
     #[test]
@@ -1923,10 +2239,8 @@ mod tests {
             },
             "parts": [{"type": "text", "text": "Making tool call..."}]
         })];
-        assert_eq!(
-            derive_agent_state_from_messages(&messages),
-            AgentState::Working
-        );
+        let state = derive_agent_state_from_messages(&messages);
+        assert_eq!(state.activity, AgentActivity::Working);
     }
 
     #[test]
@@ -1939,13 +2253,12 @@ mod tests {
             },
             "parts": [
                 {"type": "text", "text": "Running a tool..."},
-                {"type": "tool", "state": {"status": "running"}}
+                {"type": "tool", "name": "bash", "state": {"status": "running"}}
             ]
         })];
-        assert_eq!(
-            derive_agent_state_from_messages(&messages),
-            AgentState::Working
-        );
+        let state = derive_agent_state_from_messages(&messages);
+        assert_eq!(state.activity, AgentActivity::Working);
+        assert_eq!(state.current_tool, Some("bash".to_string()));
     }
 
     #[test]
@@ -1961,9 +2274,17 @@ mod tests {
                 {"type": "tool", "state": {"status": "completed"}}
             ]
         })];
-        assert_eq!(
-            derive_agent_state_from_messages(&messages),
-            AgentState::Idle
-        );
+        let state = derive_agent_state_from_messages(&messages);
+        assert_eq!(state.activity, AgentActivity::Idle);
+    }
+
+    #[test]
+    fn test_extract_text_from_parts() {
+        let parts = vec![
+            serde_json::json!({"type": "text", "text": "Hello world\nSecond line"}),
+            serde_json::json!({"type": "tool", "name": "bash", "state": {"status": "running"}}),
+        ];
+        let lines = extract_text_from_parts(&parts, 3);
+        assert!(!lines.is_empty());
     }
 }

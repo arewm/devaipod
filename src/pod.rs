@@ -122,8 +122,11 @@ use crate::config::{Config, DotfilesConfig};
 use crate::devcontainer::DevcontainerConfig;
 use crate::podman::{ContainerConfig, PodmanService};
 
-/// Port for the opencode server in the agent container
+/// Port for the opencode server in the agent container (internal, no auth)
 pub const OPENCODE_PORT: u16 = 4096;
+
+/// Port for the auth proxy in the agent container (external, requires Basic Auth)
+pub const OPENCODE_AUTH_PROXY_PORT: u16 = 4097;
 
 /// Generate a random password for API authentication
 ///
