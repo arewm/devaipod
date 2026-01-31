@@ -446,72 +446,16 @@ pub fn load(path: &Path) -> Result<DevcontainerConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
 
-    // Remove JSON comments (// style) - devcontainer.json allows them
-    let content = remove_json_comments(&content);
-
-    let config: DevcontainerConfig = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    // Parse JSONC (JSON with comments) - devcontainer.json uses this format
+    let config: DevcontainerConfig =
+        jsonc_parser::parse_to_serde_value(&content, &Default::default())
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to parse JSONC: {}", e))?
+            .map(|v| serde_json::from_value(v))
+            .transpose()
+            .with_context(|| format!("Failed to deserialize {}", path.display()))?
+            .unwrap_or_default();
 
     Ok(config)
-}
-
-/// Remove // and /* */ comments from JSON (devcontainer.json extension)
-fn remove_json_comments(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut in_string = false;
-    let mut escape_next = false;
-    let mut chars = input.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if escape_next {
-            result.push(c);
-            escape_next = false;
-            continue;
-        }
-
-        if c == '\\' && in_string {
-            result.push(c);
-            escape_next = true;
-            continue;
-        }
-
-        if c == '"' {
-            in_string = !in_string;
-            result.push(c);
-            continue;
-        }
-
-        if !in_string && c == '/' {
-            if chars.peek() == Some(&'/') {
-                // Skip until end of line
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        result.push('\n');
-                        break;
-                    }
-                }
-                continue;
-            } else if chars.peek() == Some(&'*') {
-                // Block comment - skip until */
-                chars.next(); // consume the '*'
-                while let Some(c) = chars.next() {
-                    if c == '*' && chars.peek() == Some(&'/') {
-                        chars.next(); // consume the '/'
-                        break;
-                    }
-                    // Preserve newlines to maintain line numbers in error messages
-                    if c == '\n' {
-                        result.push('\n');
-                    }
-                }
-                continue;
-            }
-        }
-
-        result.push(c);
-    }
-
-    result
 }
 
 #[cfg(test)]
@@ -560,36 +504,6 @@ mod tests {
         assert_eq!(build.context, Some("..".to_string()));
         assert_eq!(build.args.get("VARIANT"), Some(&"bullseye".to_string()));
         assert_eq!(config.remote_user, Some("vscode".to_string()));
-    }
-
-    #[test]
-    fn test_remove_json_comments() {
-        let input = r#"{
-            // This is a comment
-            "key": "value" // inline comment
-        }"#;
-
-        let result = remove_json_comments(input);
-        assert!(!result.contains("// This is a comment"));
-        assert!(!result.contains("// inline"));
-        assert!(result.contains("\"key\": \"value\""));
-    }
-
-    #[test]
-    fn test_remove_block_comments() {
-        let input = r#"{
-            /* This is a block comment */
-            "key": "value", /* inline block */
-            "other": /* mid-line */ "data"
-        }"#;
-
-        let result = remove_json_comments(input);
-        assert!(!result.contains("block comment"));
-        assert!(!result.contains("inline block"));
-        assert!(!result.contains("mid-line"));
-        assert!(result.contains("\"key\": \"value\""));
-        assert!(result.contains("\"other\":"));
-        assert!(result.contains("\"data\""));
     }
 
     #[test]

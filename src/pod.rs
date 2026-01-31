@@ -894,9 +894,11 @@ echo "Dotfiles installed successfully"
         Ok(())
     }
 
-    /// Run lifecycle commands from devcontainer.json in the workspace container
+    /// Run lifecycle commands from devcontainer.json in both workspace and agent containers
     ///
     /// Executes in order: onCreateCommand, postCreateCommand, postStartCommand
+    /// Commands run in both containers to ensure consistent environment setup
+    /// (e.g., nested podman configuration needed for both human and AI).
     pub async fn run_lifecycle_commands(
         &self,
         podman: &PodmanService,
@@ -904,29 +906,39 @@ echo "Dotfiles installed successfully"
     ) -> Result<()> {
         let user = config.effective_user();
         let workdir = Some(self.workspace_folder.as_str());
+        let containers = [&self.workspace_container, &self.agent_container];
 
         // onCreateCommand
         if let Some(cmd) = &config.on_create_command {
-            tracing::debug!("Running onCreateCommand...");
-            self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
-                .await
-                .context("onCreateCommand failed")?;
+            let shell_cmd = cmd.to_shell_command();
+            for container in &containers {
+                tracing::debug!("Running onCreateCommand in {}...", container);
+                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
+                    .await
+                    .with_context(|| format!("onCreateCommand failed in {}", container))?;
+            }
         }
 
         // postCreateCommand
         if let Some(cmd) = &config.post_create_command {
-            tracing::debug!("Running postCreateCommand...");
-            self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
-                .await
-                .context("postCreateCommand failed")?;
+            let shell_cmd = cmd.to_shell_command();
+            for container in &containers {
+                tracing::debug!("Running postCreateCommand in {}...", container);
+                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
+                    .await
+                    .with_context(|| format!("postCreateCommand failed in {}", container))?;
+            }
         }
 
         // postStartCommand
         if let Some(cmd) = &config.post_start_command {
-            tracing::debug!("Running postStartCommand...");
-            self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
-                .await
-                .context("postStartCommand failed")?;
+            let shell_cmd = cmd.to_shell_command();
+            for container in &containers {
+                tracing::debug!("Running postStartCommand in {}...", container);
+                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
+                    .await
+                    .with_context(|| format!("postStartCommand failed in {}", container))?;
+            }
         }
 
         Ok(())
@@ -936,6 +948,7 @@ echo "Dotfiles installed successfully"
     ///
     /// Executes: postCreateCommand, postStartCommand
     /// Used when rebuilding a container where the workspace already exists.
+    /// Commands run in both containers to ensure consistent environment setup.
     pub async fn run_rebuild_lifecycle_commands(
         &self,
         podman: &PodmanService,
@@ -943,21 +956,28 @@ echo "Dotfiles installed successfully"
     ) -> Result<()> {
         let user = config.effective_user();
         let workdir = Some(self.workspace_folder.as_str());
+        let containers = [&self.workspace_container, &self.agent_container];
 
         // postCreateCommand - runs because we created new containers
         if let Some(cmd) = &config.post_create_command {
-            tracing::debug!("Running postCreateCommand...");
-            self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
-                .await
-                .context("postCreateCommand failed")?;
+            let shell_cmd = cmd.to_shell_command();
+            for container in &containers {
+                tracing::debug!("Running postCreateCommand in {}...", container);
+                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
+                    .await
+                    .with_context(|| format!("postCreateCommand failed in {}", container))?;
+            }
         }
 
         // postStartCommand
         if let Some(cmd) = &config.post_start_command {
-            tracing::debug!("Running postStartCommand...");
-            self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
-                .await
-                .context("postStartCommand failed")?;
+            let shell_cmd = cmd.to_shell_command();
+            for container in &containers {
+                tracing::debug!("Running postStartCommand in {}...", container);
+                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
+                    .await
+                    .with_context(|| format!("postStartCommand failed in {}", container))?;
+            }
         }
 
         Ok(())
@@ -1296,21 +1316,17 @@ CONFIG_EOF
         Ok(())
     }
 
-    /// Execute a shell command in the workspace container
-    async fn run_shell_command(
+    /// Execute a shell command in a specific container
+    async fn run_shell_command_in(
         &self,
+        container: &str,
         podman: &PodmanService,
         command: &str,
         user: Option<&str>,
         workdir: Option<&str>,
     ) -> Result<()> {
         let exit_code = podman
-            .exec(
-                &self.workspace_container,
-                &["/bin/sh", "-c", command],
-                user,
-                workdir,
-            )
+            .exec(container, &["/bin/sh", "-c", command], user, workdir)
             .await
             .context("Failed to execute command")?;
 
