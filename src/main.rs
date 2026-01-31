@@ -500,6 +500,9 @@ enum HostCommand {
         /// Task for the agent (alternative to positional argument)
         #[arg(short = 'c', long = "command", value_name = "TASK")]
         command: Option<String>,
+        /// Attach to the agent after starting
+        #[arg(short = 'A', long = "attach")]
+        attach: bool,
         /// Use a specific container image instead of building from devcontainer.json
         #[arg(long, value_name = "IMAGE")]
         image: Option<String>,
@@ -812,6 +815,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             source,
             task,
             command,
+            attach,
             image,
             name,
             service_gator_scopes,
@@ -861,7 +865,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 None => default_task,
             };
 
-            cmd_run(
+            let pod_name = cmd_run(
                 &config,
                 &effective_source,
                 effective_task.as_deref(),
@@ -870,7 +874,12 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 &service_gator_scopes,
                 service_gator_image.as_deref(),
             )
-            .await
+            .await?;
+
+            if attach {
+                cmd_attach(&pod_name, None).await?;
+            }
+            Ok(())
         }
         HostCommand::Completions { shell } => cmd_completions(shell),
         HostCommand::Init { config } => init::cmd_init(config.as_deref()),
@@ -986,9 +995,8 @@ async fn finalize_pod_with_mode(
 
     // Success message
     let short_name = strip_pod_prefix(&devaipod_pod.pod_name);
-    tracing::info!("Pod ready: {}", devaipod_pod.pod_name);
-    tracing::info!("  SSH: devaipod ssh {}", short_name);
-    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
+    tracing::info!("Pod ready ({})", short_name);
+    tracing::info!("  Attach to agent: devaipod attach {short_name}");
 
     Ok(())
 }
@@ -1542,6 +1550,8 @@ async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Resul
 ///
 /// It creates a workspace and starts the agent with the task, then returns
 /// immediately. Use `devaipod ssh <workspace>` to monitor the agent's progress.
+///
+/// Returns the pod name for optional follow-up operations (e.g., attach).
 async fn cmd_run(
     config: &config::Config,
     source: &str,
@@ -1550,7 +1560,7 @@ async fn cmd_run(
     explicit_name: Option<&str>,
     service_gator_scopes: &[String],
     service_gator_image: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
         task: command.map(|s| s.to_string()),
@@ -1562,9 +1572,9 @@ async fn cmd_run(
     };
 
     // Create the workspace - no SSH by default (async execution)
-    let _result = create_workspace(config, source, &create_opts).await?;
+    let result = create_workspace(config, source, &create_opts).await?;
 
-    Ok(())
+    Ok(result.pod_name)
 }
 
 /// Handle dry-run mode for the up command
