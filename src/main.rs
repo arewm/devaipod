@@ -23,6 +23,7 @@ mod podman;
 mod prompt;
 mod secrets;
 mod service_gator;
+mod ssh_server;
 mod tui;
 
 /// Prefix for all devaipod pod names
@@ -485,6 +486,19 @@ enum HostCommand {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Clean up stale resources
+    ///
+    /// Runs various cleanup tasks:
+    /// - Removes orphaned SSH config entries for deleted pods
+    /// - (Future: other cleanup tasks)
+    ///
+    /// This is run automatically on `devaipod delete`, but can be run
+    /// manually to clean up after crashes or external pod deletions.
+    Cleanup {
+        /// Dry run - show what would be cleaned without doing it
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
     /// List workspaces
     List {
         /// Output in JSON format
@@ -721,6 +735,16 @@ enum HostCommand {
         #[command(subcommand)]
         action: GatorAction,
     },
+
+    /// Internal helper commands (not for direct user use)
+    ///
+    /// These commands are used internally for remote development integration.
+    /// They can run in any context (host or container).
+    #[command(hide = true)]
+    Helper {
+        #[command(subcommand)]
+        action: HelperCommand,
+    },
 }
 
 /// Actions for interacting with the opencode agent
@@ -861,6 +885,24 @@ enum ContainerCommand {
     /// This command is idempotent and should be run at container startup.
     /// Typically called from postStartCommand in devcontainer.json.
     ConfigureEnv,
+
+    /// Internal helper commands for container operations
+    #[command(subcommand)]
+    Helper(HelperCommand),
+}
+
+/// Helper commands that run inside containers (not for direct user use)
+#[derive(Debug, Parser)]
+enum HelperCommand {
+    /// Run SSH server for remote development (VSCode/Zed integration)
+    ///
+    /// This starts an embedded SSH server that speaks the SSH protocol over
+    /// stdin/stdout. Used as a ProxyCommand target for editor remote development.
+    SshServer {
+        /// Run over stdin/stdout instead of a TCP port (for ProxyCommand use)
+        #[arg(long, default_value = "true")]
+        stdio: bool,
+    },
 }
 
 #[tokio::main]
@@ -976,11 +1018,12 @@ async fn run_host(cli: HostCli) -> Result<()> {
             } else {
                 AttachTarget::Agent
             };
-            cmd_exec(&normalize_pod_name(&workspace), target, stdio, &command)
+            cmd_exec(&normalize_pod_name(&workspace), target, stdio, &command).await
         }
         HostCommand::SshConfig { workspace, user } => {
             cmd_ssh_config(&normalize_pod_name(&workspace), user.as_deref())
         }
+        HostCommand::Cleanup { dry_run } => cmd_cleanup(dry_run),
         HostCommand::List { json } => cmd_list(json),
         HostCommand::Tui => tui::run().await,
         HostCommand::Start { workspace } => cmd_start(&normalize_pod_name(&workspace)),
@@ -1113,15 +1156,39 @@ async fn run_host(cli: HostCli) -> Result<()> {
             json,
         } => cmd_controlplane(serve, port, list, json).await,
         HostCommand::Gator { action } => cmd_gator(action).await,
+        HostCommand::Helper { action } => run_helper_async(action).await,
     }
 }
 
 fn run_container(cli: ContainerCli) -> Result<()> {
-    let _config = config::load_config(cli.config.as_deref())?;
-
     match cli.command {
-        ContainerCommand::ConfigureEnv => cmd_configure_env(),
+        ContainerCommand::ConfigureEnv => {
+            let _config = config::load_config(cli.config.as_deref())?;
+            cmd_configure_env()
+        }
+        ContainerCommand::Helper(helper) => run_helper(helper),
     }
+}
+
+/// Run helper commands
+async fn run_helper_async(cmd: HelperCommand) -> Result<()> {
+    match cmd {
+        HelperCommand::SshServer { stdio: _ } => {
+            // The SSH server now runs on the host (not in the container).
+            // This command is kept for backwards compatibility but is no longer used.
+            bail!(
+                "ssh-server helper is deprecated. The SSH server now runs on the host. \
+                 Use 'devaipod exec --stdio <workspace>' instead."
+            )
+        }
+    }
+}
+
+/// Wrapper for sync context (container mode)
+fn run_helper(cmd: HelperCommand) -> Result<()> {
+    tokio::runtime::Runtime::new()
+        .context("Failed to create tokio runtime")?
+        .block_on(run_helper_async(cmd))
 }
 
 /// Which lifecycle commands to run
@@ -1269,16 +1336,31 @@ async fn create_workspace(
     opts: &CreateOptions,
 ) -> Result<CreateResult> {
     // Dispatch based on source type
-    if let Some(pr_ref) = forge::parse_pr_url(source) {
-        create_workspace_from_pr(config, pr_ref, opts).await
+    let result = if let Some(pr_ref) = forge::parse_pr_url(source) {
+        create_workspace_from_pr(config, pr_ref, opts).await?
     } else if source.starts_with("http://")
         || source.starts_with("https://")
         || source.starts_with("git@")
     {
-        create_workspace_from_remote(config, source, opts).await
+        create_workspace_from_remote(config, source, opts).await?
     } else {
-        create_workspace_from_local(config, source, opts).await
+        create_workspace_from_local(config, source, opts).await?
+    };
+
+    // Auto-create SSH config entry if enabled (default: true)
+    if config.ssh.auto_config {
+        if let Some(config_path) = write_ssh_config(&result.pod_name) {
+            tracing::info!("Created SSH config: {}", config_path.display());
+            // Warn once if Include directive is missing
+            if !ssh_config_has_include() {
+                tracing::warn!(
+                    "Add 'Include ~/.ssh/config.d/*' to the top of ~/.ssh/config for SSH integration"
+                );
+            }
+        }
     }
+
+    Ok(result)
 }
 
 /// Create a workspace from a local git repository
@@ -1604,10 +1686,7 @@ async fn create_workspace_from_remote(
                     },
                 );
                 if opts.service_gator_ro {
-                    tracing::debug!(
-                        "Auto-enabled service-gator for {} (read-only)",
-                        owner_repo
-                    );
+                    tracing::debug!("Auto-enabled service-gator for {} (read-only)", owner_repo);
                 } else {
                     tracing::debug!(
                         "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
@@ -1801,10 +1880,7 @@ async fn create_workspace_from_pr(
                     },
                 );
                 if opts.service_gator_ro {
-                    tracing::debug!(
-                        "Auto-enabled service-gator for {} (read-only)",
-                        owner_repo
-                    );
+                    tracing::debug!("Auto-enabled service-gator for {} (read-only)", owner_repo);
                 } else {
                     tracing::debug!(
                         "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
@@ -1899,7 +1975,8 @@ async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Resul
             AttachTarget::Workspace,
             false,
             &["bash".to_string()],
-        );
+        )
+        .await;
     }
 
     Ok(())
@@ -2642,31 +2719,38 @@ exec tmux attach -t {session}
 }
 
 /// Exec into a container using podman exec
-fn cmd_exec(pod_name: &str, target: AttachTarget, stdio: bool, command: &[String]) -> Result<()> {
+async fn cmd_exec(
+    pod_name: &str,
+    target: AttachTarget,
+    stdio: bool,
+    command: &[String],
+) -> Result<()> {
     let container = get_attach_container_name(pod_name, target);
 
     if stdio {
-        // Stdio mode: pipe stdin/stdout directly for ProxyCommand use
-        // VSCode/Zed Remote SSH uses this to tunnel SSH protocol
-        let mut cmd = podman_command();
-        cmd.args(["exec", "-i", &container]);
-
+        // Stdio mode: run the embedded SSH server on the host
+        // The SSH server speaks real SSH protocol over stdin/stdout and
+        // translates SSH requests into podman exec commands
         if command.is_empty() {
-            cmd.arg("bash");
+            // Run the SSH server - this runs on the host and uses podman exec
+            ssh_server::run_stdio_for_container(&container).await?;
         } else {
+            // Direct command execution via podman exec
+            let mut cmd = podman_command();
+            cmd.args(["exec", "-i", &container]);
             cmd.args(command);
-        }
 
-        let status = cmd.status().context("Failed to run podman exec")?;
+            let status = cmd.status().context("Failed to run podman exec")?;
 
-        if !status.success() {
-            bail!(
-                "podman exec failed for container '{}' (exit code {:?}). \
-                 The container may not exist or is not running. \
-                 Run 'devaipod list' to see available pods.",
-                container,
-                status.code()
-            );
+            if !status.success() {
+                bail!(
+                    "podman exec failed for container '{}' (exit code {:?}). \
+                     The container may not exist or is not running. \
+                     Run 'devaipod list' to see available pods.",
+                    container,
+                    status.code()
+                );
+            }
         }
     } else {
         // Interactive mode with TTY
@@ -2763,25 +2847,266 @@ fn remove_ssh_config(workspace: &str) -> Result<()> {
     Ok(())
 }
 
-/// Generate SSH config entry for a workspace
+/// Run cleanup tasks
+///
+/// Currently includes:
+/// - Garbage collect orphaned SSH config entries
+/// - (Future: other cleanup tasks)
+fn cmd_cleanup(dry_run: bool) -> Result<()> {
+    println!("Running cleanup tasks...\n");
+
+    // SSH config garbage collection
+    println!("=== SSH Config Cleanup ===");
+    gc_ssh_configs(dry_run)?;
+
+    // Future cleanup tasks would go here
+    // println!("\n=== Other Cleanup ===");
+    // ...
+
+    Ok(())
+}
+
+/// Garbage collect orphaned SSH config entries
+///
+/// 1. List all devaipod pods
+/// 2. List all SSH config files in ~/.ssh/config.d/
+/// 3. Find configs that don't have a corresponding pod
+/// 4. Delete orphaned configs (with re-verification to avoid races)
+fn gc_ssh_configs(dry_run: bool) -> Result<()> {
+    // Step 1: Get list of all existing pod names
+    let existing_pods = get_pod_names()?;
+    let existing_pods_set: std::collections::HashSet<_> = existing_pods.iter().collect();
+
+    // Step 2: List all SSH config files
+    let config_dir = get_ssh_config_dir()?;
+    if !config_dir.exists() {
+        println!("No SSH config directory found at {}", config_dir.display());
+        return Ok(());
+    }
+
+    let entries = std::fs::read_dir(&config_dir)
+        .with_context(|| format!("Failed to read {}", config_dir.display()))?;
+
+    let mut orphaned = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let filename_str = filename.to_string_lossy();
+
+        // Only consider files with our prefix
+        if !filename_str.starts_with(POD_NAME_PREFIX) {
+            continue;
+        }
+
+        // Extract pod name from filename (filename IS the pod name)
+        let pod_name = filename_str.to_string();
+
+        // Check if this pod exists
+        if !existing_pods_set.contains(&pod_name) {
+            orphaned.push((entry.path(), pod_name));
+        }
+    }
+
+    if orphaned.is_empty() {
+        println!("No orphaned SSH config entries found.");
+        return Ok(());
+    }
+
+    println!(
+        "Found {} orphaned SSH config {}:",
+        orphaned.len(),
+        if orphaned.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        }
+    );
+
+    for (path, pod_name) in &orphaned {
+        println!("  {} (pod: {})", path.display(), pod_name);
+    }
+
+    if dry_run {
+        println!("\nDry run - no files deleted. Run without -n to delete.");
+        return Ok(());
+    }
+
+    // Step 4: Delete orphaned configs with re-verification
+    let mut deleted = 0;
+    for (path, pod_name) in orphaned {
+        // Re-verify pod doesn't exist (avoid race with concurrent `devaipod up`)
+        if pod_exists(&pod_name)? {
+            println!("Skipping {} - pod appeared since check", path.display());
+            continue;
+        }
+
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                println!("Deleted: {}", path.display());
+                deleted += 1;
+            }
+            Err(e) => {
+                eprintln!("Failed to delete {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    println!("\nDeleted {} orphaned SSH config file(s).", deleted);
+    Ok(())
+}
+
+/// Get list of all devaipod pod names
+fn get_pod_names() -> Result<Vec<String>> {
+    let filter = format!("name={}*", POD_NAME_PREFIX);
+    let output = podman_command()
+        .args(["pod", "ps", "--filter", &filter, "--format={{.Name}}"])
+        .output()
+        .context("Failed to run podman pod ps")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("podman pod ps failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().map(|s| s.to_string()).collect())
+}
+
+/// Check if a specific pod exists
+fn pod_exists(pod_name: &str) -> Result<bool> {
+    let output = podman_command()
+        .args(["pod", "exists", pod_name])
+        .output()
+        .context("Failed to run podman pod exists")?;
+
+    Ok(output.status.success())
+}
+
+/// Quietly garbage collect orphaned SSH configs
+///
+/// This is called automatically after `devaipod delete` to clean up stragglers.
+/// Returns the number of configs deleted.
+fn gc_ssh_configs_quiet() -> Result<usize> {
+    // Get list of existing pods
+    let existing_pods = get_pod_names()?;
+    let existing_pods_set: std::collections::HashSet<_> = existing_pods.iter().collect();
+
+    let config_dir = get_ssh_config_dir()?;
+    if !config_dir.exists() {
+        return Ok(0);
+    }
+
+    let entries = std::fs::read_dir(&config_dir)?;
+
+    let mut deleted = 0;
+    for entry in entries.flatten() {
+        let filename = entry.file_name();
+        let filename_str = filename.to_string_lossy();
+
+        if !filename_str.starts_with(POD_NAME_PREFIX) {
+            continue;
+        }
+
+        let pod_name = filename_str.to_string();
+
+        // Check if pod exists
+        if existing_pods_set.contains(&pod_name) {
+            continue;
+        }
+
+        // Re-verify before deleting (race protection)
+        if pod_exists(&pod_name).unwrap_or(true) {
+            continue;
+        }
+
+        if std::fs::remove_file(entry.path()).is_ok() {
+            tracing::debug!("GC: removed orphaned SSH config {}", entry.path().display());
+            deleted += 1;
+        }
+    }
+
+    Ok(deleted)
+}
+
+/// Write SSH config entry for a workspace (internal helper)
+///
+/// Returns the path to the created config file, or None if an error occurred.
+/// This is a best-effort operation - errors are logged but don't fail the caller.
+fn write_ssh_config(pod_name: &str) -> Option<std::path::PathBuf> {
+    let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+
+    match write_ssh_config_with_user(pod_name, &username) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!("Failed to write SSH config: {}", e);
+            None
+        }
+    }
+}
+
+/// Generate SSH config entry for a workspace (CLI command)
 fn cmd_ssh_config(pod_name: &str, user: Option<&str>) -> Result<()> {
-    // Determine username: --user flag, or current user
+    // For the CLI command, we support --user override
     let username = user
         .map(|s| s.to_string())
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "user".to_string());
+
+    let config_path = write_ssh_config_with_user(pod_name, &username)?;
+
+    println!("Added SSH config to {}", config_path.display());
+
+    // Check if Include directive exists in ~/.ssh/config
+    if !ssh_config_has_include() {
+        println!();
+        println!("Add this line to the TOP of ~/.ssh/config:");
+        println!("Include ~/.ssh/config.d/*");
+    }
+
+    Ok(())
+}
+
+/// Write SSH config with explicit username (used by CLI command)
+///
+/// Creates SSH config entries for all containers in the pod:
+/// - `<pod>.devaipod` - workspace container (default for development)
+/// - `<pod>-agent.devaipod` - agent/orchestrator container
+/// - `<pod>-worker.devaipod` - worker container
+fn write_ssh_config_with_user(pod_name: &str, username: &str) -> Result<std::path::PathBuf> {
+    use cap_std_ext::cap_primitives::fs::PermissionsExt;
+    use cap_std_ext::cap_std;
+    use cap_std_ext::dirext::CapStdExtDirExt;
 
     // Find the devaipod binary path for the ProxyCommand
     let devaipod_path = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "devaipod".to_string());
 
-    // Create SSH config content
-    // Uses exec -W --stdio to connect to the workspace container for IDE remote dev
+    // Create SSH config content for all containers
+    // - workspace: -W flag (primary for development)
+    // - agent: no flag (default target)
+    // - worker: --worker flag
     let config_content = format!(
-        r#"# Generated by devaipod ssh-config
+        r#"# Generated by devaipod
+# Workspace container (development environment)
 Host {pod}.devaipod
     ProxyCommand {devaipod} exec -W --stdio {pod}
+    User {user}
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+
+# Agent/orchestrator container
+Host {pod}-agent.devaipod
+    ProxyCommand {devaipod} exec --stdio {pod}
+    User {user}
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+
+# Worker container
+Host {pod}-worker.devaipod
+    ProxyCommand {devaipod} exec --worker --stdio {pod}
     User {user}
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
@@ -2797,21 +3122,24 @@ Host {pod}.devaipod
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create {}", config_dir.display()))?;
 
-    // Write the config file
+    // Open the directory for atomic writes
+    let dir = cap_std::fs::Dir::open_ambient_dir(&config_dir, cap_std::ambient_authority())
+        .with_context(|| format!("Failed to open {}", config_dir.display()))?;
+
     let config_path = get_ssh_config_path(pod_name)?;
-    std::fs::write(&config_path, &config_content)
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+    let filename = config_path
+        .file_name()
+        .ok_or_else(|| color_eyre::eyre::eyre!("Invalid SSH config path"))?;
 
-    println!("Added SSH config to {}", config_path.display());
+    // Write atomically with proper permissions (0600) - SSH requires restrictive perms
+    dir.atomic_write_with_perms(
+        filename,
+        config_content.as_bytes(),
+        cap_std::fs::Permissions::from_mode(0o600),
+    )
+    .with_context(|| format!("Failed to write {}", config_path.display()))?;
 
-    // Check if Include directive exists in ~/.ssh/config
-    if !ssh_config_has_include() {
-        println!();
-        println!("Add this line to the TOP of ~/.ssh/config:");
-        println!("Include ~/.ssh/config.d/*");
-    }
-
-    Ok(())
+    Ok(config_path)
 }
 
 /// List devaipod pods using podman pod ps
@@ -3262,6 +3590,11 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
     // Clean up SSH config file if it exists
     if let Err(e) = remove_ssh_config(pod_name) {
         tracing::warn!("Failed to remove SSH config: {}", e);
+    }
+
+    // Run GC to clean up any other orphaned SSH configs
+    if let Err(e) = gc_ssh_configs_quiet() {
+        tracing::debug!("SSH config GC: {}", e);
     }
 
     Ok(())

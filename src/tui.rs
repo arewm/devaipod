@@ -1430,14 +1430,12 @@ fn render_launch_prompt(frame: &mut ratatui::Frame, app: &LaunchPromptApp) {
         )
     };
 
-    let url_paragraph = Paragraph::new(url_content)
-        .style(url_style)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(url_border_style)
-                .title(" Source "),
-        );
+    let url_paragraph = Paragraph::new(url_content).style(url_style).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(url_border_style)
+            .title(" Source "),
+    );
     frame.render_widget(url_paragraph, chunks[1]);
 
     // Task field

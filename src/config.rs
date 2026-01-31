@@ -76,6 +76,10 @@ pub struct Config {
     /// Multi-agent orchestration configuration
     #[serde(default)]
     pub orchestration: OrchestrationConfig,
+
+    /// SSH configuration for editor integration
+    #[serde(default)]
+    pub ssh: SshConfig,
 }
 
 /// Configuration for binding paths from host home to container home
@@ -691,6 +695,37 @@ pub enum WorkerGatorMode {
     Inherit,
     /// Worker has no gator access; communicates only via git with task owner
     None,
+}
+
+// =============================================================================
+// SSH configuration
+// =============================================================================
+
+/// SSH configuration for editor integration
+///
+/// Controls automatic SSH config file generation for VSCode/Zed Remote SSH.
+///
+/// Example configuration:
+/// ```toml
+/// [ssh]
+/// auto_config = true  # default: true
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SshConfig {
+    /// Whether to automatically create SSH config entries in ~/.ssh/config.d/
+    /// when workspaces are created. (default: true)
+    ///
+    /// Set to false to disable automatic SSH config generation.
+    /// You can still manually run `devaipod ssh-config <workspace>`.
+    #[serde(default = "default_true")]
+    pub auto_config: bool,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self { auto_config: true }
+    }
 }
 
 /// Get the XDG config directory
@@ -1836,5 +1871,44 @@ secrets = ["GH_TOKEN=gh_token"]
             .trusted_env
             .secrets
             .contains(&"GH_TOKEN=gh_token".to_string()));
+    }
+
+    // =========================================================================
+    // SSH configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_ssh_config_default() {
+        let config = SshConfig::default();
+        // Default is auto_config = true
+        assert!(config.auto_config);
+    }
+
+    #[test]
+    fn test_ssh_config_in_minimal_config() {
+        let toml = "";
+        let config: Config = toml::from_str(toml).unwrap();
+        // Default should have auto_config = true
+        assert!(config.ssh.auto_config);
+    }
+
+    #[test]
+    fn test_parse_ssh_auto_config_true() {
+        let toml = r#"
+[ssh]
+auto-config = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ssh.auto_config);
+    }
+
+    #[test]
+    fn test_parse_ssh_auto_config_false() {
+        let toml = r#"
+[ssh]
+auto-config = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ssh.auto_config);
     }
 }

@@ -14,6 +14,13 @@ Priorities may shift based on user feedback and practical experience.
 
 Larger features under consideration:
 
+- **SSH server for editor connections**: ✅ Implemented via embedded Rust SSH
+  server using the `russh` crate. The `devaipod helper ssh-server` command runs
+  inside containers and speaks the real SSH protocol over stdio. When used with
+  `devaipod exec --stdio`, this enables VSCode/Zed Remote SSH to connect via
+  ProxyCommand without requiring dropbear or openssh in the container. The SSH
+  server supports exec, shell, PTY, and port forwarding. SFTP is scaffolded but
+  not yet fully implemented.
 - **Network isolation**: Configure podman-level network settings to restrict agent network access
 - **LLM credential isolation**: Proxy container (possibly service-gator) that holds LLM API keys, so the agent doesn't have direct credential access
 - **Kubernetes support**: Use kube-rs to create pods on real Kubernetes clusters for remote dev environments
