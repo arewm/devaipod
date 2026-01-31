@@ -136,9 +136,10 @@ build-mdbook:
 build-mdbook-to dir: build-mdbook
     #!/usr/bin/env bash
     set -xeuo pipefail
-    mkdir -p {{dir}}
+    outdir="$(pwd)/{{dir}}"
+    mkdir -p "${outdir}"
     cid=$(podman create localhost/devaipod-mdbook)
-    podman cp ${cid}:/src/docs/book/. {{dir}}
+    podman cp ${cid}:/src/docs/book/. "${outdir}"
     podman rm -f ${cid}
 
 # Serve docs locally (prints URL)
