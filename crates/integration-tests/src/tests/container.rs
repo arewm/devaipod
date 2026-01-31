@@ -8,12 +8,61 @@
 
 use color_eyre::eyre::bail;
 use color_eyre::Result;
-use xshell::cmd;
+use std::time::{Duration, Instant};
+use xshell::{cmd, Shell};
 
 use crate::{
     podman_integration_test, readonly_test, run_devaipod, run_devaipod_in, shell, short_name,
     unique_test_name, PodGuard, SharedFixture, TestRepo,
 };
+
+/// Poll a condition until it succeeds or times out.
+/// Returns Ok(output) on success, Err on timeout.
+fn poll_until<F>(timeout: Duration, interval: Duration, mut check: F) -> Result<String>
+where
+    F: FnMut() -> Result<Option<String>>,
+{
+    let start = Instant::now();
+    loop {
+        match check() {
+            Ok(Some(output)) => return Ok(output),
+            Ok(None) => {}
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    return Err(e);
+                }
+            }
+        }
+        if start.elapsed() >= timeout {
+            bail!("Timed out after {:?}", timeout);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Wait for a file to exist in a container with expected content
+fn wait_for_file_content(
+    sh: &Shell,
+    container: &str,
+    path: &str,
+    expected: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let container = container.to_string();
+    let path = path.to_string();
+    let expected = expected.to_string();
+
+    poll_until(timeout, Duration::from_millis(500), || {
+        let output = cmd!(sh, "podman exec {container} cat {path}")
+            .ignore_status()
+            .read()?;
+        if output.contains(&expected) {
+            Ok(Some(output))
+        } else {
+            Ok(None)
+        }
+    })
+}
 
 // =============================================================================
 // Readonly tests - use shared fixture
@@ -729,3 +778,127 @@ fn test_agent_device_passthrough() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_agent_device_passthrough);
+
+/// Verify lifecycle commands (postCreateCommand) run in BOTH workspace and agent containers.
+///
+/// This is critical for init scripts that configure nested podman, subuid mappings, etc.
+/// Both containers need these configurations for nested containers to work.
+fn test_lifecycle_commands_run_in_both_containers() -> Result<()> {
+    // Create a devcontainer with a postCreateCommand that creates a marker file
+    let marker_path = "/tmp/lifecycle-test-marker";
+    let devcontainer_json = format!(
+        r#"{{
+    "name": "lifecycle-test",
+    "image": "ghcr.io/bootc-dev/devenv-debian:latest",
+    "postCreateCommand": "echo 'lifecycle-ran' > {}"
+}}"#,
+        marker_path
+    );
+
+    let repo = TestRepo::new_with_devcontainer(&devcontainer_json)?;
+    let pod_name = unique_test_name("test-lifecycle");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    let sh = shell()?;
+    let agent_container = format!("{}-agent", pod_name);
+    let workspace_container = format!("{}-workspace", pod_name);
+
+    // Give containers time to finish lifecycle commands
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Verify marker file exists in workspace container
+    let workspace_marker = cmd!(sh, "podman exec {workspace_container} cat {marker_path}")
+        .ignore_status()
+        .read()?;
+    assert!(
+        workspace_marker.contains("lifecycle-ran"),
+        "Workspace should have marker file from postCreateCommand: {}",
+        workspace_marker
+    );
+
+    // Verify marker file exists in agent container
+    let agent_marker = cmd!(sh, "podman exec {agent_container} cat {marker_path}")
+        .ignore_status()
+        .read()?;
+    assert!(
+        agent_marker.contains("lifecycle-ran"),
+        "Agent should have marker file from postCreateCommand: {}",
+        agent_marker
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_lifecycle_commands_run_in_both_containers);
+
+/// Verify that a more complex init script runs in both containers.
+///
+/// This simulates what devenv-init.sh does: creates config files that are needed
+/// for nested container operations.
+fn test_init_script_configures_both_containers() -> Result<()> {
+    // Create a devcontainer with an init script that creates a config file
+    let config_path = "/tmp/nested-container-config";
+    let devcontainer_json = format!(
+        r#"{{
+    "name": "init-script-test",
+    "image": "ghcr.io/bootc-dev/devenv-debian:latest",
+    "postCreateCommand": "echo 'subuid_configured=true' > {} && echo 'Init script completed for user:' $(whoami)"
+}}"#,
+        config_path
+    );
+
+    let repo = TestRepo::new_with_devcontainer(&devcontainer_json)?;
+    let pod_name = unique_test_name("test-init");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    let sh = shell()?;
+    let agent_container = format!("{}-agent", pod_name);
+    let workspace_container = format!("{}-workspace", pod_name);
+
+    // Give containers time to finish lifecycle commands
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Verify config file exists and has correct content in workspace
+    let workspace_config = cmd!(sh, "podman exec {workspace_container} cat {config_path}")
+        .ignore_status()
+        .read()?;
+    assert!(
+        workspace_config.contains("subuid_configured=true"),
+        "Workspace should have config from init script: {}",
+        workspace_config
+    );
+
+    // Verify config file exists and has correct content in agent
+    let agent_config = cmd!(sh, "podman exec {agent_container} cat {config_path}")
+        .ignore_status()
+        .read()?;
+    assert!(
+        agent_config.contains("subuid_configured=true"),
+        "Agent should have config from init script: {}",
+        agent_config
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_init_script_configures_both_containers);
