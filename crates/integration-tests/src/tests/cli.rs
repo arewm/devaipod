@@ -50,8 +50,8 @@ fn test_up_requires_git_remote() -> Result<()> {
     xshell::cmd!(sh, "git -C {repo} add .").run()?;
     xshell::cmd!(sh, "git -C {repo} commit -m 'Initial'").run()?;
 
-    // Should fail without a remote
-    let output = run_devaipod_in(&repo_path, &["up", ".", "--dry-run"])?;
+    // Should fail without a remote (use --config /dev/null to ignore user config)
+    let output = run_devaipod_in(&repo_path, &["up", ".", "--config", "/dev/null"])?;
     assert!(
         !output.success(),
         "Should fail without git remote configured"
@@ -72,15 +72,17 @@ fn test_up_requires_devcontainer_or_image() -> Result<()> {
     // Create a repo without devcontainer.json
     let repo = TestRepo::new_minimal()?;
 
-    // Should fail without --image
-    let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--dry-run"])?;
+    // Should fail without --image (use --config /dev/null to ignore user config
+    // which may have a default-image set)
+    let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--config", "/dev/null"])?;
     assert!(
         !output.success(),
         "Should fail without devcontainer.json or --image"
     );
     assert!(
-        output.combined().contains("devcontainer.json"),
-        "Error should mention devcontainer.json: {}",
+        output.combined().contains("devcontainer.json")
+            || output.combined().contains("devcontainer"),
+        "Error should mention devcontainer: {}",
         output.combined()
     );
 

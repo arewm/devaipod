@@ -6,11 +6,20 @@
 // Unfortunately needed here to work with linkme
 #![allow(unsafe_code)]
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 /// Label used to identify pods/containers created by integration tests
 pub const INTEGRATION_TEST_LABEL: &str = "io.devaipod.integration-test=1";
 
+/// Name used for the shared integration test pod
+pub const SHARED_POD_NAME: &str = "devaipod-integration-shared";
+
 /// A test function that returns a Result
 pub type TestFn = fn() -> color_eyre::Result<()>;
+
+/// A readonly test function that receives a SharedFixture reference
+pub type ReadonlyTestFn = fn(&SharedFixture) -> color_eyre::Result<()>;
 
 /// Metadata for a registered integration test
 #[derive(Debug)]
@@ -43,9 +52,29 @@ impl IntegrationTest {
     }
 }
 
+/// Metadata for a registered readonly integration test
+#[derive(Debug)]
+pub struct ReadonlyIntegrationTest {
+    /// Name of the integration test
+    pub name: &'static str,
+    /// Test function to execute (receives SharedFixture)
+    pub f: ReadonlyTestFn,
+}
+
+impl ReadonlyIntegrationTest {
+    /// Create a new readonly integration test
+    pub const fn new(name: &'static str, f: ReadonlyTestFn) -> Self {
+        Self { name, f }
+    }
+}
+
 /// Distributed slice holding all registered integration tests
 #[linkme::distributed_slice]
 pub static INTEGRATION_TESTS: [IntegrationTest];
+
+/// Distributed slice holding all registered readonly integration tests
+#[linkme::distributed_slice]
+pub static READONLY_INTEGRATION_TESTS: [ReadonlyIntegrationTest];
 
 /// Register an integration test with less boilerplate.
 ///
@@ -72,15 +101,16 @@ macro_rules! integration_test {
     };
 }
 
-/// Register an integration test that requires podman.
+/// Register an integration test that requires podman and may mutate pod state.
 ///
 /// These tests will be skipped if podman is not available.
+/// Each test creates and manages its own pods.
 ///
 /// # Examples
 ///
 /// ```ignore
 /// fn test_pod_creation() -> Result<()> {
-///     // This test needs podman
+///     // This test needs podman and creates/deletes pods
 ///     let output = run_devaipod(&["up", "..."])?;
 ///     output.assert_success("up");
 ///     Ok(())
@@ -96,4 +126,272 @@ macro_rules! podman_integration_test {
                 $crate::IntegrationTest::new_podman(stringify!($fn_name), $fn_name);
         }
     };
+}
+
+/// Register a readonly integration test that uses the shared pod fixture.
+///
+/// These tests receive a `&SharedFixture` and should only perform read operations
+/// on the shared pod (query state, run commands that don't modify state, etc.).
+///
+/// # Examples
+///
+/// ```ignore
+/// fn test_readonly_pod_exists(fixture: &SharedFixture) -> Result<()> {
+///     // Verify the shared pod exists
+///     let sh = shell()?;
+///     let pod_name = fixture.pod_name();
+///     let exists = cmd!(sh, "podman pod exists {pod_name}")
+///         .ignore_status()
+///         .output()?;
+///     assert!(exists.status.success());
+///     Ok(())
+/// }
+/// readonly_test!(test_readonly_pod_exists);
+/// ```
+#[macro_export]
+macro_rules! readonly_test {
+    ($fn_name:ident) => {
+        ::paste::paste! {
+            #[::linkme::distributed_slice($crate::READONLY_INTEGRATION_TESTS)]
+            static [<$fn_name:upper>]: $crate::ReadonlyIntegrationTest =
+                $crate::ReadonlyIntegrationTest::new(stringify!($fn_name), $fn_name);
+        }
+    };
+}
+
+/// Shared fixture for readonly integration tests.
+///
+/// This fixture is created once and reused by all readonly tests.
+/// It contains a test repository and a running pod that tests can query.
+///
+/// The fixture uses `OnceLock` for thread-safe lazy initialization.
+/// Cleanup should be performed explicitly by calling `cleanup()` after tests complete.
+pub struct SharedFixture {
+    /// The name of the shared pod
+    pod_name: String,
+    /// Path to the test repository
+    repo_path: PathBuf,
+    /// Keep the temp dir alive
+    _temp_dir: tempfile::TempDir,
+}
+
+impl SharedFixture {
+    /// Get the shared fixture instance, creating it on first access.
+    ///
+    /// This method is thread-safe and will only create the fixture once.
+    /// Returns an error if fixture creation fails.
+    pub fn get() -> color_eyre::Result<&'static SharedFixture> {
+        static INSTANCE: OnceLock<SharedFixture> = OnceLock::new();
+
+        // Try to get existing instance first
+        if let Some(fixture) = INSTANCE.get() {
+            return Ok(fixture);
+        }
+
+        // Need to initialize - this races but OnceLock handles it
+        let fixture = Self::create()?;
+
+        // get_or_init ensures only one initializer wins
+        Ok(INSTANCE.get_or_init(|| fixture))
+    }
+
+    /// Create a new shared fixture (internal)
+    fn create() -> color_eyre::Result<Self> {
+        use color_eyre::eyre::{bail, Context};
+        use std::process::Command;
+
+        tracing::info!("Creating shared integration test fixture");
+
+        // Create temp directory and test repo
+        let temp_dir = tempfile::TempDir::new()?;
+        let repo_path = temp_dir.path().join("shared-test-repo");
+        std::fs::create_dir_all(&repo_path)?;
+
+        // Initialize git repo
+        let repo_str = repo_path.to_str().unwrap();
+
+        let status = Command::new("git")
+            .args(["-C", repo_str, "init"])
+            .status()
+            .context("Failed to run git init")?;
+        if !status.success() {
+            bail!("git init failed");
+        }
+
+        Command::new("git")
+            .args(["-C", repo_str, "config", "user.email", "test@example.com"])
+            .status()?;
+        Command::new("git")
+            .args(["-C", repo_str, "config", "user.name", "Test User"])
+            .status()?;
+
+        // Create devcontainer.json
+        let devcontainer_dir = repo_path.join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir)?;
+        let test_image = std::env::var("DEVAIPOD_TEST_IMAGE")
+            .unwrap_or_else(|_| "ghcr.io/bootc-dev/devenv-debian:latest".to_string());
+        let devcontainer_json = format!(
+            r#"{{
+    "name": "shared-integration-test",
+    "image": "{}"
+}}"#,
+            test_image
+        );
+        std::fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            devcontainer_json,
+        )?;
+        std::fs::write(repo_path.join("README.md"), "# Shared Test Repo\n")?;
+
+        // Add remote (required by devaipod)
+        Command::new("git")
+            .args([
+                "-C",
+                repo_str,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/test/shared-test-repo.git",
+            ])
+            .status()?;
+
+        // Commit
+        Command::new("git")
+            .args(["-C", repo_str, "add", "."])
+            .status()?;
+        Command::new("git")
+            .args(["-C", repo_str, "commit", "-m", "Initial commit"])
+            .status()?;
+
+        // Get devaipod path
+        let devaipod = Self::get_devaipod_command()?;
+
+        // Remove any existing shared pod first (in case of previous failed run)
+        let _ = Command::new("podman")
+            .args(["pod", "rm", "-f", SHARED_POD_NAME])
+            .output();
+        let volume_name = format!("{}-workspace", SHARED_POD_NAME);
+        let _ = Command::new("podman")
+            .args(["volume", "rm", "-f", &volume_name])
+            .output();
+
+        // Create the shared pod
+        // Note: We pass "integration-shared" since devaipod adds "devaipod-" prefix
+        let short_name = SHARED_POD_NAME
+            .strip_prefix("devaipod-")
+            .unwrap_or(SHARED_POD_NAME);
+        let output = Command::new(&devaipod)
+            .current_dir(&repo_path)
+            .args(["up", ".", "--name", short_name])
+            .output()
+            .context("Failed to run devaipod up for shared fixture")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            bail!(
+                "Failed to create shared pod:\nstdout: {}\nstderr: {}",
+                stdout,
+                stderr
+            );
+        }
+
+        tracing::info!("Shared fixture created with pod: {}", SHARED_POD_NAME);
+
+        Ok(SharedFixture {
+            pod_name: SHARED_POD_NAME.to_string(),
+            repo_path,
+            _temp_dir: temp_dir,
+        })
+    }
+
+    /// Get the path to the devaipod binary (duplicated from main.rs for independence)
+    fn get_devaipod_command() -> color_eyre::Result<String> {
+        use color_eyre::eyre::eyre;
+
+        if let Ok(path) = std::env::var("DEVAIPOD_PATH") {
+            let path = std::path::PathBuf::from(&path);
+            if path.is_relative() {
+                // Find workspace root
+                let mut dir = std::env::current_dir()?;
+                loop {
+                    if dir.join("Cargo.lock").exists() {
+                        let abs_path = dir.join(&path);
+                        if abs_path.exists() {
+                            return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
+                        }
+                        break;
+                    }
+                    if !dir.pop() {
+                        break;
+                    }
+                }
+                let cwd = std::env::current_dir()?;
+                let abs_path = cwd.join(&path);
+                if abs_path.exists() {
+                    return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
+                }
+                return Err(eyre!("Cannot find devaipod binary at {}", path.display()));
+            }
+            return Ok(path.to_string_lossy().to_string());
+        }
+
+        // Fall back to hoping it's in PATH
+        Ok("devaipod".to_string())
+    }
+
+    /// Get the full pod name (for podman commands)
+    ///
+    /// Returns the full name including the `devaipod-` prefix, e.g. `devaipod-integration-shared`.
+    /// Use this for direct podman commands like `podman pod inspect`.
+    pub fn pod_name(&self) -> &str {
+        &self.pod_name
+    }
+
+    /// Get the short pod name (for devaipod CLI commands)
+    ///
+    /// Returns the name without the `devaipod-` prefix, e.g. `integration-shared`.
+    /// Use this for devaipod commands like `devaipod status`, `devaipod ssh`, etc.
+    pub fn short_name(&self) -> &str {
+        self.pod_name
+            .strip_prefix("devaipod-")
+            .unwrap_or(&self.pod_name)
+    }
+
+    /// Get the path to the test repository
+    pub fn repo_path(&self) -> &PathBuf {
+        &self.repo_path
+    }
+
+    /// Get the workspace container name
+    pub fn workspace_container(&self) -> String {
+        format!("{}-workspace", self.pod_name)
+    }
+
+    /// Get the agent container name
+    pub fn agent_container(&self) -> String {
+        format!("{}-agent", self.pod_name)
+    }
+
+    /// Clean up the shared fixture (remove pod and volume)
+    ///
+    /// This should be called after all tests complete.
+    pub fn cleanup() {
+        use std::process::Command;
+
+        tracing::info!("Cleaning up shared fixture");
+
+        // Remove the pod
+        let _ = Command::new("podman")
+            .args(["pod", "rm", "-f", SHARED_POD_NAME])
+            .output();
+
+        // Remove associated volume
+        let volume_name = format!("{}-workspace", SHARED_POD_NAME);
+        let _ = Command::new("podman")
+            .args(["volume", "rm", "-f", &volume_name])
+            .output();
+
+        tracing::info!("Shared fixture cleanup complete");
+    }
 }

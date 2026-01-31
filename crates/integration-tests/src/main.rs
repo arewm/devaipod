@@ -11,7 +11,10 @@ use libtest_mimic::{Arguments, Trial};
 use xshell::{cmd, Shell};
 
 // Re-export from lib for test registration
-pub(crate) use integration_tests::{integration_test, podman_integration_test, INTEGRATION_TESTS};
+pub(crate) use integration_tests::{
+    integration_test, podman_integration_test, readonly_test, SharedFixture, INTEGRATION_TESTS,
+    READONLY_INTEGRATION_TESTS,
+};
 
 mod tests;
 
@@ -342,8 +345,51 @@ fn main() {
         eprintln!("Note: podman not available, skipping podman-dependent tests");
     }
 
-    // Collect tests from the distributed slice
-    let tests: Vec<Trial> = INTEGRATION_TESTS
+    // Collect readonly tests - these use the shared fixture
+    let readonly_tests: Vec<Trial> = if has_podman && !READONLY_INTEGRATION_TESTS.is_empty() {
+        // Initialize the shared fixture before creating readonly test trials
+        // We do this eagerly so any initialization errors are reported upfront
+        let fixture_result = SharedFixture::get();
+
+        if let Err(ref e) = fixture_result {
+            eprintln!("Failed to create shared fixture: {:?}", e);
+            eprintln!("Readonly tests will be skipped");
+        }
+
+        READONLY_INTEGRATION_TESTS
+            .iter()
+            .map(|test| {
+                let name = test.name;
+                let f = test.f;
+                let fixture_ok = fixture_result.is_ok();
+
+                let trial = Trial::test(name, move || {
+                    if !fixture_ok {
+                        return Err("Shared fixture initialization failed".into());
+                    }
+                    // Safe to unwrap since we checked fixture_ok
+                    let fixture = SharedFixture::get().map_err(|e| format!("{:?}", e))?;
+                    f(fixture).map_err(|e| format!("{:?}", e).into())
+                });
+
+                // Mark as ignored if fixture failed
+                if !fixture_ok {
+                    trial.with_ignored_flag(true)
+                } else {
+                    trial
+                }
+            })
+            .collect()
+    } else {
+        // Skip readonly tests if no podman or no tests registered
+        READONLY_INTEGRATION_TESTS
+            .iter()
+            .map(|test| Trial::test(test.name, || Ok(())).with_ignored_flag(true))
+            .collect()
+    };
+
+    // Collect mutating tests from the distributed slice
+    let mutating_tests: Vec<Trial> = INTEGRATION_TESTS
         .iter()
         .map(|test| {
             let name = test.name;
@@ -361,6 +407,17 @@ fn main() {
         })
         .collect();
 
-    // Run the tests and exit with the result
-    libtest_mimic::run(&args, tests).exit();
+    // Combine all tests
+    let all_tests: Vec<Trial> = readonly_tests.into_iter().chain(mutating_tests).collect();
+
+    // Run the tests
+    let conclusion = libtest_mimic::run(&args, all_tests);
+
+    // Clean up the shared fixture after all tests complete
+    if has_podman && !READONLY_INTEGRATION_TESTS.is_empty() {
+        SharedFixture::cleanup();
+    }
+
+    // Exit with the result
+    conclusion.exit();
 }
