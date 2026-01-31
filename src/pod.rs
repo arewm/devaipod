@@ -1606,6 +1606,42 @@ exec python3 /opt/devaipod/scripts/workspace_monitor.py
         // This avoids UID mapping issues with rootless podman
         let mounts = vec![];
 
+        // Get security settings from devcontainer config to match workspace container.
+        // In rootless podman, capabilities are relative to the user namespace, so the
+        // agent container can safely have the same settings as workspace for nested containers.
+        let (devices, privileged, security_opts, cap_add) =
+            if let Some(config) = devcontainer_config {
+                // Auto-detect development devices to pass through
+                let mut devices: Vec<String> = DEV_PASSTHROUGH_PATHS
+                    .iter()
+                    .filter(|path| Path::new(path).exists())
+                    .map(|path| path.to_string())
+                    .collect();
+
+                // Add devices from runArgs (e.g., --device=/dev/kvm or --device /dev/kvm)
+                for device_spec in config.device_args() {
+                    let path = device_spec.split(':').next().unwrap_or(&device_spec);
+                    if !path.is_empty() && !devices.contains(&path.to_string()) {
+                        devices.push(path.to_string());
+                    }
+                }
+
+                // Check if privileged mode is requested
+                let privileged = config.privileged || config.has_privileged_run_arg();
+
+                // Merge security options from both securityOpt field and runArgs
+                let mut security_opts = config.security_opt.clone();
+                for opt in config.security_opt_args() {
+                    if !security_opts.contains(&opt) {
+                        security_opts.push(opt);
+                    }
+                }
+
+                (devices, privileged, security_opts, config.cap_add.clone())
+            } else {
+                (vec![], false, vec![], vec![])
+            };
+
         // If gcloud ADC is in bind_home, set GOOGLE_APPLICATION_CREDENTIALS to point to it
         // Files are copied to the agent's home directory after container starts
         const GCLOUD_ADC_PATH: &str = ".config/gcloud/application_default_credentials.json";
@@ -1675,10 +1711,15 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
                 "-c".to_string(),
                 startup_script,
             ]),
-            // Security restrictions
-            drop_all_caps: true,
-            cap_add: vec!["NET_BIND_SERVICE".to_string()],
-            no_new_privileges: true,
+            // Security settings match workspace container - in rootless podman, capabilities
+            // are relative to the user namespace so both containers can safely have the same
+            // settings. This enables nested containers (e.g., bcvk) to work in the agent.
+            drop_all_caps: false,
+            cap_add,
+            no_new_privileges: false,
+            devices,
+            security_opts,
+            privileged,
             // Mount the workspace volume and agent home volume
             volume_mounts: vec![
                 (workspace_volume.to_string(), "/workspaces".to_string()),

@@ -592,3 +592,140 @@ fn test_api_authentication_works() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_api_authentication_works);
+
+/// Verify agent container has matching security settings to workspace.
+///
+/// In rootless podman, capabilities are relative to the user namespace, so both
+/// containers should have the same security settings to enable nested containers.
+fn test_agent_matches_workspace_security(fixture: &SharedFixture) -> Result<()> {
+    let sh = shell()?;
+    let workspace = fixture.workspace_container();
+    let agent = fixture.agent_container();
+
+    // Check that both containers have SELinux disabled (label=disable) if workspace does
+    // We check this by looking at the security options in the container inspect output
+    let format_security = "{{json .HostConfig.SecurityOpt}}";
+    let workspace_security =
+        cmd!(sh, "podman inspect {workspace} --format {format_security}").read()?;
+    let agent_security = cmd!(sh, "podman inspect {agent} --format {format_security}").read()?;
+
+    // If workspace has label:disable, agent should too
+    if workspace_security.contains("label") {
+        assert!(
+            agent_security.contains("label"),
+            "Agent should have same SELinux settings as workspace.\nWorkspace: {}\nAgent: {}",
+            workspace_security,
+            agent_security
+        );
+    }
+
+    // Check that agent doesn't have no-new-privileges (which would block nested containers)
+    let format_nnp = "{{.HostConfig.SecurityOpt}}";
+    let agent_nnp = cmd!(sh, "podman inspect {agent} --format {format_nnp}").read()?;
+    assert!(
+        !agent_nnp.contains("no-new-privileges"),
+        "Agent should not have no-new-privileges: {}",
+        agent_nnp
+    );
+
+    Ok(())
+}
+readonly_test!(test_agent_matches_workspace_security);
+
+/// Verify both workspace and agent containers can run commands that require user namespaces.
+///
+/// This tests that newuidmap/newgidmap work, which is required for nested containers.
+/// We test by checking if unshare --user works (creates a user namespace).
+fn test_containers_support_user_namespaces(fixture: &SharedFixture) -> Result<()> {
+    let sh = shell()?;
+    let workspace = fixture.workspace_container();
+    let agent = fixture.agent_container();
+
+    // Test workspace can create user namespace
+    let workspace_unshare = cmd!(
+        sh,
+        "podman exec {workspace} unshare --user --map-root-user id"
+    )
+    .ignore_status()
+    .output()?;
+
+    // Test agent can create user namespace
+    let agent_unshare = cmd!(sh, "podman exec {agent} unshare --user --map-root-user id")
+        .ignore_status()
+        .output()?;
+
+    // If workspace supports user namespaces, agent should too
+    if workspace_unshare.status.success() {
+        assert!(
+            agent_unshare.status.success(),
+            "Agent should support user namespaces like workspace.\nWorkspace: success\nAgent stderr: {}",
+            String::from_utf8_lossy(&agent_unshare.stderr)
+        );
+    }
+
+    Ok(())
+}
+readonly_test!(test_containers_support_user_namespaces);
+
+/// Verify agent container has access to devices when devcontainer.json specifies them.
+///
+/// This creates a pod with a devcontainer.json that requests /dev/kvm (if available),
+/// and verifies the agent container can see it.
+fn test_agent_device_passthrough() -> Result<()> {
+    use std::path::Path;
+
+    // Skip if /dev/kvm doesn't exist on host
+    if !Path::new("/dev/kvm").exists() {
+        tracing::info!("Skipping test_agent_device_passthrough: /dev/kvm not available");
+        return Ok(());
+    }
+
+    let repo = TestRepo::new_with_devcontainer(
+        r#"{
+    "name": "device-test",
+    "image": "ghcr.io/bootc-dev/devenv-debian:latest",
+    "runArgs": ["--device", "/dev/kvm"]
+}"#,
+    )?;
+    let pod_name = unique_test_name("test-device");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    let sh = shell()?;
+    let agent_container = format!("{}-agent", pod_name);
+    let workspace_container = format!("{}-workspace", pod_name);
+
+    // Give containers time to start
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Verify workspace has /dev/kvm
+    let workspace_kvm = cmd!(sh, "podman exec {workspace_container} test -e /dev/kvm")
+        .ignore_status()
+        .output()?;
+    assert!(
+        workspace_kvm.status.success(),
+        "Workspace should have /dev/kvm"
+    );
+
+    // Verify agent also has /dev/kvm
+    let agent_kvm = cmd!(sh, "podman exec {agent_container} test -e /dev/kvm")
+        .ignore_status()
+        .output()?;
+    assert!(
+        agent_kvm.status.success(),
+        "Agent should have /dev/kvm like workspace"
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_agent_device_passthrough);

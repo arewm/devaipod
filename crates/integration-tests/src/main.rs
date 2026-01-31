@@ -237,6 +237,46 @@ impl TestRepo {
         })
     }
 
+    /// Create a test repository with custom devcontainer.json content
+    pub fn new_with_devcontainer(devcontainer_json: &str) -> Result<Self> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let repo_path = temp_dir.path().join("test-repo");
+        std::fs::create_dir_all(&repo_path)?;
+
+        let sh = shell()?;
+        let repo = repo_path.to_str().unwrap();
+
+        // Initialize git repo
+        cmd!(sh, "git -C {repo} init").run()?;
+        cmd!(sh, "git -C {repo} config user.email test@example.com").run()?;
+        cmd!(sh, "git -C {repo} config user.name 'Test User'").run()?;
+
+        // Create devcontainer.json with provided content
+        let devcontainer_dir = repo_path.join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir)?;
+        std::fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            devcontainer_json,
+        )?;
+        std::fs::write(repo_path.join("README.md"), "# Test Repo\n")?;
+
+        // Add remote (required by devaipod)
+        cmd!(
+            sh,
+            "git -C {repo} remote add origin https://github.com/test/test-repo.git"
+        )
+        .run()?;
+
+        // Commit
+        cmd!(sh, "git -C {repo} add .").run()?;
+        cmd!(sh, "git -C {repo} commit -m 'Initial commit'").run()?;
+
+        Ok(TestRepo {
+            temp_dir,
+            repo_path,
+        })
+    }
+
     /// Create a minimal test repo (just git init, no devcontainer)
     pub fn new_minimal() -> Result<Self> {
         let temp_dir = tempfile::TempDir::new()?;
