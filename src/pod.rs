@@ -224,9 +224,6 @@ pub struct DevaipodPod {
     /// Name of the gator container (if enabled)
     #[allow(dead_code)] // Stored for future container management
     pub gator_container: Option<String>,
-    /// Name of the proxy container (if network isolation enabled)
-    #[allow(dead_code)] // Used for container management
-    pub proxy_container: Option<String>,
     /// The image used for workspace and agent containers
     #[allow(dead_code)] // Stored for reference, used in operations
     pub image: String,
@@ -270,7 +267,6 @@ impl DevaipodPod {
         devcontainer_config: &DevcontainerConfig,
         pod_name: &str,
         enable_gator: bool,
-        enable_network_isolation: bool,
         global_config: &Config,
         source: &WorkspaceSource,
         extra_labels: &[(String, String)],
@@ -517,37 +513,6 @@ impl DevaipodPod {
                 )
             })?;
 
-        // Create proxy container if network isolation is enabled
-        let proxy_container_name = format!("{}-proxy", pod_name);
-        let proxy_container = if enable_network_isolation {
-            tracing::info!("Network isolation enabled, creating proxy container...");
-
-            // Pull proxy image
-            let proxy_image = global_config.network_isolation.proxy_image();
-            podman
-                .pull_image(proxy_image)
-                .await
-                .with_context(|| format!("Failed to pull proxy image: {}", proxy_image))?;
-
-            // Combine allowed domains from global config and devcontainer customizations
-            let mut network_config = global_config.network_isolation.clone();
-            network_config
-                .allowed_domains
-                .extend(devcontainer_config.allowed_domains());
-
-            let proxy_config = crate::proxy::proxy_container_config(&network_config);
-            podman
-                .create_container(&proxy_container_name, proxy_image, pod_name, proxy_config)
-                .await
-                .with_context(|| {
-                    format!("Failed to create proxy container: {}", proxy_container_name)
-                })?;
-
-            Some(proxy_container_name)
-        } else {
-            None
-        };
-
         // Note: Task is written to the agent home volume after dotfiles installation
         // in finalize_pod() via write_task_to_volume(). This ensures user dotfiles
         // don't overwrite the task config.
@@ -559,7 +524,6 @@ impl DevaipodPod {
             &agent_bind_home,
             &container_home,
             Some(devcontainer_config),
-            enable_network_isolation,
             enable_gator,
             &volume_name,
             &agent_home_volume,
@@ -615,9 +579,7 @@ impl DevaipodPod {
             None
         };
 
-        let container_count = 2
-            + if gator_container.is_some() { 1 } else { 0 }
-            + if proxy_container.is_some() { 1 } else { 0 };
+        let container_count = 2 + if gator_container.is_some() { 1 } else { 0 };
         tracing::debug!(
             "Created pod '{}' with {} containers",
             pod_name,
@@ -629,7 +591,6 @@ impl DevaipodPod {
             workspace_container,
             agent_container,
             gator_container,
-            proxy_container,
             image,
             workspace_folder,
             workspace_bind_home,
@@ -1479,9 +1440,6 @@ exec sleep infinity
     /// If `devcontainer_config` is provided, env vars from its `customizations.devaipod.env_allowlist`
     /// will be forwarded to the agent.
     ///
-    /// If `use_proxy` is true, HTTP_PROXY/HTTPS_PROXY env vars are set to route
-    /// traffic through the network isolation proxy.
-    ///
     /// If `enable_gator` is true, OPENCODE_CONFIG_CONTENT is set with MCP config
     /// to connect opencode to the service-gator container.
     #[allow(clippy::too_many_arguments)]
@@ -1491,7 +1449,6 @@ exec sleep infinity
         bind_home: &BindHomeConfig,
         _container_home: &str,
         devcontainer_config: Option<&DevcontainerConfig>,
-        use_proxy: bool,
         enable_gator: bool,
         workspace_volume: &str,
         agent_home_volume: &str,
@@ -1546,13 +1503,6 @@ exec sleep infinity
 
         // Add env vars from global config (allowlist + explicit vars)
         env.extend(global_config.env.collect());
-
-        // If network isolation is enabled, route traffic through the proxy
-        if use_proxy {
-            for (key, value) in crate::proxy::agent_proxy_env() {
-                env.insert(key, value);
-            }
-        }
 
         // No bind mounts - we clone the repo into the container instead
         // This avoids UID mapping issues with rootless podman
@@ -1872,7 +1822,6 @@ mod tests {
             &bind_home,
             container_home,
             None,
-            false, // use_proxy
             false, // enable_gator
             "test-volume",
             "test-agent-home",
@@ -1931,7 +1880,6 @@ mod tests {
             &bind_home,
             container_home,
             None,
-            false, // use_proxy
             false, // enable_gator
             "test-volume",
             "test-agent-home",
@@ -2246,7 +2194,6 @@ mod tests {
             &bind_home,
             container_home,
             None,
-            false, // use_proxy
             false, // enable_gator
             "test-volume",
             "test-agent-home",
@@ -2447,67 +2394,6 @@ mod tests {
             script: None,
         };
         assert!(dotfiles_no_script.script.is_none());
-    }
-
-    #[test]
-    fn test_agent_with_network_isolation() {
-        let project_path = Path::new("/home/user/myproject");
-        let workspace_folder = "/workspaces/myproject";
-        let bind_home = BindHomeConfig::default();
-        let container_home = "/home/vscode";
-
-        // Test with network isolation enabled
-        let global_config = crate::config::Config::default();
-        let container_config = DevaipodPod::agent_container_config(
-            project_path,
-            workspace_folder,
-            &bind_home,
-            container_home,
-            None,
-            true,  // use_proxy
-            false, // enable_gator
-            "test-volume",
-            "test-agent-home",
-            &global_config,
-            "test-password",
-        );
-
-        // Should have proxy env vars set
-        assert!(container_config.env.contains_key("HTTP_PROXY"));
-        assert!(container_config.env.contains_key("HTTPS_PROXY"));
-        assert!(container_config.env.contains_key("NO_PROXY"));
-
-        let proxy_url = format!("http://localhost:{}", crate::proxy::PROXY_PORT);
-        assert_eq!(container_config.env.get("HTTP_PROXY"), Some(&proxy_url));
-        assert_eq!(container_config.env.get("HTTPS_PROXY"), Some(&proxy_url));
-    }
-
-    #[test]
-    fn test_agent_without_network_isolation() {
-        let project_path = Path::new("/home/user/myproject");
-        let workspace_folder = "/workspaces/myproject";
-        let bind_home = BindHomeConfig::default();
-        let container_home = "/home/vscode";
-
-        // Test without network isolation
-        let global_config = crate::config::Config::default();
-        let container_config = DevaipodPod::agent_container_config(
-            project_path,
-            workspace_folder,
-            &bind_home,
-            container_home,
-            None,
-            false, // no proxy
-            false, // enable_gator
-            "test-volume",
-            "test-agent-home",
-            &global_config,
-            "test-password",
-        );
-
-        // Should NOT have proxy env vars set
-        assert!(!container_config.env.contains_key("HTTP_PROXY"));
-        assert!(!container_config.env.contains_key("HTTPS_PROXY"));
     }
 
     #[test]

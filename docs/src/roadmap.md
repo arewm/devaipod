@@ -14,6 +14,8 @@ Priorities may shift based on user feedback and practical experience.
 
 Larger features under consideration:
 
+- **Network isolation**: Configure podman-level network settings to restrict agent network access
+- **LLM credential isolation**: Proxy container (possibly service-gator) that holds LLM API keys, so the agent doesn't have direct credential access
 - **Kubernetes support**: Use kube-rs to create pods on real Kubernetes clusters for remote dev environments
 - **Quadlet/systemd integration**: Generate Quadlet units for proper lifecycle management
 - **Local Forgejo instance**: Git caching, local CI/CD, and code review UI (see [forgejo-integration.md](../todo/forgejo-integration.md))
@@ -26,6 +28,5 @@ Larger features under consideration:
 ## Known Limitations
 
 - **Agent requires opencode in the image**: The agent container runs `opencode serve`, so opencode must be installed in the devcontainer image
-- **Network isolation is HTTP only**: The proxy blocks HTTP/HTTPS to non-allowed domains; non-HTTP traffic is not blocked
 - **Lifecycle commands only run in workspace**: onCreateCommand etc. run in the workspace container, not the agent container
 - **Single agent type**: Only opencode is currently tested

@@ -21,7 +21,6 @@ mod gpu;
 mod init;
 mod pod;
 mod podman;
-mod proxy;
 mod secrets;
 mod service_gator;
 mod tui;
@@ -1175,9 +1174,6 @@ async fn create_workspace_from_local(
         .await
         .context("Failed to start podman service")?;
 
-    // Check if network isolation should be enabled
-    let enable_network_isolation = config.network_isolation.enabled;
-
     // Create the pod with all containers
     tracing::debug!("Creating pod '{}'...", pod_name);
     let source = pod::WorkspaceSource::LocalRepo(git_info);
@@ -1198,7 +1194,6 @@ async fn create_workspace_from_local(
         &devcontainer_config,
         &pod_name,
         enable_gator,
-        enable_network_isolation,
         config,
         &source,
         &extra_labels,
@@ -1355,7 +1350,6 @@ async fn create_workspace_from_remote(
         .context("Failed to start podman service")?;
 
     let enable_gator = service_gator_config.is_enabled();
-    let enable_network_isolation = config.network_isolation.enabled;
 
     // Create source from remote repo info
     let remote_info = git::RemoteRepoInfo {
@@ -1383,7 +1377,6 @@ async fn create_workspace_from_remote(
         &devcontainer_config,
         &pod_name,
         enable_gator,
-        enable_network_isolation,
         config,
         &source,
         &extra_labels,
@@ -1491,9 +1484,8 @@ async fn create_workspace_from_pr(
         .await
         .context("Failed to start podman service")?;
 
-    // Check for gator and network isolation settings
+    // Check for gator settings
     let enable_gator = config.service_gator.is_enabled();
-    let enable_network_isolation = config.network_isolation.enabled;
 
     // Create source from PR info
     let source = pod::WorkspaceSource::PullRequest(pr_info);
@@ -1517,7 +1509,6 @@ async fn create_workspace_from_pr(
         &devcontainer_config,
         &pod_name,
         enable_gator,
-        enable_network_isolation,
         config,
         &source,
         &extra_labels,
@@ -2564,7 +2555,6 @@ async fn cmd_rebuild(
         .context("Failed to start podman service")?;
 
     let enable_gator = config.service_gator.is_enabled();
-    let enable_network_isolation = config.network_isolation.enabled;
 
     // Build extra labels
     let mut extra_labels = Vec::new();
@@ -2582,7 +2572,6 @@ async fn cmd_rebuild(
         &devcontainer_config,
         pod_name,
         enable_gator,
-        enable_network_isolation,
         config,
         &source,
         &extra_labels,

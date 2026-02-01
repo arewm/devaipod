@@ -122,11 +122,6 @@ pub struct DevaipodCustomizations {
     /// This is an alternative to using DEVAIPOD_AGENT_* prefix.
     #[serde(default)]
     pub env_allowlist: Vec<String>,
-
-    /// Additional allowed domains for network isolation.
-    /// Merged with the global config's allowed_domains.
-    #[serde(default)]
-    pub allowed_domains: Vec<String>,
 }
 
 fn default_workspace_folder() -> String {
@@ -314,15 +309,6 @@ impl DevcontainerConfig {
             .iter()
             .filter_map(|key| std::env::var(key).ok().map(|value| (key.clone(), value)))
             .collect()
-    }
-
-    /// Get additional allowed domains from devcontainer customizations
-    pub fn allowed_domains(&self) -> Vec<String> {
-        self.customizations
-            .as_ref()
-            .and_then(|c| c.devaipod.as_ref())
-            .map(|d| d.allowed_domains.clone())
-            .unwrap_or_default()
     }
 
     /// Check if this configuration has any features defined
@@ -540,8 +526,7 @@ mod tests {
             "image": "foo",
             "customizations": {
                 "devaipod": {
-                    "envAllowlist": ["MY_API_KEY", "CUSTOM_TOKEN"],
-                    "allowedDomains": ["api.example.com"]
+                    "envAllowlist": ["MY_API_KEY", "CUSTOM_TOKEN"]
                 }
             }
         }"#;
@@ -551,29 +536,6 @@ mod tests {
         let devaipod = customizations.devaipod.expect("devaipod should exist");
 
         assert_eq!(devaipod.env_allowlist, vec!["MY_API_KEY", "CUSTOM_TOKEN"]);
-        assert_eq!(devaipod.allowed_domains, vec!["api.example.com"]);
-    }
-
-    #[test]
-    fn test_allowed_domains_helper() {
-        let json = r#"{
-            "image": "foo",
-            "customizations": {
-                "devaipod": {
-                    "allowedDomains": ["api.custom.com", "other.example.org"]
-                }
-            }
-        }"#;
-        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
-
-        let domains = config.allowed_domains();
-        assert_eq!(domains, vec!["api.custom.com", "other.example.org"]);
-    }
-
-    #[test]
-    fn test_allowed_domains_empty_when_no_customizations() {
-        let config = DevcontainerConfig::default();
-        assert!(config.allowed_domains().is_empty());
     }
 
     #[test]

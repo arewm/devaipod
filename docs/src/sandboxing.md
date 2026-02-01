@@ -14,8 +14,6 @@ For implementation details, see the Rust module docs in `src/pod.rs`.
 
 3. **Isolated home directory** - The agent's `$HOME` is a separate volume that doesn't contain user credentials from the host.
 
-4. **Network isolation (optional)** - When enabled, an HTTPS proxy restricts the agent to allowed LLM API domains.
-
 ## Architecture
 
 ```mermaid
@@ -25,7 +23,6 @@ flowchart TB
             workspace[Workspace Container<br/>Full dev env, GH_TOKEN]
             agent[Agent Container<br/>LLM keys only, isolated HOME]
             gator[Gator Container<br/>service-gator MCP]
-            proxy[Proxy Container<br/>Network isolation - optional]
             volume[(Shared Volume)]
         end
     end
@@ -33,9 +30,7 @@ flowchart TB
     agent <-->|mount| volume
     workspace -->|oc :4096| agent
     agent -->|MCP :8765| gator
-    agent -.->|HTTPS| proxy
     gator -->|scoped| github[GitHub API]
-    proxy -.->|allowed domains| llm[LLM APIs]
 ```
 
 ## Container Security
@@ -59,13 +54,6 @@ flowchart TB
 - Receives trusted credentials (GH_TOKEN, JIRA_API_TOKEN)
 - Provides scope-restricted access to external services
 - Agent connects via MCP protocol, never sees raw credentials
-
-### Proxy Container (Optional)
-- HTTPS proxy for network isolation
-- Restricts agent to allowed LLM API domains
-- Prevents exfiltration to arbitrary endpoints
-
-**Note:** Network isolation via proxy is an optional feature. Enable with `[network-isolation] enabled = true` in config. This is HTTP/HTTPS only; non-HTTP traffic is not blocked.
 
 ## Volume Strategy
 
@@ -97,11 +85,7 @@ allowlist = ["GH_TOKEN", "GITLAB_TOKEN", "JIRA_API_TOKEN"]
 
 1. **Workspace file access**: The agent can read/write any file in the workspace. Secrets in `.env` files are visible.
 
-2. **Network access**: Without the proxy container, the agent has full network access. Enable network isolation in config:
-   ```toml
-   [network-isolation]
-   enabled = true
-   ```
+2. **Network access**: The agent has full network access within the pod's shared network namespace.
 
 3. **Same image requirement**: The agent container uses the same image as the workspace. OpenCode must be installed in your devcontainer image.
 

@@ -25,11 +25,6 @@ allowlist = ["GH_TOKEN", "GITLAB_TOKEN", "JIRA_API_TOKEN"]
 [trusted]
 secrets = ["GH_TOKEN=gh_token", "GITLAB_TOKEN=gitlab_token"]
 
-# Network isolation (optional)
-[network-isolation]
-enabled = true
-allowed_domains = ["api.custom.com"]  # Additional domains (LLM APIs allowed by default)
-
 # GPU passthrough (optional)
 [gpu]
 enabled = true  # or "auto" to detect

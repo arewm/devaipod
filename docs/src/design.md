@@ -8,7 +8,7 @@ devaipod is designed as **mid-level infrastructure** for AI coding workflows.
 
 **Less opinionated than full platforms**: Unlike monolithic solutions (OpenHands Cloud, Cursor), devaipod focuses on the primitives and leaves room for building different workflows on top. Want a web UI? Build one that talks to our pods. Prefer a TUI? That works too.
 
-**Composable building blocks**: The pod abstraction, service-gator MCP, and network isolation are independent pieces. Use what you need, skip what you don't.
+**Composable building blocks**: The pod abstraction and service-gator MCP are independent pieces. Use what you need, skip what you don't.
 
 This design enables:
 
