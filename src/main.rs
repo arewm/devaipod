@@ -1805,7 +1805,7 @@ fn podman_command() -> ProcessCommand {
 /// - Left pane: opencode-connect (AI agent interface)
 /// - Right pane: bash shell for manual work
 ///
-/// If a tmux session already exists for this workspace, it attaches to it.
+/// Any existing tmux session is killed first to ensure a fresh state.
 async fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
     let workspace_container = format!("{}-workspace", pod_name);
     let tmux_session = strip_pod_prefix(pod_name).replace(['.', ':'], "-");
@@ -1822,19 +1822,19 @@ async fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
     };
 
     // Script to run inside the workspace container:
-    // 1. Check if tmux session exists
-    // 2. If not, create it with two panes (agent left, shell right)
+    // 1. Kill any existing tmux session (ensures fresh state)
+    // 2. Create new session with two panes (agent left, shell right)
     // 3. Attach to the session
     let tmux_script = format!(
         r#"
-if ! tmux has-session -t {session} 2>/dev/null; then
-    # Create new session with agent in left pane
-    tmux new-session -d -s {session} '{agent_cmd}'
-    # Split horizontally and start shell in right pane
-    tmux split-window -h -t {session} 'bash'
-    # Focus left pane (agent)
-    tmux select-pane -t {session}:0.0
-fi
+# Kill any existing session to ensure fresh state
+tmux kill-session -t {session} 2>/dev/null || true
+# Create new session with agent in left pane
+tmux new-session -d -s {session} '{agent_cmd}'
+# Split horizontally and start shell in right pane
+tmux split-window -h -t {session} 'bash'
+# Focus left pane (agent)
+tmux select-pane -t {session}:0.0
 # Attach to the session
 exec tmux attach -t {session}
 "#,
