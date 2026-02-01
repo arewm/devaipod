@@ -21,7 +21,7 @@ This design enables:
 
 The fundamental design principle is that AI agents should have minimal access to credentials and external services. Rather than trusting the agent with your GitHub token, devaipod:
 
-1. Runs the agent in an isolated container with dropped capabilities
+1. Runs the agent in an isolated container without trusted credentials (GH_TOKEN, etc.)
 2. Routes external service access through [service-gator](service-gator.md), which enforces fine-grained scopes
 3. By default, only allows the agent to read repositories and create *draft* pull requests
 

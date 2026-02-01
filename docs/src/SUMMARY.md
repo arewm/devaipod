@@ -5,7 +5,6 @@
 # User Guide
 
 - [Quick Start](quickstart.md)
-- [Commands](commands.md)
 - [Configuration](configuration.md)
 - [Design Philosophy](design.md)
 
@@ -23,7 +22,6 @@
 
 - [Contributing](contributing.md)
 - [Debugging](debugging.md)
-- [E2E Testing](e2e-testing.md)
 - [Roadmap](roadmap.md)
 - [Internals](internals.md)
 

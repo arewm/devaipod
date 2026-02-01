@@ -1471,10 +1471,10 @@ exec sleep infinity
 
     /// Create container config for the agent container
     ///
-    /// The agent runs `opencode serve` with restricted security:
-    /// - Drops all capabilities except NET_BIND_SERVICE
-    /// - Sets no-new-privileges
-    /// - Uses a separate home directory
+    /// The agent runs `opencode serve` with credential isolation:
+    /// - Receives LLM API keys but NOT trusted credentials (GH_TOKEN, etc.)
+    /// - Uses a separate home directory volume
+    /// - Has the same Linux capabilities as workspace (for nested container support)
     ///
     /// If `devcontainer_config` is provided, env vars from its `customizations.devaipod.env_allowlist`
     /// will be forwarded to the agent.
@@ -1892,13 +1892,12 @@ mod tests {
         assert!(cmd[2].contains("opencode serve"));
         assert!(cmd[2].contains(&format!("--port {}", OPENCODE_PORT)));
 
-        // Verify security restrictions
-        assert!(container_config.drop_all_caps);
-        assert!(container_config.no_new_privileges);
-        assert_eq!(
-            container_config.cap_add,
-            vec!["NET_BIND_SERVICE".to_string()]
-        );
+        // Agent has the same security settings as workspace (not restricted)
+        // to support nested containers. Security comes from credential isolation.
+        assert!(!container_config.drop_all_caps);
+        assert!(!container_config.no_new_privileges);
+        // When no devcontainer_config is provided, cap_add is empty
+        assert!(container_config.cap_add.is_empty());
 
         // Verify agent has persistent home directory
         assert_eq!(
