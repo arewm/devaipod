@@ -9,29 +9,22 @@ Combines in an opinionated way:
 - [Devcontainers](https://containers.dev/) as a specification mechanism
 - [service-gator](https://github.com/cgwalters/service-gator) as fine-grained MCP server for Github/Gitlab/Forgejo/etc
 
-This tool is primarily designed by @cgwalters who would "un-invent" large language models if he could because he believes the long term negatives are likely to outweigh the gains. But since that's not possible, this project is about maximizing the positive aspects of LLMs with a focus on software production. We need to use LLMs safely and responsibly, with efficient human-in-the-loop controls and auditability.
+To be clear: this tool is primarily designed by @cgwalters who would "un-invent" large language models if he could because he believes the long term negatives for society are likely to outweigh the gains. But since that's not possible, this project is about maximizing the positive aspects of LLMs with a focus on software production. We need to use LLMs safely and responsibly, with efficient human-in-the-loop controls and auditability.
 
-If you want to use LLMs, but are terrified of e.g. [prompt injection](https://simonwillison.net/tags/prompt-injection/) attacks from un-sandboxed agent use especially with unbound access to your machine secrets (especially e.g. Github token): then devaipod can help you.
-
-## Quick Start
-
-```bash
-# Clone and build
-git clone https://github.com/cgwalters/devaipod && cd devaipod
-cargo install --path .
-
-# First-time setup
-devaipod init
-
-# Run agent on a GitHub issue
-devaipod run https://github.com/org/repo/issues/123
-```
-
-When you do this, the default service-gator configuration *only* allows editing that issue and creation of a draft pull request.
+However, @cgwalters uses LLMs every day. If you use LLMs or want to, but have heard of e.g. [prompt injection](https://simonwillison.net/tags/prompt-injection/) attacks and share similar concerns from un-sandboxed agent use, then devaipod can help you, as it does the author.
 
 ## Documentation
 
-Full documentation is available at **[cgwalters.github.io/devaipod](https://cgwalters.github.io/devaipod)**
+Full documentation including quick start is available at **[cgwalters.github.io/devaipod](https://cgwalters.github.io/devaipod)**
+
+## Related Projects
+
+- [OpenHands](https://github.com/All-Hands-AI/OpenHands) - Open platform for AI software developers as generalist agents
+- [SWE-agent](https://github.com/princeton-nlp/SWE-agent) - Agent-computer interface for software engineering tasks (from Princeton NLP)
+- [Auto-Claude](https://github.com/siddicky/auto-claude) - Autonomous Claude with sandboxed execution
+- [Ambient Code](https://ambient.run/) - AI coding assistant with local execution
+- [Ona](https://github.com/synthetic-selves/ona) - Open source AI agent framework
+- [Gastown](https://github.com/gastown-ai/gastown) - Sandboxed AI coding environments
 
 ## Contributing
 
