@@ -74,3 +74,10 @@ a devaipod could request more devaipods in the general case...
 
 Our testing story needs to be improved across the board of
 course.
+
+# Bot/Assistant Accounts
+
+**Status: Spec complete, see [bot-assistant-accounts.md](./bot-assistant-accounts.md)**
+
+Use OAuth2 apps (GitHub Apps, GitLab Applications, etc.) with "on behalf of"
+user authentication instead of PATs. Actions are attributed to the user.
