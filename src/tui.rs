@@ -1624,13 +1624,23 @@ fn render_instance_card(
         None => Style::default().fg(Color::DarkGray),
     };
 
-    // Selection indicator for delete mode
+    // Selection indicator for delete mode: arrow shows cursor, checkbox shows marked for deletion
     let prefix: Span<'static> = if in_delete_mode {
-        if is_marked_for_delete {
-            Span::styled("[x] ".to_string(), Style::default().fg(Color::Red).bold())
+        let arrow = if is_selected { "▶ " } else { "  " };
+        let checkbox = if is_marked_for_delete { "[x]" } else { "[ ]" };
+        let style = if is_selected {
+            // Selected row: cyan for visibility (red if also marked)
+            if is_marked_for_delete {
+                Style::default().fg(Color::Red).bold()
+            } else {
+                Style::default().fg(Color::Cyan).bold()
+            }
+        } else if is_marked_for_delete {
+            Style::default().fg(Color::Red).bold()
         } else {
-            Span::styled("[ ] ".to_string(), Style::default().fg(Color::DarkGray))
-        }
+            Style::default().fg(Color::DarkGray)
+        };
+        Span::styled(format!("{arrow}{checkbox} "), style)
     } else if is_selected {
         Span::styled("▶ ".to_string(), Style::default().fg(Color::Cyan).bold())
     } else {
