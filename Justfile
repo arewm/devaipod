@@ -13,7 +13,7 @@ build-release:
     cargo build --release
 
 # Run format and type checks, record tree hash for pre-commit hook
-check:
+check: install-hooks
     cargo fmt -- --check
     cargo check
     @mkdir -p target
