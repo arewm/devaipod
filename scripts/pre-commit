@@ -17,10 +17,8 @@ current_tree=$(git write-tree 2>/dev/null) || exit 0
 
 if [ ! -f "$STAMP_FILE" ]; then
     echo ""
-    echo "Warning: 'just check' has not been run"
-    echo "Consider running: just check"
-    echo ""
-    sleep 2
+    echo "IMPORTANT: 'just check' has not been run for this commit, this is required"
+    sleep 1.5
     exit 0
 fi
 

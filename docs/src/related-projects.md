@@ -1,79 +1,132 @@
 # Related Projects
 
-The AI coding agent space is evolving rapidly. This page provides an overview of related projects and how devaipod relates to them. For some projects we have detailed comparison documents.
+The AI coding agent space is evolving rapidly. This page compares devaipod to related projects, with emphasis on licensing and cloud dependencies.
 
-## Platforms and Orchestrators
+For broader context on the state of agentic AI coding tools, see [Thoughts on agentic AI coding as of Oct 2025](https://blog.verbum.org/2025/10/27/thoughts-on-agentic-ai-coding-as-of-oct-2025/).
 
-### OpenHands
+## Comparison Table
 
-[OpenHands](https://github.com/All-Hands-AI/OpenHands) (formerly OpenDevin) is an open platform for AI software developers as generalist agents. It provides a web interface for managing agent sessions with Docker-based sandboxing.
+| Project | License | Local-only? | Notes |
+|---------|---------|-------------|-------|
+| **devaipod** | Apache-2.0/MIT | Yes | No cloud services required |
+| [OpenHands](https://github.com/All-Hands-AI/OpenHands) | MIT | Yes | Self-hostable, Docker-based |
+| [Ambient Code](https://github.com/ambient-code/platform) | MIT | Yes | Kubernetes-native, self-hosted |
+| [Gastown](https://github.com/steveyegge/gastown) | MIT | Yes | Multi-agent orchestration, no sandboxing |
+| [Auto-Claude](https://github.com/AndyMik90/Auto-Claude) | AGPL-3.0 | Yes | Desktop app, no sandboxing |
+| [Continue](https://github.com/continuedev/continue) | Apache-2.0 | Partial | CLI is local; "Mission Control" cloud is proprietary |
+| [SWE-agent](https://github.com/princeton-nlp/SWE-agent) | MIT | Partial | Core is open; [depends on Daytona cloud](https://www.daytona.io/dotfiles/langchain-s-open-swe-runs-on-daytona-here-s-why) for some features |
+| [Ona](https://ona.com/) | Proprietary | No | Cloud service, not open source |
+| [Cursor](https://cursor.sh/) | Proprietary | No | Commercial product |
+| Claude Code Web | Proprietary | No | Anthropic-hosted, sandboxed but not open source |
 
-**Relationship to devaipod**: OpenHands is a more complete platform with its own web UI, while devaipod focuses on CLI-first workflows and devcontainer.json compatibility. OpenHands targets teams wanting a managed experience; devaipod targets developers who want fine-grained control over sandboxing.
+## Basic Agent Frameworks
 
-### Ambient Code Platform
+These are the "raw" agent tools that devaipod can wrap with sandboxing. They run directly on your machine with full access to your filesystem and credentials.
 
-[Ambient Code Platform](https://github.com/ambient-code/platform) is a Kubernetes-native platform for running AI coding agents ("virtual teams"). It provides orchestration, credential management, and issue-driven workflows.
+### Claude Code
 
-**Relationship to devaipod**: Ambient Code targets team/organization deployment on Kubernetes with enterprise features. devaipod targets individual developer workstations with zero infrastructure beyond a container runtime. Both projects are solving credential scoping, and Ambient Code's broker architecture influenced devaipod's service-gator integration.
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) is Anthropic's official CLI agent. Proprietary, closed source. Runs locally but with no sandboxing—the agent has full access to your machine and any credentials in your environment.
 
-See [detailed comparison](relationship-ambient-code.md) for architecture analysis.
+### Gemini CLI
 
-### SWE-agent
+[Gemini CLI](https://github.com/google-gemini/gemini-cli) is Google's agent CLI. Apache-2.0 licensed.
 
-[SWE-agent](https://github.com/princeton-nlp/SWE-agent) from Princeton NLP provides an agent-computer interface designed for software engineering tasks. It focuses on the agent's ability to navigate and modify codebases.
+Gemini CLI has a "sandbox" mode using Docker, but **the sandboxing is insufficient for security-conscious use**:
 
-**Relationship to devaipod**: SWE-agent is primarily a research project exploring how agents interact with code. devaipod could potentially use SWE-agent as an agent backend, though we currently focus on OpenCode.
+- The sandbox isolates filesystem access, but credentials (API keys, tokens) are still passed into the container environment
+- There is no credential scoping—if you give the agent a GitHub token, it has full access to all repos that token can reach
+- No network isolation beyond what Docker provides by default
+- No fine-grained control over what the agent can do with external services
+- No devcontainer.json support—you can't use your project's existing dev environment spec
 
-## Agent Frameworks
-
-### Continue
-
-[Continue](https://github.com/continuedev/continue) is an open-source AI coding assistant with VS Code and JetBrains extensions, plus a CLI and cloud platform (Mission Control).
-
-**Relationship to devaipod**: Continue's cloud agent features are proprietary (Mission Control). Continue's local CLI has no sandboxing. devaipod provides the sandboxing layer that Continue's local mode lacks.
-
-See [detailed comparison](relationship-continue.md) for architecture analysis.
-
-### Auto-Claude
-
-[Auto-Claude](https://github.com/AndyMik90/Auto-Claude) is an autonomous multi-agent coding framework with a desktop UI, visual task management (Kanban), and parallel agent execution.
-
-**Relationship to devaipod**: Auto-Claude has excellent UI/UX but runs agents directly on the host with full system access. devaipod could serve as a sandboxed backend for Auto-Claude's interface.
-
-See [detailed comparison](relationship-auto-claude.md) for integration analysis.
-
-### Ona
-
-[Ona](https://github.com/synthetic-selves/ona) is an open source AI agent framework focused on autonomous task execution.
-
-**Relationship to devaipod**: Ona is an agent framework; devaipod is agent-agnostic sandboxing infrastructure. devaipod could potentially run Ona agents in isolated containers.
+devaipod addresses these gaps: the agent container has no direct access to your GitHub token; instead, all GitHub operations go through service-gator which enforces scopes (e.g., only draft PRs to a specific repo).
 
 ### Goose
 
-[Goose](https://github.com/block/goose) from Block is an extensible AI agent that can take actions on your behalf. It supports MCP (Model Context Protocol) for tool integration.
+[Goose](https://github.com/block/goose) from Block is an extensible AI agent with MCP (Model Context Protocol) support. Apache-2.0 licensed, fully open source, runs locally.
 
-**Relationship to devaipod**: Goose is one of the agents devaipod can run (via `--agent goose`), though OpenCode is the primary tested agent. Goose is used in Aipproval-Forge.
+devaipod can run Goose as an agent backend (via `--agent goose`), though OpenCode is the primary tested agent.
 
-## Commercial/Hybrid Products
+### OpenCode
 
-### Cursor
+[OpenCode](https://github.com/anomalyco/opencode/) is the primary agent framework used by devaipod. Apache-2.0 licensed. It provides a TUI and a server mode that devaipod uses for sandboxed execution.
 
-[Cursor](https://cursor.sh/) is a commercial AI-first code editor based on VS Code. It provides deep IDE integration with AI assistance.
+## Orchestration Platforms
 
-**Relationship to devaipod**: Cursor is a monolithic commercial product. devaipod is open infrastructure for composing your own workflows.
+### OpenHands
+
+[OpenHands](https://github.com/All-Hands-AI/OpenHands) (formerly OpenDevin) is an open platform for AI software developers. It provides a web interface for managing agent sessions with Docker-based sandboxing. MIT licensed.
+
+OpenHands is a more complete platform with its own web UI. devaipod focuses on CLI-first workflows, devcontainer.json compatibility, and fine-grained credential scoping via service-gator.
+
+### Ambient Code Platform
+
+[Ambient Code Platform](https://github.com/ambient-code/platform) is a Kubernetes-native platform for running AI coding agents. MIT licensed, self-hostable.
+
+Ambient Code targets team/organization deployment on Kubernetes. devaipod targets individual developer workstations with zero infrastructure beyond podman. Both projects solve credential scoping—Ambient Code's broker architecture influenced devaipod's service-gator integration.
+
+### Auto-Claude
+
+[Auto-Claude](https://github.com/AndyMik90/Auto-Claude) is an autonomous multi-agent coding framework with a desktop UI, Kanban board, and parallel agent execution. AGPL-3.0 licensed.
+
+Auto-Claude has excellent UI/UX but runs agents directly on the host with full system access—no sandboxing. devaipod could serve as a sandboxed backend for Auto-Claude's interface.
 
 ### Gastown
 
-[Gastown](https://github.com/gastown-ai/gastown) provides sandboxed AI coding environments with a focus on isolation.
+[Gastown](https://github.com/steveyegge/gastown) (from Steve Yegge) is a multi-agent orchestration system for Claude Code. MIT licensed, written in Go. It provides workspace management, agent coordination via "convoys", and persistent work tracking through git-backed "hooks" (git worktrees).
 
-**Relationship to devaipod**: Similar goals around sandboxing, different implementation approaches.
+Gastown focuses on **orchestration** rather than **sandboxing**:
 
-## Key Differentiators
+- No container isolation—agents run in tmux sessions with full host filesystem access
+- No credential scoping—agents receive your full GitHub token, API keys, etc.
+- Claude Code runs with `--dangerously-skip-permissions` by default
+- No devcontainer.json support
+- Isolation is via git worktrees (separate working directories) and prompt-based instructions to "stay in your worktree"
 
-What makes devaipod unique:
+Gastown and devaipod solve different problems and could be complementary: Gastown for orchestrating work distribution across many agents, devaipod for sandboxing individual agent execution with credential scoping.
 
-1. **devcontainer.json first**: Uses the standard devcontainer spec rather than custom formats
-2. **Fine-grained credential scoping**: service-gator MCP provides scoped access (e.g., draft PRs only)
-3. **Fully open source**: No "open core" with proprietary cloud features
-4. **Local-first**: Runs 100% on your machine with podman
-5. **Mid-level infrastructure**: Provides primitives for building workflows, not a monolithic platform
+## Open Core (Partial Cloud Dependencies)
+
+### Continue
+
+[Continue](https://github.com/continuedev/continue) provides VS Code and JetBrains extensions, plus a CLI. The extensions and CLI are Apache-2.0.
+
+**Cloud dependency**: "Mission Control" (hub.continue.dev) is Continue's proprietary cloud platform for running cloud agents. The backend code is not open source. Local CLI execution has no sandboxing.
+
+### SWE-agent
+
+[SWE-agent](https://github.com/princeton-nlp/SWE-agent) from Princeton NLP provides an agent-computer interface for software engineering tasks. MIT licensed.
+
+**Cloud dependency**: The "Open SWE" product [runs on Daytona](https://www.daytona.io/dotfiles/langchain-s-open-swe-runs-on-daytona-here-s-why), a commercial cloud service for dev environments.
+
+## Proprietary / Cloud-Required
+
+### Ona
+
+[Ona](https://ona.com/) is a commercial AI agent platform. **Requires cloud services**—there is no open source version or self-hosted option.
+
+### Cursor
+
+[Cursor](https://cursor.sh/) is a commercial AI-first code editor based on VS Code. Proprietary, cloud-connected.
+
+### Claude Code Web
+
+Claude Code is also available as a hosted web service at claude.ai. Anthropic runs it in their own sandboxed infrastructure with a git proxy for credential scoping (described in their [sandboxing blog post](https://www.anthropic.com/engineering/claude-code-sandboxing)). However, **that sandbox code is not open source**—you cannot run it yourself. If you want similar sandboxing locally, you need something like devaipod.
+
+## Why devaipod?
+
+1. **Fully open source**: Apache-2.0/MIT, no "open core" trap
+2. **100% local**: No cloud services required (you bring your own LLM API keys)
+3. **devcontainer.json**: Uses the standard spec, not custom formats
+4. **Fine-grained credential scoping**: service-gator MCP provides scoped access (e.g., draft PRs only to specific repos)—not just filesystem sandboxing
+5. **Podman-native**: Rootless containers, works in toolbox, no Docker daemon required
+
+## Reusable Components
+
+A design goal for devaipod is that its core components should be reusable building blocks, not a monolithic system. Projects like OpenHands, Ona, and Ambient Code are building centralized platforms for corporate/team agentic AI usage. We hope that a fully open source version of such a platform emerges, and when it does, components from devaipod should be useful:
+
+- **service-gator**: Fine-grained credential scoping for GitHub/GitLab/Forgejo could plug into any orchestration system
+- **Container sandboxing patterns**: The podman pod architecture with separate workspace/agent/gator containers
+- **devcontainer.json integration**: Parsing and applying the devcontainer spec for agent environments
+
+devaipod is designed for individual developers today, but the primitives should scale to team/org deployment when composed with appropriate orchestration.

@@ -9,6 +9,25 @@ And of course any fine-grained scopes.
 Can we detect when the git tree has commits that aren't pushed,
 and make that clearer?
 
+# Login as bot
+
+While we have a workspace pod that has full privileges (e.g. GH_TOKEN)
+so that a user can do their own pushes or other arbitrary code,
+a major downside I've encountered is that the agent pod doesn't share
+container images with the workspace pod.
+
+Related to this...in many cases one might want to actually manually
+do things in the agent context. I think `devaipod attach` should
+probably have *three* TUIs: one with the opencode UX and one that
+is basically "workspace terminal" and "agent terminal".
+
+A few things first let's set distinct clear env vars like
+`CONTAINER_NAME=agent` `CONTAINER_NAME=workspace` etc. so bash
+prompts can distinguish.
+
+(Actually bigger picture on this topic we will likely need to get
+ away from tmux into a custom app)
+
 # Improved "done" vs "active" state
 
 For `run` the pod should probably stop by default when the agent

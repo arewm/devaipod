@@ -156,9 +156,8 @@ We recommend creating a personal GitHub App for secure, scoped access.
 This gives you control over permissions and easy revocation.
 
 Would you like to:
-  1. Create a new GitHub App (recommended)
-  2. Use an existing GitHub App
-  3. Use a Personal Access Token (legacy)
+  1. Create or use a GitHub App (recommended)
+  2. Use a Personal Access Token
 
 > 1
 
