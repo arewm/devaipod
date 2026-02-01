@@ -19,12 +19,7 @@ Full documentation including quick start is available at **[cgwalters.github.io/
 
 ## Related Projects
 
-- [OpenHands](https://github.com/All-Hands-AI/OpenHands) - Open platform for AI software developers as generalist agents
-- [SWE-agent](https://github.com/princeton-nlp/SWE-agent) - Agent-computer interface for software engineering tasks (from Princeton NLP)
-- [Auto-Claude](https://github.com/siddicky/auto-claude) - Autonomous Claude with sandboxed execution
-- [Ambient Code](https://ambient.run/) - AI coding assistant with local execution
-- [Ona](https://github.com/synthetic-selves/ona) - Open source AI agent framework
-- [Gastown](https://github.com/gastown-ai/gastown) - Sandboxed AI coding environments
+See the [full comparison](https://cgwalters.github.io/devaipod/related-projects.html) in the docs. Key projects in this space include [OpenHands](https://github.com/All-Hands-AI/OpenHands), [SWE-agent](https://github.com/princeton-nlp/SWE-agent), [Ambient Code](https://github.com/ambient-code/platform), [Auto-Claude](https://github.com/AndyMik90/Auto-Claude), [Continue](https://github.com/continuedev/continue), and [Goose](https://github.com/block/goose).
 
 ## Contributing
 

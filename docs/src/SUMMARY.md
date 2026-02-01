@@ -27,8 +27,9 @@
 - [Roadmap](roadmap.md)
 - [Internals](internals.md)
 
-# Comparisons
+# Related Projects
 
+- [Overview](related-projects.md)
 - [vs Auto-Claude](relationship-auto-claude.md)
 - [vs Ambient Code](relationship-ambient-code.md)
 - [vs Continue](relationship-continue.md)
