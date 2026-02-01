@@ -864,8 +864,24 @@ async fn run_host(cli: HostCli) -> Result<()> {
                         Err(e) => return Err(e).context("Failed to read task from terminal"),
                     }
                 }
-                // Non-interactive: use the default task from issue URL if available
-                None => default_task,
+                // Non-interactive: try to read from stdin (for piped input), fall back to default_task
+                None => {
+                    use std::io::BufRead;
+                    let stdin = std::io::stdin();
+                    let mut line = String::new();
+                    match stdin.lock().read_line(&mut line) {
+                        Ok(0) => default_task, // EOF, no input
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                default_task
+                            } else {
+                                Some(trimmed.to_string())
+                            }
+                        }
+                        Err(_) => default_task, // Read error, use default
+                    }
+                }
             };
 
             let pod_name = cmd_run(
@@ -976,6 +992,14 @@ async fn finalize_pod_with_mode(
             .install_dotfiles_agent(podman, dotfiles)
             .await
             .context("Failed to install dotfiles in agent")?;
+    }
+
+    // Write task to agent container AFTER dotfiles (so we don't get overwritten)
+    if let Some(ref task) = devaipod_pod.task {
+        devaipod_pod
+            .write_task(podman, task, devaipod_pod.enable_gator)
+            .await
+            .context("Failed to write task to agent")?;
     }
 
     // Run lifecycle commands based on mode

@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{Context, Result};
+use color_eyre::eyre::{bail, Context, Result};
 
 use crate::forge::PullRequestInfo;
 use crate::git::{GitRepoInfo, RemoteRepoInfo};
@@ -238,6 +238,10 @@ pub struct DevaipodPod {
     pub agent_bind_home: BindHomeConfig,
     /// Container home directory path
     pub container_home: String,
+    /// Task to run (if this is a 'run' mode pod)
+    pub task: Option<String>,
+    /// Whether service-gator is enabled
+    pub enable_gator: bool,
 }
 
 impl DevaipodPod {
@@ -544,18 +548,9 @@ impl DevaipodPod {
             None
         };
 
-        // If task is provided, write it to the agent home volume before starting the container
-        // This ensures opencode sees the task file when it reads its config at startup
-        if let Some(task_content) = task {
-            Self::write_task_to_volume(
-                podman,
-                &image,
-                &agent_home_volume,
-                task_content,
-                enable_gator,
-            )
-            .await?;
-        }
+        // Note: Task is written to the agent home volume after dotfiles installation
+        // in finalize_pod() via write_task_to_volume(). This ensures user dotfiles
+        // don't overwrite the task config.
 
         // Create agent container with restricted security
         let agent_config = Self::agent_container_config(
@@ -640,6 +635,8 @@ impl DevaipodPod {
             workspace_bind_home,
             agent_bind_home,
             container_home,
+            task: task.map(|s| s.to_string()),
+            enable_gator,
         })
     }
 
@@ -991,20 +988,6 @@ echo "Dotfiles installed successfully"
     // at container creation time in agent_container_config(), so we don't need
     // a separate configure_agent_opencode() method.
 
-    /// Generate a default opencode config with the given task file in instructions
-    fn default_config_with_task(task_file_path: &str) -> String {
-        serde_json::to_string_pretty(&serde_json::json!({
-            "$schema": "https://opencode.ai/config.json",
-            "instructions": [task_file_path]
-        }))
-        .unwrap_or_else(|_| {
-            format!(
-                r#"{{"$schema": "https://opencode.ai/config.json", "instructions": ["{}"]}}"#,
-                task_file_path
-            )
-        })
-    }
-
     /// Write scripts to the agent home volume before containers start
     ///
     /// This writes the auth_proxy.py script which provides authenticated HTTP access
@@ -1106,19 +1089,19 @@ chmod +x {agent_home}/scripts/auth_proxy.py
         Ok(())
     }
 
-    /// Write task instructions to the agent home volume before the agent container starts
+    /// Write task instructions to the agent home volume
     ///
-    /// This uses a one-shot init container to write the task file and opencode config
-    /// to the volume. This ensures opencode sees the task when it reads config at startup.
+    /// This should be called after dotfiles installation to ensure the task config
+    /// is not overwritten by user dotfiles. Uses podman exec to write the task file
+    /// and merge instructions into the opencode config.
     ///
     /// The task file includes:
     /// - System context about the devaipod environment
     /// - Instructions for using service-gator for forge operations
     /// - The user's task
-    async fn write_task_to_volume(
+    pub async fn write_task(
+        &self,
         podman: &PodmanService,
-        image: &str,
-        agent_home_volume: &str,
         task: &str,
         enable_gator: bool,
     ) -> Result<()> {
@@ -1159,46 +1142,93 @@ You are running as an AI agent in a **devaipod** sandboxed environment.
             gator_instructions = gator_instructions
         );
 
-        // Create opencode config that references the task file
         let task_file_path = format!("{}/{}", AGENT_HOME_PATH, task_file);
-        let config_content = Self::default_config_with_task(&task_file_path);
+        let config_file_path = format!("{}/{}", AGENT_HOME_PATH, config_file);
 
-        // Using quoted heredoc delimiters ('TASK_EOF') prevents shell expansion,
-        // so we don't need to escape content - it's passed through literally.
-        let script = format!(
-            r#"set -e
-mkdir -p {agent_home}/.config/opencode
-cat > '{agent_home}/{task_file}' << 'TASK_EOF'
+        // Write the task markdown file
+        tracing::debug!("Writing task to agent container...");
+        let task_script = format!(
+            r#"mkdir -p {agent_home}/.config/opencode && cat > '{agent_home}/{task_file}' << 'TASK_EOF'
 {task_content}
-TASK_EOF
-cat > '{agent_home}/{config_file}' << 'CONFIG_EOF'
-{config_content}
-CONFIG_EOF
-"#,
+TASK_EOF"#,
             agent_home = AGENT_HOME_PATH,
             task_file = task_file,
-            config_file = config_file,
             task_content = task_content,
-            config_content = config_content,
         );
-
-        tracing::debug!("Writing task to agent home volume...");
         let exit_code = podman
-            .run_init_container(
-                image,
-                agent_home_volume,
-                AGENT_HOME_PATH,
-                &["/bin/sh", "-c", &script],
-                &[],
+            .exec_quiet(
+                &self.agent_container,
+                &["/bin/sh", "-c", &task_script],
+                None,
+                None,
             )
             .await
-            .context("Failed to write task to agent volume")?;
+            .context("Failed to write task file")?;
+        if exit_code != 0 {
+            bail!("Failed to write task file (exit code {})", exit_code);
+        }
+
+        // Read existing opencode.json from container (if it exists)
+        let (exit_code, stdout, _stderr) = podman
+            .exec_output(&self.agent_container, &["cat", &config_file_path])
+            .await
+            .context("Failed to read opencode config")?;
+
+        // Parse existing config or create new one
+        // Use jsonc-parser to handle JSONC (comments, trailing commas)
+        let mut config: serde_json::Value = if exit_code == 0 && !stdout.is_empty() {
+            let content = String::from_utf8_lossy(&stdout);
+            match jsonc_parser::parse_to_serde_value(&content, &Default::default()) {
+                Ok(Some(value)) => value,
+                Ok(None) | Err(_) => {
+                    tracing::debug!("Could not parse existing opencode.json, creating new one");
+                    serde_json::json!({"$schema": "https://opencode.ai/config.json"})
+                }
+            }
+        } else {
+            serde_json::json!({"$schema": "https://opencode.ai/config.json"})
+        };
+
+        // Merge task into instructions array
+        let instructions = config.as_object_mut().and_then(|obj| {
+            obj.entry("instructions")
+                .or_insert(serde_json::json!([]))
+                .as_array_mut()
+        });
+        if let Some(arr) = instructions {
+            let task_path_value = serde_json::Value::String(task_file_path.clone());
+            if !arr.contains(&task_path_value) {
+                arr.push(task_path_value);
+            }
+        }
+
+        // Write merged config back to container
+        let config_json = serde_json::to_string_pretty(&config).unwrap_or_else(|_| {
+            format!(
+                r#"{{"$schema": "https://opencode.ai/config.json", "instructions": ["{}"]}}"#,
+                task_file_path
+            )
+        });
+        let config_script = format!(
+            r#"cat > '{}' << 'CONFIG_EOF'
+{}
+CONFIG_EOF"#,
+            config_file_path, config_json
+        );
+        let exit_code = podman
+            .exec_quiet(
+                &self.agent_container,
+                &["/bin/sh", "-c", &config_script],
+                None,
+                None,
+            )
+            .await
+            .context("Failed to write opencode config")?;
 
         if exit_code != 0 {
-            tracing::warn!("Failed to write task to volume (exit code {})", exit_code);
-        } else {
-            tracing::debug!("Task written to agent home volume");
+            bail!("Failed to write opencode config (exit code {})", exit_code);
         }
+        tracing::debug!("Task written to agent container");
 
         Ok(())
     }
