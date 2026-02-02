@@ -440,6 +440,14 @@ enum HostCommand {
     ///   r: Refresh
     ///   q: Quit
     Tui,
+    /// Start a stopped workspace
+    ///
+    /// Starts a previously stopped pod (restarts all containers).
+    /// Use 'devaipod list' to see available workspaces.
+    Start {
+        /// Workspace name (devaipod- prefix optional)
+        workspace: String,
+    },
     /// Stop a workspace
     Stop {
         /// Workspace name (devaipod- prefix optional)
@@ -830,6 +838,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
         }
         HostCommand::List { json } => cmd_list(json),
         HostCommand::Tui => tui::run().await,
+        HostCommand::Start { workspace } => cmd_start(&normalize_pod_name(&workspace)),
         HostCommand::Stop { workspace } => cmd_stop(&normalize_pod_name(&workspace)),
         HostCommand::Delete { workspace, force } => {
             cmd_delete(&normalize_pod_name(&workspace), force)
@@ -2581,6 +2590,35 @@ fn format_created_time(timestamp: &str) -> String {
     } else {
         timestamp.to_string()
     }
+}
+
+/// Start a stopped pod using podman pod start
+fn cmd_start(pod_name: &str) -> Result<()> {
+    tracing::info!("Starting pod '{}'...", pod_name);
+
+    let output = podman_command()
+        .args(["pod", "start", "--", pod_name])
+        .output()
+        .context("Failed to run podman pod start")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        // Ignore "already running" type errors
+        if !stderr.contains("already running") && !stderr.contains("no such pod") {
+            if stderr.is_empty() {
+                bail!(
+                    "podman pod start failed with exit code {:?}",
+                    output.status.code()
+                );
+            } else {
+                bail!("podman pod start failed: {}", stderr);
+            }
+        }
+    }
+
+    tracing::info!("Pod '{}' started", pod_name);
+    Ok(())
 }
 
 /// Stop a pod using podman pod stop
