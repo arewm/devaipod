@@ -540,6 +540,88 @@ echo "Dotfiles ready"
     )
 }
 
+/// Generate a shell script to clone a git repo for the agent using --reference
+/// to share objects with the main workspace clone.
+///
+/// This enables efficient disk usage by sharing git objects between the main
+/// workspace and the agent's isolated workspace. The agent gets its own working
+/// tree but shares the object database with the reference repository.
+///
+/// The script will:
+/// 1. Clone from the local reference repository (fast, no network access needed)
+/// 2. Set up the same remote URL as the main workspace
+/// 3. Checkout the same commit as the main workspace
+/// 4. Optionally chown to target user
+///
+/// Parameters:
+/// - `workspace_folder`: Target path for the clone (e.g., "/workspaces/project")
+/// - `reference_git_path`: Path to the reference .git directory (e.g., "/mnt/main-workspace")
+/// - `git_info`: Git repository info from the main workspace
+/// - `target_user`: Optional user to chown the workspace to
+pub fn clone_agent_workspace_script(
+    workspace_folder: &str,
+    reference_git_path: &str,
+    git_info: &GitRepoInfo,
+    target_user: Option<&str>,
+) -> String {
+    // Clone from the local reference repository's .git directory using --shared.
+    // This is much faster than cloning from remote since all objects are local.
+    // --shared creates an alternates file to share objects with the reference repo,
+    // avoiding object duplication and saving disk space.
+    let clone_source = format!(
+        r#"# Clone from local reference workspace with shared objects
+git clone --shared "{reference}/.git" "{workspace}" 2>&1"#,
+        reference = reference_git_path,
+        workspace = workspace_folder,
+    );
+
+    // Set up remote if we have a URL
+    let setup_remote = if let Some(ref url) = git_info.remote_url {
+        format!(
+            r#"
+# Ensure origin remote is set correctly
+git remote set-url origin "{url}" 2>/dev/null || git remote add origin "{url}"
+"#,
+            url = url
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"
+set -e
+echo "Cloning agent workspace with reference to main workspace..."
+mkdir -p "$(dirname "{workspace}")"
+
+# Mark the reference git directory as safe (different ownership in container)
+git config --global --add safe.directory "{reference}/.git"
+git config --global --add safe.directory "{reference}"
+
+{clone_source}
+
+cd "{workspace}"
+
+# Checkout the exact commit from the main workspace
+git checkout "{commit}" 2>&1
+{setup_remote}
+{chown_cmd}
+echo "Agent workspace cloned successfully at commit {short_commit}"
+"#,
+        workspace = workspace_folder,
+        reference = reference_git_path,
+        clone_source = clone_source,
+        commit = git_info.commit_sha,
+        setup_remote = setup_remote,
+        short_commit = &git_info.commit_sha[..git_info.commit_sha.len().min(8)],
+        chown_cmd = target_user
+            .map(|u| format!(
+                "# Set ownership to target user\nchown -R {u}:{u} \"{workspace_folder}\""
+            ))
+            .unwrap_or_default(),
+    )
+}
+
 /// Extract repository name from a git URL
 ///
 /// Handles both HTTPS and SSH formats:
@@ -912,5 +994,119 @@ mod tests {
         ));
         // Should output SHA with prefix for parsing
         assert!(script.contains("DOTFILES_SHA:$DOTFILES_SHA"));
+    }
+
+    #[test]
+    fn test_clone_agent_workspace_script_with_remote() {
+        let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/home/user/project"),
+            remote_url: Some("https://github.com/owner/repo.git".to_string()),
+            commit_sha: "abc123def456789".to_string(),
+            branch: Some("main".to_string()),
+            is_dirty: false,
+            dirty_files: vec![],
+        };
+
+        let script = clone_agent_workspace_script(
+            "/workspaces/project",
+            "/mnt/main-workspace",
+            &info,
+            Some("devenv"),
+        );
+
+        // Should clone from local reference with shared objects
+        assert!(
+            script.contains("--shared"),
+            "should use --shared to share objects via alternates"
+        );
+        // Should reference the main workspace
+        assert!(
+            script.contains("/mnt/main-workspace/.git"),
+            "should reference main workspace .git"
+        );
+        // Should set up remote URL after cloning (not clone from remote)
+        assert!(
+            script.contains("https://github.com/owner/repo.git"),
+            "should configure remote URL"
+        );
+        // Should checkout the exact commit
+        assert!(
+            script.contains("abc123def456789"),
+            "should checkout the commit"
+        );
+        // Should set up origin remote
+        assert!(
+            script.contains("git remote set-url origin")
+                || script.contains("git remote add origin"),
+            "should configure origin remote"
+        );
+        // Should chown to target user
+        assert!(
+            script.contains("chown -R devenv:devenv"),
+            "should chown to target user"
+        );
+        // Should mark directories as safe
+        assert!(
+            script.contains("safe.directory"),
+            "should mark directories as safe"
+        );
+    }
+
+    #[test]
+    fn test_clone_agent_workspace_script_no_remote() {
+        let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/home/user/project"),
+            remote_url: None,
+            commit_sha: "abc123def456789".to_string(),
+            branch: None,
+            is_dirty: false,
+            dirty_files: vec![],
+        };
+
+        let script =
+            clone_agent_workspace_script("/workspaces/project", "/mnt/main-workspace", &info, None);
+
+        // Should clone directly from reference with shared objects
+        assert!(
+            script.contains("clone --shared \"/mnt/main-workspace/.git\""),
+            "should clone from reference .git directory with shared objects"
+        );
+        // Should checkout the exact commit
+        assert!(
+            script.contains("abc123def456789"),
+            "should checkout the commit"
+        );
+        // Should NOT have chown (no target user)
+        assert!(
+            !script.contains("chown"),
+            "should not chown without target user"
+        );
+    }
+
+    #[test]
+    fn test_clone_agent_workspace_script_no_user() {
+        let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/home/user/project"),
+            remote_url: Some("https://github.com/owner/repo.git".to_string()),
+            commit_sha: "abc123def456789".to_string(),
+            branch: Some("feature".to_string()),
+            is_dirty: false,
+            dirty_files: vec![],
+        };
+
+        let script = clone_agent_workspace_script(
+            "/workspaces/project",
+            "/mnt/main-workspace",
+            &info,
+            None, // No target user
+        );
+
+        // Should still clone from local reference with shared objects
+        assert!(script.contains("--shared"));
+        // Should NOT have chown
+        assert!(
+            !script.contains("chown"),
+            "should not chown without target user"
+        );
     }
 }

@@ -154,3 +154,87 @@ install-hooks:
     cp scripts/pre-commit .git/hooks/pre-commit
     chmod +x .git/hooks/pre-commit
     @echo "Installed pre-commit hook"
+
+# Default repo for agent draft PR E2E test
+e2e_test_repo := "cgwalters/playground"
+
+# E2E test: verify agent can start a task and create a draft PR
+# This is a real integration test that exercises the full flow:
+# 1. devaipod run with a task message
+# 2. Agent starts working autonomously
+# 3. Agent creates a draft PR on GitHub
+#
+# Requirements:
+# - GH_TOKEN in environment (for service-gator to push)
+# - Network access to GitHub
+#
+# The test polls for PR creation with a timeout.
+e2e-draft-pr repo=e2e_test_repo:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    REPO="{{repo}}"
+    TASK="Create a draft PR that adds a single line to README.md with today's date ($(date +%Y-%m-%d)) and a random UUID. The commit message should mention this is an automated test."
+    
+    echo "Building devaipod..."
+    cargo build --release
+    
+    # Generate unique identifier for this test run
+    TEST_ID="e2e-$(date +%s)-$$"
+    POD_NAME="e2e-test-${TEST_ID}"
+    
+    echo "Starting devaipod with task..."
+    echo "  Repo: https://github.com/${REPO}"
+    echo "  Task: ${TASK}"
+    
+    # Start the agent with the task
+    ./target/release/devaipod run "https://github.com/${REPO}" "${TASK}" --name "${POD_NAME}" || {
+        echo "Failed to start devaipod"
+        exit 1
+    }
+    
+    # Function to cleanup on exit
+    cleanup() {
+        echo "Cleaning up pod ${POD_NAME}..."
+        ./target/release/devaipod delete "${POD_NAME}" --force 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    
+    echo "Agent started. Polling for draft PR creation..."
+    
+    # Poll for draft PR creation (timeout: 5 minutes)
+    MAX_ATTEMPTS=60
+    POLL_INTERVAL=5
+    
+    for i in $(seq 1 $MAX_ATTEMPTS); do
+        echo "  Checking for draft PRs (attempt $i/$MAX_ATTEMPTS)..."
+        
+        # Check for draft PRs created in the last 10 minutes
+        DRAFT_PRS=$(gh pr list --repo "${REPO}" --state open --draft --json number,title,createdAt --jq '.[] | select(.createdAt > (now - 600 | strftime("%Y-%m-%dT%H:%M:%SZ"))) | "\(.number): \(.title)"' 2>/dev/null || echo "")
+        
+        if [ -n "$DRAFT_PRS" ]; then
+            echo ""
+            echo "SUCCESS: Found draft PR(s):"
+            echo "$DRAFT_PRS"
+            echo ""
+            echo "E2E test passed!"
+            exit 0
+        fi
+        
+        # Also check if agent is still working by looking at session activity
+        CONTAINER="devaipod-${POD_NAME}-workspace"
+        LAST_UPDATE=$(podman exec "$CONTAINER" curl -sf http://localhost:4096/session 2>/dev/null | jq -r '.[0].time.updated // 0' || echo "0")
+        NOW_MS=$(($(date +%s) * 1000))
+        IDLE_MS=$((NOW_MS - LAST_UPDATE))
+        
+        if [ "$IDLE_MS" -gt 120000 ] && [ "$i" -gt 10 ]; then
+            echo "  Agent appears idle (last activity: ${IDLE_MS}ms ago)"
+        fi
+        
+        sleep $POLL_INTERVAL
+    done
+    
+    echo ""
+    echo "TIMEOUT: No draft PR found after $((MAX_ATTEMPTS * POLL_INTERVAL)) seconds"
+    echo "Check agent logs: devaipod attach ${POD_NAME}"
+    exit 1

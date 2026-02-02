@@ -436,7 +436,7 @@ pub fn load(path: &Path) -> Result<DevcontainerConfig> {
     let config: DevcontainerConfig =
         jsonc_parser::parse_to_serde_value(&content, &Default::default())
             .map_err(|e| color_eyre::eyre::eyre!("Failed to parse JSONC: {}", e))?
-            .map(|v| serde_json::from_value(v))
+            .map(serde_json::from_value)
             .transpose()
             .with_context(|| format!("Failed to deserialize {}", path.display()))?
             .unwrap_or_default();

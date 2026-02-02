@@ -9,6 +9,7 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 | Project | License | Local-only? | Notes |
 |---------|---------|-------------|-------|
 | **devaipod** | Apache-2.0/MIT | Yes | No cloud services required |
+| [nono](https://nono.sh/) | Apache-2.0 | Yes | OS-level sandboxing (Landlock/Seatbelt), agent-agnostic |
 | [OpenHands](https://github.com/All-Hands-AI/OpenHands) | MIT | Yes | Self-hostable, Docker-based |
 | [Ambient Code](https://github.com/ambient-code/platform) | MIT | Yes | Kubernetes-native, self-hosted |
 | [Gastown](https://github.com/steveyegge/gastown) | MIT | Yes | Multi-agent orchestration, no sandboxing |
@@ -112,6 +113,26 @@ Gastown and devaipod solve different problems and could be complementary: Gastow
 ### Claude Code Web
 
 Claude Code is also available as a hosted web service at claude.ai. Anthropic runs it in their own sandboxed infrastructure with a git proxy for credential scoping (described in their [sandboxing blog post](https://www.anthropic.com/engineering/claude-code-sandboxing)). However, **that sandbox code is not open source**—you cannot run it yourself. If you want similar sandboxing locally, you need something like devaipod.
+
+## Other Sandboxing Tools
+
+### nono
+
+[nono](https://nono.sh/) ([GitHub](https://github.com/lukehinds/nono)) is an OS-level sandboxing tool for AI agents. Apache-2.0 licensed, created by Luke Hinds (creator of Sigstore).
+
+nono defaults to Landlock on Linux and Seatbelt on macOS (but
+
+Key characteristics:
+- **Agent-agnostic**: Works with Claude Code, Goose, OpenCode, or any process
+- **Capability-based**: You grant explicit path capabilities; everything else is denied
+- **Irreversible**: Once sandboxed, there's no mechanism to request more permissions
+- **No containers**: Lighter weight than container-based sandboxing
+
+nono and devaipod are **complementary**:
+- nono provides process-level sandboxing via OS primitives
+- devaipod provides container isolation plus **credential scoping** via service-gator
+
+You could use both together: run devaipod's containerized agent with nono inside the container for defense-in-depth, or use nono standalone when you don't need devcontainer environments or fine-grained credential scoping.
 
 ## Why devaipod?
 

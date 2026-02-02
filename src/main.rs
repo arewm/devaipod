@@ -42,6 +42,32 @@ fn strip_pod_prefix(name: &str) -> &str {
     name.strip_prefix(POD_NAME_PREFIX).unwrap_or(name)
 }
 
+/// Target container for the attach command.
+///
+/// Devaipod pods contain multiple containers with different roles. This enum
+/// specifies which container to attach to when using `devaipod attach`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachTarget {
+    /// The workspace container where the user's development environment runs.
+    /// Use `-W` flag to attach to this container for direct access to your
+    /// development environment without AI interaction.
+    Workspace,
+    /// The agent container where the AI coding agent runs in isolation.
+    /// This is the default target. The agent has its own workspace clone
+    /// and cannot modify the main workspace.
+    Agent,
+}
+
+/// Get the container name for a given pod and attach target.
+///
+/// Returns the full container name that can be used with `podman exec`.
+fn get_attach_container_name(pod_name: &str, target: AttachTarget) -> String {
+    match target {
+        AttachTarget::Workspace => format!("{}-workspace", pod_name),
+        AttachTarget::Agent => format!("{}-agent", pod_name),
+    }
+}
+
 /// Resolve a workspace name, handling the --latest flag
 ///
 /// If a workspace name is provided, normalizes it. If --latest is set,
@@ -337,12 +363,17 @@ enum HostCommand {
     /// - Left pane: AI agent (opencode attach)
     /// - Right pane: Shell for manual work
     ///
+    /// By default, attaches to the agent container where the AI runs. Use -W to
+    /// attach to the workspace container for direct access to your development
+    /// environment without AI interaction.
+    ///
     /// This is the primary way to interact with a workspace. Use tmux keys
     /// (Ctrl-b + arrow keys) to switch panes, or Ctrl-b d to detach.
     ///
     /// Examples:
-    ///   devaipod attach myworkspace              # Attach to workspace
+    ///   devaipod attach myworkspace              # Attach to agent (default)
     ///   devaipod attach -l                       # Attach to most recent workspace
+    ///   devaipod attach myworkspace -W           # Attach to workspace container
     ///   devaipod attach myworkspace -s abc123    # Connect to specific session
     Attach {
         /// Workspace name (devaipod- prefix optional)
@@ -353,6 +384,13 @@ enum HostCommand {
         /// Session ID to attach to (default: auto-detect existing session)
         #[arg(short, long)]
         session: Option<String>,
+        /// Attach to the workspace container instead of the agent
+        ///
+        /// By default, devaipod attach logs into the agent container where the AI
+        /// runs. Use this flag to access the workspace container for direct access
+        /// to your development environment without AI interaction.
+        #[arg(short = 'W', long)]
+        workspace_mode: bool,
     },
     /// SSH into a workspace shell
     ///
@@ -772,9 +810,15 @@ async fn run_host(cli: HostCli) -> Result<()> {
             workspace,
             latest,
             session,
+            workspace_mode,
         } => {
             let pod_name = resolve_workspace(workspace.as_deref(), latest)?;
-            cmd_attach(&pod_name, session.as_deref()).await
+            let target = if workspace_mode {
+                AttachTarget::Workspace
+            } else {
+                AttachTarget::Agent
+            };
+            cmd_attach(&pod_name, session.as_deref(), target).await
         }
         HostCommand::Ssh {
             workspace,
@@ -895,7 +939,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             .await?;
 
             if attach {
-                cmd_attach(&pod_name, None).await?;
+                cmd_attach(&pod_name, None, AttachTarget::Agent).await?;
             }
             Ok(())
         }
@@ -1018,6 +1062,14 @@ async fn finalize_pod_with_mode(
                 .context("Failed to run lifecycle commands")?;
         }
     }
+
+    // Set up git remotes for bidirectional collaboration
+    // - 'agent' remote in workspace container (human can fetch agent's commits)
+    // - 'workspace' remote in agent container (agent can fetch human's changes)
+    devaipod_pod
+        .setup_git_remotes(podman)
+        .await
+        .context("Failed to set up git remotes")?;
 
     // Success message
     let short_name = strip_pod_prefix(&devaipod_pod.pod_name);
@@ -1592,7 +1644,153 @@ async fn cmd_run(
     // Create the workspace - no SSH by default (async execution)
     let result = create_workspace(config, source, &create_opts).await?;
 
+    // If a task was provided, send the initial message to start the agent working
+    if let Some(task) = command {
+        start_agent_task(&result.pod_name, task)?;
+    }
+
     Ok(result.pod_name)
+}
+
+/// Wait for the agent to be healthy and send an initial message to start working
+///
+/// This is called after workspace creation when a task was provided.
+/// The task content is sent directly in the initial message to ensure the agent
+/// receives it even if opencode started before the config file was written.
+fn start_agent_task(pod_name: &str, task: &str) -> Result<()> {
+    tracing::info!("Waiting for agent to be ready...");
+
+    // Wait for the agent to be healthy (up to 60 seconds)
+    let max_attempts = 30;
+    let poll_interval = std::time::Duration::from_secs(2);
+
+    for attempt in 1..=max_attempts {
+        match check_agent_health(pod_name) {
+            Some(true) => {
+                tracing::debug!("Agent healthy after {} attempts", attempt);
+                break;
+            }
+            Some(false) => {
+                if attempt == max_attempts {
+                    bail!(
+                        "Agent did not become healthy after {} seconds. Check logs with: devaipod logs {}",
+                        max_attempts * 2,
+                        strip_pod_prefix(pod_name)
+                    );
+                }
+                std::thread::sleep(poll_interval);
+            }
+            None => {
+                // Container may not be running yet
+                if attempt == max_attempts {
+                    bail!(
+                        "Could not check agent health. Is the pod running? Check with: devaipod list"
+                    );
+                }
+                std::thread::sleep(poll_interval);
+            }
+        }
+    }
+
+    // Send the initial message with the task directly included.
+    // We include the full task in the message because opencode may have started
+    // before the config file (with instructions path) was written.
+    tracing::info!("Starting agent on task...");
+
+    let initial_message = format!(
+        r#"# Your Task
+
+{}
+
+---
+
+Please start working on this task now. Make commits with clear messages as you work."#,
+        task
+    );
+
+    // Create session and send message (reusing the existing API logic)
+    match send_initial_message(pod_name, &initial_message) {
+        Ok(_) => {
+            tracing::info!(
+                "Agent started. Attach with: devaipod attach {}",
+                strip_pod_prefix(pod_name)
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Log the error but don't fail - the task is still configured
+            tracing::warn!(
+                "Failed to send initial message: {}. Agent may need manual start.",
+                e
+            );
+            tracing::info!(
+                "To start manually: devaipod opencode {} send 'Start working on your task'",
+                strip_pod_prefix(pod_name)
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Send an initial message to the agent to start working
+///
+/// Creates a new session and sends the message asynchronously (without waiting
+/// for the LLM response). This returns immediately after the request is sent.
+fn send_initial_message(pod_name: &str, message: &str) -> Result<()> {
+    // Create a new session (this is fast, we can wait for it)
+    let session = opencode_api_post(pod_name, "/session", "{}")?;
+    let session_id = session
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| color_eyre::eyre::eyre!("Failed to get session ID from response"))?;
+
+    // Build message payload
+    let payload = serde_json::json!({
+        "parts": [{"type": "text", "text": message}]
+    });
+
+    // Fire off the message request asynchronously - don't wait for LLM response.
+    // The opencode /message endpoint blocks until the LLM finishes, which can take
+    // minutes. We spawn the curl process and don't wait for it.
+    send_message_async(pod_name, session_id, &payload.to_string())?;
+
+    tracing::debug!("Sent initial message to session {}", session_id);
+    Ok(())
+}
+
+/// Send a message to opencode asynchronously (fire-and-forget)
+///
+/// Spawns a curl process in the background and returns immediately.
+/// Used for starting agent tasks where we don't need to wait for the response.
+fn send_message_async(pod_name: &str, session_id: &str, payload: &str) -> Result<()> {
+    let workspace_container = format!("{}-workspace", pod_name);
+    let url = format!(
+        "http://localhost:{}/session/{}/message",
+        pod::OPENCODE_PORT,
+        session_id
+    );
+
+    // Use spawn() instead of output() to not wait for the curl process.
+    // The curl command runs in the container background.
+    podman_command()
+        .args([
+            "exec",
+            "-d", // detached mode - run in background
+            &workspace_container,
+            "curl",
+            "-sf",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            payload,
+            &url,
+        ])
+        .spawn()
+        .context("Failed to spawn curl process for async message")?;
+
+    Ok(())
 }
 
 /// Handle dry-run mode for the up command
@@ -1790,34 +1988,82 @@ fn podman_command() -> ProcessCommand {
     }
 }
 
-/// Attach to a workspace with tmux split panes (agent + shell)
+/// Attach to a devaipod workspace
 ///
-/// Opens a tmux session inside the workspace container with two panes:
-/// - Left pane: opencode-connect (AI agent interface)
-/// - Right pane: bash shell for manual work
+/// Behavior depends on the target:
+/// - **Agent (default)**: Runs `opencode attach` to connect to the AI agent's session
+/// - **Workspace (-W flag)**: Opens tmux with opencode-connect + shell panes
 ///
-/// Any existing tmux session is killed first to ensure a fresh state.
-async fn cmd_attach(pod_name: &str, session: Option<&str>) -> Result<()> {
-    let workspace_container = format!("{}-workspace", pod_name);
-    let tmux_session = strip_pod_prefix(pod_name).replace(['.', ':'], "-");
+/// The agent container runs `opencode serve`, so we connect directly to it.
+/// The workspace container is the human's development environment with tmux.
+async fn cmd_attach(pod_name: &str, session: Option<&str>, target: AttachTarget) -> Result<()> {
+    let container = get_attach_container_name(pod_name, target);
 
-    tracing::info!(
-        "Attaching to workspace '{}' with tmux...",
-        strip_pod_prefix(pod_name)
-    );
+    match target {
+        AttachTarget::Agent => {
+            // Agent container: connect directly to opencode serve
+            tracing::info!("Attaching to agent in '{}'...", strip_pod_prefix(pod_name));
 
-    // Build the opencode-connect command with optional session
-    let agent_cmd = match session {
-        Some(sid) => format!("opencode-connect -s {}", sid),
-        None => "opencode-connect".to_string(),
-    };
+            // If no session specified, try to auto-detect an existing session
+            // This enables seamless handoff from `devaipod run "task"` to interactive mode
+            let effective_session = match session {
+                Some(sid) => Some(sid.to_string()),
+                None => detect_active_session(pod_name),
+            };
 
-    // Script to run inside the workspace container:
-    // 1. Kill any existing tmux session (ensures fresh state)
-    // 2. Create new session with two panes (agent left, shell right)
-    // 3. Attach to the session
-    let tmux_script = format!(
-        r#"
+            if let Some(ref sid) = effective_session {
+                tracing::info!("Continuing session: {}", sid);
+            }
+
+            // Build the opencode attach command
+            // The agent runs opencode serve on localhost:4096
+            let mut attach_args = vec![
+                "opencode".to_string(),
+                "attach".to_string(),
+                "http://localhost:4096".to_string(),
+            ];
+            if let Some(sid) = effective_session {
+                attach_args.push("-s".to_string());
+                attach_args.push(sid);
+            }
+
+            let mut cmd = podman_command();
+            cmd.args(["exec", "-it", &container]);
+            cmd.args(&attach_args);
+
+            let status = cmd.status().context("Failed to run podman exec")?;
+
+            if !status.success() {
+                bail!(
+                    "Failed to attach to agent in '{}' (exit code {:?}). \
+                     The container may not exist or is not running. \
+                     Run 'devaipod list' to see available pods.",
+                    pod_name,
+                    status.code()
+                );
+            }
+        }
+        AttachTarget::Workspace => {
+            // Workspace container: tmux session with opencode-connect + shell
+            let tmux_session = strip_pod_prefix(pod_name).replace(['.', ':'], "-");
+
+            tracing::info!(
+                "Attaching to workspace '{}' with tmux...",
+                strip_pod_prefix(pod_name)
+            );
+
+            // Build the opencode-connect command with optional session
+            let agent_cmd = match session {
+                Some(sid) => format!("opencode-connect -s {}", sid),
+                None => "opencode-connect".to_string(),
+            };
+
+            // Script to run inside the workspace container:
+            // 1. Kill any existing tmux session (ensures fresh state)
+            // 2. Create new session with two panes (agent left, shell right)
+            // 3. Attach to the session
+            let tmux_script = format!(
+                r#"
 # Kill any existing session to ensure fresh state
 tmux kill-session -t {session} 2>/dev/null || true
 # Create new session with agent in left pane
@@ -1829,30 +2075,25 @@ tmux select-pane -t {session}:0.0
 # Attach to the session
 exec tmux attach -t {session}
 "#,
-        session = tmux_session,
-        agent_cmd = agent_cmd,
-    );
+                session = tmux_session,
+                agent_cmd = agent_cmd,
+            );
 
-    let mut cmd = podman_command();
-    cmd.args([
-        "exec",
-        "-it",
-        &workspace_container,
-        "bash",
-        "-c",
-        &tmux_script,
-    ]);
+            let mut cmd = podman_command();
+            cmd.args(["exec", "-it", &container, "bash", "-c", &tmux_script]);
 
-    let status = cmd.status().context("Failed to run podman exec")?;
+            let status = cmd.status().context("Failed to run podman exec")?;
 
-    if !status.success() {
-        bail!(
-            "Failed to attach to workspace '{}' (exit code {:?}). \
-             The container may not exist or is not running. \
-             Run 'devaipod list' to see available pods.",
-            pod_name,
-            status.code()
-        );
+            if !status.success() {
+                bail!(
+                    "Failed to attach to workspace '{}' (exit code {:?}). \
+                     The container may not exist or is not running. \
+                     Run 'devaipod list' to see available pods.",
+                    pod_name,
+                    status.code()
+                );
+            }
+        }
     }
 
     Ok(())
@@ -3082,6 +3323,62 @@ async fn cmd_opencode(pod_name: &str, action: OpencodeAction) -> Result<()> {
     }
 }
 
+/// Detect an existing active session to continue
+///
+/// This enables seamless handoff from autonomous mode (`devaipod run "task"`)
+/// to interactive mode (`devaipod attach`). We look for root sessions (those
+/// without a parent) and return the oldest one, which is typically the main
+/// task session.
+///
+/// Returns None if no session is found or if there's an error (fail-open).
+fn detect_active_session(pod_name: &str) -> Option<String> {
+    // Try to get sessions from the API
+    let sessions = match opencode_api_get(pod_name, "/session") {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let sessions = sessions.as_array()?;
+    if sessions.is_empty() {
+        return None;
+    }
+
+    // Find root sessions (those without a parentID)
+    // These are the main task sessions, not subagent sessions
+    let mut root_sessions: Vec<_> = sessions
+        .iter()
+        .filter(|s| {
+            s.get("parentID").is_none() || s.get("parentID") == Some(&serde_json::Value::Null)
+        })
+        .collect();
+
+    if root_sessions.is_empty() {
+        // No root sessions, just use the first session
+        return sessions.first()?.get("id")?.as_str().map(|s| s.to_string());
+    }
+
+    // Sort by creation time (oldest first) - we want the original task session
+    root_sessions.sort_by(|a, b| {
+        let time_a = a
+            .get("time")
+            .and_then(|t| t.get("created"))
+            .and_then(|c| c.as_i64())
+            .unwrap_or(0);
+        let time_b = b
+            .get("time")
+            .and_then(|t| t.get("created"))
+            .and_then(|c| c.as_i64())
+            .unwrap_or(0);
+        time_a.cmp(&time_b)
+    });
+
+    root_sessions
+        .first()
+        .and_then(|s| s.get("id"))
+        .and_then(|id| id.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Execute a curl command in the workspace container and return the output
 /// (Legacy approach for pods without published API)
 fn opencode_api_get(pod_name: &str, path: &str) -> Result<serde_json::Value> {
@@ -3753,5 +4050,42 @@ mod tests {
         // This tests the detection function - result depends on runtime environment
         // Just verify it runs without panicking
         let _inside = is_inside_devcontainer();
+    }
+
+    #[test]
+    fn test_get_attach_container_name_workspace() {
+        let pod_name = "devaipod-myproject";
+        let result = get_attach_container_name(pod_name, AttachTarget::Workspace);
+        assert_eq!(result, "devaipod-myproject-workspace");
+    }
+
+    #[test]
+    fn test_get_attach_container_name_agent() {
+        let pod_name = "devaipod-myproject";
+        let result = get_attach_container_name(pod_name, AttachTarget::Agent);
+        assert_eq!(result, "devaipod-myproject-agent");
+    }
+
+    #[test]
+    fn test_get_attach_container_name_with_special_chars() {
+        // Pod names may contain dots and colons which get sanitized elsewhere,
+        // but the container name function should handle them transparently
+        let pod_name = "devaipod-my.project";
+        assert_eq!(
+            get_attach_container_name(pod_name, AttachTarget::Workspace),
+            "devaipod-my.project-workspace"
+        );
+        assert_eq!(
+            get_attach_container_name(pod_name, AttachTarget::Agent),
+            "devaipod-my.project-agent"
+        );
+    }
+
+    #[test]
+    fn test_attach_target_equality() {
+        // Verify that AttachTarget derives PartialEq correctly
+        assert_eq!(AttachTarget::Workspace, AttachTarget::Workspace);
+        assert_eq!(AttachTarget::Agent, AttachTarget::Agent);
+        assert_ne!(AttachTarget::Workspace, AttachTarget::Agent);
     }
 }

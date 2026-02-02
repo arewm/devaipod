@@ -911,3 +911,500 @@ fn test_init_script_configures_both_containers() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_init_script_configures_both_containers);
+
+// =============================================================================
+// Agent workspace isolation tests
+// =============================================================================
+
+/// Verify that the agent container has its own /workspaces directory that is separate
+/// from the workspace container's /workspaces.
+///
+/// This tests the core workspace isolation feature: the agent gets a git clone with
+/// --reference to share objects, but has its own working tree.
+fn test_agent_has_separate_workspace() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = unique_test_name("test-agent-ws");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    let sh = shell()?;
+    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
+
+    // Give containers time to start
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Create a unique marker file in the workspace container
+    let workspace_marker = "workspace-unique-marker-12345";
+    let ws_marker_cmd = format!(
+        "echo '{}' > /workspaces/test-repo/workspace-marker.txt",
+        workspace_marker
+    );
+    cmd!(
+        sh,
+        "podman exec {workspace_container} sh -c {ws_marker_cmd}"
+    )
+    .run()?;
+
+    // Verify the workspace container can see its marker
+    let ws_check = cmd!(
+        sh,
+        "podman exec {workspace_container} cat /workspaces/test-repo/workspace-marker.txt"
+    )
+    .read()?;
+    assert!(
+        ws_check.contains(workspace_marker),
+        "Workspace should see its own marker: {}",
+        ws_check
+    );
+
+    // Verify the agent container does NOT see the workspace marker
+    let agent_check_ws = cmd!(
+        sh,
+        "podman exec {agent_container} cat /workspaces/test-repo/workspace-marker.txt"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        !agent_check_ws.status.success(),
+        "Agent should NOT see workspace's marker file (has separate workspace)"
+    );
+
+    // Create a unique marker file in the agent container
+    let agent_marker = "agent-unique-marker-67890";
+    let agent_marker_cmd = format!(
+        "echo '{}' > /workspaces/test-repo/agent-marker.txt",
+        agent_marker
+    );
+    cmd!(sh, "podman exec {agent_container} sh -c {agent_marker_cmd}").run()?;
+
+    // Verify the agent container can see its marker
+    let agent_check = cmd!(
+        sh,
+        "podman exec {agent_container} cat /workspaces/test-repo/agent-marker.txt"
+    )
+    .read()?;
+    assert!(
+        agent_check.contains(agent_marker),
+        "Agent should see its own marker: {}",
+        agent_check
+    );
+
+    // Verify the workspace container does NOT see the agent marker
+    let ws_check_agent = cmd!(
+        sh,
+        "podman exec {workspace_container} cat /workspaces/test-repo/agent-marker.txt"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        !ws_check_agent.status.success(),
+        "Workspace should NOT see agent's marker file (has separate workspace)"
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_agent_has_separate_workspace);
+
+/// Verify that the agent container has read-only access to /mnt/main-workspace.
+///
+/// The agent should be able to read the main workspace for reference but cannot
+/// write to it, preventing accidental modifications.
+fn test_agent_cannot_write_to_main_workspace() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = unique_test_name("test-agent-ro");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    let sh = shell()?;
+    let agent_container = format!("{}-agent", pod_name);
+
+    // Give containers time to start
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // First verify the mount point exists and is accessible for reading
+    let read_check = cmd!(
+        sh,
+        "podman exec {agent_container} ls /mnt/main-workspace/test-repo"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        read_check.status.success(),
+        "Agent should be able to read /mnt/main-workspace: {}",
+        String::from_utf8_lossy(&read_check.stderr)
+    );
+
+    // Verify the agent can read the README.md from main workspace
+    let readme_check = cmd!(
+        sh,
+        "podman exec {agent_container} cat /mnt/main-workspace/test-repo/README.md"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        readme_check.status.success(),
+        "Agent should be able to read files from /mnt/main-workspace"
+    );
+
+    // Try to create a file in /mnt/main-workspace - this should fail (read-only)
+    let write_attempt = cmd!(
+        sh,
+        "podman exec {agent_container} touch /mnt/main-workspace/test-repo/should-fail.txt"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        !write_attempt.status.success(),
+        "Agent should NOT be able to write to /mnt/main-workspace (read-only filesystem)"
+    );
+
+    // Verify the error message indicates read-only filesystem
+    let stderr = String::from_utf8_lossy(&write_attempt.stderr);
+    assert!(
+        stderr.contains("Read-only") || stderr.contains("read-only") || stderr.contains("EROFS"),
+        "Error should indicate read-only filesystem: {}",
+        stderr
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_agent_cannot_write_to_main_workspace);
+
+/// Verify that git objects are shared between the main workspace and agent workspace
+/// via the --reference mechanism.
+///
+/// This tests that the agent's .git/objects/info/alternates file exists and points
+/// to the main workspace's git objects.
+fn test_agent_workspace_shares_git_objects() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = unique_test_name("test-git-ref");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    let sh = shell()?;
+    let agent_container = format!("{}-agent", pod_name);
+
+    // Give containers time to start
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Check that the alternates file exists in the agent's git repo
+    let alternates_check = cmd!(
+        sh,
+        "podman exec {agent_container} cat /workspaces/test-repo/.git/objects/info/alternates"
+    )
+    .ignore_status()
+    .output()?;
+
+    assert!(
+        alternates_check.status.success(),
+        "Agent should have .git/objects/info/alternates file for git --reference: {}",
+        String::from_utf8_lossy(&alternates_check.stderr)
+    );
+
+    // Verify the alternates file references the main workspace's git objects
+    // The path should be /mnt/main-workspace/<project>/objects
+    let alternates_content = String::from_utf8_lossy(&alternates_check.stdout);
+    assert!(
+        alternates_content.contains("/mnt/main-workspace/test-repo"),
+        "Alternates should reference /mnt/main-workspace/test-repo: {}",
+        alternates_content
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_agent_workspace_shares_git_objects);
+
+/// Readonly test: Verify the agent workspace isolation volumes are set up correctly.
+///
+/// This is a lightweight check that uses the shared fixture to verify the volume
+/// configuration without modifying state.
+fn test_readonly_agent_has_separate_workspace(fixture: &SharedFixture) -> Result<()> {
+    let sh = shell()?;
+    let workspace = fixture.workspace_container();
+    let agent = fixture.agent_container();
+
+    // Verify both containers have /workspaces mounted
+    let ws_workspaces = cmd!(sh, "podman exec {workspace} ls /workspaces")
+        .ignore_status()
+        .output()?;
+    assert!(
+        ws_workspaces.status.success(),
+        "Workspace container should have /workspaces"
+    );
+
+    let agent_workspaces = cmd!(sh, "podman exec {agent} ls /workspaces")
+        .ignore_status()
+        .output()?;
+    assert!(
+        agent_workspaces.status.success(),
+        "Agent container should have /workspaces"
+    );
+
+    // Verify agent has /mnt/main-workspace mount
+    let agent_main_ws = cmd!(sh, "podman exec {agent} ls /mnt/main-workspace")
+        .ignore_status()
+        .output()?;
+    assert!(
+        agent_main_ws.status.success(),
+        "Agent container should have /mnt/main-workspace mount"
+    );
+
+    // Verify the agent's /mnt/main-workspace contains the shared test repo
+    let agent_main_ws_content = cmd!(sh, "podman exec {agent} ls /mnt/main-workspace")
+        .ignore_status()
+        .read()?;
+    assert!(
+        agent_main_ws_content.contains("shared-test-repo"),
+        "Agent's /mnt/main-workspace should contain shared-test-repo: {}",
+        agent_main_ws_content
+    );
+
+    // Verify the mount is read-only by checking mount options
+    let mount_info = cmd!(sh, "podman exec {agent} cat /proc/mounts").read()?;
+
+    // Find the line for /mnt/main-workspace and check it has 'ro' option
+    let main_ws_mount = mount_info
+        .lines()
+        .find(|line| line.contains("/mnt/main-workspace"));
+    assert!(
+        main_ws_mount.is_some(),
+        "/mnt/main-workspace should appear in /proc/mounts"
+    );
+    assert!(
+        main_ws_mount.unwrap().contains(" ro,")
+            || main_ws_mount.unwrap().contains(",ro ")
+            || main_ws_mount.unwrap().contains(",ro,"),
+        "/mnt/main-workspace should be mounted read-only: {}",
+        main_ws_mount.unwrap()
+    );
+
+    Ok(())
+}
+readonly_test!(test_readonly_agent_has_separate_workspace);
+
+// =============================================================================
+// Gator container tests
+// =============================================================================
+
+/// Verify that the gator container can access the agent's workspace.
+///
+/// With agent isolation, the gator needs to read from /workspaces/<project>
+/// which is mounted from the agent-workspace volume (not main workspace).
+/// This is required for git_push_local to read the agent's commits.
+fn test_gator_can_access_agent_workspace() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = unique_test_name("test-gator-ws");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod with service-gator explicitly enabled (local repos don't auto-enable gator)
+    // We use a dummy scope to force gator creation
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &[
+            "up",
+            ".",
+            "--name",
+            short_name(&pod_name),
+            "--service-gator=github:test/test-repo",
+        ],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    let sh = shell()?;
+    let gator_container = format!("{}-gator", pod_name);
+
+    // Give containers time to start
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Verify gator can read from /workspaces
+    let ws_check = cmd!(sh, "podman exec {gator_container} ls /workspaces")
+        .ignore_status()
+        .output()?;
+    assert!(
+        ws_check.status.success(),
+        "Gator should be able to read /workspaces: {}",
+        String::from_utf8_lossy(&ws_check.stderr)
+    );
+
+    // Verify gator can see the project directory
+    let ws_content = String::from_utf8_lossy(&ws_check.stdout);
+    assert!(
+        ws_content.contains("test-repo"),
+        "Gator /workspaces should contain the project: {}",
+        ws_content
+    );
+
+    // Verify the project has git data (meaning we're looking at the agent workspace clone)
+    let git_check = cmd!(
+        sh,
+        "podman exec {gator_container} ls /workspaces/test-repo/.git"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        git_check.status.success(),
+        "Gator should see .git directory in agent workspace: {}",
+        String::from_utf8_lossy(&git_check.stderr)
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_gator_can_access_agent_workspace);
+
+/// Verify that the gator container can resolve git alternates.
+///
+/// The agent workspace uses `git clone --shared` with alternates pointing to
+/// /mnt/main-workspace/<project>/.git/objects. The gator needs this path
+/// mounted so git operations (like reading commits for git_push_local) work.
+fn test_gator_can_resolve_git_alternates() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = unique_test_name("test-gator-alt");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod with service-gator explicitly enabled (local repos don't auto-enable gator)
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &[
+            "up",
+            ".",
+            "--name",
+            short_name(&pod_name),
+            "--service-gator=github:test/test-repo",
+        ],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    let sh = shell()?;
+    let gator_container = format!("{}-gator", pod_name);
+
+    // Give containers time to start
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Verify gator has /mnt/main-workspace mounted
+    let main_ws_check = cmd!(sh, "podman exec {gator_container} ls /mnt/main-workspace")
+        .ignore_status()
+        .output()?;
+    assert!(
+        main_ws_check.status.success(),
+        "Gator should have /mnt/main-workspace mounted: {}",
+        String::from_utf8_lossy(&main_ws_check.stderr)
+    );
+
+    // Verify /mnt/main-workspace contains the project
+    let main_ws_content = String::from_utf8_lossy(&main_ws_check.stdout);
+    assert!(
+        main_ws_content.contains("test-repo"),
+        "Gator /mnt/main-workspace should contain the project: {}",
+        main_ws_content
+    );
+
+    // Read the alternates file from the agent workspace
+    let alternates = cmd!(
+        sh,
+        "podman exec {gator_container} cat /workspaces/test-repo/.git/objects/info/alternates"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        alternates.status.success(),
+        "Gator should be able to read alternates file: {}",
+        String::from_utf8_lossy(&alternates.stderr)
+    );
+
+    let alternates_path = String::from_utf8_lossy(&alternates.stdout);
+    assert!(
+        alternates_path.contains("/mnt/main-workspace"),
+        "Alternates should reference /mnt/main-workspace: {}",
+        alternates_path
+    );
+
+    // Verify the alternates path is accessible (the key test!)
+    // This is what was broken before the fix - gator couldn't resolve this path
+    let alternates_path = alternates_path.trim();
+    let objects_check = cmd!(sh, "podman exec {gator_container} ls {alternates_path}")
+        .ignore_status()
+        .output()?;
+    assert!(
+        objects_check.status.success(),
+        "Gator should be able to access the alternates objects path {}: {}",
+        alternates_path,
+        String::from_utf8_lossy(&objects_check.stderr)
+    );
+
+    // Verify git log works in the gator container (requires resolving alternates)
+    let git_log = cmd!(
+        sh,
+        "podman exec {gator_container} git -C /workspaces/test-repo log --oneline -1"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        git_log.status.success(),
+        "Gator should be able to run git log (requires alternates): {}",
+        String::from_utf8_lossy(&git_log.stderr)
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_gator_can_resolve_git_alternates);
+
+// =============================================================================
+// TODO: Agent task/message flow tests
+// =============================================================================
+//
+// The following tests are needed but require mocking opencode:
+//
+// 1. test_run_with_task_sends_message()
+//    - Verify `devaipod run "task"` sends the initial message
+//    - Requires intercepting/mocking the opencode API
+//
+// 2. test_initial_message_includes_task()
+//    - Verify the task text is included in the message body
+//    - Requires mocking to inspect message content
+//
+// 3. test_message_send_is_async()
+//    - Verify the message send doesn't block waiting for LLM response
+//    - Could use a mock that delays response to verify timeout doesn't occur
+//
+// Approach: Could add a test mode where opencode is replaced with a simple
+// HTTP server that records requests. The `send_message_async` function could
+// be tested by checking the detached process is spawned correctly.

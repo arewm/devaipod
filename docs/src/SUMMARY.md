@@ -11,6 +11,7 @@
 # Security
 
 - [Sandboxing Model](sandboxing.md)
+- [Agent Workspace Isolation](agent-isolation.md)
 - [Secret Management](secrets.md)
 - [Service-gator Integration](service-gator.md)
 
