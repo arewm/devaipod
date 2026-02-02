@@ -9,6 +9,7 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 | Project | License | Local-only? | Notes |
 |---------|---------|-------------|-------|
 | **devaipod** | Apache-2.0/MIT | Yes | No cloud services required |
+| [Docker AI Sandboxes](https://docs.docker.com/ai/sandboxes/) | Proprietary | Yes | MicroVM isolation, Docker Desktop required |
 | [nono](https://nono.sh/) | Apache-2.0 | Yes | OS-level sandboxing (Landlock/Seatbelt), agent-agnostic |
 | [OpenHands](https://github.com/All-Hands-AI/OpenHands) | MIT | Yes | Self-hostable, Docker-based |
 | [Ambient Code](https://github.com/ambient-code/platform) | MIT | Yes | Kubernetes-native, self-hosted |
@@ -115,6 +116,26 @@ Gastown and devaipod solve different problems and could be complementary: Gastow
 Claude Code is also available as a hosted web service at claude.ai. Anthropic runs it in their own sandboxed infrastructure with a git proxy for credential scoping (described in their [sandboxing blog post](https://www.anthropic.com/engineering/claude-code-sandboxing)). However, **that sandbox code is not open source**—you cannot run it yourself. If you want similar sandboxing locally, you need something like devaipod.
 
 ## Other Sandboxing Tools
+
+### Docker AI Sandboxes
+
+[Docker AI Sandboxes](https://docs.docker.com/ai/sandboxes/) is Docker's solution for running AI coding agents in isolated environments. It uses lightweight microVMs with private Docker daemons for each sandbox.
+
+Key characteristics:
+- **MicroVM-based**: Runs agents in microVMs rather than containers, providing stronger isolation
+- **Private Docker daemon**: Each sandbox has its own Docker daemon for running test containers
+- **Multi-agent support**: Works with Claude Code, Codex, Gemini, and others
+- **Workspace sync**: Syncs your project directory into the sandbox at the same absolute path
+- **Proprietary**: Part of Docker Desktop, not open source
+
+Docker AI Sandboxes and devaipod solve similar problems but differ in several ways:
+- **Licensing**: Docker Sandboxes is proprietary; devaipod is fully open source (Apache-2.0/MIT)
+- **Platform**: Docker Sandboxes requires Docker Desktop with microVM support (macOS, Windows experimental); devaipod uses podman and works on Linux natively
+- **Credential scoping**: Docker Sandboxes provides isolation but does not mention fine-grained credential scoping like service-gator; devaipod can limit agent access to specific repos/operations
+- **devcontainer.json**: devaipod uses the standard devcontainer spec; Docker Sandboxes has its own sandbox configuration
+- **Container runtime**: Docker Sandboxes requires the Docker daemon; devaipod works with rootless podman (no daemon required)
+
+For Linux users who want open source tooling with credential scoping, devaipod is the better fit. For macOS/Windows users already invested in Docker Desktop who want quick agent isolation without credential scoping needs, Docker Sandboxes is convenient.
 
 ### nono
 
