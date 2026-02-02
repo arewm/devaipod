@@ -121,39 +121,23 @@ Claude Code is also available as a hosted web service at claude.ai. Anthropic ru
 
 [Docker AI Sandboxes](https://docs.docker.com/ai/sandboxes/) is Docker's solution for running AI coding agents in isolated environments. It uses lightweight microVMs with private Docker daemons for each sandbox.
 
-Key characteristics:
-- **MicroVM-based**: Runs agents in microVMs rather than containers, providing stronger isolation
-- **Private Docker daemon**: Each sandbox has its own Docker daemon for running test containers
-- **Multi-agent support**: Works with Claude Code, Codex, Gemini, and others
-- **Workspace sync**: Syncs your project directory into the sandbox at the same absolute path
-- **Proprietary**: Part of Docker Desktop, not open source
+devaipod is just a wrapper for podman and uses the **devcontainer.json** standard.
 
-Docker AI Sandboxes and devaipod solve similar problems but differ in several ways:
-- **Licensing**: Docker Sandboxes is proprietary; devaipod is fully open source (Apache-2.0/MIT)
+Note that the use case of running containers *inside* the sandbox is captured via nested containerization: VMs are not required.
+
+- **Licensing**: Docker Sandboxes is part of Docker Desktop, which is [proprietary software](https://www.docker.com/legal/docker-subscription-service-agreement/) requiring paid subscriptions for commercial use in organizations with 250+ employees or $10M+ revenue; devaipod is fully open source (Apache-2.0/MIT)
 - **Platform**: Docker Sandboxes requires Docker Desktop with microVM support (macOS, Windows experimental); devaipod uses podman and works on Linux natively
 - **Credential scoping**: Docker Sandboxes provides isolation but does not mention fine-grained credential scoping like service-gator; devaipod can limit agent access to specific repos/operations
-- **devcontainer.json**: devaipod uses the standard devcontainer spec; Docker Sandboxes has its own sandbox configuration
-- **Container runtime**: Docker Sandboxes requires the Docker daemon; devaipod works with rootless podman (no daemon required)
-
-For Linux users who want open source tooling with credential scoping, devaipod is the better fit. For macOS/Windows users already invested in Docker Desktop who want quick agent isolation without credential scoping needs, Docker Sandboxes is convenient.
 
 ### nono
 
 [nono](https://nono.sh/) ([GitHub](https://github.com/lukehinds/nono)) is an OS-level sandboxing tool for AI agents. Apache-2.0 licensed, created by Luke Hinds (creator of Sigstore).
 
-nono defaults to Landlock on Linux and Seatbelt on macOS (but
+nono defaults to Landlock on Linux and Seatbelt on macOS. I think OCI containers provide more security and are more flexible and well understood by tools.
+Further, containers provide reproducible environments that are just a foundational piece.
 
-Key characteristics:
-- **Agent-agnostic**: Works with Claude Code, Goose, OpenCode, or any process
-- **Capability-based**: You grant explicit path capabilities; everything else is denied
-- **Irreversible**: Once sandboxed, there's no mechanism to request more permissions
-- **No containers**: Lighter weight than container-based sandboxing
-
-nono and devaipod are **complementary**:
-- nono provides process-level sandboxing via OS primitives
-- devaipod provides container isolation plus **credential scoping** via service-gator
-
-You could use both together: run devaipod's containerized agent with nono inside the container for defense-in-depth, or use nono standalone when you don't need devcontainer environments or fine-grained credential scoping.
+Landlock is complementary to containerization, but how nono is doing it is conceptually against what the Landlock creators
+want in my opinion: Landlock was supposed to primarily used by apps to sandbox *themselves*, not as a container-replacement framework.
 
 ## Why devaipod?
 
