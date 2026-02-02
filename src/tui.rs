@@ -257,10 +257,10 @@ pub enum Action {
     Refresh,
     /// Delete selected instances
     Delete(Vec<String>),
-    /// Start a stopped instance
-    Start(String),
-    /// Stop a running instance
-    Stop(String),
+    /// Toggle start/stop for an instance
+    ToggleStartStop(String),
+    /// SSH into a running instance
+    Ssh(String),
 }
 
 /// Application state for the TUI
@@ -1327,38 +1327,51 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                     app.status_message = Some(format!("Errors: {}", errors.join(", ")));
                                 }
                             }
-                            Action::Start(name) => {
-                                app.status_message = Some(format!("Starting {}...", name));
-                                terminal.draw(|f| ui(f, &mut app))?;
+                            Action::ToggleStartStop(name) => {
+                                // Check instance status to determine whether to start or stop
+                                let is_running = app
+                                    .instances
+                                    .iter()
+                                    .find(|i| i.name == name)
+                                    .is_some_and(|i| i.status == "Running");
 
-                                match run_subprocess_silent(&["start", &name]).await {
-                                    Ok(()) => {
-                                        app.status_message = Some(format!("Started {}", name));
+                                if is_running {
+                                    app.status_message = Some(format!("Stopping {}...", name));
+                                    terminal.draw(|f| ui(f, &mut app))?;
+
+                                    match run_subprocess_silent(&["stop", &name]).await {
+                                        Ok(()) => {
+                                            app.status_message = Some(format!("Stopped {}", name));
+                                        }
+                                        Err(e) => {
+                                            app.status_message =
+                                                Some(format!("Failed to stop {}: {}", name, e));
+                                        }
                                     }
-                                    Err(e) => {
-                                        app.status_message = Some(format!("Failed to start {}: {}", name, e));
+                                } else {
+                                    app.status_message = Some(format!("Starting {}...", name));
+                                    terminal.draw(|f| ui(f, &mut app))?;
+
+                                    match run_subprocess_silent(&["start", &name]).await {
+                                        Ok(()) => {
+                                            app.status_message = Some(format!("Started {}", name));
+                                        }
+                                        Err(e) => {
+                                            app.status_message =
+                                                Some(format!("Failed to start {}: {}", name, e));
+                                        }
                                     }
                                 }
 
-                                // Refresh after start
+                                // Refresh after start/stop
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
                                 spawn_agent_refresh(&app.instances, agent_tx.clone());
                             }
-                            Action::Stop(name) => {
-                                app.status_message = Some(format!("Stopping {}...", name));
-                                terminal.draw(|f| ui(f, &mut app))?;
-
-                                match run_subprocess_silent(&["stop", &name]).await {
-                                    Ok(()) => {
-                                        app.status_message = Some(format!("Stopped {}", name));
-                                    }
-                                    Err(e) => {
-                                        app.status_message = Some(format!("Failed to stop {}: {}", name, e));
-                                    }
-                                }
-
-                                // Refresh after stop
+                            Action::Ssh(name) => {
+                                // Run SSH in subprocess
+                                run_subprocess(terminal, &["ssh", &name]).await?;
+                                // Refresh after returning from subprocess
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
                                 spawn_agent_refresh(&app.instances, agent_tx.clone());
@@ -1413,12 +1426,12 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
             None
         }
         KeyCode::Char('s') => {
-            // Start the selected instance
+            // SSH into the selected instance
             if let Some(instance) = app.selected_instance() {
-                if instance.status != "Running" {
-                    Some(Action::Start(instance.name.clone()))
+                if instance.status == "Running" {
+                    Some(Action::Ssh(instance.name.clone()))
                 } else {
-                    app.status_message = Some("Instance is already running".to_string());
+                    app.status_message = Some("Instance is not running".to_string());
                     None
                 }
             } else {
@@ -1427,14 +1440,9 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
             }
         }
         KeyCode::Char('S') => {
-            // Stop the selected instance
+            // Toggle start/stop for the selected instance
             if let Some(instance) = app.selected_instance() {
-                if instance.status == "Running" {
-                    Some(Action::Stop(instance.name.clone()))
-                } else {
-                    app.status_message = Some("Instance is not running".to_string());
-                    None
-                }
+                Some(Action::ToggleStartStop(instance.name.clone()))
             } else {
                 app.status_message = Some("No instance selected".to_string());
                 None
@@ -1632,7 +1640,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // Footer with help and status (mode-dependent)
     let (help_base, footer_style) = match app.mode {
         TuiMode::Normal => (
-            " q: Quit │ j/k: Navigate │ a: Attach │ s/S: Start/Stop │ d: Delete │ r: Refresh",
+            " q: Quit │ j/k: Navigate │ a: Attach │ s: SSH │ S: Start/Stop │ d: Delete │ r: Refresh",
             Style::default().fg(Color::DarkGray),
         ),
         TuiMode::DeleteSelect => (
