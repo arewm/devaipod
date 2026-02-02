@@ -125,7 +125,8 @@ devaipod wraps DevPod, treating it as an implementation detail:
 ```bash
 # User interacts with devaipod
 devaipod up .              # Start workspace
-devaipod ssh my-project    # SSH into workspace container
+devaipod exec my-project   # Shell in agent container (default)
+devaipod exec my-project -W # Shell in workspace container
 devaipod status            # Show workspaces + agent status
 devaipod logs my-project   # Stream agent logs
 devaipod stop my-project   # Stop workspace

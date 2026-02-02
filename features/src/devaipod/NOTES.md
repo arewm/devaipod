@@ -16,8 +16,11 @@ devaipod is primarily run on the **host** to create podman pods with workspace a
 # On host: create a workspace pod
 devaipod up /path/to/project
 
-# SSH into the workspace
-devaipod ssh myproject
+# Get a shell in the agent container
+devaipod exec myproject
+
+# Or in the workspace container
+devaipod exec myproject -W
 
 # Inside workspace: connect to the sandboxed agent
 oc

@@ -201,7 +201,8 @@ QUICK START:
 COMMON WORKFLOWS:
   devaipod list                               See all workspaces
   devaipod attach <workspace>                 Connect to agent in workspace
-  devaipod ssh <workspace>                    Get a shell in workspace
+  devaipod exec <workspace>                   Get a shell in agent container
+  devaipod exec <workspace> -W                Get a shell in workspace container
   devaipod logs <workspace> -f                Follow agent logs
   devaipod delete <workspace>                 Clean up when done
 
@@ -257,9 +258,9 @@ struct UpOptions {
     /// Generate configuration files but don't start containers
     #[arg(long)]
     dry_run: bool,
-    /// SSH into workspace after starting
-    #[arg(short = 'S', long)]
-    ssh: bool,
+    /// Exec into workspace container after starting
+    #[arg(short = 'S', long = "exec")]
+    exec_after: bool,
     /// Internal: mode of workspace creation (not exposed as CLI arg)
     #[arg(skip)]
     mode: WorkspaceMode,
@@ -392,17 +393,25 @@ enum HostCommand {
         #[arg(short = 'W', long)]
         workspace_mode: bool,
     },
-    /// SSH into a workspace shell
+    /// Execute a shell in a container
     ///
-    /// Opens an interactive shell in the workspace container. Use this for
-    /// manual development work or to run commands directly.
+    /// Opens an interactive shell in the agent container by default.
+    /// Use -W to exec into the workspace container instead.
     ///
     /// Examples:
-    ///   devaipod ssh myworkspace           # Interactive shell
-    ///   devaipod ssh myworkspace -- ls -la # Run a specific command
-    Ssh {
+    ///   devaipod exec myworkspace           # Shell in agent container (default)
+    ///   devaipod exec myworkspace -W        # Shell in workspace container
+    ///   devaipod exec myworkspace -- ls -la # Run a specific command
+    Exec {
         /// Workspace name (devaipod- prefix optional)
         workspace: String,
+        /// Exec into the workspace container instead of the agent
+        ///
+        /// By default, devaipod exec logs into the agent container where the AI
+        /// operates. Use this flag to access the workspace container for manual
+        /// development work or to review/pull agent changes.
+        #[arg(short = 'W', long = "workspace")]
+        workspace_mode: bool,
         /// Stdio mode: pipe stdin/stdout for ProxyCommand use (VSCode/Zed remote dev)
         #[arg(long, hide = true)]
         stdio: bool,
@@ -527,7 +536,7 @@ enum HostCommand {
     /// Run an agent on a repository with a task
     ///
     /// Creates a workspace and starts the agent with a task. Returns immediately
-    /// after setup (async by default). Use 'devaipod ssh <workspace>' to monitor
+    /// after setup (async by default). Use 'devaipod attach <workspace>' to monitor
     /// the agent's progress.
     ///
     /// For issue URLs, the source repo is extracted and the default task is
@@ -828,11 +837,19 @@ async fn run_host(cli: HostCli) -> Result<()> {
             };
             cmd_attach(&pod_name, session.as_deref(), target).await
         }
-        HostCommand::Ssh {
+        HostCommand::Exec {
             workspace,
+            workspace_mode,
             stdio,
             command,
-        } => cmd_ssh(&normalize_pod_name(&workspace), stdio, &command),
+        } => {
+            let target = if workspace_mode {
+                AttachTarget::Workspace
+            } else {
+                AttachTarget::Agent
+            };
+            cmd_exec(&normalize_pod_name(&workspace), target, stdio, &command)
+        }
         HostCommand::SshConfig { workspace, user } => {
             cmd_ssh_config(&normalize_pod_name(&workspace), user.as_deref())
         }
@@ -1612,10 +1629,15 @@ async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Resul
     let create_opts = CreateOptions::from_up_options(&opts);
     let result = create_workspace(config, source, &create_opts).await?;
 
-    // Optionally SSH into the workspace - go directly to bash, not the monitor
+    // Optionally exec into the workspace container - go directly to bash
     // (the monitor is for observing a running agent, but `up -S` is for interactive work)
-    if opts.ssh {
-        return cmd_ssh(&result.pod_name, false, &["bash".to_string()]);
+    if opts.exec_after {
+        return cmd_exec(
+            &result.pod_name,
+            AttachTarget::Workspace,
+            false,
+            &["bash".to_string()],
+        );
     }
 
     Ok(())
@@ -1625,10 +1647,10 @@ async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Resul
 ///
 /// This is a thin wrapper around `create_workspace` that:
 /// - Sets mode to Run (for tracking)
-/// - Does not SSH by default (async execution)
+/// - Does not attach by default (async execution)
 ///
 /// It creates a workspace and starts the agent with the task, then returns
-/// immediately. Use `devaipod ssh <workspace>` to monitor the agent's progress.
+/// immediately. Use `devaipod attach <workspace>` to monitor the agent's progress.
 ///
 /// Returns the pod name for optional follow-up operations (e.g., attach).
 async fn cmd_run(
@@ -2108,9 +2130,9 @@ exec tmux attach -t {session}
     Ok(())
 }
 
-/// SSH into workspace using podman exec
-fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
-    let container = format!("{}-workspace", pod_name);
+/// Exec into a container using podman exec
+fn cmd_exec(pod_name: &str, target: AttachTarget, stdio: bool, command: &[String]) -> Result<()> {
+    let container = get_attach_container_name(pod_name, target);
 
     if stdio {
         // Stdio mode: pipe stdin/stdout directly for ProxyCommand use
@@ -2137,7 +2159,15 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         }
     } else {
         // Interactive mode with TTY
-        tracing::info!("Connecting to container '{}'...", container);
+        let target_name = match target {
+            AttachTarget::Agent => "agent",
+            AttachTarget::Workspace => "workspace",
+        };
+        tracing::info!(
+            "Exec into {} container '{}'...",
+            target_name,
+            strip_pod_prefix(pod_name)
+        );
 
         let mut cmd = podman_command();
         cmd.args(["exec", "-it", &container]);
@@ -2235,10 +2265,11 @@ fn cmd_ssh_config(pod_name: &str, user: Option<&str>) -> Result<()> {
         .unwrap_or_else(|_| "devaipod".to_string());
 
     // Create SSH config content
+    // Uses exec -W --stdio to connect to the workspace container for IDE remote dev
     let config_content = format!(
         r#"# Generated by devaipod ssh-config
 Host {pod}.devaipod
-    ProxyCommand {devaipod} ssh --stdio {pod}
+    ProxyCommand {devaipod} exec -W --stdio {pod}
     User {user}
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
@@ -4049,7 +4080,7 @@ mod tests {
 
         assert!(subcommands.contains(&"up"), "Missing 'up' command");
         assert!(subcommands.contains(&"run"), "Missing 'run' command");
-        assert!(subcommands.contains(&"ssh"), "Missing 'ssh' command");
+        assert!(subcommands.contains(&"exec"), "Missing 'exec' command");
         assert!(
             subcommands.contains(&"ssh-config"),
             "Missing 'ssh-config' command"

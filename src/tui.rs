@@ -259,8 +259,10 @@ pub enum Action {
     Delete(Vec<String>),
     /// Toggle start/stop for an instance
     ToggleStartStop(String),
-    /// SSH into a running instance
-    Ssh(String),
+    /// Exec into agent container
+    ExecAgent(String),
+    /// Exec into workspace container
+    ExecWorkspace(String),
 }
 
 /// Application state for the TUI
@@ -1368,9 +1370,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
                                 spawn_agent_refresh(&app.instances, agent_tx.clone());
                             }
-                            Action::Ssh(name) => {
-                                // Run SSH in subprocess
-                                run_subprocess(terminal, &["ssh", &name]).await?;
+                            Action::ExecAgent(name) => {
+                                // Exec into agent container
+                                run_subprocess(terminal, &["exec", &name]).await?;
+                                // Refresh after returning from subprocess
+                                let _ = app.refresh_instances().await;
+                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                            }
+                            Action::ExecWorkspace(name) => {
+                                // Exec into workspace container
+                                run_subprocess(terminal, &["exec", "-W", &name]).await?;
                                 // Refresh after returning from subprocess
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
@@ -1425,11 +1435,25 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
                 Some("Delete mode: Space to select, Enter to confirm, Esc to cancel".to_string());
             None
         }
-        KeyCode::Char('s') => {
-            // SSH into the selected instance
+        KeyCode::Char('e') => {
+            // Exec into agent container
             if let Some(instance) = app.selected_instance() {
                 if instance.status == "Running" {
-                    Some(Action::Ssh(instance.name.clone()))
+                    Some(Action::ExecAgent(instance.name.clone()))
+                } else {
+                    app.status_message = Some("Instance is not running".to_string());
+                    None
+                }
+            } else {
+                app.status_message = Some("No instance selected".to_string());
+                None
+            }
+        }
+        KeyCode::Char('E') => {
+            // Exec into workspace container
+            if let Some(instance) = app.selected_instance() {
+                if instance.status == "Running" {
+                    Some(Action::ExecWorkspace(instance.name.clone()))
                 } else {
                     app.status_message = Some("Instance is not running".to_string());
                     None
@@ -1640,7 +1664,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // Footer with help and status (mode-dependent)
     let (help_base, footer_style) = match app.mode {
         TuiMode::Normal => (
-            " q: Quit │ j/k: Navigate │ a: Attach │ s: SSH │ S: Start/Stop │ d: Delete │ r: Refresh",
+            " q: Quit │ j/k: Navigate │ a: Attach │ e: Exec │ E: Exec -W │ S: Start/Stop │ d: Delete │ r: Refresh",
             Style::default().fg(Color::DarkGray),
         ),
         TuiMode::DeleteSelect => (

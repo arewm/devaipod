@@ -81,10 +81,16 @@ Create a pod and auto-start the agent on a task:
 devaipod run <repo> "fix the bug in auth.rs"
 ```
 
-SSH into the workspace container:
+Get a shell in the agent container:
 
 ```bash
-devaipod ssh <name>
+devaipod exec <name>
+```
+
+Get a shell in the workspace container:
+
+```bash
+devaipod exec <name> -W
 ```
 
 ## Bidirectional git remotes
@@ -107,7 +113,7 @@ First, connect to the workspace container:
 ```bash
 devaipod attach <name> -W
 # or
-devaipod ssh <name>
+devaipod exec <name> -W
 ```
 
 The `agent` remote is already configured. Review and pull changes:

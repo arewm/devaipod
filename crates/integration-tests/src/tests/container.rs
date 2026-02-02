@@ -95,23 +95,23 @@ fn test_readonly_pod_exists(fixture: &SharedFixture) -> Result<()> {
 }
 readonly_test!(test_readonly_pod_exists);
 
-/// Verify we can SSH into the shared pod and run commands
-fn test_readonly_can_ssh(fixture: &SharedFixture) -> Result<()> {
+/// Verify we can exec into the shared pod and run commands
+fn test_readonly_can_exec(fixture: &SharedFixture) -> Result<()> {
     // Use short_name() for devaipod CLI commands
     let short_name = fixture.short_name();
 
-    // Run a simple command via ssh
-    let output = run_devaipod(&["ssh", short_name, "--", "echo", "hello-from-shared"])?;
-    output.assert_success("devaipod ssh echo");
+    // Run a simple command via exec -W (workspace container)
+    let output = run_devaipod(&["exec", "-W", short_name, "--", "echo", "hello-from-shared"])?;
+    output.assert_success("devaipod exec echo");
     assert!(
         output.stdout.contains("hello-from-shared"),
-        "SSH should return command output: {}",
+        "Exec should return command output: {}",
         output.combined()
     );
 
     // Verify we can see the workspace
-    let ls_output = run_devaipod(&["ssh", short_name, "--", "ls", "/workspaces"])?;
-    ls_output.assert_success("devaipod ssh ls");
+    let ls_output = run_devaipod(&["exec", "-W", short_name, "--", "ls", "/workspaces"])?;
+    ls_output.assert_success("devaipod exec ls");
     assert!(
         ls_output.stdout.contains("shared-test-repo"),
         "Should see shared workspace directory: {}",
@@ -120,7 +120,7 @@ fn test_readonly_can_ssh(fixture: &SharedFixture) -> Result<()> {
 
     Ok(())
 }
-readonly_test!(test_readonly_can_ssh);
+readonly_test!(test_readonly_can_exec);
 
 /// Verify the agent API endpoint responds to authenticated requests
 fn test_readonly_api_responds(fixture: &SharedFixture) -> Result<()> {
@@ -466,9 +466,9 @@ fn test_logs_command() -> Result<()> {
 }
 podman_integration_test!(test_logs_command);
 
-fn test_ssh_runs_command() -> Result<()> {
+fn test_exec_runs_command() -> Result<()> {
     let repo = TestRepo::new()?;
-    let pod_name = unique_test_name("test-ssh");
+    let pod_name = unique_test_name("test-exec");
 
     let mut pods = PodGuard::new();
     pods.add(&pod_name);
@@ -485,37 +485,56 @@ fn test_ssh_runs_command() -> Result<()> {
     // Give containers a moment to start
     std::thread::sleep(std::time::Duration::from_secs(2));
 
-    // Run a command via ssh (use short name for CLI)
-    let ssh_output = run_devaipod(&["ssh", short_name(&pod_name), "--", "echo", "hello"])?;
-    ssh_output.assert_success("devaipod ssh echo");
+    // Run a command via exec (defaults to agent container)
+    let exec_output = run_devaipod(&["exec", short_name(&pod_name), "--", "echo", "hello"])?;
+    exec_output.assert_success("devaipod exec echo");
     assert!(
-        ssh_output.stdout.contains("hello"),
-        "ssh should run command and return output: {}",
-        ssh_output.combined()
+        exec_output.stdout.contains("hello"),
+        "exec should run command and return output: {}",
+        exec_output.combined()
     );
 
-    // Verify we can see the workspace
-    let ls_output = run_devaipod(&["ssh", short_name(&pod_name), "--", "ls", "/workspaces"])?;
-    ls_output.assert_success("devaipod ssh ls");
+    // Verify we can see the workspace in agent container
+    let ls_output = run_devaipod(&["exec", short_name(&pod_name), "--", "ls", "/workspaces"])?;
+    ls_output.assert_success("devaipod exec ls");
     assert!(
         ls_output.stdout.contains("test-repo"),
         "Should see workspace directory: {}",
         ls_output.stdout
     );
 
+    // Also verify exec -W works (workspace container)
+    let ws_output = run_devaipod(&[
+        "exec",
+        "-W",
+        short_name(&pod_name),
+        "--",
+        "echo",
+        "workspace",
+    ])?;
+    ws_output.assert_success("devaipod exec -W echo");
+    assert!(
+        ws_output.stdout.contains("workspace"),
+        "exec -W should run command in workspace container: {}",
+        ws_output.combined()
+    );
+
     Ok(())
 }
-podman_integration_test!(test_ssh_runs_command);
+podman_integration_test!(test_exec_runs_command);
 
-fn test_ssh_nonexistent_pod_fails() -> Result<()> {
-    // SSH to an instance that doesn't exist should fail gracefully
+fn test_exec_nonexistent_pod_fails() -> Result<()> {
+    // Exec into an instance that doesn't exist should fail gracefully
     // Use a short name since that's what devaipod CLI expects
-    let output = run_devaipod(&["ssh", "nonexistent-instance-12345", "--", "echo", "hi"])?;
-    assert!(!output.success(), "ssh to nonexistent instance should fail");
+    let output = run_devaipod(&["exec", "nonexistent-instance-12345", "--", "echo", "hi"])?;
+    assert!(
+        !output.success(),
+        "exec to nonexistent instance should fail"
+    );
 
     Ok(())
 }
-podman_integration_test!(test_ssh_nonexistent_pod_fails);
+podman_integration_test!(test_exec_nonexistent_pod_fails);
 
 fn test_pod_has_api_credentials() -> Result<()> {
     let repo = TestRepo::new()?;

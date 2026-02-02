@@ -58,8 +58,10 @@ agent that is idle by default.
 devaipod up https://github.com/org/repo
 # Attach to the agent when ready
 devaipod attach <workspace>
-# Or get a shell for manual work
-devaipod ssh <workspace>
+# Or get a shell in agent container
+devaipod exec <workspace>
+# Or get a shell in workspace container for manual work
+devaipod exec <workspace> -W
 ```
 
 ## Next Steps

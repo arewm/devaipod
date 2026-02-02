@@ -139,7 +139,7 @@ ContainerConfig {
 
 The user interacts via:
 - `devaipod attach` - connect to agent (with auto-session detection)
-- `devaipod ssh` - shell in workspace
+- `devaipod exec` - shell in agent (default) or workspace (-W)
 - `devaipod monitor` - live status display (optional)
 
 ### 4. Send initial task from host

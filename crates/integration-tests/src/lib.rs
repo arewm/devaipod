@@ -351,7 +351,7 @@ impl SharedFixture {
     /// Get the short pod name (for devaipod CLI commands)
     ///
     /// Returns the name without the `devaipod-` prefix, e.g. `integration-shared`.
-    /// Use this for devaipod commands like `devaipod status`, `devaipod ssh`, etc.
+    /// Use this for devaipod commands like `devaipod status`, `devaipod exec`, etc.
     pub fn short_name(&self) -> &str {
         self.pod_name
             .strip_prefix("devaipod-")
