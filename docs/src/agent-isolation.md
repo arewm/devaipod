@@ -25,9 +25,13 @@ The pod contains three containers that share git objects but maintain isolated w
 │  /workspaces/<project>  │  /workspaces/<project>  │  MCP    │
 │  (human's working tree) │  (agent's isolated      │  Server │
 │                         │   working tree)         │         │
-│  /mnt/agent-workspace   │  /mnt/main-workspace    │         │
-│  (readonly, agent's     │  (readonly, for git     │         │
-│   changes to pull)      │   object sharing)       │         │
+│  /mnt/main-workspace    │  /mnt/main-workspace    │         │
+│  (same as /workspaces,  │  (readonly, for git     │         │
+│   for git alternates)   │   object sharing)       │         │
+│                         │                         │         │
+│  /mnt/agent-workspace   │                         │         │
+│  (readonly, agent's     │                         │         │
+│   changes to pull)      │                         │         │
 └─────────────────────────┴─────────────────────────┴─────────┘
 ```
 
@@ -36,11 +40,14 @@ The pod contains three containers that share git objects but maintain isolated w
 | Container | Path | Source | Access |
 |-----------|------|--------|--------|
 | Workspace | `/workspaces` | main workspace volume | read-write |
+| Workspace | `/mnt/main-workspace` | main workspace volume | **read-only** |
 | Workspace | `/mnt/agent-workspace` | agent workspace volume | **read-only** |
 | Agent | `/workspaces` | agent workspace volume | read-write |
 | Agent | `/mnt/main-workspace` | main workspace volume | **read-only** |
 
 The cross-mounts are read-only, so neither container can modify the other's working tree.
+
+Note: The workspace container mounts the main volume at both `/workspaces` (read-write) and `/mnt/main-workspace` (read-only). This allows `git fetch agent` to work correctly—the agent's clone uses `--shared` which creates an alternates file referencing `/mnt/main-workspace`, and this path must exist in both containers.
 
 ## Git object sharing
 

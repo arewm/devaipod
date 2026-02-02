@@ -1617,10 +1617,19 @@ exec sleep infinity
             privileged,
             // Mount volumes:
             // - workspace volume at /workspaces (main workspace clone)
+            // - workspace volume also at /mnt/main-workspace (read-only, for git alternates resolution)
             // - agent home volume at /opt/devaipod (read-only, for scripts)
             // - agent workspace volume at /mnt/agent-workspace (read-only, for git remote)
+            //
+            // Note: The /mnt/main-workspace mount is needed because the agent's git clone uses
+            // --shared which creates an alternates file pointing to /mnt/main-workspace/...
+            // This path must exist in the workspace container for `git fetch agent` to work.
             volume_mounts: vec![
                 (volume_name.to_string(), "/workspaces".to_string()),
+                (
+                    volume_name.to_string(),
+                    "/mnt/main-workspace:ro".to_string(),
+                ),
                 (
                     agent_home_volume.to_string(),
                     "/opt/devaipod:ro".to_string(),
@@ -1967,15 +1976,21 @@ mod tests {
             &[], // labels
         );
 
-        // Volume mounts for workspace, agent home, and agent workspace
-        assert_eq!(container_config.volume_mounts.len(), 3);
+        // Volume mounts for workspace (2x), agent home, and agent workspace
+        assert_eq!(container_config.volume_mounts.len(), 4);
         assert_eq!(container_config.volume_mounts[0].0, "test-volume");
         assert_eq!(container_config.volume_mounts[0].1, "/workspaces");
-        assert_eq!(container_config.volume_mounts[1].0, "test-agent-home");
-        assert_eq!(container_config.volume_mounts[1].1, "/opt/devaipod:ro");
-        assert_eq!(container_config.volume_mounts[2].0, "test-agent-workspace");
+        // Same volume mounted at /mnt/main-workspace for git alternates resolution
+        assert_eq!(container_config.volume_mounts[1].0, "test-volume");
         assert_eq!(
-            container_config.volume_mounts[2].1,
+            container_config.volume_mounts[1].1,
+            "/mnt/main-workspace:ro"
+        );
+        assert_eq!(container_config.volume_mounts[2].0, "test-agent-home");
+        assert_eq!(container_config.volume_mounts[2].1, "/opt/devaipod:ro");
+        assert_eq!(container_config.volume_mounts[3].0, "test-agent-workspace");
+        assert_eq!(
+            container_config.volume_mounts[3].1,
             "/mnt/agent-workspace:ro"
         );
         assert_eq!(container_config.user, Some("vscode".to_string()));
