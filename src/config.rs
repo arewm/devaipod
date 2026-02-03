@@ -30,6 +30,7 @@ pub enum ContainerTarget {
 
 /// Top-level configuration
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Environment variable configuration for containers
     #[serde(default)]
@@ -75,6 +76,7 @@ pub struct Config {
 
 /// Configuration for binding paths from host home to container home
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct BindHomeConfig {
     /// Paths relative to $HOME to bind mount
     #[serde(default)]
@@ -99,6 +101,7 @@ pub struct BindHomeConfig {
 /// EDITOR = "vim"
 /// ```
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct EnvConfig {
     /// Environment variable names to forward from host to containers.
     /// These are looked up in the current environment when the pod is created.
@@ -157,6 +160,7 @@ impl EnvConfig {
 /// secrets = ["GH_TOKEN=gh_token", "GITLAB_TOKEN=gitlab_token"]
 /// ```
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedEnvConfig {
     /// Environment settings for trusted containers
     #[serde(default)]
@@ -219,6 +223,7 @@ impl TrustedEnvConfig {
 /// Similar to devpod's dotfiles feature, this clones a git repository
 /// containing dotfiles and runs an install script.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DotfilesConfig {
     /// Git URL of the dotfiles repository (e.g., "https://github.com/user/dotfiles")
     pub url: String,
@@ -244,6 +249,7 @@ pub const AGENT_ENV_PREFIX: &str = "DEVAIPOD_AGENT_";
 /// When enabled, GPUs are passed through to the workspace container.
 /// Supports NVIDIA (via CDI or direct device passthrough) and AMD GPUs.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct GpuPassthroughConfig {
     /// Whether to enable GPU passthrough (default: false)
     /// Set to "auto" to auto-detect and enable if GPUs are available
@@ -329,6 +335,7 @@ pub fn collect_agent_env_vars() -> Vec<(String, String)> {
 ///
 /// Note: Sidecar feature is planned but not yet implemented.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct SidecarConfig {
     /// Sidecar image override (default: uses main container's image)
@@ -364,6 +371,7 @@ pub struct SidecarConfig {
 /// A bind mount specification for sidecar containers
 /// Part of planned sidecar feature.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct MountSpec {
     /// Host path to mount (supports ~ expansion)
@@ -382,6 +390,7 @@ fn default_true() -> bool {
 /// A named sidecar profile for quick switching between different AI agents
 /// Part of planned sidecar feature.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct SidecarProfile {
     /// Sidecar image for this profile (if None, uses main container's image)
@@ -412,6 +421,7 @@ pub struct SidecarProfile {
 
 /// Mapping of a podman secret to an environment variable
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SecretMapping {
     /// The podman secret name
     pub secret: String,
@@ -435,6 +445,7 @@ pub const SERVICE_GATOR_DEFAULT_PORT: u16 = 8765;
 /// (GitHub, JIRA, GitLab) for AI agents. It runs in a separate container
 /// and enforces fine-grained permissions on API operations.
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceGatorConfig {
     /// Whether to enable service-gator (default: false, auto-enabled if scopes configured)
     #[serde(default)]
@@ -458,7 +469,8 @@ impl ServiceGatorConfig {
             return enabled;
         }
         // Auto-enable if any scopes are configured
-        !self.gh.repos.is_empty()
+        self.gh.read
+            || !self.gh.repos.is_empty()
             || !self.gh.prs.is_empty()
             || !self.jira.projects.is_empty()
             || !self.jira.issues.is_empty()
@@ -473,8 +485,19 @@ impl ServiceGatorConfig {
 
 /// GitHub scope configuration for service-gator
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct GithubScope {
+    /// Global read-only access to all GitHub repos and endpoints
+    ///
+    /// When set to true, enables read access to:
+    /// - All `/repos/OWNER/REPO/...` endpoints (any owner/repo)
+    /// - Non-repo endpoints: `/search/...`, `/gists/...`, `/user/...`, `/orgs/...`
+    /// - GraphQL queries
+    ///
+    /// This is the recommended default for productive AI-assisted development.
+    /// Set `[service-gator.gh] read = true` in your config.
+    #[serde(default)]
+    pub read: bool,
     /// Repository permissions: "owner/repo" or "owner/*" → permission
     #[serde(default)]
     pub repos: HashMap<String, GhRepoPermission>,
@@ -491,7 +514,7 @@ pub struct GithubScope {
 
 /// Fine-grained permissions for a GitHub repository
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct GhRepoPermission {
     /// Can read the repository (view PRs, issues, code, etc.)
     #[serde(default)]
@@ -509,7 +532,7 @@ pub struct GhRepoPermission {
 
 /// Permissions for a specific PR or issue
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct GhResourcePermission {
     /// Can read this resource
     #[serde(default)]
@@ -534,7 +557,7 @@ pub enum GraphQlPermission {
 
 /// JIRA scope configuration for service-gator
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct JiraScope {
     /// Project permissions: "PROJ" → permission
     #[serde(default)]
@@ -546,7 +569,7 @@ pub struct JiraScope {
 
 /// JIRA project permissions
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct JiraProjectPermission {
     /// Can read the project (list issues, view, etc.)
     #[serde(default)]
@@ -561,7 +584,7 @@ pub struct JiraProjectPermission {
 
 /// JIRA issue permissions
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct JiraIssuePermission {
     /// Can read this issue
     #[serde(default)]
@@ -942,6 +965,40 @@ port = 9000
             .repos
             .insert("owner/repo".to_string(), GhRepoPermission::default());
         assert!(config.is_enabled());
+
+        // Auto-enable when gh.read = true
+        let mut config = ServiceGatorConfig::default();
+        config.gh.read = true;
+        assert!(config.is_enabled());
+    }
+
+    #[test]
+    fn test_parse_service_gator_gh_read() {
+        // Test that [service-gator.gh] read = true is parsed correctly
+        let toml = r#"
+[service-gator.gh]
+read = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.service_gator.gh.read);
+        assert!(config.service_gator.is_enabled());
+    }
+
+    #[test]
+    fn test_parse_service_gator_gh_read_with_repos() {
+        // Test that gh.read = true works alongside specific repo overrides
+        let toml = r#"
+[service-gator.gh]
+read = true
+
+[service-gator.gh.repos]
+"myorg/myrepo" = { create-draft = true }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.service_gator.gh.read);
+        assert!(config.service_gator.is_enabled());
+        assert_eq!(config.service_gator.gh.repos.len(), 1);
+        assert!(config.service_gator.gh.repos["myorg/myrepo"].create_draft);
     }
 
     #[test]

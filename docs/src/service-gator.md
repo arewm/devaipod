@@ -27,9 +27,63 @@
 └───────────────────────────────────────────────────────────────────┘
 ```
 
+## Recommended Setup: Global GitHub Read-Only
+
+For most users, the recommended configuration is **global read-only access to all GitHub repos**. This allows the AI agent to browse code, read PRs/issues, and understand context across repositories while preventing any write operations.
+
+First, create a podman secret for your GitHub token (one-time setup):
+```bash
+echo 'ghp_your_token_here' | podman secret create gh_token -
+```
+
+Then add this to `~/.config/devaipod.toml`:
+
+```toml
+# Use podman secrets to provide GH_TOKEN to service-gator (but NOT to the agent)
+[trusted]
+secrets = ["GH_TOKEN=gh_token"]
+
+# Enable service-gator with global read-only GitHub access
+[service-gator.gh]
+read = true
+```
+
+With this configuration, every `devaipod up` or `devaipod run` will automatically have service-gator enabled with read access to all GitHub repos. The agent can:
+- Read repository contents, PRs, issues, and comments via `gh api repos/OWNER/REPO/...`
+- Understand cross-repo dependencies
+
+But the agent **cannot**:
+- Push code or create branches
+- Create, merge, or close PRs
+- Comment on issues or PRs
+- Modify any repository state
+
+This is the safest default for productive AI-assisted development.
+
+The `read = true` setting enables:
+- All `/repos/OWNER/REPO/...` endpoints (any owner/repo)
+- Non-repo endpoints: `/search/...`, `/gists/...`, `/user/...`, `/orgs/...`
+- GraphQL queries (implicitly enabled)
+
+This is the most permissive read-only configuration. The agent can browse any public/accessible GitHub data but cannot modify anything.
+
+### Adding Write Access for Specific Repos
+
+You can layer additional permissions on top of the global readonly:
+
+```toml
+[service-gator.gh.repos]
+# Global read-only baseline
+"*/*" = { read = true }
+
+# Allow draft PRs for your main projects
+"myorg/frontend" = { read = true, create-draft = true }
+"myorg/backend" = { read = true, create-draft = true }
+```
+
 ## Quick Start (CLI)
 
-The simplest way to use service-gator is via command-line flags:
+For one-off usage or overriding the config, use command-line flags:
 
 ```bash
 # Read-only access to all GitHub repos
@@ -80,47 +134,41 @@ This is useful for testing local changes to service-gator or pinning to a specif
 
 ## Configuration File
 
-For persistent configuration, use `~/.config/devaipod.toml`:
+For persistent configuration, use `~/.config/devaipod.toml`. Here's a complete example:
 
 ```toml
-# Trusted environment variables - forwarded to workspace and gator containers
-# but NOT to the agent container. This is where credentials go.
-[trusted.env]
-allowlist = ["GH_TOKEN", "GITLAB_TOKEN", "JIRA_API_TOKEN"]
+# Podman secrets for credentials - forwarded to workspace and gator containers
+# but NOT to the agent container. Format: "ENV_VAR=secret_name"
+# Create secrets with: echo 'token' | podman secret create secret_name -
+[trusted]
+secrets = ["GH_TOKEN=gh_token", "GITLAB_TOKEN=gitlab_token", "JIRA_API_TOKEN=jira_token"]
 
-[service-gator]
-# Optional: explicitly enable (auto-enabled if any scopes are configured)
-enabled = true
-# Optional: custom port (default: 8765)
-port = 8765
+# RECOMMENDED: Global read-only access to all GitHub data
+# Enables: all repos, /search, /gists, /user, GraphQL
+[service-gator.gh]
+read = true
 
-# GitHub repository permissions
+# Optional: Add write permissions for specific repos
 [service-gator.gh.repos]
-# Read-only access to all repos under an owner
-"myorg/*" = { read = true }
+# Read + create draft PRs for specific repos you actively develop
+"myorg/main-project" = { create-draft = true }
 
-# Read + create draft PRs for a specific repo
-"myorg/main-project" = { read = true, create-draft = true }
+# Read + manage pending PR reviews (for AI code review workflows)
+"myorg/reviewed-repo" = { pending-review = true }
 
-# Read + manage pending PR reviews (for AI code review)
-"myorg/reviewed-repo" = { read = true, pending-review = true }
+# Full write access (use sparingly - only for highly trusted workflows)
+# "myorg/trusted-repo" = { write = true }
 
-# Full write access (use sparingly!)
-"myorg/trusted-repo" = { read = true, create-draft = true, pending-review = true, write = true }
+# PR-specific grants (typically set dynamically via CLI)
+# [service-gator.gh.prs]
+# "myorg/repo#42" = { write = true }
 
-# PR-specific grants (typically set dynamically)
-[service-gator.gh.prs]
-"myorg/repo#42" = { read = true, write = true }
-
-# JIRA project permissions
-[service-gator.jira.projects]
-"MYPROJ" = { read = true, create = true }
-"OTHER" = { read = true }
-
-# JIRA issue-specific grants
-[service-gator.jira.issues]
-"MYPROJ-123" = { read = true, write = true }
+# JIRA project permissions (if you use JIRA)
+# [service-gator.jira.projects]
+# "MYPROJ" = { read = true, create = true }
 ```
+
+Note: The `[service-gator] enabled = true` setting is optional - service-gator is auto-enabled when any scopes are configured.
 
 ### Trusted Environment Variables
 

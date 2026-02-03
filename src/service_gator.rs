@@ -217,6 +217,12 @@ pub fn merge_configs(
 pub fn config_to_cli_args(config: &ServiceGatorConfig) -> Vec<String> {
     let mut args = Vec::new();
 
+    // Handle global GitHub read flag - translates to */*:read wildcard
+    if config.gh.read {
+        args.push("--gh-repo".to_string());
+        args.push("*/*:read".to_string());
+    }
+
     // Add GitHub repo scopes
     for (pattern, perm) in &config.gh.repos {
         let mut perms = Vec::new();
@@ -402,6 +408,40 @@ mod tests {
         // The order of permissions in the string may vary, so just check it contains expected parts
         let repo_arg = args.iter().find(|a| a.contains("myorg/myrepo")).unwrap();
         assert!(repo_arg.contains("read"));
+        assert!(repo_arg.contains("create-draft"));
+    }
+
+    #[test]
+    fn test_config_to_cli_args_global_read() {
+        // Test that gh.read = true generates */*:read
+        let mut config = ServiceGatorConfig::default();
+        config.gh.read = true;
+
+        let args = config_to_cli_args(&config);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--gh-repo");
+        assert_eq!(args[1], "*/*:read");
+    }
+
+    #[test]
+    fn test_config_to_cli_args_global_read_with_repos() {
+        // Test that gh.read = true works alongside specific repo overrides
+        let mut config = ServiceGatorConfig::default();
+        config.gh.read = true;
+        config.gh.repos.insert(
+            "myorg/myrepo".to_string(),
+            GhRepoPermission {
+                read: true,
+                create_draft: true,
+                ..Default::default()
+            },
+        );
+
+        let args = config_to_cli_args(&config);
+        // Should have both the global */*:read and the specific repo
+        assert!(args.contains(&"--gh-repo".to_string()));
+        assert!(args.contains(&"*/*:read".to_string()));
+        let repo_arg = args.iter().find(|a| a.contains("myorg/myrepo")).unwrap();
         assert!(repo_arg.contains("create-draft"));
     }
 }

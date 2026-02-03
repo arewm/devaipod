@@ -33,21 +33,23 @@ Monitor progress with `devaipod attach <workspace>` which connects to the agent.
 
 See below for other verbs.
 
-## Automatic Service-gator for Remote URLs
+## Service-gator: GitHub Access for the Agent
 
-When you start a pod from a remote URL (GitHub repo or PR), devaipod automatically enables [service-gator](https://github.com/cgwalters/service-gator) with **read + draft PR** permissions for that repository. This means the agent can:
+[service-gator](service-gator.md) provides scope-controlled GitHub access (read PRs/issues, create drafts, etc.) to the AI agent without exposing your `GH_TOKEN` directly.
 
-- Read repository contents, issues, and PRs
-- Create **draft** pull requests
+**Automatic for GitHub URLs:** When you run `devaipod up https://github.com/...` or `devaipod run https://github.com/.../pull/123`, service-gator is auto-enabled with **read + draft PR** permissions for that repository.
 
-This is a safe default: the agent can propose changes via draft PRs, but a human must review and mark them ready before they can be merged. No additional configuration needed.
+**Recommended: Global read-only config.** For local repos (`devaipod up .`) and broader access, first create a podman secret (`echo 'ghp_...' | podman secret create gh_token -`), then add to `~/.config/devaipod.toml`:
 
-```bash
-# This automatically grants read + draft PR access to org/repo
-devaipod up https://github.com/org/repo 'implement feature X'
+```toml
+[trusted]
+secrets = ["GH_TOKEN=gh_token"]
+
+[service-gator.gh]
+read = true
 ```
 
-To grant additional permissions or configure for local repos, see the [Security](sandboxing.md) section.
+This gives all pods read-only access to all GitHub data (repos, search, gists, GraphQL). See [Service-gator Integration](service-gator.md) for write permissions and advanced configuration.
 
 ## Example 2: Manual control
 

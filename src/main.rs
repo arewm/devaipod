@@ -893,13 +893,19 @@ async fn run_host(cli: HostCli) -> Result<()> {
             service_gator_scopes,
             service_gator_image,
         } => {
-            // Check if source is an issue URL - if so, extract repo and set default task
+            // Check if source is an issue or PR URL - if so, set default task
+            // Format: "<url> - work on" so human can easily edit the action
             let (effective_source, default_task) =
                 if let Some(issue_ref) = forge::parse_issue_url(&source) {
                     let issue_url = issue_ref.issue_url();
                     let repo_url = issue_ref.repo_url();
                     tracing::info!("Issue URL detected: {}", issue_ref.short_display());
-                    (repo_url, Some(format!("Fix {}", issue_url)))
+                    (repo_url, Some(format!("{} - work on", issue_url)))
+                } else if let Some(pr_ref) = forge::parse_pr_url(&source) {
+                    let pr_url = pr_ref.pr_url();
+                    tracing::info!("PR URL detected: {}", pr_ref.short_display());
+                    // For PRs, keep the PR URL as source (will be handled by create_workspace_from_pr)
+                    (source.clone(), Some(format!("{} - work on", pr_url)))
                 } else {
                     (source.clone(), None)
                 };
@@ -1235,10 +1241,47 @@ async fn create_workspace_from_local(
     check_api_keys_configured();
 
     // Parse CLI service-gator scopes and merge with file config
+    // For local repos with a remote URL, auto-enable service-gator with read + draft access
+    // (same behavior as remote URL path in create_workspace_from_remote)
     let service_gator_config = if !opts.service_gator_scopes.is_empty() {
         let cli_scopes = service_gator::parse_scopes(&opts.service_gator_scopes)
             .context("Failed to parse --service-gator scopes")?;
         service_gator::merge_configs(&config.service_gator, &cli_scopes)
+    } else if let Some(ref remote_url) = git_info.remote_url {
+        // Auto-configure: read + create-draft for the target repo based on remote URL
+        if let Some(repo_ref) = forge::parse_repo_url(remote_url) {
+            let mut sg_config = config.service_gator.clone();
+            let owner_repo = repo_ref.owner_repo();
+
+            match repo_ref.forge_type {
+                forge::ForgeType::GitHub => {
+                    sg_config.gh.repos.insert(
+                        owner_repo.clone(),
+                        config::GhRepoPermission {
+                            read: true,
+                            create_draft: true,
+                            pending_review: false,
+                            write: false,
+                        },
+                    );
+                    tracing::debug!(
+                        "Auto-enabled service-gator for {} (read + draft PRs)",
+                        owner_repo
+                    );
+                }
+                forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
+                    // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
+                    tracing::debug!(
+                        "Auto service-gator not yet supported for {} ({})",
+                        repo_ref.forge_type,
+                        owner_repo
+                    );
+                }
+            }
+            sg_config
+        } else {
+            config.service_gator.clone()
+        }
     } else {
         config.service_gator.clone()
     };
@@ -1562,8 +1605,46 @@ async fn create_workspace_from_pr(
         .await
         .context("Failed to start podman service")?;
 
-    // Check for gator settings
-    let enable_gator = config.service_gator.is_enabled();
+    // Auto-enable service-gator for PR workflows based on forge type
+    // PRs are the primary use case for service-gator (reviewing, pushing, etc.)
+    let service_gator_config = if !opts.service_gator_scopes.is_empty() {
+        let cli_scopes = service_gator::parse_scopes(&opts.service_gator_scopes)
+            .context("Failed to parse --service-gator scopes")?;
+        service_gator::merge_configs(&config.service_gator, &cli_scopes)
+    } else {
+        // Auto-configure: read + create-draft for the PR's repo
+        let mut sg_config = config.service_gator.clone();
+        let owner_repo = format!("{}/{}", pr_ref.owner, pr_ref.repo);
+
+        match pr_ref.forge_type {
+            forge::ForgeType::GitHub => {
+                sg_config.gh.repos.insert(
+                    owner_repo.clone(),
+                    config::GhRepoPermission {
+                        read: true,
+                        create_draft: true,
+                        pending_review: false,
+                        write: false,
+                    },
+                );
+                tracing::debug!(
+                    "Auto-enabled service-gator for {} (read + draft PRs)",
+                    owner_repo
+                );
+            }
+            forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
+                // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
+                tracing::debug!(
+                    "Auto service-gator not yet supported for {} ({})",
+                    pr_ref.forge_type,
+                    owner_repo
+                );
+            }
+        }
+        sg_config
+    };
+
+    let enable_gator = service_gator_config.is_enabled();
 
     // Create source from PR info
     let source = pod::WorkspaceSource::PullRequest(pr_info);
@@ -1579,7 +1660,6 @@ async fn create_workspace_from_pr(
     }
 
     // Create the pod
-    // Note: For PR workflows, we use the file-based service_gator config (no CLI override yet)
     tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
@@ -1590,7 +1670,7 @@ async fn create_workspace_from_pr(
         config,
         &source,
         &extra_labels,
-        None, // Use config.service_gator for PR workflows
+        Some(&service_gator_config),
         effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),

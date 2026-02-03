@@ -131,6 +131,30 @@ impl PullRequestRef {
     pub fn host_repo(&self) -> String {
         format!("{}/{}/{}", self.host, self.owner, self.repo)
     }
+
+    /// Get the full PR URL
+    pub fn pr_url(&self) -> String {
+        match self.forge_type {
+            ForgeType::GitHub => {
+                format!(
+                    "https://{}/{}/{}/pull/{}",
+                    self.host, self.owner, self.repo, self.number
+                )
+            }
+            ForgeType::GitLab => {
+                format!(
+                    "https://{}/{}/{}/-/merge_requests/{}",
+                    self.host, self.owner, self.repo, self.number
+                )
+            }
+            ForgeType::Forgejo | ForgeType::Gitea => {
+                format!(
+                    "https://{}/{}/{}/pulls/{}",
+                    self.host, self.owner, self.repo, self.number
+                )
+            }
+        }
+    }
 }
 
 /// Metadata about a pull/merge request
