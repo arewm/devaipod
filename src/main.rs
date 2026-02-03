@@ -1883,6 +1883,7 @@ fn send_message_async(pod_name: &str, session_id: &str, payload: &str) -> Result
 
     // Use spawn() instead of output() to not wait for the curl process.
     // The curl command runs in the container background.
+    // Suppress stdout to avoid printing the exec session ID.
     podman_command()
         .args([
             "exec",
@@ -1898,6 +1899,8 @@ fn send_message_async(pod_name: &str, session_id: &str, payload: &str) -> Result
             payload,
             &url,
         ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .context("Failed to spawn curl process for async message")?;
 
