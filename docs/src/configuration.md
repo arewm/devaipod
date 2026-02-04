@@ -7,6 +7,9 @@ devaipod is configured via `~/.config/devaipod.toml` and per-project `devcontain
 Create `~/.config/devaipod.toml`:
 
 ```toml
+# Default image for repositories without devcontainer.json (optional)
+default-image = "ghcr.io/bootc-dev/devenv-debian"
+
 # Global environment variables for all containers
 [env]
 # Forward these from host environment (if they exist)
@@ -39,6 +42,29 @@ port = 8765
 "myorg/*" = { read = true }
 "myorg/main-project" = { read = true, create-draft = true }
 ```
+
+## Using Without devcontainer.json
+
+Not all repositories include a `devcontainer.json`. There are two ways to use devaipod with these repos:
+
+**Option 1: Set a default image globally** (recommended)
+
+Add to `~/.config/devaipod.toml`:
+
+```toml
+default-image = "ghcr.io/bootc-dev/devenv-debian"
+```
+
+This image will be used automatically for any repository that lacks a devcontainer.json.
+
+**Option 2: Specify an image per-invocation**
+
+```bash
+devaipod up https://github.com/org/repo --image ghcr.io/bootc-dev/devenv-debian
+devaipod run https://github.com/org/repo --image ghcr.io/bootc-dev/devenv-debian -c 'fix typos'
+```
+
+The `--image` flag takes precedence over both `default-image` and any devcontainer.json.
 
 ## Per-Project Configuration
 
