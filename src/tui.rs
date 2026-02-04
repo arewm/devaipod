@@ -1318,6 +1318,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             Action::Attach(name) => {
                                 // Run attach in subprocess (opens tmux with agent + shell)
                                 run_subprocess(terminal, &["attach", &name]).await?;
+                                // Reset intervals to prevent accumulated ticks from firing
+                                refresh_interval.reset();
+                                agent_refresh_interval.reset();
                                 // Refresh after returning from subprocess
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
@@ -1340,6 +1343,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                     }
                                 }
 
+                                // Reset intervals to prevent accumulated ticks from firing
+                                refresh_interval.reset();
+                                agent_refresh_interval.reset();
                                 // Refresh after deletions
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
@@ -1391,6 +1397,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                     }
                                 }
 
+                                // Reset intervals to prevent accumulated ticks from firing
+                                refresh_interval.reset();
+                                agent_refresh_interval.reset();
                                 // Refresh after start/stop
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
@@ -1399,6 +1408,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             Action::ExecAgent(name) => {
                                 // Exec into agent container
                                 run_subprocess(terminal, &["exec", &name]).await?;
+                                // Reset intervals to prevent accumulated ticks from firing
+                                refresh_interval.reset();
+                                agent_refresh_interval.reset();
                                 // Refresh after returning from subprocess
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
@@ -1407,6 +1419,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             Action::ExecWorkspace(name) => {
                                 // Exec into workspace container
                                 run_subprocess(terminal, &["exec", "-W", &name]).await?;
+                                // Reset intervals to prevent accumulated ticks from firing
+                                refresh_interval.reset();
+                                agent_refresh_interval.reset();
                                 // Refresh after returning from subprocess
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
@@ -1429,6 +1444,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                     }
                                 }
 
+                                // Reset intervals to prevent accumulated ticks from firing
+                                refresh_interval.reset();
+                                agent_refresh_interval.reset();
                                 // Refresh after launches
                                 let _ = app.refresh_instances().await;
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
