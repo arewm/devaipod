@@ -23,7 +23,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, TableState};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, TableState};
 use ratatui::Terminal;
 use tokio::time::interval;
 
@@ -244,6 +244,27 @@ pub enum TuiMode {
     DeleteSelect,
     /// Confirming deletion of selected instances
     DeleteConfirm,
+    /// Launch dialog - input URLs and task
+    Launch,
+}
+
+/// Which field is active in the launch dialog
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LaunchField {
+    #[default]
+    Urls,
+    Task,
+}
+
+/// State for the launch dialog
+#[derive(Debug, Clone, Default)]
+pub struct LaunchInput {
+    /// URLs (one per line)
+    pub urls: String,
+    /// Task to run
+    pub task: String,
+    /// Which field is currently active
+    pub active_field: LaunchField,
 }
 
 /// Action to perform after exiting TUI
@@ -263,6 +284,8 @@ pub enum Action {
     ExecAgent(String),
     /// Exec into workspace container
     ExecWorkspace(String),
+    /// Launch new instances with URLs and a task
+    Launch { urls: Vec<String>, task: String },
 }
 
 /// Application state for the TUI
@@ -283,6 +306,8 @@ pub struct App {
     mode: TuiMode,
     /// Instances selected for deletion (by name)
     selected_for_delete: std::collections::HashSet<String>,
+    /// Launch dialog input state
+    launch_input: LaunchInput,
 }
 
 impl App {
@@ -317,6 +342,7 @@ impl App {
             cache,
             mode: TuiMode::Normal,
             selected_for_delete: std::collections::HashSet::new(),
+            launch_input: LaunchInput::default(),
         };
 
         // Initial data fetch
@@ -1386,6 +1412,38 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
                                 spawn_agent_refresh(&app.instances, agent_tx.clone());
                             }
+                            Action::Launch { urls, task } => {
+                                // Launch instances for each URL in parallel
+                                let count = urls.len();
+                                app.status_message = Some(format!(
+                                    "Launching {} instance{}...",
+                                    count,
+                                    if count == 1 { "" } else { "s" }
+                                ));
+                                terminal.draw(|f| ui(f, &mut app))?;
+
+                                let mut errors = Vec::new();
+                                for url in &urls {
+                                    if let Err(e) = run_subprocess_silent(&["run", url, "-c", &task]).await {
+                                        errors.push(format!("{}: {}", url, e));
+                                    }
+                                }
+
+                                // Refresh after launches
+                                let _ = app.refresh_instances().await;
+                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+
+                                if errors.is_empty() {
+                                    app.status_message = Some(format!(
+                                        "Launched {} instance{}",
+                                        count,
+                                        if count == 1 { "" } else { "s" }
+                                    ));
+                                } else {
+                                    app.status_message = Some(format!("Errors: {}", errors.join(", ")));
+                                }
+                            }
                         }
                     }
                 }
@@ -1401,6 +1459,7 @@ fn handle_event(app: &mut App, event: Event) -> Option<Action> {
             TuiMode::Normal => handle_normal_mode(app, key.code),
             TuiMode::DeleteSelect => handle_delete_select_mode(app, key.code),
             TuiMode::DeleteConfirm => handle_delete_confirm_mode(app, key.code),
+            TuiMode::Launch => handle_launch_mode(app, key),
         },
         _ => None,
     }
@@ -1471,6 +1530,13 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
                 app.status_message = Some("No instance selected".to_string());
                 None
             }
+        }
+        KeyCode::Char('L') => {
+            // Enter launch mode
+            app.mode = TuiMode::Launch;
+            app.launch_input = LaunchInput::default();
+            app.status_message = None;
+            None
         }
         _ => None,
     }
@@ -1548,6 +1614,91 @@ fn handle_delete_confirm_mode(app: &mut App, code: KeyCode) -> Option<Action> {
                 "Delete mode: {} selected. Space to toggle, Enter to confirm, Esc to cancel",
                 count
             ));
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Handle key events in launch mode (URL + task input dialog)
+fn handle_launch_mode(app: &mut App, key: crossterm::event::KeyEvent) -> Option<Action> {
+    use crossterm::event::KeyModifiers;
+
+    match key.code {
+        KeyCode::Esc => {
+            // Cancel launch mode
+            app.mode = TuiMode::Normal;
+            app.launch_input = LaunchInput::default();
+            app.status_message = None;
+            None
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            // Switch between fields
+            app.launch_input.active_field = match app.launch_input.active_field {
+                LaunchField::Urls => LaunchField::Task,
+                LaunchField::Task => LaunchField::Urls,
+            };
+            None
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+Enter: Submit from any field
+            let urls: Vec<String> = app
+                .launch_input
+                .urls
+                .lines()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+
+            let task = app.launch_input.task.trim().to_string();
+
+            if urls.is_empty() {
+                app.status_message = Some("Enter at least one URL".to_string());
+                None
+            } else if task.is_empty() {
+                app.status_message = Some("Enter a task".to_string());
+                None
+            } else {
+                app.mode = TuiMode::Normal;
+                app.launch_input = LaunchInput::default();
+                Some(Action::Launch { urls, task })
+            }
+        }
+        KeyCode::Enter => {
+            // Regular Enter: add newline to current field
+            match app.launch_input.active_field {
+                LaunchField::Urls => {
+                    app.launch_input.urls.push('\n');
+                }
+                LaunchField::Task => {
+                    app.launch_input.task.push('\n');
+                }
+            }
+            None
+        }
+        KeyCode::Backspace => {
+            // Delete character from active field
+            match app.launch_input.active_field {
+                LaunchField::Urls => {
+                    app.launch_input.urls.pop();
+                }
+                LaunchField::Task => {
+                    app.launch_input.task.pop();
+                }
+            }
+            None
+        }
+        KeyCode::Char(c) => {
+            // Add character to active field
+            match app.launch_input.active_field {
+                LaunchField::Urls => {
+                    app.launch_input.urls.push(c);
+                }
+                LaunchField::Task => {
+                    app.launch_input.task.push(c);
+                }
+            }
             None
         }
         _ => None,
@@ -1664,7 +1815,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // Footer with help and status (mode-dependent)
     let (help_base, footer_style) = match app.mode {
         TuiMode::Normal => (
-            " q: Quit │ j/k: Navigate │ a: Attach │ e: Exec │ E: Exec -W │ S: Start/Stop │ d: Delete │ r: Refresh",
+            " q: Quit │ j/k: Navigate │ a: Attach │ e: Exec │ E: Exec -W │ S: Start/Stop │ d: Delete │ L: Launch │ r: Refresh",
             Style::default().fg(Color::DarkGray),
         ),
         TuiMode::DeleteSelect => (
@@ -1675,12 +1826,149 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
             " y: Confirm delete │ n/Esc: Cancel",
             Style::default().fg(Color::Red),
         ),
+        TuiMode::Launch => (
+            " Tab: Switch field │ Enter: New line │ Ctrl+Enter: Submit │ Esc: Cancel",
+            Style::default().fg(Color::Cyan),
+        ),
     };
     let help_text = format!("{}{}", help_base, status);
     let footer = Paragraph::new(help_text)
         .style(footer_style)
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
+
+    // Render launch dialog popup if in launch mode
+    if app.mode == TuiMode::Launch {
+        render_launch_dialog(frame, app, area);
+    }
+}
+
+/// Render the launch dialog popup
+fn render_launch_dialog(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    // Calculate URLs field height: 2 lines minimum, expand based on content
+    // +2 for borders
+    let urls_line_count = app.launch_input.urls.lines().count().max(1);
+    let urls_height = (urls_line_count as u16 + 2).clamp(4, 12); // min 4 (2 lines + borders), max 12
+
+    // Task field: 5 lines minimum, expand based on content
+    // +2 for borders
+    let task_line_count = app.launch_input.task.lines().count().max(1);
+    let task_height = (task_line_count as u16 + 2).clamp(7, 12); // min 7 (5 lines + borders), max 12
+
+    // Total popup height: title (3) + urls + task
+    let popup_height = (3 + urls_height + task_height).min(area.height - 4);
+    let popup_width = (area.width * 60 / 100).max(50).min(area.width - 4);
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear the area behind the popup
+    frame.render_widget(Clear, popup_area);
+
+    // Split popup into title, URLs field, Task field
+    let inner_chunks = Layout::vertical([
+        Constraint::Length(3),           // Title
+        Constraint::Length(urls_height), // URLs (dynamic height)
+        Constraint::Length(task_height), // Task (3 lines)
+    ])
+    .split(popup_area);
+
+    // Title bar
+    let title = Paragraph::new(" Launch New Instances ")
+        .style(Style::default().fg(Color::Cyan).bold())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    frame.render_widget(title, inner_chunks[0]);
+
+    // Helper to add cursor character to text when field is active
+    let add_cursor = |text: &str, is_active: bool| -> String {
+        if is_active {
+            format!("{}▌", text)
+        } else {
+            text.to_string()
+        }
+    };
+
+    // URLs field
+    let urls_is_active = app.launch_input.active_field == LaunchField::Urls;
+    let urls_border_style = if urls_is_active {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let (urls_content, urls_style) = if app.launch_input.urls.is_empty() {
+        if urls_is_active {
+            ("▌".to_string(), Style::default().fg(Color::Yellow))
+        } else {
+            (
+                "Enter git URLs (one per line)...".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
+        }
+    } else {
+        (
+            add_cursor(&app.launch_input.urls, urls_is_active),
+            Style::default().fg(Color::Yellow),
+        )
+    };
+
+    // Calculate scroll offset for URLs field (show last lines if content exceeds height)
+    let urls_inner_height = inner_chunks[1].height.saturating_sub(2) as usize; // -2 for borders
+    let urls_line_count = urls_content.lines().count();
+    let urls_scroll = urls_line_count.saturating_sub(urls_inner_height) as u16;
+
+    let urls_paragraph = Paragraph::new(urls_content)
+        .style(urls_style)
+        .scroll((urls_scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(urls_border_style)
+                .title(" URLs "),
+        );
+    frame.render_widget(urls_paragraph, inner_chunks[1]);
+
+    // Task field
+    let task_is_active = app.launch_input.active_field == LaunchField::Task;
+    let task_border_style = if task_is_active {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let (task_content, task_style) = if app.launch_input.task.is_empty() {
+        if task_is_active {
+            ("▌".to_string(), Style::default().fg(Color::Yellow))
+        } else {
+            (
+                "Enter task to run...".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
+        }
+    } else {
+        (
+            add_cursor(&app.launch_input.task, task_is_active),
+            Style::default().fg(Color::Yellow),
+        )
+    };
+
+    // Calculate scroll offset for Task field
+    let task_inner_height = inner_chunks[2].height.saturating_sub(2) as usize;
+    let task_content_lines = task_content.lines().count();
+    let task_scroll = task_content_lines.saturating_sub(task_inner_height) as u16;
+
+    let task_paragraph = Paragraph::new(task_content)
+        .style(task_style)
+        .scroll((task_scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(task_border_style)
+                .title(" Task "),
+        );
+    frame.render_widget(task_paragraph, inner_chunks[2]);
 }
 
 /// Height of each instance card (lines)
