@@ -1261,11 +1261,12 @@ async fn create_workspace_from_local(
                             read: true,
                             create_draft: true,
                             pending_review: false,
+                            push_new_branch: true,
                             write: false,
                         },
                     );
                     tracing::debug!(
-                        "Auto-enabled service-gator for {} (read + draft PRs)",
+                        "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
                         owner_repo
                     );
                 }
@@ -1443,11 +1444,12 @@ async fn create_workspace_from_remote(
                         read: true,
                         create_draft: true,
                         pending_review: false,
+                        push_new_branch: true,
                         write: false,
                     },
                 );
                 tracing::debug!(
-                    "Auto-enabled service-gator for {} (read + draft PRs)",
+                    "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
                     owner_repo
                 );
             }
@@ -1624,11 +1626,12 @@ async fn create_workspace_from_pr(
                         read: true,
                         create_draft: true,
                         pending_review: false,
+                        push_new_branch: true,
                         write: false,
                     },
                 );
                 tracing::debug!(
-                    "Auto-enabled service-gator for {} (read + draft PRs)",
+                    "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
                     owner_repo
                 );
             }

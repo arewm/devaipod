@@ -525,6 +525,10 @@ pub struct GhRepoPermission {
     /// Can create/update/delete pending PR reviews
     #[serde(default)]
     pub pending_review: bool,
+    /// Can create and push to new branches (agent-* or PR head branches).
+    /// More permissive than create_draft - allows updating existing work.
+    #[serde(default)]
+    pub push_new_branch: bool,
     /// Full write access (merge, close, create non-draft, etc.)
     #[serde(default)]
     pub write: bool,

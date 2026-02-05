@@ -128,7 +128,16 @@ fn parse_github_scope(rest: &str, config: &mut ServiceGatorConfig) -> Result<()>
 
 /// Check if a string looks like a permission specification
 fn is_permission_string(s: &str) -> bool {
-    let known_perms = ["read", "write", "create-draft", "pending-review"];
+    let known_perms = [
+        "read",
+        "write",
+        "create-draft",
+        "draft",
+        "pending-review",
+        "review",
+        "push-new-branch",
+        "push",
+    ];
     s.split(',')
         .all(|p| known_perms.contains(&p.trim().to_lowercase().as_str()))
 }
@@ -152,9 +161,13 @@ fn parse_github_permissions(perms: &str) -> Result<GhRepoPermission> {
                 permission.read = true; // pending-review implies read
                 permission.pending_review = true;
             }
+            "push-new-branch" | "push" => {
+                permission.read = true; // push-new-branch implies read
+                permission.push_new_branch = true;
+            }
             other => {
                 bail!(
-                    "Unknown GitHub permission '{}'. Supported: read, write, create-draft, pending-review",
+                    "Unknown GitHub permission '{}'. Supported: read, write, create-draft, pending-review, push-new-branch",
                     other
                 );
             }
@@ -228,6 +241,9 @@ pub fn config_to_cli_args(config: &ServiceGatorConfig) -> Vec<String> {
         let mut perms = Vec::new();
         if perm.read {
             perms.push("read");
+        }
+        if perm.push_new_branch {
+            perms.push("push-new-branch");
         }
         if perm.create_draft {
             perms.push("create-draft");
@@ -442,6 +458,82 @@ mod tests {
         assert!(args.contains(&"--gh-repo".to_string()));
         assert!(args.contains(&"*/*:read".to_string()));
         let repo_arg = args.iter().find(|a| a.contains("myorg/myrepo")).unwrap();
+        assert!(repo_arg.contains("create-draft"));
+    }
+
+    #[test]
+    fn test_parse_scope_push_new_branch() {
+        let scopes = vec!["github:myorg/myrepo:push-new-branch".to_string()];
+        let config = parse_scopes(&scopes).unwrap();
+
+        let perm = &config.gh.repos["myorg/myrepo"];
+        assert!(perm.read); // push-new-branch implies read
+        assert!(perm.push_new_branch);
+        assert!(!perm.create_draft);
+        assert!(!perm.write);
+    }
+
+    #[test]
+    fn test_parse_scope_push_alias() {
+        // "push" is a short alias for "push-new-branch"
+        let scopes = vec!["github:myorg/myrepo:push".to_string()];
+        let config = parse_scopes(&scopes).unwrap();
+
+        let perm = &config.gh.repos["myorg/myrepo"];
+        assert!(perm.push_new_branch);
+    }
+
+    #[test]
+    fn test_parse_scope_combined_permissions() {
+        let scopes = vec!["github:myorg/myrepo:read,push-new-branch,create-draft".to_string()];
+        let config = parse_scopes(&scopes).unwrap();
+
+        let perm = &config.gh.repos["myorg/myrepo"];
+        assert!(perm.read);
+        assert!(perm.push_new_branch);
+        assert!(perm.create_draft);
+        assert!(!perm.pending_review);
+        assert!(!perm.write);
+    }
+
+    #[test]
+    fn test_config_to_cli_args_push_new_branch() {
+        let mut config = ServiceGatorConfig::default();
+        config.gh.repos.insert(
+            "myorg/myrepo".to_string(),
+            GhRepoPermission {
+                read: true,
+                push_new_branch: true,
+                create_draft: false,
+                ..Default::default()
+            },
+        );
+
+        let args = config_to_cli_args(&config);
+        let repo_arg = args.iter().find(|a| a.contains("myorg/myrepo")).unwrap();
+        assert!(repo_arg.contains("read"));
+        assert!(repo_arg.contains("push-new-branch"));
+        assert!(!repo_arg.contains("create-draft"));
+    }
+
+    #[test]
+    fn test_config_to_cli_args_push_and_draft() {
+        // When both push_new_branch and create_draft are true, both should be emitted
+        let mut config = ServiceGatorConfig::default();
+        config.gh.repos.insert(
+            "myorg/myrepo".to_string(),
+            GhRepoPermission {
+                read: true,
+                push_new_branch: true,
+                create_draft: true,
+                ..Default::default()
+            },
+        );
+
+        let args = config_to_cli_args(&config);
+        let repo_arg = args.iter().find(|a| a.contains("myorg/myrepo")).unwrap();
+        assert!(repo_arg.contains("read"));
+        assert!(repo_arg.contains("push-new-branch"));
         assert!(repo_arg.contains("create-draft"));
     }
 }
