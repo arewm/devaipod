@@ -135,6 +135,28 @@ fn get_latest_workspace() -> Result<String> {
     Ok(latest.to_string())
 }
 
+/// Resolve the source for a workspace, using dotfiles.url as fallback
+///
+/// If source is provided, returns it. Otherwise, returns the dotfiles URL
+/// from config, or an error if neither is available.
+fn resolve_source<'a>(source: Option<&'a str>, config: &'a config::Config) -> Result<&'a str> {
+    if let Some(s) = source {
+        return Ok(s);
+    }
+    config
+        .dotfiles
+        .as_ref()
+        .map(|d| d.url.as_str())
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "No source specified and no dotfiles repository configured.\n\
+                 Either provide a source argument or configure dotfiles in your config:\n\n\
+                 [dotfiles]\n\
+                 url = \"https://github.com/youruser/dotfiles\""
+            )
+        })
+}
+
 /// Sanitize a name for use in pod names (alphanumeric and hyphens only)
 fn sanitize_name(name: &str) -> String {
     name.chars()
@@ -344,7 +366,11 @@ enum HostCommand {
     /// For remote URLs (GitHub repos/PRs), service-gator is automatically enabled
     /// with read + draft PR permissions for that repository.
     ///
+    /// If no source is specified, uses the dotfiles repository from config
+    /// (which must contain a devcontainer.json).
+    ///
     /// Examples:
+    ///   devaipod up                                        # Use dotfiles repo
     ///   devaipod up .                                      # Local repo
     ///   devaipod up . -S                                   # Local repo, SSH in after
     ///   devaipod up https://github.com/user/repo           # Remote repo
@@ -352,8 +378,8 @@ enum HostCommand {
     ///   devaipod up . 'fix the bug'                        # With task for agent
     ///   devaipod up . --service-gator=github:myorg/*       # Custom permissions
     Up {
-        /// Source: local path, git URL, or PR URL
-        source: String,
+        /// Source: local path, git URL, or PR URL (default: dotfiles repo from config)
+        source: Option<String>,
         #[command(flatten)]
         opts: UpOptions,
     },
@@ -543,14 +569,18 @@ enum HostCommand {
     /// "Fix <issue_url>". If no task is provided and stdin is a TTY, prompts
     /// interactively with the default pre-filled.
     ///
+    /// If no source is specified, uses the dotfiles repository from config
+    /// (which must contain a devcontainer.json).
+    ///
     /// Examples:
+    ///   devaipod run                                         # Use dotfiles repo
     ///   devaipod run https://github.com/org/repo
     ///   devaipod run https://github.com/org/repo 'fix typos in README.md'
     ///   devaipod run https://github.com/org/repo/issues/123  # Default: "Fix <url>"
     ///   devaipod run . 'add unit tests for the parser module'
     Run {
-        /// Source: local path, git URL, issue URL, or PR URL
-        source: String,
+        /// Source: local path, git URL, issue URL, or PR URL (default: dotfiles repo from config)
+        source: Option<String>,
         /// Task description for the AI agent
         #[arg(value_name = "TASK")]
         task: Option<String>,
@@ -875,7 +905,10 @@ async fn run_host(cli: HostCli) -> Result<()> {
     let config = config::load_config(cli.config.as_deref())?;
 
     match cli.command {
-        HostCommand::Up { source, opts } => cmd_up(&config, &source, opts).await,
+        HostCommand::Up { source, opts } => {
+            let source = resolve_source(source.as_deref(), &config)?;
+            cmd_up(&config, source, opts).await
+        }
 
         HostCommand::Attach {
             workspace,
@@ -947,21 +980,23 @@ async fn run_host(cli: HostCli) -> Result<()> {
             service_gator_scopes,
             service_gator_image,
         } => {
+            let source = resolve_source(source.as_deref(), &config)?;
+
             // Check if source is an issue or PR URL - if so, set default task
             // Format: "<url> - work on" so human can easily edit the action
             let (effective_source, default_task) =
-                if let Some(issue_ref) = forge::parse_issue_url(&source) {
+                if let Some(issue_ref) = forge::parse_issue_url(source) {
                     let issue_url = issue_ref.issue_url();
                     let repo_url = issue_ref.repo_url();
                     tracing::info!("Issue URL detected: {}", issue_ref.short_display());
                     (repo_url, Some(format!("{} - work on", issue_url)))
-                } else if let Some(pr_ref) = forge::parse_pr_url(&source) {
+                } else if let Some(pr_ref) = forge::parse_pr_url(source) {
                     let pr_url = pr_ref.pr_url();
                     tracing::info!("PR URL detected: {}", pr_ref.short_display());
                     // For PRs, keep the PR URL as source (will be handled by create_workspace_from_pr)
-                    (source.clone(), Some(format!("{} - work on", pr_url)))
+                    (source.to_string(), Some(format!("{} - work on", pr_url)))
                 } else {
-                    (source.clone(), None)
+                    (source.to_string(), None)
                 };
 
             // Merge task sources: positional arg takes precedence, then -c/--command
