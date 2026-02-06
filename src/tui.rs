@@ -159,6 +159,8 @@ pub struct AgentState {
     pub current_tool: Option<String>,
     /// Brief summary of what agent is doing
     pub status_line: Option<String>,
+    /// Timestamp of the most recent message (Unix milliseconds)
+    pub last_message_ts: Option<i64>,
 }
 
 /// Git repository state
@@ -213,6 +215,7 @@ pub struct InstanceInfo {
     /// Created timestamp (formatted for display)
     pub created: Option<String>,
     /// Raw creation timestamp (Unix seconds) for sorting
+    #[allow(dead_code)]
     pub created_ts: Option<i64>,
     /// Git repository state (fetched async)
     pub git_state: Option<GitState>,
@@ -232,6 +235,9 @@ pub struct InstanceInfo {
     pub gator_healthy: Option<bool>,
     /// Service-gator scopes (from pod labels)
     pub gator_scopes: Option<String>,
+    /// Most recent activity timestamp (Unix milliseconds) for sorting by "last active"
+    /// Derived from agent state (last message time) or falls back to created_ts
+    pub last_activity_ts: Option<i64>,
 }
 
 /// Mode of the TUI (normal browsing vs delete selection)
@@ -554,6 +560,11 @@ impl App {
                 .and_then(|l| l.get("io.devaipod.service-gator"))
                 .cloned();
 
+            // Initialize last_activity_ts from agent state if available, otherwise from created_ts
+            let last_activity_ts = agent_state
+                .last_message_ts
+                .or(created_ts.map(|ts| ts * 1000)); // Convert created_ts (seconds) to milliseconds
+
             instances.push(InstanceInfo {
                 name: short_name,
                 full_name,
@@ -573,12 +584,13 @@ impl App {
                 api_port,
                 gator_healthy: Some(gator_healthy),
                 gator_scopes,
+                last_activity_ts,
             });
         }
 
-        // Sort by creation time (newest first), with fallback to name for ties
-        instances.sort_by(|a, b| match (b.created_ts, a.created_ts) {
-            (Some(b_ts), Some(a_ts)) => b_ts.cmp(&a_ts),
+        // Sort by last activity time (most recently active first), with fallback to name for ties
+        instances.sort_by(|a, b| match (b.last_activity_ts, a.last_activity_ts) {
+            (Some(b_ts), Some(a_ts)) => b_ts.cmp(&a_ts).then_with(|| a.name.cmp(&b.name)),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.name.cmp(&b.name),
@@ -993,11 +1005,28 @@ fn derive_agent_state_from_messages(messages: &[serde_json::Value]) -> AgentStat
         }
     };
 
+    // Extract the most recent message timestamp from all messages
+    // We look for the latest time.completed or time.created across all messages
+    let last_message_ts = messages
+        .iter()
+        .filter_map(|msg| {
+            msg.get("info").and_then(|info| {
+                info.get("time").and_then(|time| {
+                    // Prefer completed time, fall back to created time
+                    time.get("completed")
+                        .or_else(|| time.get("created"))
+                        .and_then(|t| t.as_i64())
+                })
+            })
+        })
+        .max();
+
     AgentState {
         activity,
         recent_output,
         current_tool,
         status_line,
+        last_message_ts,
     }
 }
 
@@ -1278,12 +1307,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
             // Receive agent state updates from background
             Some(update) = agent_rx.recv() => {
                 if let Some(instance) = app.instances.iter_mut().find(|i| i.name == update.instance_name) {
+                    // Update last_activity_ts from agent's last message timestamp
+                    if let Some(ts) = update.agent_state.last_message_ts {
+                        instance.last_activity_ts = Some(ts);
+                    }
                     instance.agent_state = update.agent_state;
                     // Update timestamp to enforce rate-limiting on subsequent refresh attempts
                     instance.last_agent_refresh = Some(std::time::Instant::now());
                 }
                 // Persist updated state to cache
                 app.update_cache();
+                // Note: We intentionally don't re-sort here. Re-sorting on every agent
+                // update would cause items to jump around constantly as agents work,
+                // which is jarring UX. The periodic full refresh handles re-sorting.
             }
             // Periodic agent state refresh (more frequent)
             _ = agent_refresh_interval.tick() => {
@@ -2424,6 +2460,7 @@ mod tests {
                 api_port: None,
                 gator_healthy: Some(true),
                 gator_scopes: Some("--gh-repo user/myproject:read".to_string()),
+                last_activity_ts: Some(1705315800000), // 2024-01-15 10:30 in millis
             },
             InstanceInfo {
                 name: "otherrepo-def456".to_string(),
@@ -2447,6 +2484,7 @@ mod tests {
                 api_port: None,
                 gator_healthy: Some(false),
                 gator_scopes: None,
+                last_activity_ts: Some(1705240800000), // 2024-01-14 14:00 in millis
             },
             InstanceInfo {
                 name: "degraded-pod".to_string(),
@@ -2476,6 +2514,7 @@ mod tests {
                 api_port: None,
                 gator_healthy: None,
                 gator_scopes: Some("--gh-repo org/repo:read,write".to_string()),
+                last_activity_ts: None,
             },
         ]
     }
