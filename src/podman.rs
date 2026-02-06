@@ -786,6 +786,45 @@ impl PodmanService {
         Ok(())
     }
 
+    /// Get labels from a pod
+    pub async fn get_pod_labels(
+        &self,
+        name: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let output = self
+            .podman_command()
+            .args(["pod", "inspect", "--format", "json", name])
+            .output()
+            .await
+            .context("Failed to inspect pod")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to inspect pod {}: {}", name, stderr);
+        }
+
+        // Parse the JSON output
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pod_info: serde_json::Value =
+            serde_json::from_str(&stdout).context("Failed to parse pod inspect output")?;
+
+        // Extract labels from the JSON
+        // podman pod inspect returns: [{"Labels": {"key": "value", ...}, ...}]
+        // Handle both array (standard) and object (legacy) formats
+        let pod_obj = pod_info.as_array().and_then(|arr| arr.first()).unwrap_or(&pod_info);
+        let labels = pod_obj
+            .get("Labels")
+            .and_then(|l| l.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(labels)
+    }
+
     /// Create a named volume if it doesn't exist
     pub async fn create_volume(&self, name: &str) -> Result<()> {
         let output = self

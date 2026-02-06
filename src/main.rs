@@ -645,6 +645,20 @@ enum HostCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Manage service-gator scopes for a workspace
+    ///
+    /// Service-gator provides scope-restricted access to external services
+    /// (GitHub, GitLab, JIRA) for AI agents. This command allows editing
+    /// the scopes for a running workspace.
+    ///
+    /// Examples:
+    ///   devaipod gator edit my-workspace      # Edit scopes in $EDITOR
+    ///   devaipod gator show my-workspace      # Show current scopes
+    #[command(alias = "service-gator")]
+    Gator {
+        #[command(subcommand)]
+        action: GatorAction,
+    },
 }
 
 /// Actions for interacting with the opencode agent
@@ -718,6 +732,46 @@ enum SessionAction {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Service-gator management actions
+#[derive(Debug, Parser)]
+enum GatorAction {
+    /// Edit service-gator scopes for a running workspace
+    ///
+    /// Opens $EDITOR with the current scope configuration in TOML format.
+    /// After saving, mints a new JWT token with the updated scopes.
+    ///
+    /// Examples:
+    ///   devaipod gator edit my-workspace
+    ///   EDITOR=vim devaipod gator edit my-workspace
+    Edit {
+        /// Workspace name (devaipod- prefix optional)
+        workspace: String,
+    },
+    /// Show current service-gator scopes
+    Show {
+        /// Workspace name (devaipod- prefix optional)
+        workspace: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a scope to a running workspace (applies immediately)
+    ///
+    /// Uses the same format as --service-gator flag.
+    ///
+    /// Examples:
+    ///   devaipod gator add my-workspace github:owner/repo
+    ///   devaipod gator add my-workspace github:owner/repo:push
+    ///   devaipod gator add my-workspace github:owner/*:read
+    Add {
+        /// Workspace name (devaipod- prefix optional)
+        workspace: String,
+        /// Scope to add (format: github:owner/repo[:permissions])
+        #[arg(required = true)]
+        scopes: Vec<String>,
     },
 }
 
@@ -986,6 +1040,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             list,
             json,
         } => cmd_controlplane(serve, port, list, json).await,
+        HostCommand::Gator { action } => cmd_gator(action).await,
     }
 }
 
@@ -2060,6 +2115,263 @@ async fn cmd_controlplane(serve: bool, _port: u16, list: bool, json: bool) -> Re
     // For now, fall back to list as a useful default
     tracing::info!("Falling back to pod list:");
     cmd_list(json)
+}
+
+/// Manage service-gator scopes for a workspace
+async fn cmd_gator(action: GatorAction) -> Result<()> {
+    // Extract workspace name from the action
+    let workspace = match &action {
+        GatorAction::Edit { workspace } => workspace,
+        GatorAction::Show { workspace, .. } => workspace,
+        GatorAction::Add { workspace, .. } => workspace,
+    };
+    let pod_name = normalize_pod_name(workspace);
+
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    // Verify the pod exists and get its labels
+    let labels = podman
+        .get_pod_labels(&pod_name)
+        .await
+        .with_context(|| format!("Failed to get pod labels for: {}", pod_name))?;
+
+    // Check if gator is enabled for this pod
+    let jwt_secret = labels.get(pod::GATOR_JWT_SECRET_LABEL);
+    let admin_key = labels.get(pod::GATOR_ADMIN_KEY_LABEL);
+    let current_scopes = labels.get(pod::GATOR_SCOPES_LABEL);
+
+    if jwt_secret.is_none() || admin_key.is_none() {
+        eprintln!("Service-gator is not enabled for this workspace.");
+        eprintln!();
+        eprintln!("To enable service-gator, recreate the workspace with --service-gator flag:");
+        eprintln!("  devaipod up <source> --service-gator=github:owner/repo");
+        std::process::exit(1);
+    }
+
+    let jwt_secret = jwt_secret.unwrap();
+
+    match action {
+        GatorAction::Show { json, .. } => {
+            if json {
+                if let Some(scopes) = current_scopes {
+                    println!("{}", scopes);
+                } else {
+                    println!("{{}}");
+                }
+            } else {
+                println!("Service-gator scopes for {}:", strip_pod_prefix(&pod_name));
+                println!();
+                if let Some(scopes) = current_scopes {
+                    // Parse as JSON and pretty-print as TOML
+                    match serde_json::from_str::<service_gator::JwtScopeConfig>(scopes) {
+                        Ok(config) => {
+                                let toml_str = toml::to_string_pretty(&config)
+                                    .unwrap_or_else(|_| scopes.to_string());
+                            println!("{}", toml_str);
+                        }
+                        Err(_) => {
+                            println!("{}", scopes);
+                        }
+                    }
+                } else {
+                    println!("  (no scopes configured)");
+                }
+            }
+        }
+        GatorAction::Edit { workspace: _ } => {
+            // Parse current scopes
+            let current_config: service_gator::JwtScopeConfig = current_scopes
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            // Convert to TOML for editing
+            let toml_content = toml::to_string_pretty(&current_config)
+                .context("Failed to serialize scopes to TOML")?;
+
+            // Create a temp file with the current scopes
+            let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+            let temp_file = temp_dir.path().join("scopes.toml");
+            std::fs::write(&temp_file, format!(
+                "# Service-gator scopes for {}\n\
+                 # Edit and save to update the scopes.\n\
+                 # See: https://github.com/cgwalters/service-gator#configuration-examples\n\n\
+                 {}", 
+                strip_pod_prefix(&pod_name),
+                toml_content
+            )).context("Failed to write temp file")?;
+
+            // Get the editor
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+            // Open the editor
+            tracing::info!("Opening {} in {}...", temp_file.display(), editor);
+            let status = std::process::Command::new(&editor)
+                .arg(&temp_file)
+                .status()
+                .with_context(|| format!("Failed to run editor: {}", editor))?;
+
+            if !status.success() {
+                eprintln!("Editor exited with non-zero status, aborting.");
+                std::process::exit(1);
+            }
+
+            // Read the edited file
+            let edited_content = std::fs::read_to_string(&temp_file)
+                .context("Failed to read edited file")?;
+
+            // Parse the edited TOML
+            let new_scopes: service_gator::JwtScopeConfig = toml::from_str(&edited_content)
+                .context("Failed to parse edited TOML. Check for syntax errors.")?;
+
+            // Mint a new JWT token with the updated scopes
+            let token = service_gator::mint_token_from_scopes(
+                jwt_secret,
+                &new_scopes,
+                None, // Default expiration
+                Some(&pod_name),
+            )
+            .context("Failed to mint new JWT token")?;
+
+            // Update the scopes label on the pod
+            let new_scopes_json = serde_json::to_string(&new_scopes)
+                .context("Failed to serialize new scopes to JSON")?;
+
+            // Build the new MCP server config with the updated token
+            let mcp_url = format!("http://localhost:{}/mcp", pod::GATOR_PORT);
+            let mcp_config = serde_json::json!({
+                "type": "remote",
+                "url": mcp_url,
+                "enabled": true,
+                "headers": {
+                    "Authorization": format!("Bearer {}", token)
+                }
+            });
+
+            // Use opencode's POST /mcp API to dynamically update the MCP server config
+            // This allows scope changes without restarting the agent
+            let agent_container = format!("{}-agent", pod_name);
+            let opencode_url = format!("http://127.0.0.1:{}/mcp", pod::OPENCODE_PORT);
+            let payload = serde_json::json!({
+                "name": "service-gator",
+                "config": mcp_config
+            });
+            
+            // Execute curl inside the agent container to update the MCP config
+            let curl_cmd = format!(
+                "curl -s -X POST -H 'Content-Type: application/json' -d '{}' '{}'",
+                payload.to_string().replace('\'', "'\\''"),
+                opencode_url
+            );
+            
+            let (exit_code, _stdout, _stderr) = podman
+                .exec_output(&agent_container, &["sh", "-c", &curl_cmd])
+                .await
+                .context("Failed to update opencode MCP config")?;
+
+            if exit_code != 0 {
+                eprintln!("Warning: Failed to update opencode MCP config dynamically.");
+                eprintln!("The agent may need to be restarted to pick up the new scopes.");
+                eprintln!("You can do this with: devaipod rebuild {}", strip_pod_prefix(&pod_name));
+            } else {
+                println!("Scopes updated successfully!");
+                println!();
+                println!("New scopes:");
+                println!("{}", toml::to_string_pretty(&new_scopes)?);
+                println!();
+                println!("The new scopes are now active. No restart needed.");
+            }
+
+            // Store the new scopes JSON for future edits
+            tracing::debug!("New scopes JSON: {}", new_scopes_json);
+        }
+        GatorAction::Add { scopes, .. } => {
+            // Parse the new scopes from CLI
+            let new_config = service_gator::parse_scopes(&scopes)
+                .context("Failed to parse scope arguments")?;
+
+            // Parse current scopes
+            let current_config: service_gator::JwtScopeConfig = current_scopes
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            // Convert new CLI scopes to JWT format
+            let new_jwt_scopes = service_gator::config_to_jwt_scopes(&new_config);
+
+            // Merge: new repos are added to existing
+            let mut merged = current_config.clone();
+            for (pattern, perm) in new_jwt_scopes.gh.repos {
+                merged.gh.repos.insert(pattern, perm);
+            }
+            if new_jwt_scopes.gh.read {
+                merged.gh.read = true;
+            }
+
+            // Mint a new JWT token with the merged scopes
+            let token = service_gator::mint_token_from_scopes(
+                jwt_secret,
+                &merged,
+                None, // Default expiration
+                Some(&pod_name),
+            )
+            .context("Failed to mint new JWT token")?;
+
+            // Update the scopes via the MCP API
+            let new_scopes_json = serde_json::to_string(&merged)
+                .context("Failed to serialize new scopes to JSON")?;
+
+            // Build the new MCP server config with the updated token
+            let mcp_url = format!("http://localhost:{}/mcp", pod::GATOR_PORT);
+            let mcp_config = serde_json::json!({
+                "type": "remote",
+                "url": mcp_url,
+                "enabled": true,
+                "headers": {
+                    "Authorization": format!("Bearer {}", token)
+                }
+            });
+
+            // Use opencode's POST /mcp API to dynamically update the MCP server config
+            let agent_container = format!("{}-agent", pod_name);
+            let opencode_url = format!("http://127.0.0.1:{}/mcp", pod::OPENCODE_PORT);
+            let payload = serde_json::json!({
+                "name": "service-gator",
+                "config": mcp_config
+            });
+            
+            // Execute curl inside the agent container to update the MCP config
+            let curl_cmd = format!(
+                "curl -s -X POST -H 'Content-Type: application/json' -d '{}' '{}'",
+                payload.to_string().replace('\'', "'\\''"),
+                opencode_url
+            );
+            
+            let (exit_code, _stdout, _stderr) = podman
+                .exec_output(&agent_container, &["sh", "-c", &curl_cmd])
+                .await
+                .context("Failed to update opencode MCP config")?;
+
+            if exit_code != 0 {
+                eprintln!("Warning: Failed to update opencode MCP config dynamically.");
+                eprintln!("The agent may need to be restarted to pick up the new scopes.");
+                eprintln!("You can do this with: devaipod rebuild {}", strip_pod_prefix(&pod_name));
+            } else {
+                println!("Scopes added successfully!");
+                println!();
+                println!("Active scopes:");
+                println!("{}", toml::to_string_pretty(&merged)?);
+                println!();
+                println!("The new scopes are now active for this session.");
+                println!("Note: These changes are not persisted. To make scopes permanent,");
+                println!("recreate the workspace with: devaipod up --service-gator=<scopes>");
+            }
+
+            tracing::debug!("New scopes JSON: {}", new_scopes_json);
+        }
+    }
+
+    Ok(())
 }
 
 /// Check if any API keys are configured for the AI agent and warn if not

@@ -4,7 +4,10 @@
 //! which provides scope-restricted access to external services (GitHub, JIRA)
 //! for AI agents running in containers.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use color_eyre::eyre::{bail, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{GhRepoPermission, ServiceGatorConfig};
 
@@ -281,6 +284,186 @@ pub fn config_to_cli_args(config: &ServiceGatorConfig) -> Vec<String> {
     args
 }
 
+// =============================================================================
+// JWT Token Generation
+// =============================================================================
+
+/// Default token lifetime: 30 days (in seconds)
+pub const DEFAULT_TOKEN_EXPIRES_IN: u64 = 30 * 24 * 3600;
+
+/// Scope configuration for JWT tokens (matches service-gator's ScopeConfig)
+///
+/// This is the format expected by service-gator's JWT token `scopes` field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct JwtScopeConfig {
+    #[serde(default, skip_serializing_if = "JwtGithubScope::is_empty")]
+    pub gh: JwtGithubScope,
+    // TODO: Add gitlab, forgejo, jira when needed
+}
+
+/// GitHub scope for JWT tokens
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct JwtGithubScope {
+    /// Global read access for all GitHub API endpoints
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read: bool,
+    /// Repository permissions
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub repos: std::collections::HashMap<String, JwtGhRepoPermission>,
+}
+
+impl JwtGithubScope {
+    fn is_empty(&self) -> bool {
+        !self.read && self.repos.is_empty()
+    }
+}
+
+/// GitHub repo permission for JWT tokens
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct JwtGhRepoPermission {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create_draft: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_review: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub push_new_branch: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub write: bool,
+}
+
+impl From<&GhRepoPermission> for JwtGhRepoPermission {
+    fn from(p: &GhRepoPermission) -> Self {
+        Self {
+            read: p.read,
+            create_draft: p.create_draft,
+            pending_review: p.pending_review,
+            push_new_branch: p.push_new_branch,
+            write: p.write,
+        }
+    }
+}
+
+/// JWT claims for service-gator tokens
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenClaims {
+    /// Issued-at timestamp (Unix seconds)
+    pub iat: u64,
+    /// Expiration timestamp (Unix seconds)
+    pub exp: u64,
+    /// The scopes this token grants
+    pub scopes: JwtScopeConfig,
+    /// Optional subject identifier (for logging/audit)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    /// Whether this token can call /token/rotate
+    #[serde(default = "default_can_rotate")]
+    pub can_rotate: bool,
+}
+
+fn default_can_rotate() -> bool {
+    true
+}
+
+/// Get current Unix timestamp
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before Unix epoch")
+        .as_secs()
+}
+
+/// Convert ServiceGatorConfig to JWT scope config
+pub fn config_to_jwt_scopes(config: &ServiceGatorConfig) -> JwtScopeConfig {
+    let mut gh = JwtGithubScope::default();
+
+    // Map global read
+    gh.read = config.gh.read;
+
+    // Map repo permissions
+    for (pattern, perm) in &config.gh.repos {
+        gh.repos
+            .insert(pattern.clone(), JwtGhRepoPermission::from(perm));
+    }
+
+    JwtScopeConfig { gh }
+}
+
+/// Mint a JWT token for service-gator
+///
+/// This generates a signed JWT token that can be used to authenticate
+/// with service-gator's MCP endpoint.
+///
+/// # Arguments
+/// * `secret` - The JWT signing secret (SERVICE_GATOR_SECRET)
+/// * `config` - The service-gator scope configuration
+/// * `expires_in` - Token lifetime in seconds (default: 30 days)
+/// * `subject` - Optional subject identifier for logging
+pub fn mint_token(
+    secret: &str,
+    config: &ServiceGatorConfig,
+    expires_in: Option<u64>,
+    subject: Option<&str>,
+) -> Result<String> {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+
+    let now = now_unix();
+    let exp = now + expires_in.unwrap_or(DEFAULT_TOKEN_EXPIRES_IN);
+
+    let claims = TokenClaims {
+        iat: now,
+        exp,
+        scopes: config_to_jwt_scopes(config),
+        sub: subject.map(|s| s.to_string()),
+        can_rotate: true,
+    };
+
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| color_eyre::eyre::eyre!("Failed to sign JWT token: {}", e))?;
+
+    Ok(token)
+}
+
+/// Mint a JWT token from a JwtScopeConfig directly
+///
+/// This is used when we have already-parsed scopes (e.g., from editing).
+pub fn mint_token_from_scopes(
+    secret: &str,
+    scopes: &JwtScopeConfig,
+    expires_in: Option<u64>,
+    subject: Option<&str>,
+) -> Result<String> {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+
+    let now = now_unix();
+    let exp = now + expires_in.unwrap_or(DEFAULT_TOKEN_EXPIRES_IN);
+
+    let claims = TokenClaims {
+        iat: now,
+        exp,
+        scopes: scopes.clone(),
+        sub: subject.map(|s| s.to_string()),
+        can_rotate: true,
+    };
+
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| color_eyre::eyre::eyre!("Failed to sign JWT token: {}", e))?;
+
+    Ok(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +718,67 @@ mod tests {
         assert!(repo_arg.contains("read"));
         assert!(repo_arg.contains("push-new-branch"));
         assert!(repo_arg.contains("create-draft"));
+    }
+
+    #[test]
+    fn test_mint_token() {
+        let mut config = ServiceGatorConfig::default();
+        config.gh.repos.insert(
+            "myorg/myrepo".to_string(),
+            GhRepoPermission {
+                read: true,
+                push_new_branch: true,
+                create_draft: true,
+                ..Default::default()
+            },
+        );
+
+        let secret = "test-secret-key-for-testing-12345";
+        let token = mint_token(secret, &config, Some(3600), Some("test-agent")).unwrap();
+
+        // Token should be a valid JWT (three parts separated by dots)
+        assert_eq!(token.split('.').count(), 3);
+
+        // Verify we can decode it
+        use jsonwebtoken::{decode, DecodingKey, Validation};
+        let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_exp = false; // Don't validate exp for test
+        validation.required_spec_claims.clear();
+
+        let decoded = decode::<TokenClaims>(
+            &token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        )
+        .expect("token should decode");
+
+        assert_eq!(decoded.claims.sub, Some("test-agent".to_string()));
+        assert!(decoded.claims.can_rotate);
+        assert!(decoded.claims.scopes.gh.repos.contains_key("myorg/myrepo"));
+
+        let repo_perm = &decoded.claims.scopes.gh.repos["myorg/myrepo"];
+        assert!(repo_perm.read);
+        assert!(repo_perm.push_new_branch);
+        assert!(repo_perm.create_draft);
+        assert!(!repo_perm.write);
+    }
+
+    #[test]
+    fn test_config_to_jwt_scopes() {
+        let mut config = ServiceGatorConfig::default();
+        config.gh.read = true;
+        config.gh.repos.insert(
+            "myorg/myrepo".to_string(),
+            GhRepoPermission {
+                read: true,
+                write: true,
+                ..Default::default()
+            },
+        );
+
+        let scopes = config_to_jwt_scopes(&config);
+        assert!(scopes.gh.read);
+        assert!(scopes.gh.repos.contains_key("myorg/myrepo"));
+        assert!(scopes.gh.repos["myorg/myrepo"].write);
     }
 }
