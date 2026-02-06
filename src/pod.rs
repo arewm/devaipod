@@ -622,6 +622,22 @@ impl DevaipodPod {
         // Write scripts to agent home volume (auth_proxy.py for authenticated API access)
         Self::write_scripts_to_volume(podman, &image, &agent_home_volume).await?;
 
+        // Write gator config to agent home volume (if gator is enabled)
+        // This stores JWT secrets and scopes persistently for `devaipod gator add/edit`
+        if let Some((jwt_secret, admin_key, _token)) = &gator_jwt_token {
+            let sg_config = service_gator_config.unwrap_or(&global_config.service_gator);
+            let jwt_scopes = crate::service_gator::config_to_jwt_scopes(sg_config);
+            Self::write_gator_config_to_volume(
+                podman,
+                &image,
+                &agent_home_volume,
+                jwt_secret,
+                admin_key,
+                &jwt_scopes,
+            )
+            .await?;
+        }
+
         // Clone dotfiles to agent home volume if configured
         // This happens before containers start, with GH_TOKEN available for private repos
         if let Some(ref dotfiles) = global_config.dotfiles {
@@ -1149,6 +1165,69 @@ chmod +x {agent_home}/scripts/auth_proxy.py
             );
         } else {
             tracing::debug!("Scripts written to agent home volume");
+        }
+
+        Ok(())
+    }
+
+    /// Write gator configuration to the agent home volume
+    ///
+    /// This stores JWT secrets and scopes persistently so they survive container
+    /// restarts and can be updated via `devaipod gator add/edit`.
+    async fn write_gator_config_to_volume(
+        podman: &PodmanService,
+        image: &str,
+        agent_home_volume: &str,
+        jwt_secret: &str,
+        admin_key: &str,
+        scopes: &crate::service_gator::JwtScopeConfig,
+    ) -> Result<()> {
+        let config = crate::service_gator::GatorConfigFile::new(
+            jwt_secret.to_string(),
+            admin_key.to_string(),
+            scopes.clone(),
+        );
+
+        let config_json = serde_json::to_string_pretty(&config)
+            .context("Failed to serialize gator config")?;
+
+        // Write the config file using a heredoc in the init container
+        // Escape any single quotes in the JSON
+        let escaped_json = config_json.replace('\'', "'\\''");
+        let config_path = format!("{}/{}", AGENT_HOME_PATH, crate::service_gator::GATOR_CONFIG_PATH);
+
+        let script = format!(
+            r#"set -e
+mkdir -p "$(dirname '{config_path}')"
+cat > '{config_path}' << 'GATOR_CONFIG_EOF'
+{config_json}
+GATOR_CONFIG_EOF
+chmod 600 '{config_path}'
+"#,
+            config_path = config_path,
+            config_json = escaped_json,
+        );
+
+        tracing::debug!("Writing gator config to agent home volume...");
+        // Run as root so the config file is owned by root and unmodifiable by the agent
+        // This prevents the agent from escalating its own scopes
+        let exit_code = podman
+            .run_init_container_as_root(
+                image,
+                agent_home_volume,
+                AGENT_HOME_PATH,
+                &["/bin/sh", "-c", &script],
+            )
+            .await
+            .context("Failed to write gator config to agent volume")?;
+
+        if exit_code != 0 {
+            tracing::warn!(
+                "Failed to write gator config to volume (exit code {})",
+                exit_code
+            );
+        } else {
+            tracing::debug!("Gator config written to {}", config_path);
         }
 
         Ok(())

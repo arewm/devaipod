@@ -464,6 +464,51 @@ pub fn mint_token_from_scopes(
     Ok(token)
 }
 
+// =============================================================================
+// Persistent Gator Configuration
+// =============================================================================
+
+/// Path to the gator config file within the agent home volume
+///
+/// This file stores JWT secrets and scopes persistently, allowing
+/// `devaipod gator add/edit` to update scopes that survive restarts.
+pub const GATOR_CONFIG_PATH: &str = ".devaipod/gator-config.json";
+
+/// Persistent gator configuration stored in the agent home volume
+///
+/// This is written at pod creation and updated by `devaipod gator add/edit`.
+/// It replaces the immutable pod labels for scope storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatorConfigFile {
+    /// JWT signing secret (for minting tokens)
+    pub jwt_secret: String,
+    /// Admin API key (for service-gator admin endpoints)
+    pub admin_key: String,
+    /// Current scope configuration
+    pub scopes: JwtScopeConfig,
+    /// When this config was last updated (Unix timestamp)
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+impl GatorConfigFile {
+    /// Create a new gator config file
+    pub fn new(jwt_secret: String, admin_key: String, scopes: JwtScopeConfig) -> Self {
+        Self {
+            jwt_secret,
+            admin_key,
+            scopes,
+            updated_at: now_unix(),
+        }
+    }
+
+    /// Update the scopes and timestamp
+    pub fn update_scopes(&mut self, scopes: JwtScopeConfig) {
+        self.scopes = scopes;
+        self.updated_at = now_unix();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

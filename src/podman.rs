@@ -900,6 +900,31 @@ impl PodmanService {
         command: &[&str],
         extra_binds: &[String],
     ) -> Result<i32> {
+        self.run_init_container_impl(image, volume_name, mount_path, command, extra_binds, None)
+            .await
+    }
+
+    /// Run an init container as root (for creating protected files)
+    pub async fn run_init_container_as_root(
+        &self,
+        image: &str,
+        volume_name: &str,
+        mount_path: &str,
+        command: &[&str],
+    ) -> Result<i32> {
+        self.run_init_container_impl(image, volume_name, mount_path, command, &[], Some("0"))
+            .await
+    }
+
+    async fn run_init_container_impl(
+        &self,
+        image: &str,
+        volume_name: &str,
+        mount_path: &str,
+        command: &[&str],
+        extra_binds: &[String],
+        user: Option<&str>,
+    ) -> Result<i32> {
         let container_name = format!("{}-init", volume_name);
 
         // Remove any existing init container
@@ -919,13 +944,21 @@ impl PodmanService {
             format!("{}:{}", volume_name, mount_path),
         ];
 
+        // Add explicit user if specified
+        if let Some(u) = user {
+            args.push("--user".to_string());
+            args.push(u.to_string());
+        }
+
         // Add extra bind mounts (with SELinux label disable and root user if any are present)
         // Root is needed because bind mounts from the host may have different UID mappings
         if !extra_binds.is_empty() {
             args.push("--security-opt".to_string());
             args.push("label=disable".to_string());
-            args.push("--user".to_string());
-            args.push("0".to_string());
+            if user.is_none() {
+                args.push("--user".to_string());
+                args.push("0".to_string());
+            }
         }
         for bind in extra_binds {
             args.push("-v".to_string());
@@ -1498,6 +1531,55 @@ impl PodmanService {
 
         tracing::debug!("Copied {} to {}:{}", source.display(), container, target);
         Ok(())
+    }
+
+    /// Copy a file from a container to the host
+    ///
+    /// Returns the file contents as a String, or None if the file doesn't exist.
+    pub async fn copy_from_container(
+        &self,
+        container: &str,
+        source: &str,
+    ) -> Result<Option<String>> {
+        // Create a temp file to receive the content
+        let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+        let temp_file = temp_dir.path().join("content");
+
+        let container_source = format!("{}:{}", container, source);
+        let output = self
+            .podman_command()
+            .args([
+                "cp",
+                &container_source,
+                &temp_file.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .context("Failed to execute podman cp")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Check if file doesn't exist (common case, not an error)
+            if stderr.contains("No such file or directory")
+                || stderr.contains("does not exist")
+                || stderr.contains("could not find")
+            {
+                return Ok(None);
+            }
+            color_eyre::eyre::bail!(
+                "Failed to copy {}:{} to host: {}",
+                container,
+                source,
+                stderr
+            );
+        }
+
+        // Read the temp file
+        let content = std::fs::read_to_string(&temp_file)
+            .with_context(|| format!("Failed to read copied file from {}", temp_file.display()))?;
+
+        tracing::debug!("Copied {}:{} to host ({} bytes)", container, source, content.len());
+        Ok(Some(content))
     }
 }
 
