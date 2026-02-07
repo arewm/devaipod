@@ -14,26 +14,26 @@ The human always has full control over when and how agent changes are incorporat
 
 ## Architecture
 
-The pod contains three containers that share git objects but maintain isolated working trees:
+Every pod contains four containers that share git objects but maintain isolated working trees:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        devaipod Pod                         │
-├─────────────────────────┬─────────────────────────┬─────────┤
-│   Workspace Container   │    Agent Container      │  Gator  │
-│                         │                         │         │
-│  /workspaces/<project>  │  /workspaces/<project>  │  MCP    │
-│  (human's working tree) │  (agent's isolated      │  Server │
-│                         │   working tree)         │         │
-│  /mnt/main-workspace    │  /mnt/main-workspace    │         │
-│  (same as /workspaces,  │  (readonly, for git     │         │
-│   for git alternates)   │   object sharing)       │         │
-│                         │                         │         │
-│  /mnt/agent-workspace   │                         │         │
-│  (readonly, agent's     │                         │         │
-│   changes to pull)      │                         │         │
-└─────────────────────────┴─────────────────────────┴─────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              devaipod Pod                                │
+├─────────────────────┬───────────────────────┬──────────────────┬────────┤
+│  Workspace Container│  Task Owner (Agent)   │  Worker          │  Gator │
+│                     │                       │                  │        │
+│  /workspaces/...    │  /workspaces/...      │  /workspaces/... │  MCP   │
+│  (human's tree)     │  (task owner's tree)  │  (worker's tree) │  Server│
+│                     │                       │                  │        │
+│  /mnt/main-workspace│  /mnt/main-workspace  │                  │        │
+│  (for git alternates)│ (readonly)           │                  │        │
+│                     │                       │                  │        │
+│  /mnt/agent-workspace│ /mnt/worker-workspace│                  │        │
+│  (readonly)         │  (readonly)           │                  │        │
+└─────────────────────┴───────────────────────┴──────────────────┴────────┘
 ```
+
+The **task owner** agent orchestrates work by delegating subtasks to the **worker** agent. The task owner reviews worker commits before merging, similar to how a human reviews agent changes.
 
 ### Volume mounts
 
@@ -63,10 +63,16 @@ The agent's clone shares objects from `/mnt/main-workspace`, which contains the 
 
 ## Commands
 
-Connect to the agent (default):
+Connect to the task owner agent (default):
 
 ```bash
 devaipod attach <name>
+```
+
+Connect to the worker agent:
+
+```bash
+devaipod attach <name> --worker
 ```
 
 Connect to workspace container for manual work:
@@ -81,10 +87,16 @@ Create a pod and auto-start the agent on a task:
 devaipod run <repo> "fix the bug in auth.rs"
 ```
 
-Get a shell in the agent container:
+Get a shell in the task owner container:
 
 ```bash
 devaipod exec <name>
+```
+
+Get a shell in the worker container:
+
+```bash
+devaipod exec <name> --worker
 ```
 
 Get a shell in the workspace container:
@@ -95,14 +107,18 @@ devaipod exec <name> -W
 
 ## Bidirectional git remotes
 
-Devaipod automatically sets up git remotes for collaboration in both directions:
+Devaipod automatically sets up git remotes for collaboration:
 
 | Container | Remote | Points to |
 |-----------|--------|-----------|
-| Workspace | `agent` | `/mnt/agent-workspace/<project>` |
-| Agent | `workspace` | `/mnt/main-workspace/<project>` |
+| Workspace | `agent` | Task owner's workspace |
+| Task Owner | `workspace` | Human's workspace |
+| Task Owner | `worker` | Worker's workspace |
+| Worker | `owner` | Task owner's workspace |
 
 These remotes are set up automatically when the pod starts—no manual configuration needed.
+
+The task owner fetches from the worker, reviews commits, and merges them before pushing to origin or creating a PR.
 
 ## Workflow: Reviewing agent changes
 

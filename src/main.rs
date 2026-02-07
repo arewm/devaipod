@@ -21,6 +21,7 @@ mod gpu;
 mod init;
 mod pod;
 mod podman;
+mod prompt;
 mod secrets;
 mod service_gator;
 mod tui;
@@ -52,10 +53,12 @@ enum AttachTarget {
     /// Use `-W` flag to attach to this container for direct access to your
     /// development environment without AI interaction.
     Workspace,
-    /// The agent container where the AI coding agent runs in isolation.
-    /// This is the default target. The agent has its own workspace clone
-    /// and cannot modify the main workspace.
+    /// The task owner agent container. This is the primary AI agent that
+    /// orchestrates work and delegates to the worker. This is the default target.
     Agent,
+    /// The worker container where the worker agent runs. The worker receives
+    /// delegated tasks from the task owner and makes commits for review.
+    Worker,
 }
 
 /// Get the container name for a given pod and attach target.
@@ -65,6 +68,7 @@ fn get_attach_container_name(pod_name: &str, target: AttachTarget) -> String {
     match target {
         AttachTarget::Workspace => format!("{}-workspace", pod_name),
         AttachTarget::Agent => format!("{}-agent", pod_name),
+        AttachTarget::Worker => format!("{}-worker", pod_name),
     }
 }
 
@@ -401,6 +405,7 @@ enum HostCommand {
     ///   devaipod attach myworkspace              # Attach to agent (default)
     ///   devaipod attach -l                       # Attach to most recent workspace
     ///   devaipod attach myworkspace -W           # Attach to workspace container
+    ///   devaipod attach myworkspace --worker     # Attach to worker agent
     ///   devaipod attach myworkspace -s abc123    # Connect to specific session
     Attach {
         /// Workspace name (devaipod- prefix optional)
@@ -413,31 +418,44 @@ enum HostCommand {
         session: Option<String>,
         /// Attach to the workspace container instead of the agent
         ///
-        /// By default, devaipod attach logs into the agent container where the AI
-        /// runs. Use this flag to access the workspace container for direct access
+        /// By default, devaipod attach connects to the task owner agent.
+        /// Use this flag to access the workspace container for direct access
         /// to your development environment without AI interaction.
         #[arg(short = 'W', long)]
         workspace_mode: bool,
+        /// Attach to the worker agent instead of the task owner
+        ///
+        /// Use this flag to connect to the worker agent that receives delegated
+        /// tasks from the task owner.
+        #[arg(long)]
+        worker: bool,
     },
     /// Execute a shell in a container
     ///
-    /// Opens an interactive shell in the agent container by default.
-    /// Use -W to exec into the workspace container instead.
+    /// Opens an interactive shell in the task owner agent container by default.
+    /// Use -W for workspace or --worker for worker agent.
     ///
     /// Examples:
-    ///   devaipod exec myworkspace           # Shell in agent container (default)
+    ///   devaipod exec myworkspace           # Shell in task owner agent (default)
     ///   devaipod exec myworkspace -W        # Shell in workspace container
+    ///   devaipod exec myworkspace --worker  # Shell in worker agent
     ///   devaipod exec myworkspace -- ls -la # Run a specific command
     Exec {
         /// Workspace name (devaipod- prefix optional)
         workspace: String,
         /// Exec into the workspace container instead of the agent
         ///
-        /// By default, devaipod exec logs into the agent container where the AI
-        /// operates. Use this flag to access the workspace container for manual
+        /// By default, devaipod exec enters the task owner agent container.
+        /// Use this flag to access the workspace container for manual
         /// development work or to review/pull agent changes.
         #[arg(short = 'W', long = "workspace")]
         workspace_mode: bool,
+        /// Exec into the worker agent instead of the task owner
+        ///
+        /// Use this flag to access the worker agent's container that receives
+        /// delegated tasks from the task owner.
+        #[arg(long)]
+        worker: bool,
         /// Stdio mode: pipe stdin/stdout for ProxyCommand use (VSCode/Zed remote dev)
         #[arg(long, hide = true)]
         stdio: bool,
@@ -915,12 +933,15 @@ async fn run_host(cli: HostCli) -> Result<()> {
             latest,
             session,
             workspace_mode,
+            worker,
         } => {
             if !std::io::stdin().is_terminal() {
                 bail!("attach requires an interactive terminal. For non-interactive use, consider using the OpenCode API directly.");
             }
             let pod_name = resolve_workspace(workspace.as_deref(), latest)?;
-            let target = if workspace_mode {
+            let target = if worker {
+                AttachTarget::Worker
+            } else if workspace_mode {
                 AttachTarget::Workspace
             } else {
                 AttachTarget::Agent
@@ -930,10 +951,13 @@ async fn run_host(cli: HostCli) -> Result<()> {
         HostCommand::Exec {
             workspace,
             workspace_mode,
+            worker,
             stdio,
             command,
         } => {
-            let target = if workspace_mode {
+            let target = if worker {
+                AttachTarget::Worker
+            } else if workspace_mode {
                 AttachTarget::Workspace
             } else {
                 AttachTarget::Agent
@@ -1416,6 +1440,8 @@ async fn create_workspace_from_local(
         effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),
+        true, // orchestration always enabled
+        config.orchestration.worker.gator.clone(),
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -1600,6 +1626,8 @@ async fn create_workspace_from_remote(
         effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),
+        true, // orchestration always enabled
+        config.orchestration.worker.gator.clone(),
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -1770,6 +1798,8 @@ async fn create_workspace_from_pr(
         effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),
+        true, // orchestration always enabled
+        config.orchestration.worker.gator.clone(),
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -1852,6 +1882,7 @@ async fn cmd_run(
     let result = create_workspace(config, source, &create_opts).await?;
 
     // If a task was provided, send the initial message to start the agent working
+    // Always include orchestration instructions since orchestration is always enabled
     if let Some(task) = command {
         start_agent_task(&result.pod_name, task)?;
     }
@@ -1864,6 +1895,9 @@ async fn cmd_run(
 /// This is called after workspace creation when a task was provided.
 /// The task content is sent directly in the initial message to ensure the agent
 /// receives it even if opencode started before the config file was written.
+///
+/// Includes mandatory orchestration instructions directly in the message to ensure
+/// the agent follows the delegation workflow.
 fn start_agent_task(pod_name: &str, task: &str) -> Result<()> {
     tracing::info!("Waiting for agent to be ready...");
 
@@ -1904,15 +1938,28 @@ fn start_agent_task(pod_name: &str, task: &str) -> Result<()> {
     // before the config file (with instructions path) was written.
     tracing::info!("Starting agent on task...");
 
-    let initial_message = format!(
-        r#"# Your Task
+    // Include orchestration instructions directly in the user message to ensure
+    // they have high priority. This is in addition to the instructions file for redundancy.
+    let orchestration_section = format!(
+        r#"
+
+---
 
 {}
 
 ---
 
+"#,
+        prompt::orchestration_instructions()
+    );
+
+    let initial_message = format!(
+        r#"# Your Task
+
+{task}{orchestration_section}
 Please start working on this task now. Make commits with clear messages as you work."#,
-        task
+        task = task,
+        orchestration_section = orchestration_section
     );
 
     // Create session and send message (reusing the existing API logic)
@@ -2177,7 +2224,11 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
 
     // Read gator config from the agent home volume (preferred)
     let agent_container = format!("{}-agent", pod_name);
-    let config_path = format!("{}/{}", pod::AGENT_HOME_PATH, service_gator::GATOR_CONFIG_PATH);
+    let config_path = format!(
+        "{}/{}",
+        pod::AGENT_HOME_PATH,
+        service_gator::GATOR_CONFIG_PATH
+    );
 
     let config_content = podman
         .copy_from_container(&agent_container, &config_path)
@@ -2186,7 +2237,8 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
         .flatten();
 
     // Try to parse from volume file first, fall back to pod labels for backwards compat
-    let gator_config: Option<service_gator::GatorConfigFile> = if let Some(content) = config_content {
+    let gator_config: Option<service_gator::GatorConfigFile> = if let Some(content) = config_content
+    {
         serde_json::from_str(&content).ok()
     } else {
         // Backwards compat: read scopes from pod labels (pre-volume pods)
@@ -2233,14 +2285,18 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
             // Create a temp file with the current scopes
             let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
             let temp_file = temp_dir.path().join("scopes.toml");
-            std::fs::write(&temp_file, format!(
-                "# Service-gator scopes for {}\n\
+            std::fs::write(
+                &temp_file,
+                format!(
+                    "# Service-gator scopes for {}\n\
                  # Edit and save to update the scopes.\n\
                  # See: https://github.com/cgwalters/service-gator#configuration-examples\n\n\
-                 {}", 
-                strip_pod_prefix(&pod_name),
-                toml_content
-            )).context("Failed to write temp file")?;
+                 {}",
+                    strip_pod_prefix(&pod_name),
+                    toml_content
+                ),
+            )
+            .context("Failed to write temp file")?;
 
             // Get the editor
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
@@ -2258,8 +2314,8 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
             }
 
             // Read the edited file
-            let edited_content = std::fs::read_to_string(&temp_file)
-                .context("Failed to read edited file")?;
+            let edited_content =
+                std::fs::read_to_string(&temp_file).context("Failed to read edited file")?;
 
             // Parse the edited TOML
             let new_scopes: service_gator::JwtScopeConfig = toml::from_str(&edited_content)
@@ -2293,8 +2349,8 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
         }
         GatorAction::Add { scopes, .. } => {
             // Parse the new scopes from CLI
-            let new_config = service_gator::parse_scopes(&scopes)
-                .context("Failed to parse scope arguments")?;
+            let new_config =
+                service_gator::parse_scopes(&scopes).context("Failed to parse scope arguments")?;
 
             // Convert new CLI scopes to JWT format
             let new_jwt_scopes = service_gator::config_to_jwt_scopes(&new_config);
@@ -2488,6 +2544,40 @@ exec tmux attach -t {session}
                 );
             }
         }
+        AttachTarget::Worker => {
+            // Worker container: connect to worker's opencode serve (uses port OPENCODE_PORT + 1)
+            tracing::info!("Attaching to worker in '{}'...", strip_pod_prefix(pod_name));
+
+            // Worker uses a different port than the task owner agent
+            let worker_port = pod::OPENCODE_PORT + 1;
+
+            // Build the opencode attach command for the worker
+            let mut attach_args = vec![
+                "opencode".to_string(),
+                "attach".to_string(),
+                format!("http://localhost:{}", worker_port),
+            ];
+            if let Some(sid) = session {
+                attach_args.push("-s".to_string());
+                attach_args.push(sid.to_string());
+            }
+
+            let mut cmd = podman_command();
+            cmd.args(["exec", "-it", &container]);
+            cmd.args(&attach_args);
+
+            let status = cmd.status().context("Failed to run podman exec")?;
+
+            if !status.success() {
+                bail!(
+                    "Failed to attach to worker in '{}' (exit code {:?}). \
+                     The worker container may not exist (is orchestration enabled?) or is not running. \
+                     Run 'devaipod list' to see available pods.",
+                    pod_name,
+                    status.code()
+                );
+            }
+        }
     }
 
     Ok(())
@@ -2525,6 +2615,7 @@ fn cmd_exec(pod_name: &str, target: AttachTarget, stdio: bool, command: &[String
         let target_name = match target {
             AttachTarget::Agent => "agent",
             AttachTarget::Workspace => "workspace",
+            AttachTarget::Worker => "worker",
         };
         tracing::info!(
             "Exec into {} container '{}'...",
@@ -3089,6 +3180,27 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
 
     tracing::info!("Pod '{}' deleted", pod_name);
 
+    // Clean up worker volumes if they exist
+    let worker_workspace_volume = format!("{}-worker-workspace", pod_name);
+    let worker_home_volume = format!("{}-worker-home", pod_name);
+
+    for volume in [&worker_workspace_volume, &worker_home_volume] {
+        let output = podman_command()
+            .args(["volume", "rm", "--force", "--", volume])
+            .output()
+            .context("Failed to run podman volume rm")?;
+
+        if output.status.success() {
+            tracing::debug!("Removed volume '{}'", volume);
+        } else {
+            // Volume might not exist, that's fine
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("no such volume") {
+                tracing::warn!("Failed to remove volume '{}': {}", volume, stderr.trim());
+            }
+        }
+    }
+
     // Clean up SSH config file if it exists
     if let Err(e) = remove_ssh_config(pod_name) {
         tracing::warn!("Failed to remove SSH config: {}", e);
@@ -3252,6 +3364,8 @@ async fn cmd_rebuild(
         image_override,
         None, // gator_image_override not yet supported for rebuild
         None, // task - agent home volume persists with original task
+        config.orchestration.is_enabled(),
+        config.orchestration.worker.gator.clone(),
     )
     .await
     .context("Failed to recreate pod")?;

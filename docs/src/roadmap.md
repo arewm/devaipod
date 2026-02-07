@@ -20,6 +20,7 @@ Larger features under consideration:
 - **Quadlet/systemd integration**: Generate Quadlet units for proper lifecycle management
 - **Local Forgejo instance**: Git caching, local CI/CD, and code review UI (see [forgejo-integration.md](../todo/forgejo-integration.md))
 - **Nested devaipods**: MCP tool allowing agents to spawn additional sandboxed environments
+- **Worker orchestration API**: MCP tools or OpenCode skill for task owner to programmatically assign subtasks to worker (see [worker-orchestration-api.md](../todo/worker-orchestration-api.md))
 - **Devcontainer features support**: Install devcontainer features into the workspace image
 - **Multi-project workspaces**: Support for monorepos or multi-repo setups
 - **Persistent agent state**: Named volumes for agent home so context persists across pod restarts

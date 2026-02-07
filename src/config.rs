@@ -72,6 +72,10 @@ pub struct Config {
     /// Bind paths specifically for the workspace container (in addition to bind_home)
     #[serde(default)]
     pub bind_home_workspace: Option<BindHomeConfig>,
+
+    /// Multi-agent orchestration configuration
+    #[serde(default)]
+    pub orchestration: OrchestrationConfig,
 }
 
 /// Configuration for binding paths from host home to container home
@@ -596,6 +600,97 @@ pub struct JiraIssuePermission {
     /// Can write to this issue
     #[serde(default)]
     pub write: bool,
+}
+
+// =============================================================================
+// Orchestration configuration
+// =============================================================================
+
+/// Default worker timeout (used when worker timeout enforcement is implemented)
+#[allow(dead_code)]
+const DEFAULT_WORKER_TIMEOUT: &str = "30m";
+
+/// Multi-agent orchestration configuration
+///
+/// Configures hierarchical multi-agent workflows where a "task owner" agent
+/// orchestrates a "worker" agent running in an isolated container.
+///
+/// Note: Orchestration is always enabled - every workspace includes a worker
+/// container. The `enabled` field is kept for backwards compatibility but is
+/// ignored (always treated as true).
+///
+/// Example configuration:
+/// ```toml
+/// [orchestration]
+/// worker_timeout = "30m"
+///
+/// [orchestration.worker]
+/// gator = "readonly"
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[allow(dead_code)] // Fields parsed from config but not all used yet
+pub struct OrchestrationConfig {
+    /// Deprecated: Orchestration is always enabled.
+    /// This field is kept for backwards compatibility but is ignored.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Timeout for worker subtasks (default: "30m")
+    /// Format: duration string like "30m", "1h", "90s"
+    /// Note: Not yet enforced, will be used when timeout handling is implemented.
+    #[serde(default)]
+    pub worker_timeout: Option<String>,
+    /// Worker-specific configuration
+    #[serde(default)]
+    pub worker: WorkerConfig,
+}
+
+impl OrchestrationConfig {
+    /// Check if orchestration is enabled (always returns true)
+    ///
+    /// Orchestration is always enabled in devaipod - every workspace includes
+    /// a worker container. This method is kept for backwards compatibility.
+    pub fn is_enabled(&self) -> bool {
+        true
+    }
+
+    /// Get the worker timeout string (defaults to "30m")
+    ///
+    /// Note: Not yet enforced, will be used when timeout handling is implemented.
+    #[allow(dead_code)]
+    pub fn worker_timeout(&self) -> &str {
+        self.worker_timeout
+            .as_deref()
+            .unwrap_or(DEFAULT_WORKER_TIMEOUT)
+    }
+}
+
+/// Worker container configuration
+///
+/// Controls how the worker agent operates within the orchestration.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerConfig {
+    /// How the worker accesses service-gator (default: readonly)
+    #[serde(default)]
+    pub gator: WorkerGatorMode,
+}
+
+/// How the worker agent accesses service-gator
+///
+/// Workers are one step further from human review, so they have restricted
+/// access by default. The task owner reviews worker commits before they
+/// can affect external systems.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerGatorMode {
+    /// Worker can only read from forge (no PRs, no pushes) — default
+    #[default]
+    Readonly,
+    /// Worker gets same gator scopes as task owner
+    Inherit,
+    /// Worker has no gator access; communicates only via git with task owner
+    None,
 }
 
 /// Get the XDG config directory
@@ -1316,6 +1411,104 @@ target = "all"
         assert_eq!(config.gpu.target, "workspace");
         assert!(!config.gpu.workspace_enabled(true));
         assert!(!config.gpu.agent_enabled(true));
+    }
+
+    // =========================================================================
+    // Orchestration configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_orchestration_config_default() {
+        let config = OrchestrationConfig::default();
+        // Orchestration is always enabled
+        assert!(config.is_enabled());
+        assert_eq!(config.worker_timeout(), "30m");
+        assert_eq!(config.worker.gator, WorkerGatorMode::Readonly);
+    }
+
+    #[test]
+    fn test_parse_orchestration_minimal() {
+        // Orchestration is always enabled even with minimal config
+        let toml = "";
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.orchestration.is_enabled());
+        assert_eq!(config.orchestration.worker_timeout(), "30m");
+        assert_eq!(config.orchestration.worker.gator, WorkerGatorMode::Readonly);
+    }
+
+    #[test]
+    fn test_parse_orchestration_with_settings() {
+        // The enabled field is ignored but should still parse
+        let toml = r#"
+[orchestration]
+enabled = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.orchestration.is_enabled());
+    }
+
+    #[test]
+    fn test_parse_orchestration_worker_timeout() {
+        let toml = r#"
+[orchestration]
+enabled = true
+worker-timeout = "1h"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.orchestration.is_enabled());
+        assert_eq!(config.orchestration.worker_timeout(), "1h");
+    }
+
+    #[test]
+    fn test_parse_orchestration_full() {
+        let toml = r#"
+[orchestration]
+enabled = true
+worker-timeout = "45m"
+
+[orchestration.worker]
+gator = "inherit"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.orchestration.is_enabled());
+        assert_eq!(config.orchestration.worker_timeout(), "45m");
+        assert_eq!(config.orchestration.worker.gator, WorkerGatorMode::Inherit);
+    }
+
+    #[test]
+    fn test_worker_gator_mode_readonly() {
+        let toml = r#"
+[orchestration.worker]
+gator = "readonly"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.orchestration.worker.gator, WorkerGatorMode::Readonly);
+    }
+
+    #[test]
+    fn test_worker_gator_mode_inherit() {
+        let toml = r#"
+[orchestration.worker]
+gator = "inherit"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.orchestration.worker.gator, WorkerGatorMode::Inherit);
+    }
+
+    #[test]
+    fn test_worker_gator_mode_none() {
+        let toml = r#"
+[orchestration.worker]
+gator = "none"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.orchestration.worker.gator, WorkerGatorMode::None);
+    }
+
+    #[test]
+    fn test_worker_gator_mode_default() {
+        // Default should be readonly
+        assert_eq!(WorkerGatorMode::default(), WorkerGatorMode::Readonly);
     }
 
     // =========================================================================

@@ -811,7 +811,10 @@ impl PodmanService {
         // Extract labels from the JSON
         // podman pod inspect returns: [{"Labels": {"key": "value", ...}, ...}]
         // Handle both array (standard) and object (legacy) formats
-        let pod_obj = pod_info.as_array().and_then(|arr| arr.first()).unwrap_or(&pod_info);
+        let pod_obj = pod_info
+            .as_array()
+            .and_then(|arr| arr.first())
+            .unwrap_or(&pod_info);
         let labels = pod_obj
             .get("Labels")
             .and_then(|l| l.as_object())
@@ -1559,11 +1562,7 @@ impl PodmanService {
         let container_source = format!("{}:{}", container, source);
         let output = self
             .podman_command()
-            .args([
-                "cp",
-                &container_source,
-                &temp_file.to_string_lossy(),
-            ])
+            .args(["cp", &container_source, &temp_file.to_string_lossy()])
             .output()
             .await
             .context("Failed to execute podman cp")?;
@@ -1589,7 +1588,12 @@ impl PodmanService {
         let content = std::fs::read_to_string(&temp_file)
             .with_context(|| format!("Failed to read copied file from {}", temp_file.display()))?;
 
-        tracing::debug!("Copied {}:{} to host ({} bytes)", container, source, content.len());
+        tracing::debug!(
+            "Copied {}:{} to host ({} bytes)",
+            container,
+            source,
+            content.len()
+        );
         Ok(Some(content))
     }
 }

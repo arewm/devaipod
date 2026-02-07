@@ -118,7 +118,7 @@ fn extract_repo_from_url(url: &str) -> Option<String> {
 /// - /dev/kvm: Hardware virtualization for VM-based testing (e.g., bootc testing)
 const DEV_PASSTHROUGH_PATHS: &[&str] = &["/dev/fuse", "/dev/net/tun", "/dev/kvm"];
 
-use crate::config::{Config, DotfilesConfig};
+use crate::config::{Config, DotfilesConfig, WorkerGatorMode};
 use crate::devcontainer::DevcontainerConfig;
 use crate::podman::{ContainerConfig, PodmanService};
 
@@ -127,6 +127,9 @@ pub const OPENCODE_PORT: u16 = 4096;
 
 /// Port for the auth proxy in the agent container (external, requires Basic Auth)
 pub const OPENCODE_AUTH_PROXY_PORT: u16 = 4097;
+
+/// Port for the worker's opencode server (internal, no auth)
+pub const WORKER_OPENCODE_PORT: u16 = 4098;
 
 /// Generate a random password for API authentication
 ///
@@ -223,11 +226,14 @@ pub struct DevaipodPod {
     pub pod_name: String,
     /// Name of the workspace container
     pub workspace_container: String,
-    /// Name of the agent container
+    /// Name of the agent container (task owner in orchestration mode)
     pub agent_container: String,
     /// Name of the gator container (if enabled)
     #[allow(dead_code)] // Stored for future container management
     pub gator_container: Option<String>,
+    /// Name of the worker container (if orchestration enabled)
+    #[allow(dead_code)] // Stored for future container management
+    pub worker_container: Option<String>,
     /// The image used for workspace and agent containers
     #[allow(dead_code)] // Stored for reference, used in operations
     pub image: String,
@@ -243,6 +249,8 @@ pub struct DevaipodPod {
     pub task: Option<String>,
     /// Whether service-gator is enabled
     pub enable_gator: bool,
+    /// Whether orchestration mode is enabled
+    pub enable_orchestration: bool,
 }
 
 impl DevaipodPod {
@@ -264,6 +272,14 @@ impl DevaipodPod {
     ///
     /// The `gator_image_override` parameter allows specifying a custom service-gator image
     /// instead of the default. This is useful for testing locally-built service-gator images.
+    ///
+    /// The `enable_orchestration` parameter enables multi-agent orchestration mode.
+    /// When true, a worker container is created in addition to the task owner (agent).
+    ///
+    /// The `worker_gator_mode` parameter controls how the worker accesses service-gator:
+    /// - `Readonly`: Worker can only read from forge (default)
+    /// - `Inherit`: Worker gets same scopes as task owner
+    /// - `None`: Worker has no gator access
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         podman: &PodmanService,
@@ -278,6 +294,8 @@ impl DevaipodPod {
         image_override: Option<&str>,
         gator_image_override: Option<&str>,
         task: Option<&str>,
+        enable_orchestration: bool,
+        worker_gator_mode: WorkerGatorMode,
     ) -> Result<Self> {
         // Note: container_home is resolved after we determine the image, since
         // we need to query the image for the user if devcontainer doesn't specify one
@@ -633,6 +651,131 @@ impl DevaipodPod {
 
         // Create agent container with restricted security
         // Agent gets its own workspace clone and read-only access to main workspace
+        // If orchestration is enabled, also mount worker workspace for git access
+        //
+        // IMPORTANT: We must create the worker volumes BEFORE creating the agent container,
+        // because the agent container config includes a mount to the worker workspace volume.
+        // If we don't create the volume first, Podman will auto-create an empty volume,
+        // and when we later check volume_exists() it will return true, skipping the clone.
+        let (worker_workspace_volume_name, worker_home_volume_name) = if enable_orchestration {
+            // Create worker home volume for persistent worker state (separate from agent home)
+            let worker_home_volume = format!("{}-worker-home", pod_name);
+            if !podman.volume_exists(&worker_home_volume).await? {
+                podman
+                    .create_volume(&worker_home_volume)
+                    .await
+                    .context("Failed to create worker home volume")?;
+                tracing::debug!("Created worker home volume '{}'", worker_home_volume);
+            } else {
+                tracing::debug!("Using existing worker home volume '{}'", worker_home_volume);
+            }
+
+            // Create worker workspace volume for isolated worker git clone
+            let worker_workspace_volume = format!("{}-worker-workspace", pod_name);
+            let worker_workspace_exists = podman.volume_exists(&worker_workspace_volume).await?;
+            if !worker_workspace_exists {
+                podman
+                    .create_volume(&worker_workspace_volume)
+                    .await
+                    .context("Failed to create worker workspace volume")?;
+                tracing::debug!(
+                    "Created worker workspace volume '{}'",
+                    worker_workspace_volume
+                );
+            } else {
+                tracing::debug!(
+                    "Using existing worker workspace volume '{}'",
+                    worker_workspace_volume
+                );
+            }
+
+            // Clone into worker workspace using --shared to share objects with task owner workspace
+            if !worker_workspace_exists {
+                // Worker references the task owner's workspace (agent_workspace_volume)
+                let project_name = workspace_folder
+                    .strip_prefix("/workspaces/")
+                    .unwrap_or(&workspace_folder);
+                let reference_repo_path = format!("/mnt/owner-workspace/{}", project_name);
+
+                let clone_script = match source {
+                    WorkspaceSource::LocalRepo(git_info) => {
+                        crate::git::clone_worker_workspace_script(
+                            &workspace_folder,
+                            &reference_repo_path,
+                            git_info,
+                            effective_user.as_deref(),
+                        )
+                    }
+                    WorkspaceSource::RemoteRepo(remote_info) => {
+                        let git_info = crate::git::GitRepoInfo {
+                            local_path: std::path::PathBuf::from(&reference_repo_path),
+                            remote_url: Some(remote_info.remote_url.clone()),
+                            commit_sha: "HEAD".to_string(),
+                            branch: Some(remote_info.default_branch.clone()),
+                            is_dirty: false,
+                            dirty_files: vec![],
+                        };
+                        crate::git::clone_worker_workspace_script(
+                            &workspace_folder,
+                            &reference_repo_path,
+                            &git_info,
+                            effective_user.as_deref(),
+                        )
+                    }
+                    WorkspaceSource::PullRequest(pr_info) => {
+                        let git_info = crate::git::GitRepoInfo {
+                            local_path: std::path::PathBuf::from(&reference_repo_path),
+                            remote_url: Some(pr_info.head_clone_url.clone()),
+                            commit_sha: pr_info.head_sha.clone(),
+                            branch: Some(pr_info.head_ref.clone()),
+                            is_dirty: false,
+                            dirty_files: vec![],
+                        };
+                        crate::git::clone_worker_workspace_script(
+                            &workspace_folder,
+                            &reference_repo_path,
+                            &git_info,
+                            effective_user.as_deref(),
+                        )
+                    }
+                };
+
+                // Mount task owner's workspace (agent_workspace_volume) as reference for git --shared clone
+                // Also mount main workspace for git alternates chain
+                let extra_binds = vec![
+                    format!("{}:/mnt/owner-workspace:ro", agent_workspace_volume),
+                    format!("{}:/mnt/main-workspace:ro", volume_name),
+                ];
+
+                tracing::debug!(
+                    "Cloning worker workspace with reference to task owner workspace..."
+                );
+                let exit_code = podman
+                    .run_init_container(
+                        &image,
+                        &worker_workspace_volume,
+                        "/workspaces",
+                        &["/bin/sh", "-c", &clone_script],
+                        &extra_binds,
+                    )
+                    .await
+                    .context("Failed to run init container for worker workspace clone")?;
+
+                if exit_code != 0 {
+                    let _ = podman.remove_volume(&worker_workspace_volume, true).await;
+                    bail!(
+                        "Failed to clone into worker workspace volume (exit code {})",
+                        exit_code
+                    );
+                }
+                tracing::debug!("Worker workspace cloned successfully");
+            }
+
+            (Some(worker_workspace_volume), Some(worker_home_volume))
+        } else {
+            (None, None)
+        };
+
         let agent_config = Self::agent_container_config(
             project_path,
             &workspace_folder,
@@ -640,9 +783,11 @@ impl DevaipodPod {
             &container_home,
             Some(devcontainer_config),
             enable_gator,
+            enable_orchestration,
             &volume_name,            // main workspace (read-only reference mount)
             &agent_workspace_volume, // agent's own workspace clone
             &agent_home_volume,
+            worker_workspace_volume_name.as_deref(),
             global_config,
             &api_password,
         );
@@ -696,7 +841,49 @@ impl DevaipodPod {
             None
         };
 
-        let container_count = 2 + if gator_container.is_some() { 1 } else { 0 };
+        // Create worker container if orchestration is enabled
+        // Note: Worker volumes were already created and cloned above (before agent container creation)
+        // to avoid Podman auto-creating empty volumes when the agent container is created.
+        let worker_container = if let (Some(worker_workspace_volume), Some(worker_home_volume)) =
+            (&worker_workspace_volume_name, &worker_home_volume_name)
+        {
+            let worker_container_name = format!("{}-worker", pod_name);
+
+            // Create worker container using the volumes created earlier
+            let worker_config = Self::worker_container_config(
+                project_path,
+                &workspace_folder,
+                &agent_bind_home,
+                &container_home,
+                Some(devcontainer_config),
+                enable_gator,
+                worker_gator_mode,
+                &volume_name,            // main workspace (read-only)
+                &agent_workspace_volume, // task owner workspace (read-only)
+                worker_workspace_volume, // worker's own workspace
+                worker_home_volume,      // worker's own home volume (read-write)
+                &agent_home_volume,      // agent's home for LLM credentials (read-only)
+                global_config,
+            );
+            podman
+                .create_container(&worker_container_name, &image, pod_name, worker_config)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to create worker container: {}",
+                        worker_container_name
+                    )
+                })?;
+
+            tracing::debug!("Created worker container '{}'", worker_container_name);
+            Some(worker_container_name)
+        } else {
+            None
+        };
+
+        let container_count = 2
+            + if gator_container.is_some() { 1 } else { 0 }
+            + if worker_container.is_some() { 1 } else { 0 };
         tracing::debug!(
             "Created pod '{}' with {} containers",
             pod_name,
@@ -708,6 +895,7 @@ impl DevaipodPod {
             workspace_container,
             agent_container,
             gator_container,
+            worker_container,
             image,
             workspace_folder,
             workspace_bind_home,
@@ -715,6 +903,7 @@ impl DevaipodPod {
             container_home,
             task: task.map(|s| s.to_string()),
             enable_gator,
+            enable_orchestration,
         })
     }
 
@@ -1059,6 +1248,42 @@ echo "Dotfiles installed successfully"
             }
         }
 
+        // Copy files to worker container (only in orchestration mode)
+        // Worker uses the same bind_home config as agent since it also runs LLM API calls
+        if let Some(worker_container) = &self.worker_container {
+            for relative_path in &agent_bind_home.paths {
+                let source = host_home.join(relative_path);
+                let target = format!("{}/{}", AGENT_HOME_PATH, relative_path);
+
+                if !source.exists() {
+                    tracing::warn!(
+                        "bind_home: skipping '{}' for worker (not found at {})",
+                        relative_path,
+                        source.display()
+                    );
+                    continue;
+                }
+
+                tracing::debug!(
+                    "bind_home: copying {} -> {}:{} for worker",
+                    source.display(),
+                    worker_container,
+                    target
+                );
+
+                if let Err(e) = podman
+                    .copy_to_container(worker_container, &source, &target, None)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to copy {} to worker container: {}",
+                        relative_path,
+                        e
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1124,13 +1349,17 @@ chmod +x {agent_home}/scripts/auth_proxy.py
     ) -> Result<()> {
         let config = crate::service_gator::GatorConfigFile::new(scopes.clone());
 
-        let config_json = serde_json::to_string_pretty(&config)
-            .context("Failed to serialize gator config")?;
+        let config_json =
+            serde_json::to_string_pretty(&config).context("Failed to serialize gator config")?;
 
         // Write the config file using a heredoc in the init container
         // Escape any single quotes in the JSON
         let escaped_json = config_json.replace('\'', "'\\''");
-        let config_path = format!("{}/{}", AGENT_HOME_PATH, crate::service_gator::GATOR_CONFIG_PATH);
+        let config_path = format!(
+            "{}/{}",
+            AGENT_HOME_PATH,
+            crate::service_gator::GATOR_CONFIG_PATH
+        );
 
         let script = format!(
             r#"set -e
@@ -1233,6 +1462,7 @@ chmod 644 '{config_path}'
     /// The task file includes:
     /// - System context about the devaipod environment
     /// - Instructions for using service-gator for forge operations
+    /// - Orchestration instructions (when enabled)
     /// - The user's task
     pub async fn write_task(
         &self,
@@ -1243,39 +1473,9 @@ chmod 644 '{config_path}'
         let task_file = ".config/opencode/devaipod-task.md";
         let config_file = ".config/opencode/opencode.json";
 
-        // Build service-gator instructions if enabled
-        let gator_instructions = if enable_gator {
-            r#"
-## IMPORTANT: GitHub/GitLab Operations
-
-For GitHub/GitLab operations (PRs, issues, etc.), use the **service-gator** MCP tool.
-The `gh` and `glab` CLI tools are NOT available in this environment.
-"#
-            .to_string()
-        } else {
-            String::new()
-        };
-
-        // Format the task as markdown with context
-        let task_content = format!(
-            r#"# devaipod Task
-
-You are running as an AI agent in a **devaipod** sandboxed environment.
-
-## Your Task
-
-{task}
-
-## Guidelines
-
-1. Work on the task described above
-2. Make commits with clear, descriptive messages
-3. When done, summarize what you accomplished
-{gator_instructions}
-"#,
-            task = task,
-            gator_instructions = gator_instructions
-        );
+        // Generate the complete system prompt using the prompt module
+        let task_content =
+            crate::prompt::generate_system_prompt(task, enable_gator, self.enable_orchestration);
 
         let task_file_path = format!("{}/{}", AGENT_HOME_PATH, task_file);
         let config_file_path = format!("{}/{}", AGENT_HOME_PATH, config_file);
@@ -1373,10 +1573,13 @@ CONFIG_EOF"#,
     /// This sets up:
     /// 1. An 'agent' remote in the workspace container pointing to the agent's workspace
     /// 2. A 'workspace' remote in the agent container pointing to the human's workspace
+    /// 3. When orchestration is enabled, a 'worker' remote in the agent container pointing
+    ///    to the worker's workspace at `/mnt/worker-workspace`
     ///
     /// This enables the full collaboration workflow:
     /// - Human reviews agent's commits: `git fetch agent && git diff agent/main`
     /// - Agent fetches human's changes: `git fetch workspace && git rebase workspace/main`
+    /// - Task owner (agent) fetches worker's commits: `git fetch worker && git cherry-pick worker/...`
     pub async fn setup_git_remotes(&self, podman: &PodmanService) -> Result<()> {
         // Extract project name from workspace folder (e.g., /workspaces/myproject -> myproject)
         let project_name = self
@@ -1422,7 +1625,28 @@ fi
         }
 
         // Set up 'workspace' remote in agent container
+        // When orchestration is enabled, also set up 'worker' remote
         let workspace_repo_path = format!("/mnt/main-workspace/{}", project_name);
+        let worker_remote_setup = if self.enable_orchestration {
+            let worker_repo_path = format!("/mnt/worker-workspace/{}", project_name);
+            format!(
+                r#"
+# Mark the worker workspace as safe (different ownership in container)
+git config --global --add safe.directory '{worker_repo_path}'
+
+if git remote get-url worker >/dev/null 2>&1; then
+    echo "Remote 'worker' already exists, skipping"
+else
+    git remote add worker '{worker_repo_path}'
+    echo "Added git remote 'worker' pointing to worker workspace"
+fi
+"#,
+                worker_repo_path = worker_repo_path
+            )
+        } else {
+            String::new()
+        };
+
         let agent_script = format!(
             r#"
 # Mark the main workspace as safe (different ownership in container)
@@ -1434,8 +1658,9 @@ else
     git remote add workspace '{workspace_repo_path}'
     echo "Added git remote 'workspace' pointing to main workspace"
 fi
-"#,
-            workspace_repo_path = workspace_repo_path
+{worker_remote_setup}"#,
+            workspace_repo_path = workspace_repo_path,
+            worker_remote_setup = worker_remote_setup
         );
 
         tracing::debug!("Setting up 'workspace' git remote in agent container...");
@@ -1456,6 +1681,9 @@ fi
             );
         } else {
             tracing::debug!("Workspace git remote set up successfully");
+            if self.enable_orchestration {
+                tracing::debug!("Worker git remote set up successfully");
+            }
         }
 
         Ok(())
@@ -1722,12 +1950,16 @@ exec sleep infinity
     /// - Has the same Linux capabilities as workspace (for nested container support)
     /// - Has its own workspace clone (using git --reference to share objects)
     /// - Has read-only access to main workspace for reference
+    /// - When orchestration is enabled, has read-only access to worker workspace
     ///
     /// If `devcontainer_config` is provided, env vars from its `customizations.devaipod.env_allowlist`
     /// will be forwarded to the agent.
     ///
     /// If `enable_gator` is true, OPENCODE_CONFIG_CONTENT is set with MCP config
     /// to connect opencode to the service-gator container (no auth needed).
+    ///
+    /// If `enable_orchestration` is true and `worker_workspace_volume` is provided,
+    /// the worker's workspace is mounted read-only at `/mnt/worker-workspace`.
     #[allow(clippy::too_many_arguments)]
     fn agent_container_config(
         _project_path: &Path,
@@ -1736,9 +1968,11 @@ exec sleep infinity
         _container_home: &str,
         devcontainer_config: Option<&DevcontainerConfig>,
         enable_gator: bool,
+        enable_orchestration: bool,
         workspace_volume: &str,
         agent_workspace_volume: &str,
         agent_home_volume: &str,
+        worker_workspace_volume: Option<&str>,
         global_config: &crate::config::Config,
         api_password: &str,
     ) -> ContainerConfig {
@@ -1875,6 +2109,16 @@ exec sleep infinity
             );
         }
 
+        // When orchestration is enabled, set OPENCODE_WORKER_URL so the task owner
+        // can use `opencode run --attach $OPENCODE_WORKER_URL` to delegate to the worker.
+        // This is much cleaner than raw curl commands.
+        if enable_orchestration {
+            env.insert(
+                "OPENCODE_WORKER_URL".to_string(),
+                format!("http://localhost:{}", WORKER_OPENCODE_PORT),
+            );
+        }
+
         let startup_script = format!(
             r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
 
@@ -1913,17 +2157,31 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             // - agent_workspace_volume at /workspaces: agent's own git clone
             // - workspace_volume at /mnt/main-workspace:ro: read-only reference to main workspace
             // - agent_home_volume at AGENT_HOME_PATH: persistent agent state
-            volume_mounts: vec![
-                (
-                    agent_workspace_volume.to_string(),
-                    "/workspaces".to_string(),
-                ),
-                (
-                    workspace_volume.to_string(),
-                    "/mnt/main-workspace:ro".to_string(),
-                ),
-                (agent_home_volume.to_string(), AGENT_HOME_PATH.to_string()),
-            ],
+            // - worker_workspace_volume at /mnt/worker-workspace:ro (when orchestration enabled)
+            volume_mounts: {
+                let mut mounts = vec![
+                    (
+                        agent_workspace_volume.to_string(),
+                        "/workspaces".to_string(),
+                    ),
+                    (
+                        workspace_volume.to_string(),
+                        "/mnt/main-workspace:ro".to_string(),
+                    ),
+                    (agent_home_volume.to_string(), AGENT_HOME_PATH.to_string()),
+                ];
+                // When orchestration is enabled, mount worker's workspace read-only
+                // so the task owner can access worker's commits via git
+                if enable_orchestration {
+                    if let Some(worker_vol) = worker_workspace_volume {
+                        mounts.push((
+                            worker_vol.to_string(),
+                            "/mnt/worker-workspace:ro".to_string(),
+                        ));
+                    }
+                }
+                mounts
+            },
             ..Default::default()
         }
     }
@@ -2010,6 +2268,241 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
             no_new_privileges: true,
             secrets,
+            ..Default::default()
+        }
+    }
+
+    /// Create container config for the worker container
+    ///
+    /// The worker runs `opencode serve` in a similar configuration to the agent (task owner),
+    /// but with different volume mounts reflecting its position in the hierarchy:
+    /// - Has its own workspace volume at `/workspaces/<project>` (read-write)
+    /// - Mounts task owner's workspace read-only at `/mnt/owner-workspace`
+    /// - Mounts main workspace read-only at `/mnt/main-workspace` (for git alternates chain)
+    /// - Has git remote `owner` pointing to `/mnt/owner-workspace/<project>`
+    ///
+    /// The `gator_mode` controls service-gator access:
+    /// - `Readonly`: Worker can only read from forge (no PRs, no pushes)
+    /// - `Inherit`: Worker gets same gator scopes as task owner
+    /// - `None`: Worker has no gator access
+    #[allow(clippy::too_many_arguments)]
+    fn worker_container_config(
+        _project_path: &Path,
+        workspace_folder: &str,
+        bind_home: &BindHomeConfig,
+        _container_home: &str,
+        devcontainer_config: Option<&DevcontainerConfig>,
+        enable_gator: bool,
+        gator_mode: WorkerGatorMode,
+        main_workspace_volume: &str,
+        owner_workspace_volume: &str,
+        worker_workspace_volume: &str,
+        worker_home_volume: &str,
+        agent_home_volume: &str,
+        global_config: &crate::config::Config,
+    ) -> ContainerConfig {
+        // Worker uses the same home path pattern as the agent
+        let worker_home = AGENT_HOME_PATH.to_string();
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("HOME".to_string(), worker_home.clone());
+
+        // Ensure worker can find opencode in PATH
+        env.insert(
+            "PATH".to_string(),
+            "/usr/local/bin:/usr/bin:/bin".to_string(),
+        );
+        // Tell opencode to create its config in the worker home
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            format!("{worker_home}/.config"),
+        );
+        env.insert(
+            "XDG_DATA_HOME".to_string(),
+            format!("{worker_home}/.local/share"),
+        );
+
+        // Forward env vars to the worker container (same pattern as agent)
+        for (key, value) in std::env::vars() {
+            if let Some(stripped) = key.strip_prefix("DEVAIPOD_AGENT_") {
+                if !stripped.is_empty() {
+                    env.insert(stripped.to_string(), value);
+                }
+            }
+        }
+
+        // Forward env vars from devcontainer.json's customizations.devaipod.env_allowlist
+        if let Some(config) = devcontainer_config {
+            for (key, value) in config.collect_allowlist_env_vars() {
+                env.insert(key, value);
+            }
+        }
+
+        // Add env vars from global config (allowlist + explicit vars)
+        env.extend(global_config.env.collect());
+
+        // Auto-allow all tool permissions so worker never prompts interactively.
+        // This is required because the worker is driven programmatically by the task owner
+        // via `opencode run --attach` and cannot respond to interactive permission prompts.
+        env.insert(
+            "OPENCODE_PERMISSION".to_string(),
+            r#"{"*":"allow"}"#.to_string(),
+        );
+
+        let mounts = vec![];
+
+        // Get security settings from devcontainer config (same as agent)
+        let (devices, privileged, security_opts, cap_add) =
+            if let Some(config) = devcontainer_config {
+                let mut devices: Vec<String> = DEV_PASSTHROUGH_PATHS
+                    .iter()
+                    .filter(|path| Path::new(path).exists())
+                    .map(|path| path.to_string())
+                    .collect();
+
+                for device_spec in config.device_args() {
+                    let path = device_spec.split(':').next().unwrap_or(&device_spec);
+                    if !path.is_empty() && !devices.contains(&path.to_string()) {
+                        devices.push(path.to_string());
+                    }
+                }
+
+                let privileged = config.privileged || config.has_privileged_run_arg();
+
+                let mut security_opts = config.security_opt.clone();
+                for opt in config.security_opt_args() {
+                    if !security_opts.contains(&opt) {
+                        security_opts.push(opt);
+                    }
+                }
+
+                (devices, privileged, security_opts, config.cap_add.clone())
+            } else {
+                (vec![], false, vec![], vec![])
+            };
+
+        // Handle gcloud ADC path (same as agent)
+        const GCLOUD_ADC_PATH: &str = ".config/gcloud/application_default_credentials.json";
+        if bind_home.paths.iter().any(|p| p == GCLOUD_ADC_PATH) {
+            if let Some(host_home) = get_host_home() {
+                if host_home.join(GCLOUD_ADC_PATH).exists() {
+                    env.insert(
+                        "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                        format!("{}/{}", worker_home, GCLOUD_ADC_PATH),
+                    );
+                }
+            }
+        }
+
+        // Configure service-gator access based on gator_mode
+        if enable_gator && gator_mode != WorkerGatorMode::None {
+            // Worker gets access to service-gator MCP server
+            // Note: The actual scope restrictions (readonly vs inherit) are enforced
+            // by the gator container's scope configuration, not here.
+            // For now, both Readonly and Inherit connect to the same gator instance.
+            // Future: could use different gator instances or JWT scopes.
+            let mcp_config = serde_json::json!({
+                "mcp": {
+                    "service-gator": {
+                        "type": "remote",
+                        "url": format!("http://localhost:{}/mcp", GATOR_PORT),
+                        "enabled": true
+                    }
+                }
+            });
+            env.insert(
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                mcp_config.to_string(),
+            );
+            tracing::debug!(
+                "Worker gator mode: {:?} - connecting to service-gator",
+                gator_mode
+            );
+        }
+
+        // Worker startup script - runs opencode serve (no auth proxy needed since
+        // worker is not directly accessed from host)
+        // Note: The agent-home volume has dotfiles cloned to .dotfiles/ but they may not
+        // be installed yet (install happens after containers start). We try both paths.
+        let startup_script = format!(
+            r#"set -e
+mkdir -p {home}/.config {home}/.local/share {home}/.local/bin {home}/.cache
+
+# Copy essential config from agent home (must happen before opencode starts)
+# Try installed location first, then dotfiles source
+
+# Copy LLM provider credentials (these come from dotfiles install)
+if [ -d /mnt/agent-home/.config/gcloud ]; then
+    cp -r /mnt/agent-home/.config/gcloud {home}/.config/
+elif [ -d /mnt/agent-home/.dotfiles/dotfiles/.config/gcloud ]; then
+    cp -r /mnt/agent-home/.dotfiles/dotfiles/.config/gcloud {home}/.config/
+fi
+
+# Copy opencode config
+if [ -d /mnt/agent-home/.config/opencode ]; then
+    cp -r /mnt/agent-home/.config/opencode {home}/.config/
+elif [ -d /mnt/agent-home/.dotfiles/dotfiles/.config/opencode ]; then
+    cp -r /mnt/agent-home/.dotfiles/dotfiles/.config/opencode {home}/.config/
+fi
+
+# Copy git identity
+if [ -f /mnt/agent-home/.gitconfig ]; then
+    cp /mnt/agent-home/.gitconfig {home}/.gitconfig
+elif [ -f /mnt/agent-home/.dotfiles/dotfiles/.gitconfig ]; then
+    cp /mnt/agent-home/.dotfiles/dotfiles/.gitconfig {home}/.gitconfig
+fi
+
+# Run opencode serve in foreground
+exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
+            home = AGENT_HOME_PATH,
+            opencode_port = WORKER_OPENCODE_PORT // Worker uses a different port to avoid conflict with agent and auth proxy
+        );
+
+        ContainerConfig {
+            mounts,
+            env,
+            workdir: Some(workspace_folder.to_string()),
+            user: None,
+            command: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                startup_script,
+            ]),
+            // Security settings match agent/workspace container
+            drop_all_caps: false,
+            cap_add,
+            no_new_privileges: false,
+            devices,
+            security_opts,
+            privileged,
+            // Mount volumes:
+            // - worker_workspace_volume at /workspaces: worker's own git clone (read-write)
+            // - owner_workspace_volume at /mnt/owner-workspace:ro: task owner's workspace
+            // - main_workspace_volume at /mnt/main-workspace:ro: human's workspace (for alternates chain)
+            // - worker_home_volume at AGENT_HOME_PATH: worker's own home (read-write)
+            // - agent_home_volume at /mnt/agent-home:ro: agent's home for LLM credentials
+            volume_mounts: vec![
+                (
+                    worker_workspace_volume.to_string(),
+                    "/workspaces".to_string(),
+                ),
+                (
+                    owner_workspace_volume.to_string(),
+                    "/mnt/owner-workspace:ro".to_string(),
+                ),
+                (
+                    main_workspace_volume.to_string(),
+                    "/mnt/main-workspace:ro".to_string(),
+                ),
+                (
+                    worker_home_volume.to_string(),
+                    AGENT_HOME_PATH.to_string(), // Worker's own home, read-write
+                ),
+                (
+                    agent_home_volume.to_string(),
+                    "/mnt/agent-home:ro".to_string(), // Agent's home for LLM credentials
+                ),
+            ],
             ..Default::default()
         }
     }
@@ -2158,9 +2651,11 @@ mod tests {
             container_home,
             None,
             false,                  // enable_gator
+            false,                  // enable_orchestration
             "test-main-workspace",  // main workspace (read-only reference)
             "test-agent-workspace", // agent's own workspace clone
             "test-agent-home",
+            None, // worker_workspace_volume (no orchestration)
             &global_config,
             "test-password",
         );
@@ -2208,6 +2703,63 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_container_config_with_orchestration() {
+        // Test that agent container mounts worker workspace when orchestration is enabled
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false,                  // enable_gator
+            true,                   // enable_orchestration
+            "test-main-workspace",  // main workspace (read-only reference)
+            "test-agent-workspace", // agent's own workspace clone
+            "test-agent-home",
+            Some("test-worker-workspace"), // worker_workspace_volume
+            &global_config,
+            "test-password",
+        );
+
+        // With orchestration enabled, should have 4 volume mounts:
+        // 1. Agent workspace at /workspaces
+        // 2. Main workspace at /mnt/main-workspace:ro
+        // 3. Agent home at AGENT_HOME_PATH
+        // 4. Worker workspace at /mnt/worker-workspace:ro
+        assert_eq!(container_config.volume_mounts.len(), 4);
+        assert_eq!(container_config.volume_mounts[0].0, "test-agent-workspace");
+        assert_eq!(container_config.volume_mounts[0].1, "/workspaces");
+        assert_eq!(container_config.volume_mounts[1].0, "test-main-workspace");
+        assert_eq!(
+            container_config.volume_mounts[1].1,
+            "/mnt/main-workspace:ro"
+        );
+        assert_eq!(container_config.volume_mounts[2].0, "test-agent-home");
+        assert_eq!(container_config.volume_mounts[2].1, AGENT_HOME_PATH);
+        assert_eq!(container_config.volume_mounts[3].0, "test-worker-workspace");
+        assert_eq!(
+            container_config.volume_mounts[3].1,
+            "/mnt/worker-workspace:ro"
+        );
+
+        // With orchestration enabled, agent should have OPENCODE_WORKER_URL set
+        assert!(
+            container_config.env.contains_key("OPENCODE_WORKER_URL"),
+            "Agent container should have OPENCODE_WORKER_URL when orchestration is enabled"
+        );
+        assert_eq!(
+            container_config.env.get("OPENCODE_WORKER_URL").unwrap(),
+            &format!("http://localhost:{}", WORKER_OPENCODE_PORT)
+        );
+    }
+
+    #[test]
     fn test_agent_bind_home_uses_podman_cp() {
         // Test that agent container config doesn't include bind_home mounts
         // (we use podman cp after container starts instead)
@@ -2227,9 +2779,11 @@ mod tests {
             container_home,
             None,
             false, // enable_gator
+            false, // enable_orchestration
             "test-main-workspace",
             "test-agent-workspace",
             "test-agent-home",
+            None, // worker_workspace_volume
             &global_config,
             "test-password",
         );
@@ -2539,9 +3093,11 @@ mod tests {
             container_home,
             None,
             false, // enable_gator
+            false, // enable_orchestration
             "test-main-workspace",
             "test-agent-workspace",
             "test-agent-home",
+            None, // worker_workspace_volume
             &global_config,
             "test-password",
         );
@@ -2864,5 +3420,170 @@ mod tests {
             container_config2.privileged,
             "both set should still be privileged"
         );
+    }
+
+    #[test]
+    fn test_worker_container_config() {
+        use crate::config::WorkerGatorMode;
+
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::worker_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false,                     // enable_gator
+            WorkerGatorMode::Readonly, // gator_mode
+            "test-main-workspace",     // main workspace (read-only)
+            "test-owner-workspace",    // task owner workspace (read-only)
+            "test-worker-workspace",   // worker's own workspace
+            "test-worker-home",        // worker's own home (read-write)
+            "test-agent-home",         // agent's home for LLM credentials (read-only)
+            &global_config,
+        );
+
+        // Volume mounts: worker workspace, owner workspace (readonly), main workspace (readonly), worker home, agent home (readonly)
+        assert_eq!(container_config.volume_mounts.len(), 5);
+        // Worker's own workspace at /workspaces
+        assert_eq!(container_config.volume_mounts[0].0, "test-worker-workspace");
+        assert_eq!(container_config.volume_mounts[0].1, "/workspaces");
+        // Task owner workspace as read-only reference
+        assert_eq!(container_config.volume_mounts[1].0, "test-owner-workspace");
+        assert_eq!(
+            container_config.volume_mounts[1].1,
+            "/mnt/owner-workspace:ro"
+        );
+        // Main workspace as read-only (for git alternates chain)
+        assert_eq!(container_config.volume_mounts[2].0, "test-main-workspace");
+        assert_eq!(
+            container_config.volume_mounts[2].1,
+            "/mnt/main-workspace:ro"
+        );
+        // Worker home volume (read-write for worker's own state)
+        assert_eq!(container_config.volume_mounts[3].0, "test-worker-home");
+        assert_eq!(
+            container_config.volume_mounts[3].1,
+            AGENT_HOME_PATH.to_string()
+        );
+        // Agent home volume (read-only for LLM credentials)
+        assert_eq!(container_config.volume_mounts[4].0, "test-agent-home");
+        assert_eq!(container_config.volume_mounts[4].1, "/mnt/agent-home:ro");
+
+        // Verify command runs opencode serve on different port than agent
+        let cmd = container_config.command.as_ref().unwrap();
+        assert_eq!(cmd[0], "/bin/sh");
+        assert_eq!(cmd[1], "-c");
+        assert!(cmd[2].contains("opencode serve"));
+        // Worker uses WORKER_OPENCODE_PORT to avoid conflict with task owner and auth proxy
+        assert!(cmd[2].contains(&format!("--port {}", WORKER_OPENCODE_PORT)));
+
+        // Worker has same security settings as agent (not restricted)
+        assert!(!container_config.drop_all_caps);
+        assert!(!container_config.no_new_privileges);
+
+        // Verify worker has HOME set correctly
+        assert_eq!(
+            container_config.env.get("HOME"),
+            Some(&AGENT_HOME_PATH.to_string())
+        );
+
+        // Worker should have OPENCODE_PERMISSION set to auto-allow all tools
+        // This prevents interactive permission prompts when driven via opencode run --attach
+        assert!(
+            container_config.env.contains_key("OPENCODE_PERMISSION"),
+            "Worker should have OPENCODE_PERMISSION set"
+        );
+        assert_eq!(
+            container_config.env.get("OPENCODE_PERMISSION"),
+            Some(&r#"{"*":"allow"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_worker_container_config_with_gator_inherit() {
+        use crate::config::WorkerGatorMode;
+
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::worker_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            true,                     // enable_gator
+            WorkerGatorMode::Inherit, // gator_mode - inherits task owner scopes
+            "test-main-workspace",
+            "test-owner-workspace",
+            "test-worker-workspace",
+            "test-worker-home",
+            "test-agent-home",
+            &global_config,
+        );
+
+        // Verify gator MCP config is set
+        assert!(
+            container_config.env.contains_key("OPENCODE_CONFIG_CONTENT"),
+            "Worker with gator=inherit should have MCP config"
+        );
+        let mcp_config = container_config.env.get("OPENCODE_CONFIG_CONTENT").unwrap();
+        assert!(
+            mcp_config.contains("service-gator"),
+            "MCP config should reference service-gator"
+        );
+    }
+
+    #[test]
+    fn test_worker_container_config_with_gator_none() {
+        use crate::config::WorkerGatorMode;
+
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::worker_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            true,                  // enable_gator
+            WorkerGatorMode::None, // gator_mode - no gator access
+            "test-main-workspace",
+            "test-owner-workspace",
+            "test-worker-workspace",
+            "test-worker-home",
+            "test-agent-home",
+            &global_config,
+        );
+
+        // Verify gator MCP config is NOT set when mode is None
+        assert!(
+            !container_config.env.contains_key("OPENCODE_CONFIG_CONTENT"),
+            "Worker with gator=none should not have MCP config"
+        );
+    }
+
+    #[test]
+    fn test_worker_container_names() {
+        // Verify naming convention for worker container
+        let pod_name = "test-project";
+        let worker = format!("{}-worker", pod_name);
+        let worker_workspace_volume = format!("{}-worker-workspace", pod_name);
+
+        assert_eq!(worker, "test-project-worker");
+        assert_eq!(worker_workspace_volume, "test-project-worker-workspace");
     }
 }

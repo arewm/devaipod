@@ -130,3 +130,27 @@ devaipod up . --service-gator=github:myorg/myrepo --service-gator-image localhos
 ```
 
 See [Service-gator Integration](service-gator.md) for full details.
+
+## Multi-Agent Orchestration
+
+Every devaipod workspace includes a worker container alongside the task owner agent. The task owner delegates subtasks to the worker and reviews its commits before merging.
+
+Configure worker behavior in `~/.config/devaipod.toml`:
+
+```toml
+[orchestration]
+worker_timeout = "30m"   # Timeout for worker subtasks
+
+[orchestration.worker]
+# How the worker accesses service-gator
+# Options: "readonly" (default), "inherit", "none"
+gator = "readonly"
+```
+
+**Worker gator options:**
+
+- `"readonly"`: Worker can only read from forge (no PRs, no pushes) — **default**
+- `"inherit"`: Worker gets same gator scopes as task owner
+- `"none"`: Worker has no gator access
+
+The worker is one step further from human review, so it has restricted access by default.

@@ -622,6 +622,108 @@ echo "Agent workspace cloned successfully at commit {short_commit}"
     )
 }
 
+/// Generate script to clone the worker workspace from the task owner's workspace
+///
+/// The worker gets its own isolated git clone. We use `--shared` for fast initial
+/// cloning, then immediately dissociate (repack and remove alternates) to make the
+/// clone self-contained. This is necessary because:
+///
+/// 1. The alternates file would point to `/mnt/owner-workspace/...` paths
+/// 2. When the task owner fetches from the worker (mounted at `/mnt/worker-workspace`),
+///    git tries to follow the alternates, but those paths don't exist in the owner's
+///    container (it has `/mnt/main-workspace`, not `/mnt/owner-workspace`)
+///
+/// The script:
+/// 1. Clones from the task owner's workspace using --shared (fast, no network)
+/// 2. Dissociates: repacks all objects locally and removes the alternates file
+/// 3. Sets up an `owner` remote pointing to the task owner's workspace
+/// 4. Checkouts the same commit as the task owner
+/// 5. Optionally chowns to target user
+///
+/// Parameters:
+/// - `workspace_folder`: Target path for the clone (e.g., "/workspaces/project")
+/// - `reference_git_path`: Path to the task owner's workspace (e.g., "/mnt/owner-workspace/project")
+/// - `git_info`: Git repository info from the task owner's workspace
+/// - `target_user`: Optional user to chown the workspace to
+pub fn clone_worker_workspace_script(
+    workspace_folder: &str,
+    reference_git_path: &str,
+    git_info: &GitRepoInfo,
+    target_user: Option<&str>,
+) -> String {
+    // Clone from the task owner's workspace using --shared for speed,
+    // then dissociate to make the clone self-contained.
+    let clone_source = format!(
+        r#"# Clone from task owner workspace with shared objects (for speed)
+git clone --shared "{reference}/.git" "{workspace}" 2>&1
+
+cd "{workspace}"
+
+# Dissociate: repack all objects locally and remove alternates file
+# This makes the clone self-contained, which is necessary because the alternates
+# path (/mnt/owner-workspace/...) won't exist when others fetch from this repo
+git repack -a -d
+rm -f .git/objects/info/alternates"#,
+        reference = reference_git_path,
+        workspace = workspace_folder,
+    );
+
+    // Set up remotes: origin for upstream, owner for task owner's workspace
+    let setup_remotes = if let Some(ref url) = git_info.remote_url {
+        format!(
+            r#"
+# Ensure origin remote is set correctly
+git remote set-url origin "{url}" 2>/dev/null || git remote add origin "{url}"
+
+# Add 'owner' remote pointing to task owner's workspace for fetching their commits
+git remote add owner "{reference}/.git" 2>/dev/null || git remote set-url owner "{reference}/.git"
+"#,
+            url = url,
+            reference = reference_git_path
+        )
+    } else {
+        // Even without origin URL, add the owner remote
+        format!(
+            r#"
+# Add 'owner' remote pointing to task owner's workspace for fetching their commits
+git remote add owner "{reference}/.git" 2>/dev/null || git remote set-url owner "{reference}/.git"
+"#,
+            reference = reference_git_path
+        )
+    };
+
+    format!(
+        r#"
+set -e
+echo "Cloning worker workspace from task owner workspace..."
+mkdir -p "$(dirname "{workspace}")"
+
+# Mark the reference git directories as safe (different ownership in container)
+git config --global --add safe.directory "{reference}/.git"
+git config --global --add safe.directory "{reference}"
+
+{clone_source}
+
+# Checkout the exact commit from the task owner's workspace
+git checkout "{commit}" 2>&1
+{setup_remotes}
+{chown_cmd}
+echo "Worker workspace cloned successfully at commit {short_commit}"
+"#,
+        workspace = workspace_folder,
+        reference = reference_git_path,
+        clone_source = clone_source,
+        commit = git_info.commit_sha,
+        setup_remotes = setup_remotes,
+        short_commit = &git_info.commit_sha[..git_info.commit_sha.len().min(8)],
+        chown_cmd = target_user
+            .map(|u| format!(
+                "# Set ownership to target user\nchown -R {u}:{u} \"{workspace_folder}\""
+            ))
+            .unwrap_or_default(),
+    )
+}
+
 /// Extract repository name from a git URL
 ///
 /// Handles both HTTPS and SSH formats:
@@ -1104,6 +1206,111 @@ mod tests {
         // Should still clone from local reference with shared objects
         assert!(script.contains("--shared"));
         // Should NOT have chown
+        assert!(
+            !script.contains("chown"),
+            "should not chown without target user"
+        );
+    }
+
+    #[test]
+    fn test_clone_worker_workspace_script_with_remote() {
+        let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/home/user/project"),
+            remote_url: Some("https://github.com/owner/repo.git".to_string()),
+            commit_sha: "abc123def456789".to_string(),
+            branch: Some("main".to_string()),
+            is_dirty: false,
+            dirty_files: vec![],
+        };
+
+        let script = clone_worker_workspace_script(
+            "/workspaces/project",
+            "/mnt/owner-workspace/project",
+            &info,
+            Some("devenv"),
+        );
+
+        // Should clone from task owner's workspace with shared objects (for speed)
+        assert!(
+            script.contains("--shared"),
+            "should use --shared for initial clone speed"
+        );
+        // Should reference the task owner's workspace
+        assert!(
+            script.contains("/mnt/owner-workspace/project/.git"),
+            "should reference owner workspace .git"
+        );
+        // Should dissociate: repack and remove alternates
+        assert!(
+            script.contains("git repack -a -d"),
+            "should repack to copy objects locally"
+        );
+        assert!(
+            script.contains("rm -f .git/objects/info/alternates"),
+            "should remove alternates file to make clone self-contained"
+        );
+        // Should set up origin remote URL
+        assert!(
+            script.contains("https://github.com/owner/repo.git"),
+            "should configure origin remote URL"
+        );
+        // Should set up 'owner' remote pointing to task owner's workspace
+        assert!(
+            script.contains("git remote add owner") || script.contains("git remote set-url owner"),
+            "should configure owner remote"
+        );
+        // Should checkout the exact commit
+        assert!(
+            script.contains("abc123def456789"),
+            "should checkout the commit"
+        );
+        // Should chown to target user
+        assert!(
+            script.contains("chown -R devenv:devenv"),
+            "should chown to target user"
+        );
+        // Should mark directories as safe
+        assert!(
+            script.contains("safe.directory"),
+            "should mark directories as safe"
+        );
+    }
+
+    #[test]
+    fn test_clone_worker_workspace_script_no_remote() {
+        let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/home/user/project"),
+            remote_url: None,
+            commit_sha: "abc123def".to_string(),
+            branch: None,
+            is_dirty: false,
+            dirty_files: vec![],
+        };
+
+        let script = clone_worker_workspace_script(
+            "/workspaces/project",
+            "/mnt/owner-workspace/project",
+            &info,
+            None,
+        );
+
+        // Should still clone from task owner's workspace with shared objects (for speed)
+        assert!(script.contains("--shared"));
+        // Should dissociate to make clone self-contained
+        assert!(
+            script.contains("git repack -a -d"),
+            "should repack to copy objects locally"
+        );
+        assert!(
+            script.contains("rm -f .git/objects/info/alternates"),
+            "should remove alternates file"
+        );
+        // Should still set up 'owner' remote even without origin URL
+        assert!(
+            script.contains("git remote add owner") || script.contains("git remote set-url owner"),
+            "should configure owner remote even without origin"
+        );
+        // Should NOT have chown without target user
         assert!(
             !script.contains("chown"),
             "should not chown without target user"
