@@ -197,16 +197,8 @@ pub const GATOR_PORT: u16 = 8765;
 /// Image for the service-gator container
 const GATOR_IMAGE: &str = "ghcr.io/cgwalters/service-gator:latest";
 
-/// Label name for storing the service-gator admin key
-/// This key is used to access the admin API for minting JWT tokens
-pub const GATOR_ADMIN_KEY_LABEL: &str = "io.devaipod.gator-admin-key";
-
-/// Label name for storing the service-gator JWT secret
-/// This is used to mint new tokens for the agent
-pub const GATOR_JWT_SECRET_LABEL: &str = "io.devaipod.gator-jwt-secret";
-
 /// Label name for storing the current service-gator scopes as JSON
-/// This is used by `devaipod service-gator edit` to show current scopes
+/// Used for backwards compatibility with pre-inotify pods
 pub const GATOR_SCOPES_LABEL: &str = "io.devaipod.gator-scopes";
 
 /// Configuration for bind_home mounts passed to container config functions
@@ -458,39 +450,6 @@ impl DevaipodPod {
         let api_password = generate_api_password();
         labels.push(("io.devaipod.api-password".to_string(), api_password.clone()));
 
-        // Generate secrets for service-gator JWT-based dynamic scopes (if gator enabled)
-        // These allow minting JWT tokens with specific scopes after pod creation
-        let gator_jwt_token = if enable_gator {
-            let jwt_secret = generate_api_password(); // 32 hex chars for JWT signing
-            let admin_key = generate_api_password(); // 32 hex chars for admin API access
-
-            // Store secrets in pod labels so `devaipod service-gator edit` can use them
-            labels.push((GATOR_ADMIN_KEY_LABEL.to_string(), admin_key.clone()));
-            labels.push((GATOR_JWT_SECRET_LABEL.to_string(), jwt_secret.clone()));
-
-            // Get the effective service-gator config for minting the initial token
-            let sg_config = service_gator_config.unwrap_or(&global_config.service_gator);
-
-            // Store scopes as JSON for later retrieval by `devaipod service-gator edit`
-            let jwt_scopes = crate::service_gator::config_to_jwt_scopes(sg_config);
-            if let Ok(scopes_json) = serde_json::to_string(&jwt_scopes) {
-                labels.push((GATOR_SCOPES_LABEL.to_string(), scopes_json));
-            }
-
-            // Mint the initial JWT token with auto-detected scopes
-            let token = crate::service_gator::mint_token(
-                &jwt_secret,
-                sg_config,
-                None, // Use default expiration (30 days)
-                Some(pod_name), // Subject = pod name for audit logging
-            )
-            .context("Failed to mint initial JWT token for service-gator")?;
-
-            Some((jwt_secret, admin_key, token))
-        } else {
-            None
-        };
-
         // Publish the auth proxy port to a random localhost port for host access.
         // The proxy handles Basic Auth and forwards to the opencode server.
         // This is a workaround for https://github.com/anomalyco/opencode/issues/8458
@@ -623,19 +582,12 @@ impl DevaipodPod {
         Self::write_scripts_to_volume(podman, &image, &agent_home_volume).await?;
 
         // Write gator config to agent home volume (if gator is enabled)
-        // This stores JWT secrets and scopes persistently for `devaipod gator add/edit`
-        if let Some((jwt_secret, admin_key, _token)) = &gator_jwt_token {
+        // Gator watches this file via inotify for live scope updates
+        if enable_gator {
             let sg_config = service_gator_config.unwrap_or(&global_config.service_gator);
             let jwt_scopes = crate::service_gator::config_to_jwt_scopes(sg_config);
-            Self::write_gator_config_to_volume(
-                podman,
-                &image,
-                &agent_home_volume,
-                jwt_secret,
-                admin_key,
-                &jwt_scopes,
-            )
-            .await?;
+            Self::write_gator_config_to_volume(podman, &image, &agent_home_volume, &jwt_scopes)
+                .await?;
         }
 
         // Clone dotfiles to agent home volume if configured
@@ -681,8 +633,6 @@ impl DevaipodPod {
 
         // Create agent container with restricted security
         // Agent gets its own workspace clone and read-only access to main workspace
-        // If gator is enabled, the agent gets a JWT token for authenticating with service-gator
-        let gator_token = gator_jwt_token.as_ref().map(|(_, _, token)| token.as_str());
         let agent_config = Self::agent_container_config(
             project_path,
             &workspace_folder,
@@ -695,7 +645,6 @@ impl DevaipodPod {
             &agent_home_volume,
             global_config,
             &api_password,
-            gator_token,
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -724,23 +673,16 @@ impl DevaipodPod {
                 }
             }
 
-            // Use provided service_gator_config or fall back to global_config.service_gator
-            let sg_config = service_gator_config.unwrap_or(&global_config.service_gator);
             // Mount the AGENT workspace volume where the agent's commits are, plus
             // the main workspace volume at /mnt/main-workspace because the agent's
             // git clone uses alternates pointing there for object sharing.
-            // Pass the JWT and admin secrets for dynamic scope configuration
-            let (jwt_secret, admin_key, _token) = gator_jwt_token
-                .as_ref()
-                .expect("gator_jwt_token should be set when enable_gator is true");
+            // Also mount agent-home volume so gator can read the scope config file
             let gator_config = Self::gator_container_config(
                 &agent_workspace_volume,
                 "/workspaces",
                 &volume_name,
-                Some(sg_config),
+                &agent_home_volume,
                 global_config,
-                jwt_secret,
-                admin_key,
             );
             podman
                 .create_container(&gator_container_name, gator_image, pod_name, gator_config)
@@ -1172,21 +1114,15 @@ chmod +x {agent_home}/scripts/auth_proxy.py
 
     /// Write gator configuration to the agent home volume
     ///
-    /// This stores JWT secrets and scopes persistently so they survive container
-    /// restarts and can be updated via `devaipod gator add/edit`.
+    /// This stores scopes persistently so they survive container restarts and can
+    /// be updated via `devaipod gator add/edit`. Gator watches this file via inotify.
     async fn write_gator_config_to_volume(
         podman: &PodmanService,
         image: &str,
         agent_home_volume: &str,
-        jwt_secret: &str,
-        admin_key: &str,
         scopes: &crate::service_gator::JwtScopeConfig,
     ) -> Result<()> {
-        let config = crate::service_gator::GatorConfigFile::new(
-            jwt_secret.to_string(),
-            admin_key.to_string(),
-            scopes.clone(),
-        );
+        let config = crate::service_gator::GatorConfigFile::new(scopes.clone());
 
         let config_json = serde_json::to_string_pretty(&config)
             .context("Failed to serialize gator config")?;
@@ -1202,7 +1138,7 @@ mkdir -p "$(dirname '{config_path}')"
 cat > '{config_path}' << 'GATOR_CONFIG_EOF'
 {config_json}
 GATOR_CONFIG_EOF
-chmod 600 '{config_path}'
+chmod 644 '{config_path}'
 "#,
             config_path = config_path,
             config_json = escaped_json,
@@ -1791,10 +1727,7 @@ exec sleep infinity
     /// will be forwarded to the agent.
     ///
     /// If `enable_gator` is true, OPENCODE_CONFIG_CONTENT is set with MCP config
-    /// to connect opencode to the service-gator container.
-    ///
-    /// If `gator_token` is provided, it's included in the MCP config headers for
-    /// JWT-based authentication with service-gator.
+    /// to connect opencode to the service-gator container (no auth needed).
     #[allow(clippy::too_many_arguments)]
     fn agent_container_config(
         _project_path: &Path,
@@ -1808,7 +1741,6 @@ exec sleep infinity
         agent_home_volume: &str,
         global_config: &crate::config::Config,
         api_password: &str,
-        gator_token: Option<&str>,
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
         let agent_home = AGENT_HOME_PATH.to_string();
@@ -1914,44 +1846,6 @@ exec sleep infinity
             }
         }
 
-        // If service-gator is enabled, set OPENCODE_CONFIG_CONTENT with MCP config
-        // This is merged with the user's existing opencode config (highest precedence)
-        if enable_gator {
-            let mcp_url = format!("http://localhost:{}/mcp", GATOR_PORT);
-
-            // Build the MCP config with JWT auth header if token is provided
-            let gator_config = if let Some(token) = gator_token {
-                serde_json::json!({
-                    "mcp": {
-                        "service-gator": {
-                            "type": "remote",
-                            "url": mcp_url,
-                            "enabled": true,
-                            "headers": {
-                                "Authorization": format!("Bearer {}", token)
-                            }
-                        }
-                    }
-                })
-            } else {
-                // Fallback for legacy mode (no JWT auth)
-                serde_json::json!({
-                    "mcp": {
-                        "service-gator": {
-                            "type": "remote",
-                            "url": mcp_url,
-                            "enabled": true
-                        }
-                    }
-                })
-            };
-
-            env.insert(
-                "OPENCODE_CONFIG_CONTENT".to_string(),
-                gator_config.to_string(),
-            );
-        }
-
         // Build the startup script that runs both opencode serve and the auth proxy.
         // The auth proxy provides authenticated access from the host, working around
         // https://github.com/anomalyco/opencode/issues/8458 where `opencode attach`
@@ -1962,6 +1856,25 @@ exec sleep infinity
         // - auth_proxy.py: listens on 0.0.0.0:4097, requires Basic Auth, forwards to :4096
         // - Host access: published port -> 4097 -> auth checked -> 4096
         // - Internal access: opencode attach -> localhost:4096 (no auth needed)
+        //
+        // If service-gator is enabled, set OPENCODE_CONFIG_CONTENT with MCP config.
+        // No JWT auth needed - gator uses file-based scopes with inotify live reload.
+        if enable_gator {
+            let mcp_config = serde_json::json!({
+                "mcp": {
+                    "service-gator": {
+                        "type": "remote",
+                        "url": format!("http://localhost:{}/mcp", GATOR_PORT),
+                        "enabled": true
+                    }
+                }
+            });
+            env.insert(
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                mcp_config.to_string(),
+            );
+        }
+
         let startup_script = format!(
             r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
 
@@ -2028,30 +1941,24 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
     ///
     /// For dynamic scopes, the server starts with `--scope '{"server":{"mode":"required"}}'`
     /// which requires JWT tokens for all MCP requests. Tokens are minted via the admin API
-    /// using the `SERVICE_GATOR_ADMIN_KEY`.
-    ///
     /// The agent workspace volume is mounted read-only so tools like `git_push_local` can
     /// access the git repository to read commits for pushing.
     ///
     /// The main workspace volume is also mounted at `/mnt/main-workspace` (read-only) because
     /// the agent's git clone uses alternates pointing there for object sharing.
+    ///
+    /// The agent-home volume is mounted at `/gator-config` (read-only) so gator can read
+    /// the scope configuration file. Gator uses inotify to watch for changes, enabling
+    /// live scope updates via `devaipod gator add` without restart.
     fn gator_container_config(
         agent_workspace_volume: &str,
         workspace_folder: &str,
         main_workspace_volume: &str,
-        _sg_config: Option<&crate::config::ServiceGatorConfig>,
+        agent_home_volume: &str,
         global_config: &Config,
-        jwt_secret: &str,
-        admin_key: &str,
     ) -> ContainerConfig {
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), "/tmp".to_string());
-
-        // Add JWT secrets for dynamic scope configuration
-        // SERVICE_GATOR_SECRET: Used to sign JWT tokens
-        // SERVICE_GATOR_ADMIN_KEY: Used to authenticate admin API requests (e.g., mint-token)
-        env.insert("SERVICE_GATOR_SECRET".to_string(), jwt_secret.to_string());
-        env.insert("SERVICE_GATOR_ADMIN_KEY".to_string(), admin_key.to_string());
 
         // Add trusted env vars (GH_TOKEN, GITLAB_TOKEN, JIRA_API_TOKEN, etc.)
         // These are the credentials that service-gator needs to access external services
@@ -2061,32 +1968,37 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
         // No need for *_FILE pattern; podman sets the env var from the secret value
         let secrets = global_config.trusted_env.secret_mounts();
 
+        // The scope config file path inside the gator container
+        // Agent-home volume is mounted at /gator-config, config is at .devaipod/gator-config.json
+        let scope_file_path = format!("/gator-config/{}", crate::service_gator::GATOR_CONFIG_PATH);
+
         // Build the command args (not including binary name since image has ENTRYPOINT)
-        // Use JWT-based dynamic scopes: server starts with mode=required, no static scopes
-        // The agent will mint JWT tokens via POST /admin/mint-token with desired scopes
+        // Use --scope-file for inotify-based live reload of scopes
+        // No JWT auth needed - each pod has its own gator instance (not multi-tenant)
         let command = vec![
             "--mcp-server".to_string(),
             format!("0.0.0.0:{}", GATOR_PORT),
-            "--scope".to_string(),
-            r#"{"server":{"mode":"required"}}"#.to_string(),
+            "--scope-file".to_string(),
+            scope_file_path,
         ];
-
-        // Note: We no longer pass --gh-repo args here. Instead, scopes are configured
-        // dynamically by minting JWT tokens with the desired permissions. The sg_config
-        // is stored in pod labels and used when minting tokens via `devaipod service-gator edit`.
 
         // Mount the agent workspace volume read-only so git_push_local can access commits
         let agent_workspace_mount = format!("{}:ro", workspace_folder);
 
         ContainerConfig {
-            // Mount both volumes:
+            // Mount volumes:
             // 1. Agent workspace at /workspaces - where the agent's commits are
             // 2. Main workspace at /mnt/main-workspace - for git alternates object sharing
+            // 3. Agent home at /gator-config - for reading scope config (inotify watched)
             volume_mounts: vec![
                 (agent_workspace_volume.to_string(), agent_workspace_mount),
                 (
                     main_workspace_volume.to_string(),
                     "/mnt/main-workspace:ro".to_string(),
+                ),
+                (
+                    agent_home_volume.to_string(),
+                    "/gator-config:ro".to_string(),
                 ),
             ],
             env,
@@ -2251,7 +2163,6 @@ mod tests {
             "test-agent-home",
             &global_config,
             "test-password",
-            None, // gator_token
         );
 
         // Volume mounts: agent workspace, main workspace (readonly), and agent home
@@ -2321,7 +2232,6 @@ mod tests {
             "test-agent-home",
             &global_config,
             "test-password",
-            None, // gator_token
         );
 
         // No bind mounts - we clone the repo into the container instead
@@ -2338,21 +2248,18 @@ mod tests {
         let agent_workspace_volume = "test-agent-workspace";
         let workspace_folder = "/workspaces";
         let main_workspace_volume = "test-main-workspace";
+        let agent_home_volume = "test-agent-home";
         let global_config = crate::config::Config::default();
-        let jwt_secret = "test_jwt_secret_12345678901234";
-        let admin_key = "test_admin_key_123456789012345";
         let container_config = DevaipodPod::gator_container_config(
             agent_workspace_volume,
             workspace_folder,
             main_workspace_volume,
-            None,
+            agent_home_volume,
             &global_config,
-            jwt_secret,
-            admin_key,
         );
 
-        // Verify both volumes are mounted read-only
-        assert_eq!(container_config.volume_mounts.len(), 2);
+        // Verify all three volumes are mounted read-only
+        assert_eq!(container_config.volume_mounts.len(), 3);
         // Agent workspace at /workspaces
         assert_eq!(container_config.volume_mounts[0].0, "test-agent-workspace");
         assert_eq!(container_config.volume_mounts[0].1, "/workspaces:ro");
@@ -2362,23 +2269,18 @@ mod tests {
             container_config.volume_mounts[1].1,
             "/mnt/main-workspace:ro"
         );
+        // Agent home at /gator-config (for scope config file with inotify watch)
+        assert_eq!(container_config.volume_mounts[2].0, "test-agent-home");
+        assert_eq!(container_config.volume_mounts[2].1, "/gator-config:ro");
 
-        // Verify JWT secrets are set as env vars
-        assert_eq!(
-            container_config.env.get("SERVICE_GATOR_SECRET"),
-            Some(&jwt_secret.to_string())
-        );
-        assert_eq!(
-            container_config.env.get("SERVICE_GATOR_ADMIN_KEY"),
-            Some(&admin_key.to_string())
-        );
-
-        // Verify command uses JWT-based dynamic scopes (mode=required, no static scopes)
+        // Verify command uses --scope-file for inotify-based live reload
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "--mcp-server");
         assert!(cmd.iter().any(|s| s.contains(&GATOR_PORT.to_string())));
-        assert!(cmd.contains(&"--scope".to_string()));
-        assert!(cmd.iter().any(|s| s.contains(r#""mode":"required""#)));
+        assert!(cmd.contains(&"--scope-file".to_string()));
+        assert!(cmd
+            .iter()
+            .any(|s| s.contains(crate::service_gator::GATOR_CONFIG_PATH)));
 
         // Verify security restrictions
         assert!(container_config.drop_all_caps);
@@ -2390,65 +2292,23 @@ mod tests {
     }
 
     #[test]
-    fn test_gator_container_config_with_scopes() {
-        // With JWT-based dynamic scopes, the sg_config is no longer passed as CLI args.
-        // Instead, it's stored in pod labels and used when minting JWT tokens.
-        // The server always starts with mode=required.
-        let agent_workspace_volume = "test-agent-workspace";
-        let workspace_folder = "/workspaces";
-        let main_workspace_volume = "test-main-workspace";
-        let mut sg_config = crate::config::ServiceGatorConfig::default();
-        sg_config.gh.repos.insert(
-            "myorg/myrepo".to_string(),
-            crate::config::GhRepoPermission {
-                read: true,
-                create_draft: true,
-                ..Default::default()
-            },
-        );
-
-        let global_config = crate::config::Config::default();
-        let jwt_secret = "test_jwt_secret_12345678901234";
-        let admin_key = "test_admin_key_123456789012345";
-        let container_config = DevaipodPod::gator_container_config(
-            agent_workspace_volume,
-            workspace_folder,
-            main_workspace_volume,
-            Some(&sg_config),
-            &global_config,
-            jwt_secret,
-            admin_key,
-        );
-
-        // Verify command uses mode=required (not static --gh-repo args)
-        let cmd = container_config.command.as_ref().unwrap();
-        assert!(cmd.contains(&"--scope".to_string()));
-        assert!(cmd.iter().any(|s| s.contains(r#""mode":"required""#)));
-        // Static scopes are NOT passed as CLI args anymore
-        assert!(!cmd.contains(&"--gh-repo".to_string()));
-    }
-
-    #[test]
     fn test_gator_container_config_with_secrets() {
         let agent_workspace_volume = "test-agent-workspace";
         let workspace_folder = "/workspaces";
         let main_workspace_volume = "test-main-workspace";
+        let agent_home_volume = "test-agent-home";
         let mut global_config = crate::config::Config::default();
         global_config.trusted_env.secrets = vec![
             "GH_TOKEN=gh_token".to_string(),
             "GITLAB_TOKEN=gitlab_token".to_string(),
         ];
 
-        let jwt_secret = "test_jwt_secret_12345678901234";
-        let admin_key = "test_admin_key_123456789012345";
         let container_config = DevaipodPod::gator_container_config(
             agent_workspace_volume,
             workspace_folder,
             main_workspace_volume,
-            None,
+            agent_home_volume,
             &global_config,
-            jwt_secret,
-            admin_key,
         );
 
         // Verify secrets are listed for mounting as (env_var, secret_name) tuples
@@ -2471,6 +2331,7 @@ mod tests {
         let agent_workspace_volume = "test-agent-workspace";
         let workspace_folder = "/workspaces";
         let main_workspace_volume = "test-main-workspace";
+        let agent_home_volume = "test-agent-home";
         let mut global_config = crate::config::Config::default();
 
         // Add a secret
@@ -2483,16 +2344,12 @@ mod tests {
             .vars
             .insert("JIRA_API_TOKEN".to_string(), "jira_value".to_string());
 
-        let jwt_secret = "test_jwt_secret_12345678901234";
-        let admin_key = "test_admin_key_123456789012345";
         let container_config = DevaipodPod::gator_container_config(
             agent_workspace_volume,
             workspace_folder,
             main_workspace_volume,
-            None,
+            agent_home_volume,
             &global_config,
-            jwt_secret,
-            admin_key,
         );
 
         // Verify secret is listed as (env_var, secret_name) tuple
@@ -2687,7 +2544,6 @@ mod tests {
             "test-agent-home",
             &global_config,
             "test-password",
-            None, // gator_token
         );
 
         // Agent should have no secrets

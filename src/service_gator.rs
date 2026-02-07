@@ -285,10 +285,11 @@ pub fn config_to_cli_args(config: &ServiceGatorConfig) -> Vec<String> {
 }
 
 // =============================================================================
-// JWT Token Generation
+// JWT Token Generation (unused - kept for potential future use)
 // =============================================================================
 
 /// Default token lifetime: 30 days (in seconds)
+#[allow(dead_code)]
 pub const DEFAULT_TOKEN_EXPIRES_IN: u64 = 30 * 24 * 3600;
 
 /// Scope configuration for JWT tokens (matches service-gator's ScopeConfig)
@@ -348,7 +349,8 @@ impl From<&GhRepoPermission> for JwtGhRepoPermission {
     }
 }
 
-/// JWT claims for service-gator tokens
+/// JWT claims for service-gator tokens (unused - kept for potential future use)
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
     /// Issued-at timestamp (Unix seconds)
@@ -365,6 +367,7 @@ pub struct TokenClaims {
     pub can_rotate: bool,
 }
 
+#[allow(dead_code)]
 fn default_can_rotate() -> bool {
     true
 }
@@ -393,7 +396,7 @@ pub fn config_to_jwt_scopes(config: &ServiceGatorConfig) -> JwtScopeConfig {
     JwtScopeConfig { gh }
 }
 
-/// Mint a JWT token for service-gator
+/// Mint a JWT token for service-gator (unused - kept for potential future use)
 ///
 /// This generates a signed JWT token that can be used to authenticate
 /// with service-gator's MCP endpoint.
@@ -403,6 +406,7 @@ pub fn config_to_jwt_scopes(config: &ServiceGatorConfig) -> JwtScopeConfig {
 /// * `config` - The service-gator scope configuration
 /// * `expires_in` - Token lifetime in seconds (default: 30 days)
 /// * `subject` - Optional subject identifier for logging
+#[allow(dead_code)]
 pub fn mint_token(
     secret: &str,
     config: &ServiceGatorConfig,
@@ -432,9 +436,10 @@ pub fn mint_token(
     Ok(token)
 }
 
-/// Mint a JWT token from a JwtScopeConfig directly
+/// Mint a JWT token from a JwtScopeConfig directly (unused - kept for potential future use)
 ///
 /// This is used when we have already-parsed scopes (e.g., from editing).
+#[allow(dead_code)]
 pub fn mint_token_from_scopes(
     secret: &str,
     scopes: &JwtScopeConfig,
@@ -470,33 +475,41 @@ pub fn mint_token_from_scopes(
 
 /// Path to the gator config file within the agent home volume
 ///
-/// This file stores JWT secrets and scopes persistently, allowing
-/// `devaipod gator add/edit` to update scopes that survive restarts.
+/// This file stores scopes persistently, allowing `devaipod gator add/edit`
+/// to update scopes that survive restarts. Gator watches this file via
+/// inotify and reloads automatically when it changes.
 pub const GATOR_CONFIG_PATH: &str = ".devaipod/gator-config.json";
 
 /// Persistent gator configuration stored in the agent home volume
 ///
 /// This is written at pod creation and updated by `devaipod gator add/edit`.
-/// It replaces the immutable pod labels for scope storage.
+/// Gator watches this file via inotify for live reload.
+///
+/// The format matches what service-gator expects for --scope-file:
+/// ```json
+/// {
+///   "scopes": {
+///     "gh": { "repos": { "owner/repo": { "read": true } } }
+///   }
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatorConfigFile {
-    /// JWT signing secret (for minting tokens)
-    pub jwt_secret: String,
-    /// Admin API key (for service-gator admin endpoints)
-    pub admin_key: String,
     /// Current scope configuration
     pub scopes: JwtScopeConfig,
     /// When this config was last updated (Unix timestamp)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub updated_at: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl GatorConfigFile {
     /// Create a new gator config file
-    pub fn new(jwt_secret: String, admin_key: String, scopes: JwtScopeConfig) -> Self {
+    pub fn new(scopes: JwtScopeConfig) -> Self {
         Self {
-            jwt_secret,
-            admin_key,
             scopes,
             updated_at: now_unix(),
         }

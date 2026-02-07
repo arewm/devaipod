@@ -1219,6 +1219,17 @@ impl PodmanService {
         Ok(())
     }
 
+    /// Restart a container (unused - kept for potential future use)
+    #[allow(dead_code)]
+    pub async fn restart_container(&self, name: &str) -> Result<()> {
+        self.client
+            .restart_container(name, None)
+            .await
+            .with_context(|| format!("Failed to restart container {}", name))?;
+        tracing::debug!("Restarted container: {}", name);
+        Ok(())
+    }
+
     /// Remove a container
     #[allow(dead_code)]
     pub async fn remove_container(&self, name: &str, force: bool) -> Result<()> {

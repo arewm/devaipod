@@ -2189,24 +2189,12 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
     let gator_config: Option<service_gator::GatorConfigFile> = if let Some(content) = config_content {
         serde_json::from_str(&content).ok()
     } else {
-        // Backwards compat: read from pod labels (pre-volume pods)
-        let jwt_secret = labels.get(pod::GATOR_JWT_SECRET_LABEL);
-        let admin_key = labels.get(pod::GATOR_ADMIN_KEY_LABEL);
+        // Backwards compat: read scopes from pod labels (pre-volume pods)
         let scopes_json = labels.get(pod::GATOR_SCOPES_LABEL);
-
-        match (jwt_secret, admin_key) {
-            (Some(secret), Some(key)) => {
-                let scopes = scopes_json
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_default();
-                Some(service_gator::GatorConfigFile::new(
-                    secret.clone(),
-                    key.clone(),
-                    scopes,
-                ))
-            }
-            _ => None,
-        }
+        scopes_json.and_then(|s| {
+            let scopes: service_gator::JwtScopeConfig = serde_json::from_str(s).ok()?;
+            Some(service_gator::GatorConfigFile::new(scopes))
+        })
     };
 
     if gator_config.is_none() {
@@ -2277,24 +2265,16 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
             let new_scopes: service_gator::JwtScopeConfig = toml::from_str(&edited_content)
                 .context("Failed to parse edited TOML. Check for syntax errors.")?;
 
-            // Mint a new JWT token with the updated scopes
-            let token = service_gator::mint_token_from_scopes(
-                &gator_config.jwt_secret,
-                &new_scopes,
-                None, // Default expiration
-                Some(&pod_name),
-            )
-            .context("Failed to mint new JWT token")?;
-
             // Update the gator config file in the volume
+            // Gator watches this file via inotify and will reload automatically
             let mut updated_config = gator_config.clone();
             updated_config.update_scopes(new_scopes.clone());
             let updated_config_json = serde_json::to_string_pretty(&updated_config)
                 .context("Failed to serialize updated config")?;
 
             // Write updated config to a temp file and copy to container
-            let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-            let config_temp = temp_dir.path().join("gator-config.json");
+            let temp_dir2 = tempfile::tempdir().context("Failed to create temp directory")?;
+            let config_temp = temp_dir2.path().join("gator-config.json");
             std::fs::write(&config_temp, &updated_config_json)?;
 
             podman
@@ -2302,49 +2282,14 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
                 .await
                 .context("Failed to save updated gator config")?;
 
-            // Build the new MCP server config with the updated token
-            let mcp_url = format!("http://localhost:{}/mcp", pod::GATOR_PORT);
-            let mcp_config = serde_json::json!({
-                "type": "remote",
-                "url": mcp_url,
-                "enabled": true,
-                "headers": {
-                    "Authorization": format!("Bearer {}", token)
-                }
-            });
-
-            // Use opencode's POST /mcp API to dynamically update the MCP server config
-            // This allows scope changes without restarting the agent
-            let opencode_url = format!("http://127.0.0.1:{}/mcp", pod::OPENCODE_PORT);
-            let payload = serde_json::json!({
-                "name": "service-gator",
-                "config": mcp_config
-            });
-            
-            // Execute curl inside the agent container to update the MCP config
-            let curl_cmd = format!(
-                "curl -s -X POST -H 'Content-Type: application/json' -d '{}' '{}'",
-                payload.to_string().replace('\'', "'\\''"),
-                opencode_url
-            );
-            
-            let (exit_code, _stdout, _stderr) = podman
-                .exec_output(&agent_container, &["sh", "-c", &curl_cmd])
-                .await
-                .context("Failed to update opencode MCP config")?;
-
-            if exit_code != 0 {
-                eprintln!("Warning: Failed to update opencode MCP config dynamically.");
-                eprintln!("The agent may need to be restarted to pick up the new scopes.");
-                eprintln!("You can do this with: devaipod rebuild {}", strip_pod_prefix(&pod_name));
-            } else {
-                println!("Scopes updated and saved!");
-                println!();
-                println!("New scopes:");
-                println!("{}", toml::to_string_pretty(&new_scopes)?);
-                println!();
-                println!("The new scopes are now active and will persist across restarts.");
-            }
+            // No restart needed - gator watches the config file via inotify
+            // and will automatically reload the new scopes
+            println!("Scopes updated!");
+            println!();
+            println!("New scopes:");
+            println!("{}", toml::to_string_pretty(&new_scopes)?);
+            println!();
+            println!("Gator will automatically reload these scopes (no restart needed).");
         }
         GatorAction::Add { scopes, .. } => {
             // Parse the new scopes from CLI
@@ -2363,16 +2308,8 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
                 merged.gh.read = true;
             }
 
-            // Mint a new JWT token with the merged scopes
-            let token = service_gator::mint_token_from_scopes(
-                &gator_config.jwt_secret,
-                &merged,
-                None, // Default expiration
-                Some(&pod_name),
-            )
-            .context("Failed to mint new JWT token")?;
-
             // Update the gator config file in the volume
+            // Gator watches this file via inotify and will reload automatically
             let mut updated_config = gator_config.clone();
             updated_config.update_scopes(merged.clone());
             let updated_config_json = serde_json::to_string_pretty(&updated_config)
@@ -2388,48 +2325,14 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
                 .await
                 .context("Failed to save updated gator config")?;
 
-            // Build the new MCP server config with the updated token
-            let mcp_url = format!("http://localhost:{}/mcp", pod::GATOR_PORT);
-            let mcp_config = serde_json::json!({
-                "type": "remote",
-                "url": mcp_url,
-                "enabled": true,
-                "headers": {
-                    "Authorization": format!("Bearer {}", token)
-                }
-            });
-
-            // Use opencode's POST /mcp API to dynamically update the MCP server config
-            let opencode_url = format!("http://127.0.0.1:{}/mcp", pod::OPENCODE_PORT);
-            let payload = serde_json::json!({
-                "name": "service-gator",
-                "config": mcp_config
-            });
-            
-            // Execute curl inside the agent container to update the MCP config
-            let curl_cmd = format!(
-                "curl -s -X POST -H 'Content-Type: application/json' -d '{}' '{}'",
-                payload.to_string().replace('\'', "'\\''"),
-                opencode_url
-            );
-            
-            let (exit_code, _stdout, _stderr) = podman
-                .exec_output(&agent_container, &["sh", "-c", &curl_cmd])
-                .await
-                .context("Failed to update opencode MCP config")?;
-
-            if exit_code != 0 {
-                eprintln!("Warning: Failed to update opencode MCP config dynamically.");
-                eprintln!("The agent may need to be restarted to pick up the new scopes.");
-                eprintln!("You can do this with: devaipod rebuild {}", strip_pod_prefix(&pod_name));
-            } else {
-                println!("Scopes added and saved!");
-                println!();
-                println!("Active scopes:");
-                println!("{}", toml::to_string_pretty(&merged)?);
-                println!();
-                println!("The new scopes are now active and will persist across restarts.");
-            }
+            // No restart needed - gator watches the config file via inotify
+            // and will automatically reload the new scopes
+            println!("Scopes added!");
+            println!();
+            println!("Active scopes:");
+            println!("{}", toml::to_string_pretty(&merged)?);
+            println!();
+            println!("Gator will automatically reload these scopes (no restart needed).");
         }
     }
 
