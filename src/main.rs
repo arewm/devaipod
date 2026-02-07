@@ -916,6 +916,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
             session,
             workspace_mode,
         } => {
+            if !std::io::stdin().is_terminal() {
+                bail!("attach requires an interactive terminal. For non-interactive use, consider using the OpenCode API directly.");
+            }
             let pod_name = resolve_workspace(workspace.as_deref(), latest)?;
             let target = if workspace_mode {
                 AttachTarget::Workspace
