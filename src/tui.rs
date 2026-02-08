@@ -13,10 +13,14 @@ use bollard::container::ListContainersOptions;
 use bollard::models::ContainerSummary;
 use bollard::Docker;
 use color_eyre::eyre::{Context, Result};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -1136,6 +1140,43 @@ fn is_valid_instance(containers: &[ContainerSummary]) -> bool {
     })
 }
 
+/// Setup terminal for TUI mode with optional keyboard enhancement.
+/// Returns whether keyboard enhancement was enabled (for cleanup).
+fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool)> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+
+    // Enable keyboard enhancement if supported (for Ctrl+Enter to work correctly)
+    let keyboard_enhancement_enabled = if supports_keyboard_enhancement().unwrap_or(false) {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+    } else {
+        false
+    };
+
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let terminal = Terminal::new(backend)?;
+    Ok((terminal, keyboard_enhancement_enabled))
+}
+
+/// Restore terminal from TUI mode.
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    keyboard_enhancement_enabled: bool,
+) -> Result<()> {
+    disable_raw_mode()?;
+    if keyboard_enhancement_enabled {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
 /// Run the TUI application
 pub async fn run() -> Result<()> {
     // Check if we're running in a terminal
@@ -1145,23 +1186,332 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let (mut terminal, keyboard_enhancement) = setup_terminal()?;
 
     // Create app and run
     let app = App::new().await?;
     let result = run_app(&mut terminal, app).await;
 
     // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    restore_terminal(&mut terminal, keyboard_enhancement)?;
 
     result
+}
+
+/// Result from the standalone launch prompt
+pub struct LaunchPromptResult {
+    /// The source URL
+    pub url: String,
+    /// The task to run
+    pub task: String,
+}
+
+/// State for the standalone launch prompt
+struct LaunchPromptApp {
+    /// Current input state
+    input: LaunchInput,
+    /// Status message
+    status_message: Option<String>,
+}
+
+impl LaunchPromptApp {
+    fn new(url: &str, task: &str) -> Self {
+        Self {
+            input: LaunchInput {
+                urls: url.to_string(),
+                task: task.to_string(),
+                active_field: if url.is_empty() {
+                    LaunchField::Urls
+                } else {
+                    LaunchField::Task
+                },
+            },
+            status_message: None,
+        }
+    }
+}
+
+/// Run a standalone launch prompt for the `run` command.
+///
+/// This provides a simple editable dialog for URL and task input,
+/// similar to the launch dialog in the full TUI.
+///
+/// Returns `Ok(Some(result))` if the user submitted, `Ok(None)` if cancelled.
+pub async fn prompt_launch_input(url: &str, task: &str) -> Result<Option<LaunchPromptResult>> {
+    // Check if we're running in a terminal
+    if !std::io::stdout().is_terminal() {
+        color_eyre::eyre::bail!("Interactive prompt requires a terminal");
+    }
+
+    let (mut terminal, keyboard_enhancement) = setup_terminal()?;
+
+    // Run the prompt
+    let result = run_launch_prompt(&mut terminal, url, task).await;
+
+    // Restore terminal
+    restore_terminal(&mut terminal, keyboard_enhancement)?;
+
+    result
+}
+
+/// Main loop for the standalone launch prompt
+async fn run_launch_prompt(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    url: &str,
+    task: &str,
+) -> Result<Option<LaunchPromptResult>> {
+    let mut app = LaunchPromptApp::new(url, task);
+    let mut event_stream = EventStream::new();
+
+    loop {
+        // Draw the UI
+        terminal.draw(|f| render_launch_prompt(f, &app))?;
+
+        // Wait for event
+        if let Some(Ok(Event::Key(key))) = event_stream.next().await {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            match key.code {
+                KeyCode::Esc => {
+                    // Cancel
+                    return Ok(None);
+                }
+                KeyCode::Tab => {
+                    // Cycle forward through fields
+                    app.input.active_field = match app.input.active_field {
+                        LaunchField::Urls => LaunchField::Task,
+                        LaunchField::Task => LaunchField::Submit,
+                        LaunchField::Submit => LaunchField::Urls,
+                    };
+                }
+                KeyCode::BackTab => {
+                    // Cycle backward through fields
+                    app.input.active_field = match app.input.active_field {
+                        LaunchField::Urls => LaunchField::Submit,
+                        LaunchField::Task => LaunchField::Urls,
+                        LaunchField::Submit => LaunchField::Task,
+                    };
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+Enter: Submit from any field
+                    let url = app.input.urls.trim().to_string();
+                    let task = app.input.task.trim().to_string();
+
+                    if url.is_empty() {
+                        app.status_message = Some("Enter a URL".to_string());
+                    } else if task.is_empty() {
+                        app.status_message = Some("Enter a task".to_string());
+                    } else {
+                        return Ok(Some(LaunchPromptResult { url, task }));
+                    }
+                }
+                KeyCode::Enter => {
+                    // Regular Enter: add newline to text fields, or submit if on button
+                    match app.input.active_field {
+                        LaunchField::Urls => {
+                            app.input.urls.push('\n');
+                        }
+                        LaunchField::Task => {
+                            app.input.task.push('\n');
+                        }
+                        LaunchField::Submit => {
+                            // Submit button pressed
+                            let url = app.input.urls.trim().to_string();
+                            let task = app.input.task.trim().to_string();
+
+                            if url.is_empty() {
+                                app.status_message = Some("Enter a URL".to_string());
+                                app.input.active_field = LaunchField::Urls;
+                            } else if task.is_empty() {
+                                app.status_message = Some("Enter a task".to_string());
+                                app.input.active_field = LaunchField::Task;
+                            } else {
+                                return Ok(Some(LaunchPromptResult { url, task }));
+                            }
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    // Delete character from active field (no-op for Submit button)
+                    match app.input.active_field {
+                        LaunchField::Urls => {
+                            app.input.urls.pop();
+                        }
+                        LaunchField::Task => {
+                            app.input.task.pop();
+                        }
+                        LaunchField::Submit => {}
+                    }
+                }
+                KeyCode::Char(c) => {
+                    // Add character to active field (no-op for Submit button)
+                    match app.input.active_field {
+                        LaunchField::Urls => {
+                            app.input.urls.push(c);
+                        }
+                        LaunchField::Task => {
+                            app.input.task.push(c);
+                        }
+                        LaunchField::Submit => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Render the standalone launch prompt
+fn render_launch_prompt(frame: &mut ratatui::Frame, app: &LaunchPromptApp) {
+    let area = frame.area();
+
+    // Clear the entire screen
+    frame.render_widget(Clear, area);
+
+    // Calculate dialog size - centered, fixed width
+    let popup_width = (area.width * 70 / 100).max(60).min(area.width - 4);
+    let popup_height = 20u16.min(area.height - 2);
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Split popup into title, URL field, Task field, submit button, and footer
+    let chunks = Layout::vertical([
+        Constraint::Length(3), // Title
+        Constraint::Length(4), // URL field (single URL for run)
+        Constraint::Min(5),    // Task field (expandable)
+        Constraint::Length(3), // Submit button
+        Constraint::Length(3), // Footer
+    ])
+    .split(popup_area);
+
+    // Title bar
+    let title = Paragraph::new(" Launch New Instance ")
+        .style(Style::default().fg(Color::Cyan).bold())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    frame.render_widget(title, chunks[0]);
+
+    // Helper to add cursor character to text when field is active
+    let add_cursor = |text: &str, is_active: bool| -> String {
+        if is_active {
+            format!("{}▌", text)
+        } else {
+            text.to_string()
+        }
+    };
+
+    // URL field
+    let url_is_active = app.input.active_field == LaunchField::Urls;
+    let url_border_style = if url_is_active {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let (url_content, url_style) = if app.input.urls.is_empty() {
+        if url_is_active {
+            ("▌".to_string(), Style::default().fg(Color::Yellow))
+        } else {
+            (
+                "Enter git URL or path...".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
+        }
+    } else {
+        (
+            add_cursor(&app.input.urls, url_is_active),
+            Style::default().fg(Color::Yellow),
+        )
+    };
+
+    let url_paragraph = Paragraph::new(url_content)
+        .style(url_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(url_border_style)
+                .title(" Source "),
+        );
+    frame.render_widget(url_paragraph, chunks[1]);
+
+    // Task field
+    let task_is_active = app.input.active_field == LaunchField::Task;
+    let task_border_style = if task_is_active {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let (task_content, task_style) = if app.input.task.is_empty() {
+        if task_is_active {
+            ("▌".to_string(), Style::default().fg(Color::Yellow))
+        } else {
+            (
+                "Enter task for the AI agent...".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
+        }
+    } else {
+        (
+            add_cursor(&app.input.task, task_is_active),
+            Style::default().fg(Color::Yellow),
+        )
+    };
+
+    // Calculate scroll offset for Task field
+    let task_inner_height = chunks[2].height.saturating_sub(2) as usize;
+    let task_content_lines = task_content.lines().count();
+    let task_scroll = task_content_lines.saturating_sub(task_inner_height) as u16;
+
+    let task_paragraph = Paragraph::new(task_content)
+        .style(task_style)
+        .scroll((task_scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(task_border_style)
+                .title(" Task "),
+        );
+    frame.render_widget(task_paragraph, chunks[2]);
+
+    // Submit button
+    let submit_is_active = app.input.active_field == LaunchField::Submit;
+    let (submit_text, submit_style) = if submit_is_active {
+        (
+            "[ Launch ]",
+            Style::default().fg(Color::Black).bg(Color::Green).bold(),
+        )
+    } else {
+        ("[ Launch ]", Style::default().fg(Color::Green).bold())
+    };
+
+    let submit_button = Paragraph::new(submit_text)
+        .style(submit_style)
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(submit_button, chunks[3]);
+
+    // Footer with help text
+    let footer_text = if let Some(ref msg) = app.status_message {
+        format!(" {} ", msg)
+    } else {
+        " Tab: Switch field │ Esc: Cancel".to_string()
+    };
+
+    let footer_style = if app.status_message.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let footer = Paragraph::new(footer_text)
+        .style(footer_style)
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(footer, chunks[4]);
 }
 
 /// Message for git state updates from background task
