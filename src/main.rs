@@ -32,9 +32,14 @@ const POD_NAME_PREFIX: &str = "devaipod-";
 ///
 /// The user-facing "short name" is what's shown by `devaipod list` and suggested
 /// after `devaipod up` (the pod name with the prefix stripped). This function
-/// always adds the prefix to convert back to the full pod name.
+/// adds the prefix to convert back to the full pod name, but is idempotent -
+/// if the name already has the prefix, it won't be added again.
 fn normalize_pod_name(name: &str) -> String {
-    format!("{}{}", POD_NAME_PREFIX, name)
+    if name.starts_with(POD_NAME_PREFIX) {
+        name.to_string()
+    } else {
+        format!("{}{}", POD_NAME_PREFIX, name)
+    }
 }
 
 /// Strip the prefix from a pod name for display
@@ -4686,5 +4691,50 @@ mod tests {
         assert_eq!(AttachTarget::Workspace, AttachTarget::Workspace);
         assert_eq!(AttachTarget::Agent, AttachTarget::Agent);
         assert_ne!(AttachTarget::Workspace, AttachTarget::Agent);
+    }
+
+    #[test]
+    fn test_normalize_pod_name_adds_prefix() {
+        // Short name without prefix gets prefixed
+        assert_eq!(normalize_pod_name("myproject"), "devaipod-myproject");
+        assert_eq!(
+            normalize_pod_name("playground-89e601"),
+            "devaipod-playground-89e601"
+        );
+    }
+
+    #[test]
+    fn test_normalize_pod_name_idempotent() {
+        // Name already with prefix should not be double-prefixed
+        assert_eq!(
+            normalize_pod_name("devaipod-myproject"),
+            "devaipod-myproject"
+        );
+        assert_eq!(
+            normalize_pod_name("devaipod-playground-89e601"),
+            "devaipod-playground-89e601"
+        );
+    }
+
+    #[test]
+    fn test_normalize_pod_name_roundtrip() {
+        // strip_pod_prefix and normalize_pod_name should roundtrip
+        let short_name = "myproject";
+        let full_name = normalize_pod_name(short_name);
+        assert_eq!(strip_pod_prefix(&full_name), short_name);
+
+        // Normalizing the full name again should be idempotent
+        assert_eq!(normalize_pod_name(&full_name), full_name);
+    }
+
+    #[test]
+    fn test_strip_pod_prefix() {
+        assert_eq!(strip_pod_prefix("devaipod-myproject"), "myproject");
+        assert_eq!(
+            strip_pod_prefix("devaipod-playground-89e601"),
+            "playground-89e601"
+        );
+        // Names without prefix are returned as-is
+        assert_eq!(strip_pod_prefix("myproject"), "myproject");
     }
 }
