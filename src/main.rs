@@ -343,6 +343,8 @@ struct CreateOptions {
     service_gator_image: Option<String>,
     /// Mode of workspace creation (up vs run)
     mode: WorkspaceMode,
+    /// Make service-gator read-only (no push, no draft PRs)
+    service_gator_ro: bool,
 }
 
 impl CreateOptions {
@@ -355,6 +357,8 @@ impl CreateOptions {
             service_gator_scopes: opts.service_gator_scopes.clone(),
             service_gator_image: opts.service_gator_image.clone(),
             mode: opts.mode,
+            // UpOptions doesn't have service_gator_ro, it's only for `run`
+            service_gator_ro: false,
         }
     }
 }
@@ -619,6 +623,12 @@ enum HostCommand {
         /// Use a specific image for the service-gator container
         #[arg(long, value_name = "IMAGE")]
         service_gator_image: Option<String>,
+        /// Suppress any default write service-gator scopes provided to the agent
+        ///
+        /// When set, the agent will only have read access to repositories -
+        /// no push-new-branch or create-draft permissions will be granted.
+        #[arg(short = 'R', long = "service-gator-ro")]
+        service_gator_ro: bool,
     },
     /// Generate shell completions
     ///
@@ -1005,6 +1015,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             name,
             service_gator_scopes,
             service_gator_image,
+            service_gator_ro,
         } => {
             let source = resolve_source(source.as_deref(), &config)?;
 
@@ -1076,6 +1087,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 name.as_deref(),
                 &service_gator_scopes,
                 service_gator_image.as_deref(),
+                service_gator_ro,
             )
             .await?;
 
@@ -1365,27 +1377,40 @@ async fn create_workspace_from_local(
             .context("Failed to parse --service-gator scopes")?;
         service_gator::merge_configs(&config.service_gator, &cli_scopes)
     } else if let Some(ref remote_url) = git_info.remote_url {
-        // Auto-configure: read + create-draft for the target repo based on remote URL
+        // Auto-configure: read + optionally create-draft for the target repo based on remote URL
         if let Some(repo_ref) = forge::parse_repo_url(remote_url) {
             let mut sg_config = config.service_gator.clone();
             let owner_repo = repo_ref.owner_repo();
 
             match repo_ref.forge_type {
                 forge::ForgeType::GitHub => {
+                    // If --service-gator-ro is set, only grant read access
+                    let (create_draft, push_new_branch) = if opts.service_gator_ro {
+                        (false, false)
+                    } else {
+                        (true, true)
+                    };
                     sg_config.gh.repos.insert(
                         owner_repo.clone(),
                         config::GhRepoPermission {
                             read: true,
-                            create_draft: true,
+                            create_draft,
                             pending_review: false,
-                            push_new_branch: true,
+                            push_new_branch,
                             write: false,
                         },
                     );
-                    tracing::debug!(
-                        "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
-                        owner_repo
-                    );
+                    if opts.service_gator_ro {
+                        tracing::debug!(
+                            "Auto-enabled service-gator for {} (read-only)",
+                            owner_repo
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
+                            owner_repo
+                        );
+                    }
                 }
                 forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
                     // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
@@ -1551,26 +1576,39 @@ async fn create_workspace_from_remote(
             .context("Failed to parse --service-gator scopes")?;
         service_gator::merge_configs(&config.service_gator, &cli_scopes)
     } else if let Some(repo_ref) = forge::parse_repo_url(remote_url) {
-        // Auto-configure: read + create-draft for the target repo
+        // Auto-configure: read + optionally create-draft for the target repo
         let mut sg_config = config.service_gator.clone();
         let owner_repo = repo_ref.owner_repo();
 
         match repo_ref.forge_type {
             forge::ForgeType::GitHub => {
+                // If --service-gator-ro is set, only grant read access
+                let (create_draft, push_new_branch) = if opts.service_gator_ro {
+                    (false, false)
+                } else {
+                    (true, true)
+                };
                 sg_config.gh.repos.insert(
                     owner_repo.clone(),
                     config::GhRepoPermission {
                         read: true,
-                        create_draft: true,
+                        create_draft,
                         pending_review: false,
-                        push_new_branch: true,
+                        push_new_branch,
                         write: false,
                     },
                 );
-                tracing::debug!(
-                    "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
-                    owner_repo
-                );
+                if opts.service_gator_ro {
+                    tracing::debug!(
+                        "Auto-enabled service-gator for {} (read-only)",
+                        owner_repo
+                    );
+                } else {
+                    tracing::debug!(
+                        "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
+                        owner_repo
+                    );
+                }
             }
             forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
                 // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
@@ -1735,26 +1773,39 @@ async fn create_workspace_from_pr(
             .context("Failed to parse --service-gator scopes")?;
         service_gator::merge_configs(&config.service_gator, &cli_scopes)
     } else {
-        // Auto-configure: read + create-draft for the PR's repo
+        // Auto-configure: read + optionally create-draft for the PR's repo
         let mut sg_config = config.service_gator.clone();
         let owner_repo = format!("{}/{}", pr_ref.owner, pr_ref.repo);
 
         match pr_ref.forge_type {
             forge::ForgeType::GitHub => {
+                // If --service-gator-ro is set, only grant read access
+                let (create_draft, push_new_branch) = if opts.service_gator_ro {
+                    (false, false)
+                } else {
+                    (true, true)
+                };
                 sg_config.gh.repos.insert(
                     owner_repo.clone(),
                     config::GhRepoPermission {
                         read: true,
-                        create_draft: true,
+                        create_draft,
                         pending_review: false,
-                        push_new_branch: true,
+                        push_new_branch,
                         write: false,
                     },
                 );
-                tracing::debug!(
-                    "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
-                    owner_repo
-                );
+                if opts.service_gator_ro {
+                    tracing::debug!(
+                        "Auto-enabled service-gator for {} (read-only)",
+                        owner_repo
+                    );
+                } else {
+                    tracing::debug!(
+                        "Auto-enabled service-gator for {} (read + push-new-branch + draft PRs)",
+                        owner_repo
+                    );
+                }
             }
             forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
                 // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
@@ -1867,6 +1918,7 @@ async fn cmd_run(
     explicit_name: Option<&str>,
     service_gator_scopes: &[String],
     service_gator_image: Option<&str>,
+    service_gator_ro: bool,
 ) -> Result<String> {
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
@@ -1876,6 +1928,7 @@ async fn cmd_run(
         service_gator_scopes: service_gator_scopes.to_vec(),
         service_gator_image: service_gator_image.map(|s| s.to_string()),
         mode: WorkspaceMode::Run,
+        service_gator_ro,
     };
 
     // Create the workspace - no SSH by default (async execution)
