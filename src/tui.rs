@@ -264,6 +264,7 @@ pub enum LaunchField {
     #[default]
     Urls,
     Task,
+    Submit,
 }
 
 /// State for the launch dialog
@@ -2024,10 +2025,36 @@ fn handle_delete_confirm_mode(app: &mut App, code: KeyCode) -> Option<Action> {
     }
 }
 
+/// Try to submit the launch dialog, returning an action if successful
+fn try_submit_launch(app: &mut App) -> Option<Action> {
+    let urls: Vec<String> = app
+        .launch_input
+        .urls
+        .lines()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    let task = app.launch_input.task.trim().to_string();
+
+    if urls.is_empty() {
+        app.status_message = Some("Enter at least one URL".to_string());
+        app.launch_input.active_field = LaunchField::Urls;
+        None
+    } else if task.is_empty() {
+        app.status_message = Some("Enter a task".to_string());
+        app.launch_input.active_field = LaunchField::Task;
+        None
+    } else {
+        app.mode = TuiMode::Normal;
+        app.launch_input = LaunchInput::default();
+        Some(Action::Launch { urls, task })
+    }
+}
+
 /// Handle key events in launch mode (URL + task input dialog)
 fn handle_launch_mode(app: &mut App, key: crossterm::event::KeyEvent) -> Option<Action> {
-    use crossterm::event::KeyModifiers;
-
     match key.code {
         KeyCode::Esc => {
             // Cancel launch mode
@@ -2036,53 +2063,47 @@ fn handle_launch_mode(app: &mut App, key: crossterm::event::KeyEvent) -> Option<
             app.status_message = None;
             None
         }
-        KeyCode::Tab | KeyCode::BackTab => {
-            // Switch between fields
+        KeyCode::Tab => {
+            // Cycle forward through fields
             app.launch_input.active_field = match app.launch_input.active_field {
                 LaunchField::Urls => LaunchField::Task,
+                LaunchField::Task => LaunchField::Submit,
+                LaunchField::Submit => LaunchField::Urls,
+            };
+            None
+        }
+        KeyCode::BackTab => {
+            // Cycle backward through fields
+            app.launch_input.active_field = match app.launch_input.active_field {
+                LaunchField::Urls => LaunchField::Submit,
                 LaunchField::Task => LaunchField::Urls,
+                LaunchField::Submit => LaunchField::Task,
             };
             None
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Ctrl+Enter: Submit from any field
-            let urls: Vec<String> = app
-                .launch_input
-                .urls
-                .lines()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
-
-            let task = app.launch_input.task.trim().to_string();
-
-            if urls.is_empty() {
-                app.status_message = Some("Enter at least one URL".to_string());
-                None
-            } else if task.is_empty() {
-                app.status_message = Some("Enter a task".to_string());
-                None
-            } else {
-                app.mode = TuiMode::Normal;
-                app.launch_input = LaunchInput::default();
-                Some(Action::Launch { urls, task })
-            }
+            try_submit_launch(app)
         }
         KeyCode::Enter => {
-            // Regular Enter: add newline to current field
+            // Regular Enter: add newline to text fields, or submit if on button
             match app.launch_input.active_field {
                 LaunchField::Urls => {
                     app.launch_input.urls.push('\n');
+                    None
                 }
                 LaunchField::Task => {
                     app.launch_input.task.push('\n');
+                    None
+                }
+                LaunchField::Submit => {
+                    // Submit button pressed
+                    try_submit_launch(app)
                 }
             }
-            None
         }
         KeyCode::Backspace => {
-            // Delete character from active field
+            // Delete character from active field (no-op for Submit button)
             match app.launch_input.active_field {
                 LaunchField::Urls => {
                     app.launch_input.urls.pop();
@@ -2090,11 +2111,12 @@ fn handle_launch_mode(app: &mut App, key: crossterm::event::KeyEvent) -> Option<
                 LaunchField::Task => {
                     app.launch_input.task.pop();
                 }
+                LaunchField::Submit => {}
             }
             None
         }
         KeyCode::Char(c) => {
-            // Add character to active field
+            // Add character to active field (no-op for Submit button)
             match app.launch_input.active_field {
                 LaunchField::Urls => {
                     app.launch_input.urls.push(c);
@@ -2102,6 +2124,7 @@ fn handle_launch_mode(app: &mut App, key: crossterm::event::KeyEvent) -> Option<
                 LaunchField::Task => {
                     app.launch_input.task.push(c);
                 }
+                LaunchField::Submit => {}
             }
             None
         }
@@ -2231,7 +2254,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
             Style::default().fg(Color::Red),
         ),
         TuiMode::Launch => (
-            " Tab: Switch field │ Enter: New line │ Ctrl+Enter: Submit │ Esc: Cancel",
+            " Tab: Switch field │ Esc: Cancel",
             Style::default().fg(Color::Cyan),
         ),
     };
@@ -2259,8 +2282,8 @@ fn render_launch_dialog(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let task_line_count = app.launch_input.task.lines().count().max(1);
     let task_height = (task_line_count as u16 + 2).clamp(7, 12); // min 7 (5 lines + borders), max 12
 
-    // Total popup height: title (3) + urls + task
-    let popup_height = (3 + urls_height + task_height).min(area.height - 4);
+    // Total popup height: title (3) + urls + task + submit button (3)
+    let popup_height = (3 + urls_height + task_height + 3).min(area.height - 4);
     let popup_width = (area.width * 60 / 100).max(50).min(area.width - 4);
     let popup_x = (area.width.saturating_sub(popup_width)) / 2;
     let popup_y = (area.height.saturating_sub(popup_height)) / 2;
@@ -2269,11 +2292,12 @@ fn render_launch_dialog(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     // Clear the area behind the popup
     frame.render_widget(Clear, popup_area);
 
-    // Split popup into title, URLs field, Task field
+    // Split popup into title, URLs field, Task field, Submit button
     let inner_chunks = Layout::vertical([
         Constraint::Length(3),           // Title
         Constraint::Length(urls_height), // URLs (dynamic height)
-        Constraint::Length(task_height), // Task (3 lines)
+        Constraint::Length(task_height), // Task
+        Constraint::Length(3),           // Submit button
     ])
     .split(popup_area);
 
@@ -2373,6 +2397,23 @@ fn render_launch_dialog(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 .title(" Task "),
         );
     frame.render_widget(task_paragraph, inner_chunks[2]);
+
+    // Submit button
+    let submit_is_active = app.launch_input.active_field == LaunchField::Submit;
+    let (submit_text, submit_style) = if submit_is_active {
+        (
+            "[ Launch ]",
+            Style::default().fg(Color::Black).bg(Color::Green).bold(),
+        )
+    } else {
+        ("[ Launch ]", Style::default().fg(Color::Green).bold())
+    };
+
+    let submit_button = Paragraph::new(submit_text)
+        .style(submit_style)
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(submit_button, inner_chunks[3]);
 }
 
 /// Height of each instance card (lines)

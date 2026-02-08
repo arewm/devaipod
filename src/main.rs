@@ -10,7 +10,6 @@ use std::process::Command as ProcessCommand;
 
 use clap::{Args, CommandFactory, Parser};
 use color_eyre::eyre::{bail, Context, Result};
-use dialoguer::Input;
 
 mod config;
 mod devcontainer;
@@ -1031,28 +1030,22 @@ async fn run_host(cli: HostCli) -> Result<()> {
             // the pre-filled text in the interactive prompt instead
             let explicit_task = task.or(command);
 
-            // Determine final task: explicit task, or prompt interactively
-            let effective_task = match explicit_task {
-                Some(t) => Some(t),
+            // Determine final source and task: explicit task, or prompt interactively
+            let (effective_source, effective_task) = match explicit_task {
+                Some(t) => (effective_source, Some(t)),
                 None if std::io::stdin().is_terminal() => {
-                    let prompt = Input::<String>::new()
-                        .with_prompt("Task for the AI agent (leave empty to skip)");
-                    // If we have a default from issue URL, pre-fill it
-                    let prompt = if let Some(ref default) = default_task {
-                        prompt.with_initial_text(default)
-                    } else {
-                        prompt
-                    };
-                    match prompt.allow_empty(true).interact_text() {
-                        Ok(task) if task.trim().is_empty() => None,
-                        Ok(task) => Some(task),
-                        Err(dialoguer::Error::IO(e))
-                            if e.kind() == std::io::ErrorKind::Interrupted =>
-                        {
-                            // User pressed Ctrl-C, exit gracefully
+                    // Use TUI-style editable prompt for both source and task
+                    match tui::prompt_launch_input(
+                        &effective_source,
+                        default_task.as_deref().unwrap_or(""),
+                    )
+                    .await?
+                    {
+                        Some(result) => (result.url, Some(result.task)),
+                        None => {
+                            // User cancelled with Esc
                             std::process::exit(130)
                         }
-                        Err(e) => return Err(e).context("Failed to read task from terminal"),
                     }
                 }
                 // Non-interactive: try to read from stdin (for piped input), fall back to default_task
@@ -1061,16 +1054,16 @@ async fn run_host(cli: HostCli) -> Result<()> {
                     let stdin = std::io::stdin();
                     let mut line = String::new();
                     match stdin.lock().read_line(&mut line) {
-                        Ok(0) => default_task, // EOF, no input
+                        Ok(0) => (effective_source, default_task), // EOF, no input
                         Ok(_) => {
                             let trimmed = line.trim();
                             if trimmed.is_empty() {
-                                default_task
+                                (effective_source, default_task)
                             } else {
-                                Some(trimmed.to_string())
+                                (effective_source, Some(trimmed.to_string()))
                             }
                         }
-                        Err(_) => default_task, // Read error, use default
+                        Err(_) => (effective_source, default_task), // Read error, use default
                     }
                 }
             };
