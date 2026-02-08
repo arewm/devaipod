@@ -1074,6 +1074,25 @@ echo "Dotfiles installed successfully"
         Ok(())
     }
 
+    /// Signal that the agent container setup is complete
+    ///
+    /// Creates a marker file that the agent startup script waits for before
+    /// starting opencode serve. This prevents a race condition where opencode
+    /// reads its config before dotfiles (with model settings) are installed.
+    pub async fn signal_agent_ready(&self, podman: &PodmanService) -> Result<()> {
+        tracing::debug!("Signaling agent ready...");
+        let marker_path = format!("{}/.devaipod-ready", AGENT_HOME_PATH);
+        let cmd = format!("touch '{}'", marker_path);
+
+        podman
+            .exec(&self.agent_container, &["sh", "-c", &cmd], None, None)
+            .await
+            .context("Failed to create agent ready marker")?;
+
+        tracing::debug!("Agent ready marker created at {}", marker_path);
+        Ok(())
+    }
+
     /// Run lifecycle commands from devcontainer.json in both workspace and agent containers
     ///
     /// Executes in order: onCreateCommand, postCreateCommand, postStartCommand
@@ -2122,6 +2141,16 @@ exec sleep infinity
         let startup_script = format!(
             r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
 
+# Wait for dotfiles installation to complete before starting opencode.
+# This prevents a race condition where opencode reads its config before
+# dotfiles (containing opencode.json with model settings) are installed.
+# The marker file is created by devaipod after install_dotfiles_agent().
+echo "Waiting for devaipod setup to complete..."
+while [ ! -f {home}/.devaipod-ready ]; do
+    sleep 0.1
+done
+echo "Setup complete, starting opencode..."
+
 # Start auth proxy in background (provides authenticated host access)
 # The proxy reads DEVAIPOD_PROXY_PASSWORD for its Basic Auth check
 python3 {home}/scripts/auth_proxy.py &
@@ -2422,34 +2451,34 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
 
         // Worker startup script - runs opencode serve (no auth proxy needed since
         // worker is not directly accessed from host)
-        // Note: The agent-home volume has dotfiles cloned to .dotfiles/ but they may not
-        // be installed yet (install happens after containers start). We try both paths.
+        // Wait for agent setup to complete, then copy configs from agent home.
         let startup_script = format!(
             r#"set -e
 mkdir -p {home}/.config {home}/.local/share {home}/.local/bin {home}/.cache
 
-# Copy essential config from agent home (must happen before opencode starts)
-# Try installed location first, then dotfiles source
+# Wait for agent dotfiles installation to complete before copying configs.
+# The marker file is created by devaipod after install_dotfiles_agent().
+echo "Waiting for agent setup to complete..."
+while [ ! -f /mnt/agent-home/.devaipod-ready ]; do
+    sleep 0.1
+done
+echo "Agent setup complete, copying configs..."
 
-# Copy LLM provider credentials (these come from dotfiles install)
+# Copy essential config from agent home (now guaranteed to be installed)
+
+# Copy LLM provider credentials
 if [ -d /mnt/agent-home/.config/gcloud ]; then
     cp -r /mnt/agent-home/.config/gcloud {home}/.config/
-elif [ -d /mnt/agent-home/.dotfiles/dotfiles/.config/gcloud ]; then
-    cp -r /mnt/agent-home/.dotfiles/dotfiles/.config/gcloud {home}/.config/
 fi
 
 # Copy opencode config
 if [ -d /mnt/agent-home/.config/opencode ]; then
     cp -r /mnt/agent-home/.config/opencode {home}/.config/
-elif [ -d /mnt/agent-home/.dotfiles/dotfiles/.config/opencode ]; then
-    cp -r /mnt/agent-home/.dotfiles/dotfiles/.config/opencode {home}/.config/
 fi
 
 # Copy git identity
 if [ -f /mnt/agent-home/.gitconfig ]; then
     cp /mnt/agent-home/.gitconfig {home}/.gitconfig
-elif [ -f /mnt/agent-home/.dotfiles/dotfiles/.gitconfig ]; then
-    cp /mnt/agent-home/.dotfiles/dotfiles/.gitconfig {home}/.gitconfig
 fi
 
 # Run opencode serve in foreground

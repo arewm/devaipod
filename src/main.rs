@@ -1194,6 +1194,13 @@ async fn finalize_pod_with_mode(
             .context("Failed to write task to agent")?;
     }
 
+    // Signal that agent setup is complete - this unblocks opencode serve
+    // which is waiting for the .devaipod-ready marker file
+    devaipod_pod
+        .signal_agent_ready(podman)
+        .await
+        .context("Failed to signal agent ready")?;
+
     // Run lifecycle commands based on mode
     match lifecycle_mode {
         LifecycleMode::Full => {
