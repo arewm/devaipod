@@ -150,6 +150,10 @@ pub const AGENT_HOME_PATH: &str = "/home/agent";
 /// where `opencode attach` doesn't support password-based auth.
 const AUTH_PROXY_SCRIPT: &str = include_str!("../scripts/auth_proxy.py");
 
+/// Python script for worker control (send tasks, monitor, get status).
+/// Replaces `opencode run --attach --format json` which returns excessive JSON.
+const WORKER_CTL_SCRIPT: &str = include_str!("../scripts/devaipod-workerctl.py");
+
 /// Port for the auth proxy (published to host for authenticated access)
 pub const AUTH_PROXY_PORT: u16 = 4097;
 
@@ -1312,8 +1316,11 @@ echo "Dotfiles installed successfully"
 
     /// Write scripts to the agent home volume before containers start
     ///
-    /// This writes the auth_proxy.py script which provides authenticated HTTP access
-    /// to the opencode API from the host. Uses a one-shot init container.
+    /// This writes:
+    /// - auth_proxy.py: Authenticated HTTP access to the opencode API from the host
+    /// - worker_monitor.py: Monitor worker until idle or timeout (for orchestration)
+    ///
+    /// Uses a one-shot init container.
     async fn write_scripts_to_volume(
         podman: &PodmanService,
         image: &str,
@@ -1327,9 +1334,15 @@ cat > '{agent_home}/scripts/auth_proxy.py' << 'PROXY_EOF'
 {proxy_script}
 PROXY_EOF
 chmod +x {agent_home}/scripts/auth_proxy.py
+
+cat > '{agent_home}/scripts/devaipod-workerctl' << 'WORKERCTL_EOF'
+{worker_ctl_script}
+WORKERCTL_EOF
+chmod +x {agent_home}/scripts/devaipod-workerctl
 "#,
             agent_home = AGENT_HOME_PATH,
             proxy_script = AUTH_PROXY_SCRIPT,
+            worker_ctl_script = WORKER_CTL_SCRIPT,
         );
 
         tracing::debug!("Writing scripts to agent home volume...");

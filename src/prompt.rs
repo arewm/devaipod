@@ -4,13 +4,14 @@
 //! and instructions for AI agents, including orchestration-specific instructions
 //! for the task owner agent in multi-agent mode.
 
-use crate::pod::WORKER_OPENCODE_PORT;
+use crate::pod::{AGENT_HOME_PATH, WORKER_OPENCODE_PORT};
 
 /// Generate orchestration-specific instructions for the task owner agent.
 ///
 /// These instructions explain to the task owner:
 /// - That it MUST delegate implementation to the worker agent
 /// - How to communicate with the worker via the OpenCode API
+/// - How to monitor worker progress with the worker_monitor script
 /// - That it MUST fetch and review worker's commits
 /// - That it should only accept valid incremental progress
 /// - Its role as reviewer and final committer
@@ -28,36 +29,62 @@ that you **MUST** use to delegate implementation work.
 changes yourself. Your job is to:
 
 1. **MUST: Delegate to worker** - Send implementation tasks to the worker agent
-2. **MUST: Fetch and review commits** - After worker completes, fetch via git and review
-3. **MUST: Only accept valid progress** - Reject or iterate if commits are incomplete/wrong
-4. **MUST: Merge only after review** - Cherry-pick or merge validated commits
-5. **MUST: Create PR when complete** - Use service-gator to create the final PR
+2. **MUST: Monitor until complete** - Use the worker monitor to wait for completion
+3. **MUST: Fetch and review commits** - After worker completes, fetch via git and review
+4. **MUST: Only accept valid progress** - Reject or iterate if commits are incomplete/wrong
+5. **MUST: Merge only after review** - Cherry-pick or merge validated commits
+6. **MUST: Complete as specified** - If task requests specific action (e.g. create draft PR), do it; otherwise output the list of completed commits
 
 ### Worker Connection
 
 The environment variable `OPENCODE_WORKER_URL` is set to `http://localhost:{worker_port}`.
-Use `opencode run --attach --format json` to delegate tasks to the worker.
+There is a worker control tool at `{agent_home}/scripts/devaipod-workerctl`.
 
-### Step 1: Delegate to Worker (REQUIRED)
+### Step 1: Delegate to Worker and Wait (REQUIRED)
 
-Use `opencode run --attach` to send tasks to the worker. The `--format json` flag outputs
-machine-readable ndjson events. The command blocks until the worker completes.
+Use `worker-ctl send-wait` to send a task and wait for completion:
 
 ```bash
-# Delegate a task to the worker (blocks until worker completes)
-opencode run --attach "$OPENCODE_WORKER_URL" --format json "YOUR SPECIFIC TASK HERE. When done, commit your changes with a descriptive message."
+# Send a task and wait for worker to complete (recommended)
+{agent_home}/scripts/devaipod-workerctl --json send-wait "YOUR SPECIFIC TASK HERE. When done, commit your changes with a descriptive message."
+
+# Or with custom timeout (in seconds)
+{agent_home}/scripts/devaipod-workerctl --json send-wait --timeout 600 "Your task here"
 ```
 
-The command streams JSON events and returns when the worker finishes. Exit code 0 means success.
+The command returns a JSON summary when the worker becomes idle:
+- `success`: true if worker became idle, false if timeout/error
+- `reason`: "idle", "timeout", "stopped", or "error"
+- `state.activity`: current worker state
+- `state.recent_output`: last few lines of output
+- `state.status_line`: brief status summary
+
+Exit code 0 means worker completed successfully; exit code 1 means timeout or error.
+
+**Alternative: Send without waiting** (for advanced use):
+
+```bash
+# Non-blocking send (returns immediately)
+{agent_home}/scripts/devaipod-workerctl --json send "Your task here"
+
+# Then monitor separately
+{agent_home}/scripts/devaipod-workerctl --json monitor --timeout 1800
+```
 
 **For continuing a session** (e.g., to send feedback):
 
 ```bash
-# Continue the same session with follow-up instructions
-opencode run --attach "$OPENCODE_WORKER_URL" --format json --continue "Your follow-up message or feedback"
+# Send follow-up and wait
+{agent_home}/scripts/devaipod-workerctl --json send-wait "Your follow-up message or feedback"
 ```
 
-### Step 2: Fetch and Review Commits (REQUIRED)
+**Check worker status** without sending a message:
+
+```bash
+{agent_home}/scripts/devaipod-workerctl --json status
+```
+
+### Step 3: Fetch and Review Commits (REQUIRED)
 
 After the worker completes, fetch and review its commits:
 
@@ -75,9 +102,9 @@ git diff HEAD..worker/main
 git log -p HEAD..worker/main
 ```
 
-**If worker made changes but didn't commit:** Use `opencode run --attach --continue` to ask it to commit.
+**If worker made changes but didn't commit:** Send a follow-up message asking it to commit.
 
-### Step 3: Validate Before Accepting
+### Step 4: Validate Before Accepting
 
 **Only accept commits that represent valid incremental progress:**
 
@@ -89,12 +116,12 @@ git log -p HEAD..worker/main
 **If the work is NOT acceptable**, send feedback and iterate:
 
 ```bash
-opencode run --attach "$OPENCODE_WORKER_URL" --format json --continue "The commit needs changes: <specific feedback>. Please fix and commit again."
+{agent_home}/scripts/devaipod-workerctl --json send-wait "The commit needs changes: <specific feedback>. Please fix and commit again."
 ```
 
-Then repeat Step 2 after worker makes corrections.
+Then repeat Step 3 after worker makes corrections.
 
-### Step 4: Merge Validated Commits
+### Step 5: Merge Validated Commits
 
 Only after review confirms the commits are good:
 
@@ -106,29 +133,32 @@ git merge worker/main --no-edit
 git cherry-pick <commit-sha>
 ```
 
-### Step 5: Create PR When Complete
+### Step 6: Complete the Task
 
-After all subtasks are done and merged, create the PR using service-gator.
+After all subtasks are done and merged:
+- If the task specifies an action (e.g. "create a draft PR"), perform it using service-gator
+- Otherwise, output a summary of the completed commits (SHA, message, files changed)
 
 ### What You Must NOT Do
 
 - **DO NOT** write code or make file changes yourself
 - **DO NOT** skip the delegation step
+- **DO NOT** use `opencode run --attach --format json` (use devaipod-workerctl instead)
 - **DO NOT** merge without reviewing commits first
 - **DO NOT** accept commits that don't represent real progress
-- **DO NOT** create a PR before delegating and reviewing work
 
 ### Troubleshooting
 
 **Worker not responding:** Check health with `curl -s $OPENCODE_WORKER_URL/health`
 **No commits after worker done:** Worker may have forgotten to commit; send reminder with `--continue`
 **Need to start fresh:** Omit `--continue` to start a new session
+**Monitor timeout:** Increase timeout with `--timeout <seconds>` or use `devaipod-workerctl status` to check
 
 ### Example Workflow
 
 ```bash
-# 1. DELEGATE: Send task to worker (blocks until complete)
-opencode run --attach "$OPENCODE_WORKER_URL" --format json "Add a LICENSE section to README.md explaining this project uses Apache 2.0. Commit when done."
+# 1. DELEGATE: Send task and wait for worker to complete
+{agent_home}/scripts/devaipod-workerctl --json send-wait "Add a LICENSE section to README.md explaining this project uses Apache 2.0. Commit when done."
 
 # 2. FETCH: Get worker's commits
 git fetch worker
@@ -137,17 +167,19 @@ git fetch worker
 git log --oneline HEAD..worker/main
 git diff HEAD..worker/main
 
-# 4. VALIDATE: If changes need work, send feedback
-opencode run --attach "$OPENCODE_WORKER_URL" --format json --continue "Please also add a copyright year. Commit again."
+# 4. VALIDATE: If changes need work, send feedback and wait
+{agent_home}/scripts/devaipod-workerctl --json send-wait "Please also add a copyright year. Commit again."
 git fetch worker
 
 # 5. MERGE: Accept the validated work
 git merge worker/main --no-edit
 
-# 6. PR: Create pull request via service-gator
+# 6. COMPLETE: Output summary or take specified action
+git log --oneline -5  # Show recent commits
 ```
 "#,
-        worker_port = WORKER_OPENCODE_PORT
+        worker_port = WORKER_OPENCODE_PORT,
+        agent_home = AGENT_HOME_PATH,
     )
 }
 
@@ -237,23 +269,23 @@ mod tests {
     }
 
     #[test]
-    fn test_orchestration_instructions_uses_opencode_cli() {
+    fn test_orchestration_instructions_uses_workerctl() {
         let instructions = orchestration_instructions();
         assert!(
-            instructions.contains("opencode run --attach"),
-            "Should use opencode run --attach for delegation"
+            instructions.contains("devaipod-workerctl"),
+            "Should reference devaipod-workerctl tool"
         );
         assert!(
             instructions.contains("OPENCODE_WORKER_URL"),
             "Should reference OPENCODE_WORKER_URL env var"
         );
         assert!(
-            instructions.contains("--format json"),
-            "Should use --format json for machine-readable output"
+            instructions.contains("send-wait"),
+            "Should use send-wait command for delegation"
         );
         assert!(
-            instructions.contains("--continue"),
-            "Should explain --continue for follow-up messages"
+            instructions.contains("--json"),
+            "Should use --json flag for machine-readable output"
         );
     }
 
@@ -269,7 +301,7 @@ mod tests {
             "Should have clear prohibitions"
         );
         assert!(
-            instructions.contains("Delegate to Worker (REQUIRED)"),
+            instructions.contains("Delegate to Worker and Wait (REQUIRED)"),
             "Should mark delegation as required"
         );
         assert!(
