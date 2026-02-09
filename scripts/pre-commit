@@ -26,10 +26,10 @@ checked_tree=$(cat "$STAMP_FILE" 2>/dev/null)
 
 if [ "$current_tree" != "$checked_tree" ]; then
     echo ""
-    echo "Warning: tree has changed since 'just check' was run"
+    echo "IMPORTANT: tree has changed since 'just check' was run"
     echo "  Current: ${current_tree%${current_tree#????????????}}"
     echo "  Checked: ${checked_tree%${checked_tree#????????????}}"
-    echo "Consider running: just check"
+    echo 'You MUST invoke: `just check` before generating a commit'
     echo ""
     sleep 2
 fi
