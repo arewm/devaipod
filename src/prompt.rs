@@ -183,6 +183,45 @@ git log --oneline -5  # Show recent commits
     )
 }
 
+/// Generate a worker-specific system prompt (no orchestration instructions).
+///
+/// The worker is the leaf executor -- it should implement changes directly,
+/// not try to delegate further. This prompt omits all orchestration instructions.
+pub fn generate_worker_prompt(task: &str, enable_gator: bool) -> String {
+    let gator_instructions = if enable_gator {
+        r#"
+## IMPORTANT: GitHub/GitLab Operations
+
+For GitHub/GitLab operations (PRs, issues, etc.), use the **service-gator** MCP tool.
+The `gh` and `glab` CLI tools are NOT available in this environment.
+"#
+        .to_string()
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"# devaipod Worker Task
+
+You are running as a **worker agent** in a **devaipod** sandboxed environment.
+You are the implementer -- make the requested changes directly.
+
+## Your Task
+
+{task}
+
+## Guidelines
+
+1. Implement the changes described above directly
+2. Make commits with clear, descriptive messages
+3. When done, ensure all changes are committed
+{gator_instructions}
+"#,
+        task = task,
+        gator_instructions = gator_instructions
+    )
+}
+
 /// Generate the complete system prompt for an agent, optionally including
 /// orchestration instructions.
 ///

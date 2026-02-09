@@ -16,8 +16,8 @@ Usage:
     # Monitor until idle or timeout
     worker-ctl monitor --timeout 1800
 
-    # Continue a session with follow-up
-    worker-ctl send --continue "Fix the typo and commit again"
+    # Send a follow-up message
+    worker-ctl send "Fix the typo and commit again"
     worker-ctl monitor
 
 Environment variables:
@@ -38,6 +38,13 @@ from typing import Any
 
 # Default worker URL
 DEFAULT_WORKER_URL = "http://localhost:4098"
+
+# Common headers for OpenCode API requests. Without Accept: application/json,
+# the server returns its web UI SPA HTML instead of JSON.
+JSON_HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+}
 
 
 class AgentActivity(Enum):
@@ -215,7 +222,7 @@ def fetch_agent_state(base_url: str, timeout: float = 10) -> AgentState:
     try:
         # Get list of sessions
         sessions_url = f"{base_url}/session"
-        req = urllib.request.Request(sessions_url)
+        req = urllib.request.Request(sessions_url, headers=JSON_HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             sessions = json.loads(resp.read().decode("utf-8"))
 
@@ -246,7 +253,7 @@ def fetch_agent_state(base_url: str, timeout: float = 10) -> AgentState:
 
         # Fetch recent messages from the session
         messages_url = f"{base_url}/session/{session_id}/message?limit=10"
-        req = urllib.request.Request(messages_url)
+        req = urllib.request.Request(messages_url, headers=JSON_HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             messages = json.loads(resp.read().decode("utf-8"))
 
@@ -367,32 +374,79 @@ class SendResult:
         }
 
 
-def send_message(base_url: str, message: str, timeout: float = 30) -> SendResult:
+def _get_or_create_session(base_url: str, timeout: float) -> str:
+    """Get an existing session or create a new one. Returns the session ID."""
+    # Check for an existing session
+    req = urllib.request.Request(f"{base_url}/session", headers=JSON_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        sessions = json.loads(resp.read().decode("utf-8"))
+
+    if sessions:
+        # Prefer the root session (no parent), matching fetch_agent_state logic
+        for s in sessions:
+            parent_id = s.get("parentID")
+            if parent_id is None or parent_id == "":
+                session_id = s.get("id")
+                if session_id:
+                    return session_id
+        # Fall back to first session if no root found
+        session_id = sessions[0].get("id")
+        if session_id:
+            return session_id
+
+    # No existing session; create one
+    req = urllib.request.Request(
+        f"{base_url}/session",
+        data=b"{}",
+        headers=JSON_HEADERS,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    session_id = result.get("id")
+    if not session_id:
+        raise RuntimeError(f"POST /session returned no id: {result}")
+    return session_id
+
+
+def send_message(
+    base_url: str, message: str, timeout: float = 30, *, async_prompt: bool = True,
+) -> SendResult:
     """
     Send a message to the worker via the OpenCode API.
 
-    This posts to /session/message which creates a session if needed.
-    Returns immediately (non-blocking) after the message is accepted.
+    Finds or creates a session, then posts the message.  When async_prompt
+    is True (the default), uses the prompt_async endpoint which returns 204
+    immediately without waiting for the LLM to finish.
     """
     try:
-        url = f"{base_url}/session/message"
-        payload = {
-            "parts": [{"type": "text", "text": message}]
-        }
+        session_id = _get_or_create_session(base_url, timeout)
+
+        payload = {"parts": [{"type": "text", "text": message}]}
         data = json.dumps(payload).encode("utf-8")
 
+        if async_prompt:
+            url = f"{base_url}/session/{session_id}/prompt_async"
+        else:
+            url = f"{base_url}/session/{session_id}/message"
+
         req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+            url, data=data, headers=JSON_HEADERS, method="POST",
         )
 
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 204:
+                # prompt_async returns no body
+                return SendResult(
+                    success=True,
+                    session_id=session_id,
+                    message_id=None,
+                    error=None,
+                )
             result = json.loads(resp.read().decode("utf-8"))
             return SendResult(
                 success=True,
-                session_id=result.get("sessionID") or result.get("session_id"),
+                session_id=session_id,
                 message_id=result.get("id"),
                 error=None,
             )

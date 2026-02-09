@@ -1597,6 +1597,37 @@ CONFIG_EOF"#,
         }
         tracing::debug!("Task written to agent container");
 
+        // When orchestration is enabled, also write a worker-specific task file
+        // to the agent home volume. The worker copies configs from /mnt/agent-home
+        // at startup and will overwrite the task file with this worker-specific version
+        // that omits orchestration instructions (the worker is the leaf executor).
+        if self.enable_orchestration {
+            let worker_task_file = ".config/opencode/devaipod-task-worker.md";
+            let worker_task_content = crate::prompt::generate_worker_prompt(task, enable_gator);
+            let worker_task_script = format!(
+                r#"cat > '{agent_home}/{worker_task_file}' << 'TASK_EOF'
+{worker_task_content}
+TASK_EOF"#,
+                agent_home = AGENT_HOME_PATH,
+                worker_task_file = worker_task_file,
+                worker_task_content = worker_task_content,
+            );
+            let exit_code = podman
+                .exec_quiet(
+                    &self.agent_container,
+                    &["/bin/sh", "-c", &worker_task_script],
+                    None,
+                    None,
+                )
+                .await
+                .context("Failed to write worker task file")?;
+            if exit_code != 0 {
+                tracing::warn!("Failed to write worker task file (exit code {})", exit_code);
+            } else {
+                tracing::debug!("Worker task file written to agent home");
+            }
+        }
+
         Ok(())
     }
 
@@ -2487,6 +2518,13 @@ fi
 # Copy opencode config
 if [ -d /mnt/agent-home/.config/opencode ]; then
     cp -r /mnt/agent-home/.config/opencode {home}/.config/
+fi
+
+# Use worker-specific task file if available (omits orchestration instructions
+# since the worker is the leaf executor, not an orchestrator)
+if [ -f /mnt/agent-home/.config/opencode/devaipod-task-worker.md ]; then
+    cp /mnt/agent-home/.config/opencode/devaipod-task-worker.md \
+       {home}/.config/opencode/devaipod-task.md
 fi
 
 # Copy git identity
