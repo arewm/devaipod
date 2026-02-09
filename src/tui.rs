@@ -970,11 +970,7 @@ fn derive_agent_state_from_messages(messages: &[serde_json::Value]) -> AgentStat
         if part.get("type").and_then(|t| t.as_str()) == Some("text") {
             part.get("text").and_then(|t| t.as_str()).map(|text| {
                 let first_line = text.lines().next().unwrap_or("");
-                if first_line.len() > 60 {
-                    format!("{}...", &first_line[..57])
-                } else {
-                    first_line.to_string()
-                }
+                truncate_with_ellipsis(first_line, 60)
             })
         } else {
             None
@@ -1111,6 +1107,19 @@ async fn fetch_agent_state(api_port: u16, api_password: &str) -> AgentState {
     };
 
     derive_agent_state_from_messages(&messages)
+}
+
+/// Truncate a string to a maximum number of characters, adding "..." if truncated.
+///
+/// This correctly handles multi-byte UTF-8 characters by counting characters,
+/// not bytes.
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{truncated}...")
+    }
 }
 
 /// Extract the pod name from a container name
@@ -2718,6 +2727,53 @@ fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState, KeyModifiers};
+
+    #[test]
+    fn test_truncate_with_ellipsis_short_string() {
+        assert_eq!(truncate_with_ellipsis("hello", 10), "hello");
+        assert_eq!(truncate_with_ellipsis("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_exact_length() {
+        assert_eq!(truncate_with_ellipsis("1234567890", 10), "1234567890");
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_long_string() {
+        assert_eq!(
+            truncate_with_ellipsis("12345678901234567890", 10),
+            "1234567..."
+        );
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_unicode() {
+        // Em-dash is 3 bytes but 1 character
+        let s = "Clean across the board — clippy, fmt, tests pass";
+        let result = truncate_with_ellipsis(s, 30);
+        assert_eq!(result.chars().count(), 30);
+        assert!(result.ends_with("..."));
+        // Verify we didn't panic on the multi-byte character
+        assert!(result.contains("—") || result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_unicode_at_boundary() {
+        // String where truncation point lands right at/near a multi-byte char
+        let s = "Test string—with em-dash";
+        let result = truncate_with_ellipsis(s, 15);
+        assert_eq!(result.chars().count(), 15);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_emoji() {
+        let s = "Hello 🎉 world with emoji";
+        let result = truncate_with_ellipsis(s, 10);
+        assert_eq!(result.chars().count(), 10);
+        assert!(result.ends_with("..."));
+    }
 
     /// Create a test app for UI testing (no Docker connection needed)
     fn create_test_app_for_ui() -> TestApp {
