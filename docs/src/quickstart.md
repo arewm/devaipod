@@ -1,5 +1,40 @@
 # Quick Start
 
+## Before you start
+
+devaipod is opinionated, but also is designed to be very configurable
+about the execution environment.
+
+### devcontainer required
+
+A core assumption of this project is that your software needs *your tools*;
+your version of npm/Rust/Go etc. using your preferred base OS.
+
+The default solution from this project is [devcontainers](https://containers.dev/).
+In particular, you must have a container image with opencode and git installed
+alongside your tools.
+
+### OpenCode configuration strongly encouraged
+
+
+While OpenCode does run out of the box with a $0 "Zen" model,
+a foundational assumption of this project is that in general, you
+will want to configure at least the provider to use your organization's
+model(s).
+
+Further, the author of this project is very strongly of the opinion
+that *everyone* should write an [AGENTS.md](https://agents.md/) that
+defines your style and rules - don't just accept stock model output!
+
+The encouraged solution to both of these is to create a "dotfiles"
+git repository. This is not a new concept, it's already supported
+by popular devcontainer tools, and this project is one of them.
+
+### Example dotfiles with opencode config
+
+- [cgwalters](https://github.com/cgwalters/homegit), specifically look at
+  https://github.com/cgwalters/homegit/tree/main/dotfiles/.config/opencode
+
 ## Installation
 
 ```bash
