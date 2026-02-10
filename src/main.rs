@@ -2680,11 +2680,11 @@ exec tmux attach -t {session}
             }
         }
         AttachTarget::Worker => {
-            // Worker container: connect to worker's opencode serve (uses port OPENCODE_PORT + 1)
+            // Worker container: connect to worker's opencode serve
             tracing::info!("Attaching to worker in '{}'...", strip_pod_prefix(pod_name));
 
-            // Worker uses a different port than the task owner agent
-            let worker_port = pod::OPENCODE_PORT + 1;
+            // Worker uses WORKER_OPENCODE_PORT (4098), not OPENCODE_PORT+1 (4097 = auth proxy)
+            let worker_port = pod::WORKER_OPENCODE_PORT;
 
             // Build the opencode attach command for the worker
             let mut attach_args = vec![
