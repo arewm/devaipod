@@ -2612,7 +2612,7 @@ async fn cmd_attach(pod_name: &str, session: Option<&str>, target: AttachTarget)
             // This enables seamless handoff from `devaipod run "task"` to interactive mode
             let effective_session = match session {
                 Some(sid) => Some(sid.to_string()),
-                None => detect_active_session(pod_name),
+                None => detect_active_session(pod_name, None),
             };
 
             if let Some(ref sid) = effective_session {
@@ -2705,15 +2705,25 @@ exec tmux attach -t {session}
             // Worker uses WORKER_OPENCODE_PORT (4098), not OPENCODE_PORT+1 (4097 = auth proxy)
             let worker_port = pod::WORKER_OPENCODE_PORT;
 
+            // If no session specified, try to auto-detect an existing session
+            let effective_session = match session {
+                Some(sid) => Some(sid.to_string()),
+                None => detect_active_session(pod_name, Some(worker_port)),
+            };
+
+            if let Some(ref sid) = effective_session {
+                tracing::info!("Continuing session: {}", sid);
+            }
+
             // Build the opencode attach command for the worker
             let mut attach_args = vec![
                 "opencode".to_string(),
                 "attach".to_string(),
                 format!("http://localhost:{}", worker_port),
             ];
-            if let Some(sid) = session {
+            if let Some(sid) = effective_session {
                 attach_args.push("-s".to_string());
-                attach_args.push(sid.to_string());
+                attach_args.push(sid);
             }
 
             let mut cmd = podman_command();
@@ -4286,10 +4296,13 @@ async fn cmd_opencode(pod_name: &str, action: OpencodeAction) -> Result<()> {
 /// without a parent) and return the oldest one, which is typically the main
 /// task session.
 ///
+/// If `port` is provided, queries that specific port; otherwise uses the default
+/// coordinator agent port.
+///
 /// Returns None if no session is found or if there's an error (fail-open).
-fn detect_active_session(pod_name: &str) -> Option<String> {
+fn detect_active_session(pod_name: &str, port: Option<u16>) -> Option<String> {
     // Try to get sessions from the API
-    let sessions = match opencode_api_get(pod_name, "/session") {
+    let sessions = match opencode_api_get_port(pod_name, "/session", port) {
         Ok(s) => s,
         Err(_) => return None,
     };
@@ -4338,8 +4351,18 @@ fn detect_active_session(pod_name: &str) -> Option<String> {
 /// Execute a curl command in the workspace container and return the output
 /// (Legacy approach for pods without published API)
 fn opencode_api_get(pod_name: &str, path: &str) -> Result<serde_json::Value> {
+    opencode_api_get_port(pod_name, path, None)
+}
+
+/// Execute a curl command in the workspace container with a specific port
+fn opencode_api_get_port(
+    pod_name: &str,
+    path: &str,
+    port: Option<u16>,
+) -> Result<serde_json::Value> {
     let workspace_container = format!("{}-workspace", pod_name);
-    let url = format!("http://localhost:{}{}", pod::OPENCODE_PORT, path);
+    let port = port.unwrap_or(pod::OPENCODE_PORT);
+    let url = format!("http://localhost:{}{}", port, path);
 
     let output = podman_command()
         .args(["exec", &workspace_container, "curl", "-sf", &url])
