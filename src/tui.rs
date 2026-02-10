@@ -1785,7 +1785,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             }
                             Action::Attach(name) => {
                                 // Run attach in subprocess (opens tmux with agent + shell)
-                                run_subprocess(terminal, &["attach", &name]).await?;
+                                // Use -- to prevent names starting with - being parsed as options
+                                run_subprocess(terminal, &["attach", "--", &name]).await?;
                                 // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
                                 agent_refresh_interval.reset();
@@ -1806,7 +1807,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
 
                                 let mut errors = Vec::new();
                                 for name in &names {
-                                    if let Err(e) = run_subprocess_silent(&["delete", "--force", name]).await {
+                                    // Use -- to prevent names starting with - being parsed as options
+                                    if let Err(e) = run_subprocess_silent(&["delete", "--force", "--", name]).await {
                                         errors.push(format!("{}: {}", name, e));
                                     }
                                 }
@@ -1841,7 +1843,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                     app.status_message = Some(format!("Stopping {}...", name));
                                     terminal.draw(|f| ui(f, &mut app))?;
 
-                                    match run_subprocess_silent(&["stop", &name]).await {
+                                    // Use -- to prevent names starting with - being parsed as options
+                                    match run_subprocess_silent(&["stop", "--", &name]).await {
                                         Ok(()) => {
                                             app.status_message = Some(format!("Stopped {}", name));
                                         }
@@ -1854,7 +1857,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                     app.status_message = Some(format!("Starting {}...", name));
                                     terminal.draw(|f| ui(f, &mut app))?;
 
-                                    match run_subprocess_silent(&["start", &name]).await {
+                                    // Use -- to prevent names starting with - being parsed as options
+                                    match run_subprocess_silent(&["start", "--", &name]).await {
                                         Ok(()) => {
                                             app.status_message = Some(format!("Started {}", name));
                                         }
@@ -1875,7 +1879,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             }
                             Action::ExecAgent(name) => {
                                 // Exec into agent container
-                                run_subprocess(terminal, &["exec", &name]).await?;
+                                // Use -- to prevent names starting with - being parsed as options
+                                run_subprocess(terminal, &["exec", "--", &name]).await?;
                                 // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
                                 agent_refresh_interval.reset();
@@ -1886,7 +1891,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             }
                             Action::ExecWorkspace(name) => {
                                 // Exec into workspace container
-                                run_subprocess(terminal, &["exec", "-W", &name]).await?;
+                                // Use -- to prevent names starting with - being parsed as options
+                                run_subprocess(terminal, &["exec", "-W", "--", &name]).await?;
                                 // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
                                 agent_refresh_interval.reset();
@@ -1897,7 +1903,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             }
                             Action::AttachWorker(name) => {
                                 // Attach to worker agent
-                                run_subprocess(terminal, &["attach", "--worker", &name]).await?;
+                                // Use -- to prevent names starting with - being parsed as options
+                                run_subprocess(terminal, &["attach", "--worker", "--", &name]).await?;
                                 // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
                                 agent_refresh_interval.reset();
@@ -1908,7 +1915,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             }
                             Action::ExecWorker(name) => {
                                 // Exec into worker container
-                                run_subprocess(terminal, &["exec", "--worker", &name]).await?;
+                                // Use -- to prevent names starting with - being parsed as options
+                                run_subprocess(terminal, &["exec", "--worker", "--", &name]).await?;
                                 // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
                                 agent_refresh_interval.reset();

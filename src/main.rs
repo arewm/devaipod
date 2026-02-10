@@ -167,6 +167,9 @@ fn resolve_source<'a>(source: Option<&'a str>, config: &'a config::Config) -> Re
 }
 
 /// Sanitize a name for use in pod names (alphanumeric and hyphens only)
+///
+/// Also strips leading hyphens to avoid generating names that look like
+/// command-line options (e.g., `-foo` would break `devaipod attach -foo`).
 fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -176,7 +179,9 @@ fn sanitize_name(name: &str) -> String {
                 '-'
             }
         })
-        .collect()
+        .collect::<String>()
+        .trim_start_matches('-')
+        .to_string()
 }
 
 /// Generate a short unique suffix for pod names
@@ -418,6 +423,7 @@ enum HostCommand {
     ///   devaipod attach myworkspace -s abc123    # Connect to specific session
     Attach {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: Option<String>,
         /// Attach to the most recently created workspace
         #[arg(short = 'l', long)]
@@ -451,6 +457,7 @@ enum HostCommand {
     ///   devaipod exec myworkspace -- ls -la # Run a specific command
     Exec {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         /// Exec into the workspace container instead of the agent
         ///
@@ -481,6 +488,7 @@ enum HostCommand {
     ///   devaipod ssh-config my-repo >> ~/.ssh/config
     SshConfig {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         /// User to connect as (default: current user)
         #[arg(long)]
@@ -521,16 +529,19 @@ enum HostCommand {
     /// Use 'devaipod list' to see available workspaces.
     Start {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
     },
     /// Stop a workspace
     Stop {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
     },
     /// Delete a workspace
     Delete {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         /// Force deletion (stop running containers first)
         #[arg(short, long)]
@@ -552,6 +563,7 @@ enum HostCommand {
     ///   devaipod rebuild my-workspace --image ghcr.io/org/devenv:latest
     Rebuild {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         /// Use a specific container image instead of rebuilding from devcontainer.json
         #[arg(long, value_name = "IMAGE")]
@@ -563,6 +575,7 @@ enum HostCommand {
     /// View container logs
     Logs {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         /// Which container to show logs for (workspace, agent, gator, proxy)
         #[arg(short, long, default_value = "agent")]
@@ -579,6 +592,7 @@ enum HostCommand {
     /// Displays pod status, container states, agent health, and exposed ports.
     Status {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         /// Output in JSON format
         #[arg(long)]
@@ -594,6 +608,7 @@ enum HostCommand {
     ///   devaipod debug my-workspace --json
     Debug {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         /// Output in JSON format for scripting
         #[arg(long)]
@@ -689,6 +704,7 @@ enum HostCommand {
     ///   devaipod opencode myworkspace send "fix bug"    # Send message to agent
     Opencode {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         #[command(subcommand)]
         action: OpencodeAction,
@@ -834,11 +850,13 @@ enum GatorAction {
     ///   EDITOR=vim devaipod gator edit my-workspace
     Edit {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
     },
     /// Show current service-gator scopes
     Show {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         /// Output in JSON format
         #[arg(long)]
@@ -854,6 +872,7 @@ enum GatorAction {
     ///   devaipod gator add my-workspace github:owner/*:read
     Add {
         /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
         workspace: String,
         /// Scope to add (format: github:owner/repo[:permissions])
         #[arg(required = true)]
@@ -5069,5 +5088,22 @@ mod tests {
         );
         // Names without prefix are returned as-is
         assert_eq!(strip_pod_prefix("myproject"), "myproject");
+    }
+
+    #[test]
+    fn test_sanitize_name_strips_leading_hyphens() {
+        // Names starting with special chars that become hyphens should have them stripped
+        assert_eq!(sanitize_name("-foo"), "foo");
+        assert_eq!(sanitize_name("--bar"), "bar");
+        assert_eq!(sanitize_name("---baz"), "baz");
+        assert_eq!(sanitize_name(".dotfile"), "dotfile");
+        assert_eq!(sanitize_name("_underscore"), "underscore");
+        // Normal names are unchanged
+        assert_eq!(sanitize_name("myproject"), "myproject");
+        // Hyphens in the middle are preserved
+        assert_eq!(sanitize_name("my-project"), "my-project");
+        // Leading hyphens stripped, middle hyphens preserved
+        assert_eq!(sanitize_name("-my-project"), "my-project");
+        assert_eq!(sanitize_name("--my-project"), "my-project");
     }
 }
