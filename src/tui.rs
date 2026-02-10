@@ -27,7 +27,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, TableState};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, TableState, Wrap};
 use ratatui::Terminal;
 use tokio::time::interval;
 
@@ -1513,12 +1513,15 @@ fn render_launch_prompt(frame: &mut ratatui::Frame, app: &LaunchPromptApp) {
         )
     };
 
-    let url_paragraph = Paragraph::new(url_content).style(url_style).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(url_border_style)
-            .title(" Source "),
-    );
+    let url_paragraph = Paragraph::new(url_content)
+        .style(url_style)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(url_border_style)
+                .title(" Source "),
+        );
     frame.render_widget(url_paragraph, chunks[1]);
 
     // Task field
@@ -1551,6 +1554,7 @@ fn render_launch_prompt(frame: &mut ratatui::Frame, app: &LaunchPromptApp) {
 
     let task_paragraph = Paragraph::new(task_content)
         .style(task_style)
+        .wrap(Wrap { trim: false })
         .scroll((task_scroll, 0))
         .block(
             Block::default()
@@ -2554,6 +2558,7 @@ fn render_launch_dialog(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 
     let urls_paragraph = Paragraph::new(urls_content)
         .style(urls_style)
+        .wrap(Wrap { trim: false })
         .scroll((urls_scroll, 0))
         .block(
             Block::default()
@@ -2593,6 +2598,7 @@ fn render_launch_dialog(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 
     let task_paragraph = Paragraph::new(task_content)
         .style(task_style)
+        .wrap(Wrap { trim: false })
         .scroll((task_scroll, 0))
         .block(
             Block::default()
