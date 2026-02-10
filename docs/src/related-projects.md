@@ -25,9 +25,14 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 
 These are the "raw" agent tools that devaipod can wrap with sandboxing. They run directly on your machine with full access to your filesystem and credentials.
 
+### OpenCode
+
+[OpenCode](https://github.com/anomalyco/opencode/) is the primary agent framework used by devaipod. Apache-2.0 licensed. It provides a TUI and a server mode that devaipod uses for sandboxed execution.
+
 ### Claude Code
 
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) is Anthropic's official CLI agent. Proprietary, closed source. Runs locally but with no sandboxing—the agent has full access to your machine and any credentials in your environment.
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) is Anthropic's official CLI agent. Proprietary, closed source.
+Claude Code recently added [builtin sandboxing](https://code.claude.com/docs/en/sandboxing), but container-based isolation is stronger and provides a reproducible environment.
 
 ### Gemini CLI
 
@@ -45,13 +50,7 @@ devaipod addresses these gaps: the agent container has no direct access to your 
 
 ### Goose
 
-[Goose](https://github.com/block/goose) from Block is an extensible AI agent with MCP (Model Context Protocol) support. Apache-2.0 licensed, fully open source, runs locally.
-
-devaipod can run Goose as an agent backend (via `--agent goose`), though OpenCode is the primary tested agent.
-
-### OpenCode
-
-[OpenCode](https://github.com/anomalyco/opencode/) is the primary agent framework used by devaipod. Apache-2.0 licensed. It provides a TUI and a server mode that devaipod uses for sandboxed execution.
+[Goose](https://github.com/block/goose) from Block is an extensible AI agent with MCP (Model Context Protocol) support. Apache-2.0 licensed, fully open source, runs locally without builtin sandboxing.
 
 ## Orchestration Platforms
 
@@ -63,9 +62,15 @@ OpenHands is a more complete platform with its own web UI. devaipod focuses on C
 
 ### Ambient Code Platform
 
-[Ambient Code Platform](https://github.com/ambient-code/platform) is a Kubernetes-native platform for running AI coding agents. MIT licensed, self-hostable.
+[Ambient Code Platform](https://github.com/ambient-code/platform) is a Kubernetes-native platform for running AI coding agents. MIT licensed (except for Claude Code), self-hostable.
 
 Ambient Code targets team/organization deployment on Kubernetes. devaipod targets individual developer workstations with zero infrastructure beyond podman. Both projects solve credential scoping—Ambient Code's broker architecture influenced devaipod's service-gator integration.
+
+The devaipod project would like to align more with Ambient Code. A few things:
+
+- [Podman support](https://github.com/ambient-code/platform/issues/431)
+- [Image needs to be pluggable](https://github.com/ambient-code/platform/pull/364)
+- It's possible to run locally with [minikube](https://minikube.sigs.k8s.io/) or [minc](https://github.com/minc-org/minc) in theory, but this adds some friction
 
 ### Auto-Claude
 
