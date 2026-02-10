@@ -242,6 +242,8 @@ pub struct InstanceInfo {
     /// Most recent activity timestamp (Unix milliseconds) for sorting by "last active"
     /// Derived from agent state (last message time) or falls back to created_ts
     pub last_activity_ts: Option<i64>,
+    /// Whether worker container exists and is running
+    pub worker_healthy: Option<bool>,
 }
 
 /// Mode of the TUI (normal browsing vs delete selection)
@@ -256,6 +258,61 @@ pub enum TuiMode {
     DeleteConfirm,
     /// Launch dialog - input URLs and task
     Launch,
+    /// Container access menu - select which container/shell to access
+    ContainerMenu,
+}
+
+/// Menu item in the container access menu
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerMenuItem {
+    /// Attach to orchestrator agent (default attach)
+    OrchestratorAgent,
+    /// Attach to worker agent
+    WorkerAgent,
+    /// Exec shell into worker container
+    WorkerShell,
+    /// Exec shell into workspace container
+    WorkspaceShell,
+}
+
+impl ContainerMenuItem {
+    /// Get display label for menu item
+    fn label(&self) -> &'static str {
+        match self {
+            ContainerMenuItem::OrchestratorAgent => "1. Orchestrator Agent",
+            ContainerMenuItem::WorkerAgent => "2. Worker Agent",
+            ContainerMenuItem::WorkerShell => "3. Worker Shell",
+            ContainerMenuItem::WorkspaceShell => "4. Workspace Shell",
+        }
+    }
+
+    /// Get description for menu item
+    fn description(&self) -> &'static str {
+        match self {
+            ContainerMenuItem::OrchestratorAgent => "opencode attach to task owner",
+            ContainerMenuItem::WorkerAgent => "opencode attach to worker",
+            ContainerMenuItem::WorkerShell => "bash shell in worker container",
+            ContainerMenuItem::WorkspaceShell => "bash shell in workspace container",
+        }
+    }
+
+    /// All menu items in order
+    fn all() -> &'static [ContainerMenuItem] {
+        &[
+            ContainerMenuItem::OrchestratorAgent,
+            ContainerMenuItem::WorkerAgent,
+            ContainerMenuItem::WorkerShell,
+            ContainerMenuItem::WorkspaceShell,
+        ]
+    }
+
+    /// Whether this menu item requires the worker container to be available
+    fn requires_worker(&self) -> bool {
+        matches!(
+            self,
+            ContainerMenuItem::WorkerAgent | ContainerMenuItem::WorkerShell
+        )
+    }
 }
 
 /// Which field is active in the launch dialog
@@ -295,6 +352,10 @@ pub enum Action {
     ExecAgent(String),
     /// Exec into workspace container
     ExecWorkspace(String),
+    /// Attach to worker agent
+    AttachWorker(String),
+    /// Exec into worker container
+    ExecWorker(String),
     /// Launch new instances with URLs and a task
     Launch { urls: Vec<String>, task: String },
 }
@@ -319,6 +380,8 @@ pub struct App {
     selected_for_delete: std::collections::HashSet<String>,
     /// Launch dialog input state
     launch_input: LaunchInput,
+    /// Selected item in container menu (0-3)
+    container_menu_selection: usize,
 }
 
 impl App {
@@ -354,6 +417,7 @@ impl App {
             mode: TuiMode::Normal,
             selected_for_delete: std::collections::HashSet::new(),
             launch_input: LaunchInput::default(),
+            container_menu_selection: 0,
         };
 
         // Initial data fetch
@@ -565,6 +629,14 @@ impl App {
                 .and_then(|l| l.get("io.devaipod.service-gator"))
                 .cloned();
 
+            // Check worker container health (orchestration always enabled)
+            let worker_healthy = containers.iter().any(|c| {
+                c.names
+                    .as_ref()
+                    .is_some_and(|n| n.iter().any(|name| name.ends_with("-worker")))
+                    && c.state.as_deref() == Some("running")
+            });
+
             // Initialize last_activity_ts from agent state if available, otherwise from created_ts
             let last_activity_ts = agent_state
                 .last_message_ts
@@ -590,6 +662,7 @@ impl App {
                 gator_healthy: Some(gator_healthy),
                 gator_scopes,
                 last_activity_ts,
+                worker_healthy: Some(worker_healthy),
             });
         }
 
@@ -1129,6 +1202,7 @@ fn extract_pod_name(container_name: &str) -> &str {
     for suffix in &[
         "-service-gator",
         "-workspace",
+        "-worker",
         "-agent",
         "-infra",
         "-gator",
@@ -1821,6 +1895,28 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
                                 spawn_agent_refresh(&app.instances, agent_tx.clone());
                             }
+                            Action::AttachWorker(name) => {
+                                // Attach to worker agent
+                                run_subprocess(terminal, &["attach", "--worker", &name]).await?;
+                                // Reset intervals to prevent accumulated ticks from firing
+                                refresh_interval.reset();
+                                agent_refresh_interval.reset();
+                                // Refresh after returning from subprocess
+                                let _ = app.refresh_instances().await;
+                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                            }
+                            Action::ExecWorker(name) => {
+                                // Exec into worker container
+                                run_subprocess(terminal, &["exec", "--worker", &name]).await?;
+                                // Reset intervals to prevent accumulated ticks from firing
+                                refresh_interval.reset();
+                                agent_refresh_interval.reset();
+                                // Refresh after returning from subprocess
+                                let _ = app.refresh_instances().await;
+                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                            }
                             Action::Launch { urls, task } => {
                                 // Launch instances for each URL in parallel
                                 let count = urls.len();
@@ -1872,6 +1968,7 @@ fn handle_event(app: &mut App, event: Event) -> Option<Action> {
             TuiMode::DeleteSelect => handle_delete_select_mode(app, key.code),
             TuiMode::DeleteConfirm => handle_delete_confirm_mode(app, key.code),
             TuiMode::Launch => handle_launch_mode(app, key),
+            TuiMode::ContainerMenu => handle_container_menu_mode(app, key.code),
         },
         _ => None,
     }
@@ -1950,7 +2047,93 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
             app.status_message = None;
             None
         }
+        KeyCode::Right | KeyCode::Char('l') => {
+            // Open container access menu
+            if let Some(instance) = app.selected_instance() {
+                if instance.status == "Running" {
+                    app.mode = TuiMode::ContainerMenu;
+                    app.container_menu_selection = 0;
+                    app.status_message = None;
+                } else {
+                    app.status_message = Some("Instance is not running".to_string());
+                }
+            } else {
+                app.status_message = Some("No instance selected".to_string());
+            }
+            None
+        }
         _ => None,
+    }
+}
+
+/// Handle key events in container menu mode
+fn handle_container_menu_mode(app: &mut App, code: KeyCode) -> Option<Action> {
+    let menu_items = ContainerMenuItem::all();
+    let max_idx = menu_items.len().saturating_sub(1);
+
+    match code {
+        KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') | KeyCode::Char('h') => {
+            // Close menu, return to normal mode
+            app.mode = TuiMode::Normal;
+            app.status_message = None;
+            None
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            // Move down in menu
+            if app.container_menu_selection < max_idx {
+                app.container_menu_selection += 1;
+            }
+            None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            // Move up in menu
+            if app.container_menu_selection > 0 {
+                app.container_menu_selection -= 1;
+            }
+            None
+        }
+        KeyCode::Char('1') => {
+            app.container_menu_selection = 0;
+            select_container_menu_item(app)
+        }
+        KeyCode::Char('2') => {
+            app.container_menu_selection = 1;
+            select_container_menu_item(app)
+        }
+        KeyCode::Char('3') => {
+            app.container_menu_selection = 2;
+            select_container_menu_item(app)
+        }
+        KeyCode::Char('4') => {
+            app.container_menu_selection = 3;
+            select_container_menu_item(app)
+        }
+        KeyCode::Enter => select_container_menu_item(app),
+        _ => None,
+    }
+}
+
+/// Execute the selected container menu item
+fn select_container_menu_item(app: &mut App) -> Option<Action> {
+    let menu_items = ContainerMenuItem::all();
+    let selected_item = menu_items.get(app.container_menu_selection)?;
+    let instance = app.selected_instance()?;
+    let name = instance.name.clone();
+    let worker_available = instance.worker_healthy == Some(true);
+
+    // Check if worker is available for worker-related actions
+    if selected_item.requires_worker() && !worker_available {
+        app.status_message = Some("Worker container not available".to_string());
+        return None;
+    }
+
+    app.mode = TuiMode::Normal;
+
+    match selected_item {
+        ContainerMenuItem::OrchestratorAgent => Some(Action::Attach(name)),
+        ContainerMenuItem::WorkerAgent => Some(Action::AttachWorker(name)),
+        ContainerMenuItem::WorkerShell => Some(Action::ExecWorker(name)),
+        ContainerMenuItem::WorkspaceShell => Some(Action::ExecWorkspace(name)),
     }
 }
 
@@ -2249,7 +2432,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // Footer with help and status (mode-dependent)
     let (help_base, footer_style) = match app.mode {
         TuiMode::Normal => (
-            " q: Quit │ j/k: Navigate │ a: Attach │ e: Exec │ E: Exec -W │ S: Start/Stop │ d: Delete │ L: Launch │ r: Refresh",
+            " q: Quit │ j/k: Nav │ a/Enter: Attach │ →/l: Menu │ e: Exec │ S: Start/Stop │ d: Del │ L: Launch │ r: Refresh",
             Style::default().fg(Color::DarkGray),
         ),
         TuiMode::DeleteSelect => (
@@ -2264,6 +2447,10 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
             " Tab: Switch field │ Esc: Cancel",
             Style::default().fg(Color::Cyan),
         ),
+        TuiMode::ContainerMenu => (
+            " j/k: Navigate │ 1-4: Quick select │ Enter: Confirm │ Esc/←: Cancel",
+            Style::default().fg(Color::Cyan),
+        ),
     };
     let help_text = format!("{}{}", help_base, status);
     let footer = Paragraph::new(help_text)
@@ -2271,9 +2458,11 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 
-    // Render launch dialog popup if in launch mode
-    if app.mode == TuiMode::Launch {
-        render_launch_dialog(frame, app, area);
+    // Render popups for dialog modes
+    match app.mode {
+        TuiMode::Launch => render_launch_dialog(frame, app, area),
+        TuiMode::ContainerMenu => render_container_menu(frame, app, area),
+        _ => {}
     }
 }
 
@@ -2421,6 +2610,78 @@ fn render_launch_dialog(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         .alignment(ratatui::layout::Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(submit_button, inner_chunks[3]);
+}
+
+/// Render the container access menu popup
+fn render_container_menu(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let menu_items = ContainerMenuItem::all();
+
+    // Get selected instance info
+    let instance = app.selected_instance();
+    let instance_name = instance.map(|i| i.name.as_str()).unwrap_or("?");
+    let worker_available = instance
+        .map(|i| i.worker_healthy == Some(true))
+        .unwrap_or(false);
+
+    // Popup dimensions: title + menu items (1 line each) + borders
+    let popup_height = (menu_items.len() as u16 + 4).min(area.height - 4); // +2 title, +2 borders
+    let popup_width = 55u16.min(area.width - 4);
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear the area behind the popup
+    frame.render_widget(Clear, popup_area);
+
+    // Build menu content
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    for (idx, item) in menu_items.iter().enumerate() {
+        let is_selected = idx == app.container_menu_selection;
+        let is_disabled = item.requires_worker() && !worker_available;
+
+        let (prefix, label_style, desc_style) = if is_disabled {
+            // Disabled items are grayed out
+            (
+                "  ",
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else if is_selected {
+            (
+                "▶ ",
+                Style::default().fg(Color::Cyan).bold(),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            (
+                "  ",
+                Style::default().fg(Color::White),
+                Style::default().fg(Color::DarkGray),
+            )
+        };
+
+        let description = if is_disabled {
+            "(no worker)"
+        } else {
+            item.description()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), label_style),
+            Span::styled(item.label().to_string(), label_style),
+            Span::raw("  "),
+            Span::styled(description.to_string(), desc_style),
+        ]));
+    }
+
+    let menu = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!(" {} ", instance_name)),
+    );
+    frame.render_widget(menu, popup_area);
 }
 
 /// Height of each instance card (lines)
@@ -2591,10 +2852,17 @@ fn render_instance_card(
         Span::styled(truncated_status, Style::default().fg(Color::White)),
     ]));
 
-    // Line 3: Repo + gator info
+    // Line 3: Repo + service indicators (gator, worker)
     let gator_indicator = match instance.gator_healthy {
         Some(true) => "🔐".to_string(),
         Some(false) => "⚠".to_string(),
+        None => String::new(),
+    };
+
+    // Worker indicator: W for running worker, shows orchestration is available
+    let worker_indicator = match instance.worker_healthy {
+        Some(true) => "W".to_string(),
+        Some(false) => "w".to_string(), // lowercase = not running
         None => String::new(),
     };
     let gator_scopes_short = instance
@@ -2641,6 +2909,18 @@ fn render_instance_card(
                     Style::default().fg(Color::Cyan),
                 ));
             }
+        }
+        // Add worker indicator if worker container exists
+        if !worker_indicator.is_empty() {
+            spans.push(Span::raw(" ".to_string()));
+            spans.push(Span::styled(
+                format!("[{}]", worker_indicator),
+                if instance.worker_healthy == Some(true) {
+                    Style::default().fg(Color::Magenta)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ));
         }
         lines.push(Line::from(spans));
     }
@@ -2906,6 +3186,7 @@ mod tests {
                 gator_healthy: Some(true),
                 gator_scopes: Some("--gh-repo user/myproject:read".to_string()),
                 last_activity_ts: Some(1705315800000), // 2024-01-15 10:30 in millis
+                worker_healthy: Some(true),
             },
             InstanceInfo {
                 name: "otherrepo-def456".to_string(),
@@ -2930,6 +3211,7 @@ mod tests {
                 gator_healthy: Some(false),
                 gator_scopes: None,
                 last_activity_ts: Some(1705240800000), // 2024-01-14 14:00 in millis
+                worker_healthy: Some(false),
             },
             InstanceInfo {
                 name: "degraded-pod".to_string(),
@@ -2960,6 +3242,7 @@ mod tests {
                 gator_healthy: None,
                 gator_scopes: Some("--gh-repo org/repo:read,write".to_string()),
                 last_activity_ts: None,
+                worker_healthy: None,
             },
         ]
     }
