@@ -25,32 +25,36 @@ devaipod uses podman pods to create a multi-container environment:
 2. Creates a podman pod with shared network namespace
 3. Starts containers:
    - **workspace**: Your development environment with `opencode-connect` shim
-   - **agent**: Runs `opencode serve` with credential isolation (no GH_TOKEN, etc.)
+   - **task owner**: Orchestrates work, runs `opencode serve` on port 4096
+   - **worker**: Executes subtasks, runs `opencode serve` on port 4098
    - **gator**: The [service-gator](https://github.com/cgwalters/service-gator) MCP server for controlled access to GitHub/JIRA
 
-All containers share the same network namespace, allowing localhost communication between the agent and workspace.
+All containers share the same network namespace, allowing localhost communication between containers.
 
 ```mermaid
 flowchart LR
     subgraph pod[Podman Pod]
         workspace[Workspace]
-        agent[Agent]
+        owner[Task Owner]
+        worker[Worker]
         gator[Gator]
     end
-    workspace -->|attach :4096| agent
-    agent -->|MCP :8765| gator
+    workspace -->|attach :4096| owner
+    owner -->|delegate :4098| worker
+    owner -->|MCP :8765| gator
+    worker -.->|MCP| gator
     gator -->|scoped| github[GitHub API]
 ```
 
 ## Key Features
 
 - **Native podman** - no devpod dependency for core workflow
-- **Sandboxed agent** - agent container is credential-isolated (no GH_TOKEN, etc.)
-- **Task kickoff** - give the agent a task and it starts working immediately
+- **Sandboxed agents** - task owner and worker containers are credential-isolated (no GH_TOKEN, etc.)
+- **Task kickoff** - give the task owner a task and it starts working immediately
 - **Auto service-gator** - remote URLs automatically get read + draft PR permissions
-- **Workspace shim** - `opencode-connect` runs `opencode attach` to connect to the agent
-- **API keys from environment** - agent receives `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.
-- **Network isolation** - optionally restrict agent to allowed LLM API domains via proxy
+- **Workspace shim** - `opencode-connect` runs `opencode attach` to connect to the task owner
+- **API keys from environment** - agents receive `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.
+- **Network isolation** - optionally restrict agents to allowed LLM API domains via proxy
 - **Env allowlist** - per-project env vars in devcontainer.json customizations
 - **Toolbox compatible** - works inside toolbox containers
 - **macOS support** - works with podman machine on macOS
@@ -59,7 +63,7 @@ flowchart LR
 
 - **podman** (rootless works, including inside toolbox containers)
 - An image with `opencode` installed (e.g., [devenv-debian](https://github.com/bootc-dev/devenv-debian))
-- A `devcontainer.json` in your project (`.devcontainer/devcontainer.json` or `.devcontainer.json`)
+- A `devcontainer.json` in your project, OR a default image configured in `~/.config/devaipod.toml`
 
 ## License
 

@@ -29,7 +29,7 @@ devaipod run https://github.com/org/repo -c 'fix typos in README.md'
 devaipod run https://github.com/org/repo/issues/123
 ```
 
-Monitor progress with `devaipod attach <workspace>` which connects to the agent.
+Monitor progress with `devaipod attach <workspace>` which connects to the task owner agent. Use `devaipod attach <workspace> --worker` to connect to the worker agent.
 
 See below for other verbs.
 
@@ -53,18 +53,35 @@ This gives all pods read-only access to all GitHub data (repos, search, gists, G
 
 ## Example 2: Manual control
 
-You can also use `devaipod` as a basic wrapper for a devcontainer with an attached
-agent that is idle by default.
+You can also use `devaipod` as a basic wrapper for a devcontainer with attached
+agents (task owner and worker) that are idle by default.
 
 ```bash
 devaipod up https://github.com/org/repo
-# Attach to the agent when ready
+# Attach to the task owner agent when ready
 devaipod attach <workspace>
-# Or get a shell in agent container
+# Attach to the worker agent
+devaipod attach <workspace> --worker
+# Or get a shell in task owner container
 devaipod exec <workspace>
 # Or get a shell in workspace container for manual work
 devaipod exec <workspace> -W
 ```
+
+## Editor integration via SSH
+
+Each devaipod workspace runs an embedded SSH server, allowing you to connect with editors that support SSH remoting (Zed, VSCode, Cursor, etc.). This lets you interrupt an autonomous task and take manual control of the codebase.
+
+```bash
+# Generate SSH config entries for your workspaces
+devaipod ssh-config >> ~/.ssh/config
+
+# Then open in your editor:
+# Zed: zed ssh://devaipod-<workspace>
+# VSCode: code --remote ssh-remote+devaipod-<workspace> /workspaces/<project>
+```
+
+The SSH connection goes to the workspace container, which has full access to credentials (GH_TOKEN, etc.) for manual development work. You can review agent changes, make edits, run tests, and push commits directly.
 
 ## Next Steps
 
