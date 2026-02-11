@@ -16,6 +16,29 @@
 use std::path::Path;
 use std::process::Command;
 
+// Git remote name constants
+// These names are used consistently across workspace and worker pods.
+
+/// The main upstream repository (where PRs merge to, the source of truth)
+pub const REMOTE_ORIGIN: &str = "origin";
+
+/// The user's fork (only present when working on a PR from a fork)
+pub const REMOTE_FORK: &str = "fork";
+
+// Cross-container remotes for collaboration:
+
+/// In workspace container: points to agent's workspace git
+pub const REMOTE_AGENT: &str = "agent";
+
+/// In agent container: points to human's workspace git
+pub const REMOTE_WORKSPACE: &str = "workspace";
+
+/// In task owner (agent) container: points to worker's workspace git
+pub const REMOTE_WORKER: &str = "worker";
+
+/// In worker container: points to task owner's workspace git
+pub const REMOTE_OWNER: &str = "owner";
+
 use color_eyre::eyre::{bail, Context, Result};
 
 /// Get a GitHub token from the environment (checks GH_TOKEN and GITHUB_TOKEN)
@@ -157,7 +180,7 @@ pub fn detect_git_info(project_path: &Path) -> Result<GitRepoInfo> {
 
     // Get remote URL (try 'origin' first, then any remote)
     let remote_url =
-        get_remote_url(project_path, "origin").or_else(|| get_first_remote_url(project_path));
+        get_remote_url(project_path, REMOTE_ORIGIN).or_else(|| get_first_remote_url(project_path));
 
     // Get current commit SHA
     let commit_output = Command::new("git")
@@ -329,9 +352,10 @@ pub fn clone_from_local_script(
         format!(
             r#"
 # Set up origin remote for push/pull
-git remote set-url origin "{url}" 2>/dev/null || git remote add origin "{url}"
+git remote set-url {REMOTE_ORIGIN} "{url}" 2>/dev/null || git remote add {REMOTE_ORIGIN} "{url}"
 "#,
-            url = url
+            url = url,
+            REMOTE_ORIGIN = REMOTE_ORIGIN
         )
     } else {
         String::new()
@@ -373,10 +397,11 @@ echo "Repository cloned successfully at commit {short_commit}"
 /// Generate a shell script to clone from a PR/MR
 ///
 /// The script will:
-/// 1. Clone the PR's head repository (using authenticated URL if token provided)
+/// 1. Clone the PR's head repository (the fork, using authenticated URL if token provided)
 /// 2. Checkout the specific commit
-/// 3. Reset the remote URL to the original (unauthenticated) URL
-/// 4. Add the upstream repository as a remote
+/// 3. Set up remotes:
+///    - `origin` points to the upstream repo (where the PR will merge to)
+///    - `fork` points to the PR author's fork (only if PR is from a fork)
 ///
 /// `gh_token` is an optional GitHub token for cloning private repositories.
 pub fn clone_pr_script(
@@ -387,15 +412,22 @@ pub fn clone_pr_script(
     // Use authenticated URL for cloning if token is provided
     let clone_url = authenticated_clone_url(&pr_info.head_clone_url, gh_token);
     let upstream_url = pr_info.pr_ref.upstream_url();
+    // The fork URL without embedded token (for storing in .git/config)
+    let fork_url = &pr_info.head_clone_url;
 
-    // After cloning, reset the remote to the original URL (without token)
-    // so the token isn't stored in .git/config
-    let reset_remote = if gh_token.is_some() {
+    // Only add fork remote if PR is actually from a fork (different repo)
+    let is_from_fork = fork_url != &upstream_url;
+    let fork_remote_setup = if is_from_fork {
         format!(
-            "\n# Reset remote URL to remove embedded token\ngit remote set-url origin \"{}\"\n",
-            pr_info.head_clone_url
+            r#"
+# Add '{REMOTE_FORK}' remote pointing to PR author's fork
+git remote add {REMOTE_FORK} "{fork_url}" 2>/dev/null || git remote set-url {REMOTE_FORK} "{fork_url}"
+"#,
+            REMOTE_FORK = REMOTE_FORK,
+            fork_url = fork_url
         )
     } else {
+        // PR is from a branch in the same repo, no fork remote needed
         String::new()
     };
 
@@ -405,17 +437,17 @@ set -e
 echo "Cloning PR #{number}: {title}"
 mkdir -p "$(dirname "{workspace}")"
 
-# Full clone of PR head (fork) repository for complete git history
+# Full clone of PR head repository for complete git history
 git clone --branch "{branch}" "{clone_url}" "{workspace}" 2>&1
 
 cd "{workspace}"
 
 # Checkout the exact commit
 git checkout "{commit}" 2>&1
-{reset_remote}
-# Add upstream as a remote for reference
-git remote add upstream "{upstream_url}" 2>/dev/null || true
 
+# Set 'origin' to point to the upstream repo (where PR merges to)
+git remote set-url {REMOTE_ORIGIN} "{upstream_url}"
+{fork_remote_setup}
 echo "PR #{number} cloned successfully at commit {short_commit}"
 "#,
         number = pr_info.pr_ref.number,
@@ -424,9 +456,10 @@ echo "PR #{number} cloned successfully at commit {short_commit}"
         clone_url = clone_url,
         branch = pr_info.head_ref,
         commit = pr_info.head_sha,
-        reset_remote = reset_remote,
         short_commit = &pr_info.head_sha[..pr_info.head_sha.len().min(8)],
         upstream_url = upstream_url,
+        fork_remote_setup = fork_remote_setup,
+        REMOTE_ORIGIN = REMOTE_ORIGIN,
     )
 }
 
@@ -451,8 +484,9 @@ pub fn clone_remote_script(
     // so the token isn't stored in .git/config
     let reset_remote = if gh_token.is_some() {
         format!(
-            "\n# Reset remote URL to remove embedded token\ngit remote set-url origin \"{}\"\n",
-            remote_info.remote_url
+            "\n# Reset remote URL to remove embedded token\ngit remote set-url {REMOTE_ORIGIN} \"{url}\"\n",
+            REMOTE_ORIGIN = REMOTE_ORIGIN,
+            url = remote_info.remote_url
         )
     } else {
         String::new()
@@ -673,22 +707,25 @@ rm -f .git/objects/info/alternates"#,
         format!(
             r#"
 # Ensure origin remote is set correctly
-git remote set-url origin "{url}" 2>/dev/null || git remote add origin "{url}"
+git remote set-url {REMOTE_ORIGIN} "{url}" 2>/dev/null || git remote add {REMOTE_ORIGIN} "{url}"
 
-# Add 'owner' remote pointing to task owner's workspace for fetching their commits
-git remote add owner "{reference}/.git" 2>/dev/null || git remote set-url owner "{reference}/.git"
+# Add '{REMOTE_OWNER}' remote pointing to task owner's workspace for fetching their commits
+git remote add {REMOTE_OWNER} "{reference}/.git" 2>/dev/null || git remote set-url {REMOTE_OWNER} "{reference}/.git"
 "#,
             url = url,
-            reference = reference_git_path
+            reference = reference_git_path,
+            REMOTE_ORIGIN = REMOTE_ORIGIN,
+            REMOTE_OWNER = REMOTE_OWNER,
         )
     } else {
         // Even without origin URL, add the owner remote
         format!(
             r#"
-# Add 'owner' remote pointing to task owner's workspace for fetching their commits
-git remote add owner "{reference}/.git" 2>/dev/null || git remote set-url owner "{reference}/.git"
+# Add '{REMOTE_OWNER}' remote pointing to task owner's workspace for fetching their commits
+git remote add {REMOTE_OWNER} "{reference}/.git" 2>/dev/null || git remote set-url {REMOTE_OWNER} "{reference}/.git"
 "#,
-            reference = reference_git_path
+            reference = reference_git_path,
+            REMOTE_OWNER = REMOTE_OWNER,
         )
     };
 

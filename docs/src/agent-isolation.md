@@ -105,9 +105,18 @@ Get a shell in the workspace container:
 devaipod exec <name> -W
 ```
 
-## Bidirectional git remotes
+## Git remotes
 
-Devaipod automatically sets up git remotes for collaboration:
+Devaipod sets up consistent git remote names across all containers.
+
+### Source repository remotes
+
+| Remote | Description |
+|--------|-------------|
+| `origin` | The main upstream repository (where PRs merge to, the source of truth) |
+| `fork` | The PR author's fork (only present when working on a PR from a fork) |
+
+### Cross-container collaboration remotes
 
 | Container | Remote | Points to |
 |-----------|--------|-----------|

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{bail, Context, Result};
 
 use crate::forge::PullRequestInfo;
-use crate::git::{GitRepoInfo, RemoteRepoInfo};
+use crate::git::{GitRepoInfo, RemoteRepoInfo, REMOTE_AGENT, REMOTE_WORKER, REMOTE_WORKSPACE};
 
 /// Source for workspace content - local git repo, remote URL, or PR/MR
 #[derive(Debug, Clone)]
@@ -1657,17 +1657,21 @@ TASK_EOF"#,
 # Mark the agent workspace as safe (different ownership in container)
 git config --global --add safe.directory '{agent_repo_path}'
 
-if git remote get-url agent >/dev/null 2>&1; then
-    echo "Remote 'agent' already exists, skipping"
+if git remote get-url {REMOTE_AGENT} >/dev/null 2>&1; then
+    echo "Remote '{REMOTE_AGENT}' already exists, skipping"
 else
-    git remote add agent '{agent_repo_path}'
-    echo "Added git remote 'agent' pointing to agent workspace"
+    git remote add {REMOTE_AGENT} '{agent_repo_path}'
+    echo "Added git remote '{REMOTE_AGENT}' pointing to agent workspace"
 fi
 "#,
-            agent_repo_path = agent_repo_path
+            agent_repo_path = agent_repo_path,
+            REMOTE_AGENT = REMOTE_AGENT,
         );
 
-        tracing::debug!("Setting up 'agent' git remote in workspace container...");
+        tracing::debug!(
+            "Setting up '{}' git remote in workspace container...",
+            REMOTE_AGENT
+        );
         let exit_code = podman
             .exec_quiet(
                 &self.workspace_container,
@@ -1697,14 +1701,15 @@ fi
 # Mark the worker workspace as safe (different ownership in container)
 git config --global --add safe.directory '{worker_repo_path}'
 
-if git remote get-url worker >/dev/null 2>&1; then
-    echo "Remote 'worker' already exists, skipping"
+if git remote get-url {REMOTE_WORKER} >/dev/null 2>&1; then
+    echo "Remote '{REMOTE_WORKER}' already exists, skipping"
 else
-    git remote add worker '{worker_repo_path}'
-    echo "Added git remote 'worker' pointing to worker workspace"
+    git remote add {REMOTE_WORKER} '{worker_repo_path}'
+    echo "Added git remote '{REMOTE_WORKER}' pointing to worker workspace"
 fi
 "#,
-                worker_repo_path = worker_repo_path
+                worker_repo_path = worker_repo_path,
+                REMOTE_WORKER = REMOTE_WORKER,
             )
         } else {
             String::new()
@@ -1715,18 +1720,22 @@ fi
 # Mark the main workspace as safe (different ownership in container)
 git config --global --add safe.directory '{workspace_repo_path}'
 
-if git remote get-url workspace >/dev/null 2>&1; then
-    echo "Remote 'workspace' already exists, skipping"
+if git remote get-url {REMOTE_WORKSPACE} >/dev/null 2>&1; then
+    echo "Remote '{REMOTE_WORKSPACE}' already exists, skipping"
 else
-    git remote add workspace '{workspace_repo_path}'
-    echo "Added git remote 'workspace' pointing to main workspace"
+    git remote add {REMOTE_WORKSPACE} '{workspace_repo_path}'
+    echo "Added git remote '{REMOTE_WORKSPACE}' pointing to main workspace"
 fi
 {worker_remote_setup}"#,
             workspace_repo_path = workspace_repo_path,
-            worker_remote_setup = worker_remote_setup
+            worker_remote_setup = worker_remote_setup,
+            REMOTE_WORKSPACE = REMOTE_WORKSPACE,
         );
 
-        tracing::debug!("Setting up 'workspace' git remote in agent container...");
+        tracing::debug!(
+            "Setting up '{}' git remote in agent container...",
+            REMOTE_WORKSPACE
+        );
         let exit_code = podman
             .exec_quiet(
                 &self.agent_container,
