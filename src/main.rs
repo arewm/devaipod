@@ -101,26 +101,10 @@ fn resolve_workspace(workspace: Option<&str>, latest: bool) -> Result<String> {
 /// Get the most recently created devaipod workspace
 fn get_latest_workspace() -> Result<String> {
     let filter = format!("name={}*", POD_NAME_PREFIX);
-    let output = std::process::Command::new(if is_toolbox() {
-        "flatpak-spawn"
-    } else {
-        "podman"
-    })
-    .args(if is_toolbox() {
-        vec![
-            "--host",
-            "podman",
-            "pod",
-            "ps",
-            "--filter",
-            &filter,
-            "--format=json",
-        ]
-    } else {
-        vec!["pod", "ps", "--filter", &filter, "--format=json"]
-    })
-    .output()
-    .context("Failed to run podman pod ps")?;
+    let output = podman_command()
+        .args(["pod", "ps", "--filter", &filter, "--format=json"])
+        .output()
+        .context("Failed to run podman pod ps")?;
 
     if !output.status.success() {
         bail!("Failed to list workspaces");
@@ -2574,23 +2558,15 @@ fn check_api_keys_configured() {
     }
 }
 
-/// Check if we're running inside a toolbox container
-fn is_toolbox() -> bool {
-    std::env::var_os("TOOLBOX_PATH").is_some()
-}
-
 /// Build a std::process::Command for running podman CLI.
 ///
-/// In toolbox mode, uses flatpak-spawn to run podman on the host.
-/// Otherwise, runs podman directly.
+/// Uses the container socket path from podman module.
 fn podman_command() -> ProcessCommand {
-    if is_toolbox() {
-        let mut cmd = ProcessCommand::new("flatpak-spawn");
-        cmd.args(["--host", "podman"]);
-        cmd
-    } else {
-        ProcessCommand::new("podman")
+    let mut cmd = ProcessCommand::new("podman");
+    if let Ok(socket_path) = podman::get_container_socket() {
+        cmd.args(["--url", &format!("unix://{}", socket_path.display())]);
     }
+    cmd
 }
 
 /// Attach to a devaipod workspace
@@ -3126,10 +3102,19 @@ fn write_ssh_config_with_user(pod_name: &str, username: &str) -> Result<std::pat
     use cap_std_ext::cap_std;
     use cap_std_ext::dirext::CapStdExtDirExt;
 
-    // Find the devaipod binary path for the ProxyCommand
-    let devaipod_path = std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "devaipod".to_string());
+    // Build the ProxyCommand.
+    // The devaipod binary path - either from container or local install
+    let devaipod_cmd = if is_using_container_ssh_export() {
+        // Container mode: use podman exec to run devaipod inside the container.
+        // Note: This has a known limitation with SSH protocol over nested podman exec.
+        // For full SSH support, install devaipod on the host or use `podman exec -it` directly.
+        "podman exec -i devaipod devaipod".to_string()
+    } else {
+        // Non-container mode: use the local binary path
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "devaipod".to_string())
+    };
 
     // Create SSH config content for all containers
     // - workspace: -W flag (primary for development)
@@ -3162,7 +3147,7 @@ Host {pod}-worker.devaipod
     LogLevel ERROR
 "#,
         pod = pod_name,
-        devaipod = devaipod_path,
+        devaipod = devaipod_cmd,
         user = username,
     );
 

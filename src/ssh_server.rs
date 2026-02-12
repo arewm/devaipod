@@ -537,9 +537,14 @@ async fn run_podman_exec(
 
 /// Async version of podman_command for tokio
 fn podman_command_async() -> Command {
-    // Use the same logic as podman_command but return tokio Command
     let podman_path = std::env::var("PODMAN_PATH").unwrap_or_else(|_| "podman".to_string());
-    Command::new(podman_path)
+    let mut cmd = Command::new(podman_path);
+    // Use container socket if available
+    if let Ok(socket_path) = crate::podman::get_container_socket() {
+        cmd.arg("--url");
+        cmd.arg(format!("unix://{}", socket_path.display()));
+    }
+    cmd
 }
 
 /// Handle SFTP subsystem by running sftp-server in the container

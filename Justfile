@@ -164,12 +164,14 @@ container-push tag="latest": container-build
 
 # Run devaipod as a container daemon
 # Mounts podman socket, config, and SSH config export directory
+# Uses host network so devaipod can access workspace ports on localhost
 [group('container')]
 container-run: container-build
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p ~/.ssh/config.d/devaipod
     podman run -d --name devaipod --privileged --replace \
+        --network host \
         -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
         -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
         -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \

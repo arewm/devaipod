@@ -387,22 +387,10 @@ pub struct App {
 impl App {
     /// Create a new App instance
     pub async fn new() -> Result<Self> {
-        // Connect to podman socket using XDG_RUNTIME_DIR or uid-based path
-        let uid = rustix::process::getuid().as_raw();
-        let socket_path = std::env::var("XDG_RUNTIME_DIR")
-            .map(|dir| format!("{}/podman/podman.sock", dir))
-            .unwrap_or_else(|_| format!("/run/user/{}/podman/podman.sock", uid));
-
-        let docker = Docker::connect_with_unix(
-            &format!("unix://{}", socket_path),
-            120,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .or_else(|_| {
-            // Try default docker socket as fallback
-            Docker::connect_with_local_defaults()
-        })
-        .context("Failed to connect to podman/docker")?;
+        // Connect to container socket - we expect to run inside a container
+        // with the host's podman/docker socket mounted at one of these paths
+        let docker = crate::podman::connect_to_container_socket()
+            .context("Failed to connect to podman/docker socket")?;
 
         // Load cached state for instant display
         let cache = load_state();

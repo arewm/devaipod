@@ -15,6 +15,7 @@ podman pull ghcr.io/cgwalters/devaipod:latest
 
 # Run as a daemon
 podman run -d --name devaipod --privileged \
+  --network host \
   -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
   -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
   ghcr.io/cgwalters/devaipod
@@ -34,11 +35,14 @@ podman exec devaipod devaipod list
 
 ## Requirements
 
-### Privileged Mode
+### Privileged Mode and Host Network
 
 The `--privileged` flag is required for:
 1. Access to the mounted podman socket
 2. Spawning privileged workspace containers (needed for nested podman in devcontainers)
+
+The `--network host` flag is required so devaipod can access workspace container ports
+(e.g., the agent's opencode serve on localhost:4096).
 
 ### Podman Socket
 

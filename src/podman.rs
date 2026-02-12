@@ -1,18 +1,15 @@
 //! Podman runtime - spawn podman service and interact via Docker API
 //!
 //! This module handles:
-//! - Spawning a per-process podman service with its own socket
-//! - Connecting via bollard (Docker API client)
+//! - Connecting to host podman/docker via mounted socket
 //! - Image building/pulling
 //! - Pod and container lifecycle
 //!
-//! We spawn our own podman service rather than relying on a system socket
-//! for isolation and to avoid permission issues.
+//! We expect to run inside a container with the host's podman/docker socket
+//! mounted at /run/podman/podman.sock or /var/run/docker.sock.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
 
 use bollard::container::{
     LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
@@ -28,121 +25,47 @@ use tokio::process::Command;
 
 use crate::devcontainer::ImageSource;
 
-/// Podman system info (subset of fields we care about)
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PodmanSystemInfo {
-    pub host: PodmanHostInfo,
-}
+/// Podman socket path (preferred)
+const PODMAN_SOCKET: &str = "/run/podman/podman.sock";
 
-/// Host info from podman system info
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PodmanHostInfo {
-    /// Whether this is a remote client (e.g., podman machine)
-    pub service_is_remote: bool,
-    /// The remote socket info
-    pub remote_socket: PodmanRemoteSocket,
-}
-
-/// Remote socket info from podman system info
-#[derive(Debug, serde::Deserialize)]
-pub struct PodmanRemoteSocket {
-    /// Socket path (e.g., "unix:///run/podman/podman.sock")
-    pub path: String,
-    /// Whether the socket exists
-    pub exists: bool,
-}
-
-/// Podman machine inspect output (subset of fields we care about)
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct PodmanMachineInspect {
-    connection_info: PodmanMachineConnectionInfo,
-}
-
-/// Connection info from podman machine inspect
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct PodmanMachineConnectionInfo {
-    podman_socket: PodmanMachineSocket,
-}
-
-/// Socket info from podman machine inspect
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct PodmanMachineSocket {
-    path: String,
-}
-
-/// Get podman system info by running `podman info --format json`
-fn get_podman_info() -> Result<PodmanSystemInfo> {
-    let output = std::process::Command::new("podman")
-        .args(["info", "--format", "json"])
-        .output()
-        .context("Failed to run podman info")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("podman info failed: {}", stderr);
-    }
-
-    serde_json::from_slice(&output.stdout).context("Failed to parse podman info JSON")
-}
-
-/// Standard Docker socket path (often symlinked to podman on macOS)
+/// Docker socket path (fallback, often symlinked to podman)
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 
-/// Podman socket path when running devaipod as a container with socket mounted
-const CONTAINER_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
-
-/// Get the local socket path for podman in remote mode
+/// Find the container socket path
 ///
-/// Checks well-known socket paths in order:
-/// 1. /run/podman/podman.sock (container mode with mounted socket)
-/// 2. /var/run/docker.sock (commonly symlinked to podman on macOS)
-/// 3. Falls back to `podman machine inspect` to get the actual socket path.
-fn get_remote_socket() -> Result<PathBuf> {
-    // Container mode: check if socket is mounted at /run/podman/podman.sock
-    let container_sock = PathBuf::from(CONTAINER_PODMAN_SOCKET);
-    if container_sock.exists() {
-        tracing::debug!(
-            "Using {} for podman connection (container mode)",
-            CONTAINER_PODMAN_SOCKET
-        );
-        return Ok(container_sock);
+/// We expect to run inside a container with the host's podman/docker socket
+/// mounted at one of the well-known paths.
+pub fn get_container_socket() -> Result<PathBuf> {
+    // Prefer podman socket
+    let podman_sock = PathBuf::from(PODMAN_SOCKET);
+    if podman_sock.exists() {
+        tracing::debug!("Using {} for podman connection", PODMAN_SOCKET);
+        return Ok(podman_sock);
     }
 
-    // macOS/Docker compat: check if /var/run/docker.sock exists
+    // Fall back to docker socket
     let docker_sock = PathBuf::from(DOCKER_SOCKET);
     if docker_sock.exists() {
         tracing::debug!("Using {} for podman connection", DOCKER_SOCKET);
         return Ok(docker_sock);
     }
 
-    // Fallback: query podman machine for the socket path
-    tracing::debug!("No well-known socket found, querying podman machine inspect");
+    bail!(
+        "No container socket found. Mount the host socket to {} or {}",
+        PODMAN_SOCKET,
+        DOCKER_SOCKET
+    )
+}
 
-    let output = std::process::Command::new("podman")
-        .args(["machine", "inspect"])
-        .output()
-        .context("Failed to run podman machine inspect")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("podman machine inspect failed: {}", stderr);
-    }
-
-    // Output is an array of machine info
-    let machines: Vec<PodmanMachineInspect> = serde_json::from_slice(&output.stdout)
-        .context("Failed to parse podman machine inspect JSON")?;
-
-    let machine = machines
-        .into_iter()
-        .next()
-        .ok_or_else(|| color_eyre::eyre::eyre!("No podman machine found"))?;
-
-    Ok(PathBuf::from(machine.connection_info.podman_socket.path))
+/// Connect to the container socket and return a bollard Docker client
+pub fn connect_to_container_socket() -> Result<Docker> {
+    let socket_path = get_container_socket()?;
+    Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .context("Failed to connect to container socket")
 }
 
 /// Check if the devcontainer CLI is available on the system
@@ -154,39 +77,27 @@ fn devcontainer_cli_available() -> bool {
         .unwrap_or(false)
 }
 
-/// A running podman service that we own
+/// Podman service connection
+///
+/// Connects to an existing podman/docker socket mounted into the container.
 pub struct PodmanService {
-    /// The socket path we're listening on
+    /// The socket path we're connected to
     socket_path: PathBuf,
-    /// PID of the podman system service process (None when using existing socket in toolbox)
+    /// PID of the podman system service process (always None - we don't own the process)
     child_pid: Option<u32>,
-    /// Bollard client connected to our socket
+    /// Bollard client connected to the socket
     client: Docker,
-    /// Whether we're running in toolbox mode (using host podman via flatpak-spawn)
-    toolbox_mode: bool,
 }
 
-/// Check if we're running inside a toolbox container
-fn is_toolbox() -> bool {
-    std::env::var_os("TOOLBOX_PATH").is_some()
-}
-
-/// Check if we're running inside a container (not toolbox)
+/// Check if we're running inside a container
 ///
 /// Detects container mode by checking for:
 /// 1. The well-known container socket mount at /run/podman/podman.sock
 /// 2. The /.dockerenv file (created by Docker/Podman)
 /// 3. The /run/.containerenv file (Podman-specific)
-///
-/// Note: toolbox is a special case and is handled separately.
 pub fn is_container_mode() -> bool {
-    // Don't treat toolbox as container mode - it has host filesystem access
-    if is_toolbox() {
-        return false;
-    }
-
     // Check for our documented container socket mount point
-    if std::path::Path::new(CONTAINER_PODMAN_SOCKET).exists() {
+    if std::path::Path::new(PODMAN_SOCKET).exists() {
         return true;
     }
 
@@ -196,247 +107,39 @@ pub fn is_container_mode() -> bool {
 }
 
 impl PodmanService {
-    /// Connect to podman, trying existing sockets before spawning a new service
+    /// Connect to podman via the mounted container socket
     ///
-    /// Connection strategy:
-    /// 1. Toolbox mode: connect to host socket via flatpak-spawn
-    /// 2. Remote mode (podman machine): use /var/run/docker.sock or podman machine inspect
-    /// 3. Native Linux with existing socket: connect to $XDG_RUNTIME_DIR/podman/podman.sock
-    /// 4. Fallback: spawn our own podman system service
-    pub async fn spawn() -> Result<Self> {
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-
-        // In toolbox, connect to existing host socket instead of spawning
-        if is_toolbox() {
-            return Self::connect_toolbox(&runtime_dir).await;
-        }
-
-        // Get podman info to understand the environment
-        let podman_info = get_podman_info().context("Failed to get podman info")?;
-
-        // If podman is a remote client (e.g., podman machine on macOS/Windows),
-        // connect to existing socket
-        if podman_info.host.service_is_remote {
-            tracing::debug!(
-                "Podman is in remote mode (remote socket: {})",
-                podman_info.host.remote_socket.path
-            );
-            return Self::connect_remote().await;
-        }
-
-        // Native podman (Linux): try to use existing socket if available
-        if podman_info.host.remote_socket.exists {
-            // Socket path may or may not have unix:// prefix depending on podman version
-            let socket_path = podman_info
-                .host
-                .remote_socket
-                .path
-                .strip_prefix("unix://")
-                .unwrap_or(&podman_info.host.remote_socket.path);
-
-            tracing::debug!("Trying existing podman socket at {}", socket_path);
-            match Self::try_connect_socket(socket_path).await {
-                Ok(service) => return Ok(service),
-                Err(e) => {
-                    tracing::debug!("Failed to connect to existing socket: {}", e);
-                    // Fall through to spawn our own
-                }
-            }
-        }
-
-        // Fallback: spawn our own podman system service
-        let socket_name = format!("devaipod-{}.sock", std::process::id());
-        let socket_path = PathBuf::from(&runtime_dir).join(socket_name);
-
-        // Remove stale socket if it exists
-        let _ = std::fs::remove_file(&socket_path);
-
-        tracing::debug!("Starting podman service at {}", socket_path.display());
-
-        // Spawn podman system service
-        // --time=0 means no idle timeout (we manage lifecycle)
-        let child = Command::new("podman")
-            .args([
-                "system",
-                "service",
-                "--time=0",
-                &format!("unix://{}", socket_path.display()),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to spawn podman service")?;
-
-        // Wait for socket to appear
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !socket_path.exists() {
-            if tokio::time::Instant::now() > deadline {
-                bail!(
-                    "Timeout waiting for podman socket at {}",
-                    socket_path.display()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        // Connect bollard
-        let client = Docker::connect_with_unix(
-            &socket_path.to_string_lossy(),
-            120, // timeout
-            bollard::API_DEFAULT_VERSION,
-        )
-        .context("Failed to connect to podman socket")?;
+    /// We expect to run inside a container with the host's podman/docker socket
+    /// mounted at /run/podman/podman.sock or /var/run/docker.sock.
+    pub async fn connect() -> Result<Self> {
+        let socket_path = get_container_socket()?;
+        let client = connect_to_container_socket()?;
 
         // Verify connection
         client
             .ping()
             .await
-            .context("Failed to ping podman service")?;
+            .context("Failed to ping podman. Is the socket mounted correctly?")?;
 
-        tracing::debug!("Podman service ready");
-
-        let child_pid = child.id().expect("child process should have pid");
-
-        Ok(Self {
-            socket_path,
-            child_pid: Some(child_pid),
-            client,
-            toolbox_mode: false,
-        })
-    }
-
-    /// Connect to existing podman socket in remote mode
-    ///
-    /// When podman is running as a remote client (e.g., podman machine on macOS),
-    /// we connect to the existing socket instead of spawning a new service.
-    /// First checks /var/run/docker.sock, then falls back to `podman machine inspect`.
-    async fn connect_remote() -> Result<Self> {
-        let socket_path = get_remote_socket().context(
-            "Failed to get podman socket. Is podman machine running? Try: podman machine start",
-        )?;
-
-        tracing::debug!(
-            "Podman remote mode: connecting to socket at {}",
-            socket_path.display()
-        );
-
-        if !socket_path.exists() {
-            bail!(
-                "Podman machine socket {} does not exist. Is podman machine running? Try: podman machine start",
-                socket_path.display()
-            );
-        }
-
-        // Connect bollard
-        let client = Docker::connect_with_unix(
-            &socket_path.to_string_lossy(),
-            120, // timeout
-            bollard::API_DEFAULT_VERSION,
-        )
-        .context("Failed to connect to podman socket")?;
-
-        // Verify connection
-        client.ping().await.context(
-            "Failed to ping podman service. Is podman machine running? Try: podman machine start",
-        )?;
-
-        tracing::debug!("Connected to podman (remote mode)");
+        tracing::debug!("Connected to podman at {}", socket_path.display());
 
         Ok(Self {
             socket_path,
             child_pid: None, // We don't own the process
             client,
-            toolbox_mode: false,
         })
     }
 
-    /// Try to connect to an existing podman socket
-    ///
-    /// Returns Ok if the socket exists and we can ping it, Err otherwise.
-    async fn try_connect_socket(socket_path: &str) -> Result<Self> {
-        let socket_path = PathBuf::from(socket_path);
-
-        if !socket_path.exists() {
-            bail!("Socket {} does not exist", socket_path.display());
-        }
-
-        let client = Docker::connect_with_unix(
-            &socket_path.to_string_lossy(),
-            120,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .context("Failed to connect to socket")?;
-
-        client.ping().await.context("Failed to ping socket")?;
-
-        tracing::debug!(
-            "Connected to existing podman socket at {}",
-            socket_path.display()
-        );
-
-        Ok(Self {
-            socket_path,
-            child_pid: None, // We don't own this service
-            client,
-            toolbox_mode: false,
-        })
+    /// Legacy alias for connect()
+    pub async fn spawn() -> Result<Self> {
+        Self::connect().await
     }
 
-    /// Connect to existing host podman socket (for toolbox mode)
-    async fn connect_toolbox(runtime_dir: &str) -> Result<Self> {
-        let socket_path = PathBuf::from(runtime_dir).join("podman/podman.sock");
-
-        tracing::debug!(
-            "Toolbox mode: connecting to host socket at {}",
-            socket_path.display()
-        );
-
-        if !socket_path.exists() {
-            bail!(
-                "Host podman socket not found at {}. Is podman running on the host?",
-                socket_path.display()
-            );
-        }
-
-        // Connect bollard
-        let client = Docker::connect_with_unix(
-            &socket_path.to_string_lossy(),
-            120, // timeout
-            bollard::API_DEFAULT_VERSION,
-        )
-        .context("Failed to connect to host podman socket")?;
-
-        // Verify connection
-        client
-            .ping()
-            .await
-            .context("Failed to ping host podman service")?;
-
-        tracing::debug!("Connected to host podman service (toolbox mode)");
-
-        Ok(Self {
-            socket_path,
-            child_pid: None,
-            client,
-            toolbox_mode: true,
-        })
-    }
-
-    /// Create a Command for running podman CLI
-    ///
-    /// In toolbox mode, uses flatpak-spawn to run podman on the host.
-    /// Otherwise, runs podman directly with our socket.
+    /// Create a Command for running podman CLI with our socket
     fn podman_command(&self) -> Command {
-        if self.toolbox_mode {
-            let mut cmd = Command::new("flatpak-spawn");
-            cmd.args(["--host", "/usr/bin/podman"]);
-            cmd
-        } else {
-            let mut cmd = Command::new("podman");
-            cmd.args(["--url", &format!("unix://{}", self.socket_path.display())]);
-            cmd
-        }
+        let mut cmd = Command::new("podman");
+        cmd.args(["--url", &format!("unix://{}", self.socket_path.display())]);
+        cmd
     }
 
     /// Get the bollard client
