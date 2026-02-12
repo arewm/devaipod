@@ -1370,8 +1370,9 @@ async fn create_workspace(
     if config.ssh.auto_config {
         if let Some(config_path) = write_ssh_config(&result.pod_name) {
             tracing::info!("Created SSH config: {}", config_path.display());
-            // Warn once if Include directive is missing
-            if !ssh_config_has_include() {
+            // Warn if Include directive is missing (skip in container mode where
+            // the config is exported via /run/devaipod-ssh bind mount)
+            if !is_using_container_ssh_export() && !ssh_config_has_include() {
                 tracing::warn!(
                     "Add 'Include ~/.ssh/config.d/*' to the top of ~/.ssh/config for SSH integration"
                 );
@@ -2819,8 +2820,26 @@ async fn cmd_exec(
     Ok(())
 }
 
-/// Get the SSH config directory path (~/.ssh/config.d)
+/// Well-known path for SSH config export in container mode.
+/// If this directory exists, SSH configs are written here instead of ~/.ssh/config.d
+const CONTAINER_SSH_CONFIG_DIR: &str = "/run/devaipod-ssh";
+
+/// Check if we're using the container SSH export directory.
+fn is_using_container_ssh_export() -> bool {
+    PathBuf::from(CONTAINER_SSH_CONFIG_DIR).exists()
+}
+
+/// Get the SSH config directory path.
+///
+/// In container mode, if `/run/devaipod-ssh` exists (bind-mounted from host),
+/// uses that directory. Otherwise falls back to `~/.ssh/config.d`.
 fn get_ssh_config_dir() -> Result<PathBuf> {
+    // Check for container mode export directory
+    if is_using_container_ssh_export() {
+        return Ok(PathBuf::from(CONTAINER_SSH_CONFIG_DIR));
+    }
+
+    // Default to ~/.ssh/config.d
     let home = std::env::var("HOME").context("HOME environment variable not set")?;
     Ok(PathBuf::from(home).join(".ssh").join("config.d"))
 }
@@ -3086,7 +3105,8 @@ fn cmd_ssh_config(pod_name: &str, user: Option<&str>) -> Result<()> {
     println!("Added SSH config to {}", config_path.display());
 
     // Check if Include directive exists in ~/.ssh/config
-    if !ssh_config_has_include() {
+    // Skip in container mode where configs are exported via bind mount
+    if !is_using_container_ssh_export() && !ssh_config_has_include() {
         println!();
         println!("Add this line to the TOP of ~/.ssh/config:");
         println!("Include ~/.ssh/config.d/*");

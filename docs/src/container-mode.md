@@ -127,10 +127,30 @@ The multi-stage Containerfile:
 
 The devaipod container uses podman-remote to communicate with the host's podman daemon via the mounted socket. This allows it to create "sibling" containers (workspace pods) that run alongside it on the host.
 
+## SSH Config Export
+
+To enable VSCode/Zed Remote SSH from the host to connect to workspaces created by the containerized devaipod, bind-mount a directory to `/run/devaipod-ssh`:
+
+```bash
+# On host: create the SSH config directory
+mkdir -p ~/.ssh/config.d/devaipod
+
+# Add to ~/.ssh/config (at the top):
+# Include config.d/devaipod/*
+
+# Run with the bind mount
+podman run -d --name devaipod --privileged \
+  -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
+  -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
+  -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
+  ghcr.io/cgwalters/devaipod
+```
+
+When `/run/devaipod-ssh` exists, devaipod automatically writes SSH configs there instead of inside the container. No configuration needed.
+
 ## Limitations
 
 - **No local repository support** - Container mode only works with remote URLs, not local directories
-- **SSH config** - The generated SSH config is inside the container; you'll need to use `podman exec` for SSH access
 - **bind_home not supported** - The `[bind_home]` config section will error in container mode; use `[trusted.secrets]` instead
 
 ## Daemon Management

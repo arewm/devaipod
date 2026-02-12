@@ -162,6 +162,23 @@ container-test: container-build
 container-push tag="latest": container-build
     podman push {{ CONTAINER_IMAGE }}:{{ tag }}
 
+# Run devaipod as a container daemon
+# Mounts podman socket, config, and SSH config export directory
+[group('container')]
+container-run: container-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ~/.ssh/config.d/devaipod
+    podman run -d --name devaipod --privileged --replace \
+        -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
+        -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
+        -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
+        {{ CONTAINER_IMAGE }}:latest
+    echo "devaipod container started"
+    echo "SSH configs will be written to ~/.ssh/config.d/devaipod/"
+    echo ""
+    echo "Ensure your ~/.ssh/config has: Include config.d/devaipod/*"
+
 # ============================================================================
 # Documentation
 # ============================================================================
