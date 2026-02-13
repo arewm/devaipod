@@ -179,6 +179,14 @@ pub struct TrustedEnvConfig {
     /// directly from the secret value using podman's --secret type=env feature.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Podman secrets to mount as files.
+    /// Each entry is "ENV_VAR_NAME=secret_name".
+    /// The secret is mounted at /run/secrets/{secret_name} and
+    /// ENV_VAR_NAME is set to that path.
+    /// Example: "GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc" mounts the secret
+    /// as a file and sets GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcloud_adc.
+    #[serde(default)]
+    pub file_secrets: Vec<String>,
 }
 
 impl TrustedEnvConfig {
@@ -217,6 +225,47 @@ impl TrustedEnvConfig {
                 } else {
                     tracing::warn!(
                         "Invalid trusted.secrets entry (expected ENV_VAR=secret_name): '{}'",
+                        entry
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get (env_var_name, secret_name) pairs for file-based secrets.
+    ///
+    /// Parses entries in the format "ENV_VAR_NAME=secret_name" and returns
+    /// a vector of tuples where each tuple contains:
+    /// - The environment variable name to set (will be set to the mounted file path)
+    /// - The podman secret name containing the value
+    ///
+    /// For each secret, podman's `--secret secret_name` mounts the secret at
+    /// `/run/secrets/{secret_name}`, and the environment variable is set to that path.
+    ///
+    /// This is useful for credentials like GOOGLE_APPLICATION_CREDENTIALS that
+    /// expect a file path rather than the file contents.
+    ///
+    /// Invalid entries (missing `=`) are logged and skipped.
+    pub fn file_secret_mounts(&self) -> Vec<(String, String)> {
+        self.file_secrets
+            .iter()
+            .filter_map(|entry| {
+                if let Some((env_var, secret_name)) = entry.split_once('=') {
+                    let env_var = env_var.trim();
+                    let secret_name = secret_name.trim();
+                    if !env_var.is_empty() && !secret_name.is_empty() {
+                        Some((env_var.to_string(), secret_name.to_string()))
+                    } else {
+                        tracing::warn!(
+                            "Invalid trusted.file_secrets entry (empty component): '{}'",
+                            entry
+                        );
+                        None
+                    }
+                } else {
+                    tracing::warn!(
+                        "Invalid trusted.file_secrets entry (expected ENV_VAR=secret_name): '{}'",
                         entry
                     );
                     None
@@ -1871,6 +1920,107 @@ secrets = ["GH_TOKEN=gh_token"]
             .trusted_env
             .secrets
             .contains(&"GH_TOKEN=gh_token".to_string()));
+    }
+
+    // =========================================================================
+    // File secrets tests
+    // =========================================================================
+
+    #[test]
+    fn test_trusted_env_file_secrets_default() {
+        let config = TrustedEnvConfig::default();
+        assert!(config.file_secrets.is_empty());
+        assert!(config.file_secret_mounts().is_empty());
+    }
+
+    #[test]
+    fn test_parse_trusted_env_file_secrets() {
+        let toml = r#"
+[trusted]
+file_secrets = ["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.trusted_env.file_secrets.len(), 1);
+        assert!(config
+            .trusted_env
+            .file_secrets
+            .contains(&"GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string()));
+    }
+
+    #[test]
+    fn test_trusted_env_file_secret_mounts() {
+        let mut trusted = TrustedEnvConfig::default();
+        trusted.file_secrets = vec![
+            "GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string(),
+            "ANOTHER_CREDENTIAL_FILE=another_secret".to_string(),
+        ];
+
+        let mounts = trusted.file_secret_mounts();
+        assert_eq!(mounts.len(), 2);
+
+        // Check that both secrets are present (order preserved from Vec)
+        // Format is (env_var_name, secret_name)
+        let has_gcloud = mounts
+            .iter()
+            .any(|(env, secret)| env == "GOOGLE_APPLICATION_CREDENTIALS" && secret == "gcloud_adc");
+        let has_another = mounts
+            .iter()
+            .any(|(env, secret)| env == "ANOTHER_CREDENTIAL_FILE" && secret == "another_secret");
+        assert!(
+            has_gcloud,
+            "Should have GOOGLE_APPLICATION_CREDENTIALS secret"
+        );
+        assert!(has_another, "Should have ANOTHER_CREDENTIAL_FILE secret");
+    }
+
+    #[test]
+    fn test_trusted_env_file_secret_mounts_invalid_entries() {
+        let mut trusted = TrustedEnvConfig::default();
+        trusted.file_secrets = vec![
+            "GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string(), // valid
+            "INVALID_NO_EQUALS".to_string(),                         // invalid: no =
+            "=empty_var".to_string(),                                // invalid: empty var name
+            "EMPTY_SECRET=".to_string(),                             // invalid: empty secret name
+            "VALID_TWO=some_secret".to_string(),                     // valid
+        ];
+
+        let mounts = trusted.file_secret_mounts();
+        // Only the 2 valid entries should be returned
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts
+            .iter()
+            .any(|(env, _)| env == "GOOGLE_APPLICATION_CREDENTIALS"));
+        assert!(mounts.iter().any(|(env, _)| env == "VALID_TWO"));
+    }
+
+    #[test]
+    fn test_parse_trusted_secrets_and_file_secrets_combined() {
+        // Test combining regular secrets (type=env) and file_secrets
+        let toml = r#"
+[trusted]
+secrets = ["GH_TOKEN=gh_token"]
+file_secrets = ["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+
+        // Regular secrets (type=env)
+        assert_eq!(config.trusted_env.secrets.len(), 1);
+        let secret_mounts = config.trusted_env.secret_mounts();
+        assert_eq!(secret_mounts.len(), 1);
+        assert!(secret_mounts
+            .iter()
+            .any(|(env, secret)| env == "GH_TOKEN" && secret == "gh_token"));
+
+        // File secrets
+        assert_eq!(config.trusted_env.file_secrets.len(), 1);
+        let file_mounts = config.trusted_env.file_secret_mounts();
+        assert_eq!(file_mounts.len(), 1);
+        assert!(
+            file_mounts
+                .iter()
+                .any(|(env, secret)| env == "GOOGLE_APPLICATION_CREDENTIALS"
+                    && secret == "gcloud_adc")
+        );
     }
 
     // =========================================================================

@@ -132,8 +132,8 @@ allow-repo-e2e repo=default_test_repo workspace=default_test_workspace:
 # Container builds
 # ============================================================================
 
-# Container image name
-CONTAINER_IMAGE := "ghcr.io/cgwalters/devaipod"
+# Container image name (use localhost/ for local builds to avoid confusion with registry)
+CONTAINER_IMAGE := "localhost/devaipod"
 
 # Build the container image
 [group('container')]

@@ -34,9 +34,10 @@ const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 /// Find the container socket path
 ///
 /// We expect to run inside a container with the host's podman/docker socket
-/// mounted at one of the well-known paths.
+/// mounted at one of the well-known paths. Also supports running on a host
+/// system with rootless podman (XDG_RUNTIME_DIR).
 pub fn get_container_socket() -> Result<PathBuf> {
-    // Prefer podman socket
+    // Prefer podman socket (container mount point)
     let podman_sock = PathBuf::from(PODMAN_SOCKET);
     if podman_sock.exists() {
         tracing::debug!("Using {} for podman connection", PODMAN_SOCKET);
@@ -48,6 +49,15 @@ pub fn get_container_socket() -> Result<PathBuf> {
     if docker_sock.exists() {
         tracing::debug!("Using {} for podman connection", DOCKER_SOCKET);
         return Ok(docker_sock);
+    }
+
+    // Try XDG_RUNTIME_DIR for rootless podman on host
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        let xdg_sock = PathBuf::from(xdg_runtime).join("podman/podman.sock");
+        if xdg_sock.exists() {
+            tracing::debug!("Using {} for podman connection", xdg_sock.display());
+            return Ok(xdg_sock);
+        }
     }
 
     bail!(
@@ -903,6 +913,15 @@ impl PodmanService {
             args.push(format!("{},type=env,target={}", secret_name, env_var));
         }
 
+        // File-based secrets (mounted as files, env var points to path)
+        for (env_var, secret_name) in &config.file_secrets {
+            args.push("--secret".to_string());
+            args.push(secret_name.to_string()); // mounts at /run/secrets/{secret_name}
+                                                // Set env var to point to the mounted file
+            args.push("-e".to_string());
+            args.push(format!("{}=/run/secrets/{}", env_var, secret_name));
+        }
+
         // Labels
         for (key, value) in &config.labels {
             args.push("--label".to_string());
@@ -1415,6 +1434,10 @@ pub struct ContainerConfig {
     /// Each tuple is (env_var_name, secret_name).
     /// Generates: --secret secret_name,type=env,target=ENV_VAR_NAME
     pub secrets: Vec<(String, String)>,
+    /// Podman secrets mounted as files (env_var -> secret_name).
+    /// Mounted at /run/secrets/{secret_name}, env var set to that path.
+    /// Generates: --secret secret_name -e ENV_VAR=/run/secrets/secret_name
+    pub file_secrets: Vec<(String, String)>,
     /// Labels to attach to the container (key -> value)
     pub labels: HashMap<String, String>,
 }

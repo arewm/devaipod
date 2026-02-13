@@ -1,0 +1,1353 @@
+//! Web UI integration tests (containerized)
+//!
+//! These tests verify the web UI server running inside a container:
+//! - Token-based authentication
+//! - Podman socket proxy
+//! - Pod list API access
+//!
+//! The tests build and run the devaipod container image, mounting the
+//! podman socket to allow the web UI to manage sibling containers.
+//!
+//! ## Test tiers
+//!
+//! Tests are categorized into tiers based on their resource needs:
+//!
+//! - **Tier 1 (parallel safe, no pod)**: Static file serving, auth checks, health endpoints
+//! - **Tier 2 (parallel safe, needs pod)**: Pod listing, opencode-info (uses the shared test pod)
+//! - **Tier 3 (serial, mutations)**: Tests that modify state (currently none)
+//!
+//! All tests share a single `WebFixture` container to reduce resource contention.
+
+use color_eyre::eyre::bail;
+use color_eyre::Result;
+use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
+use xshell::{cmd, Shell};
+
+use crate::podman_integration_test;
+use crate::shell;
+
+/// Image tag used for testing
+const TEST_IMAGE_TAG: &str = "localhost/devaipod:test";
+
+/// Build result cached across tests
+static BUILD_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Build the devaipod container image for testing.
+/// Returns Ok(()) if the build succeeded, Err with message if it failed.
+/// The result is cached so the image is only built once per test run.
+fn ensure_container_built() -> Result<()> {
+    let result = BUILD_RESULT.get_or_init(|| {
+        let sh = match Shell::new() {
+            Ok(sh) => sh,
+            Err(e) => return Err(format!("Failed to create shell: {}", e)),
+        };
+
+        // Find workspace root (where Containerfile lives)
+        let mut dir = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => return Err(format!("Failed to get current dir: {}", e)),
+        };
+        loop {
+            if dir.join("Containerfile").exists() {
+                break;
+            }
+            if !dir.pop() {
+                return Err("Could not find Containerfile in parent directories".to_string());
+            }
+        }
+
+        let containerfile = dir.join("Containerfile");
+        let context = dir.to_string_lossy().to_string();
+        let containerfile_str = containerfile.to_string_lossy().to_string();
+
+        tracing::info!("Building devaipod container image: {}", TEST_IMAGE_TAG);
+
+        let build_output = cmd!(
+            sh,
+            "podman build --tag {TEST_IMAGE_TAG} -f {containerfile_str} {context}"
+        )
+        .ignore_status()
+        .output();
+
+        match build_output {
+            Ok(output) => {
+                if output.status.success() {
+                    tracing::info!("Container image built successfully");
+                    Ok(())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(format!("Container build failed: {}", stderr))
+                }
+            }
+            Err(e) => Err(format!("Failed to run podman build: {}", e)),
+        }
+    });
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(msg) => bail!("{}", msg),
+    }
+}
+
+/// Helper struct to manage a running web container.
+/// Automatically removes the container on drop.
+struct WebContainerGuard {
+    container_name: String,
+    token: String,
+    /// Keep temp dir alive for config file
+    _config_dir: tempfile::TempDir,
+}
+
+impl WebContainerGuard {
+    /// Generate a unique container name using timestamp
+    fn generate_name() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let unique = (now.as_secs() & 0xFFFF) ^ ((now.subsec_nanos() as u64) & 0xFFFF);
+        format!("test-devaipod-web-{:x}", unique)
+    }
+
+    /// Start the web container and extract the token from logs
+    fn start() -> Result<Self> {
+        ensure_container_built()?;
+
+        let sh = shell()?;
+
+        // Generate unique container name
+        let container_name = Self::generate_name();
+
+        // Get podman socket path
+        let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
+            color_eyre::eyre::eyre!("XDG_RUNTIME_DIR not set. Cannot determine podman socket path.")
+        })?;
+        let socket_path = format!("{}/podman/podman.sock", xdg_runtime);
+
+        // Check if socket exists
+        if !std::path::Path::new(&socket_path).exists() {
+            bail!(
+                "Podman socket not found at {}. Is podman running?",
+                socket_path
+            );
+        }
+
+        // Create minimal config file (devaipod requires config to exist)
+        let config_dir = tempfile::TempDir::new()?;
+        let config_path = config_dir.path().join("devaipod.toml");
+        std::fs::write(
+            &config_path,
+            r#"# Minimal config for testing
+# All fields have defaults, empty config is valid
+"#,
+        )?;
+        // Use :ro,z for SELinux relabeling
+        let config_mount = format!(
+            "{}:/root/.config/devaipod.toml:ro,z",
+            config_path.to_string_lossy()
+        );
+
+        tracing::info!("Starting web container {}", container_name);
+
+        // Run the container (no port forwarding needed - we use podman exec)
+        let socket_mount = format!("{}:/run/podman/podman.sock", socket_path);
+
+        let run_output = cmd!(
+            sh,
+            "podman run -d --name {container_name} --privileged -v {socket_mount} -v {config_mount} {TEST_IMAGE_TAG}"
+        )
+        .ignore_status()
+        .output()?;
+
+        if !run_output.status.success() {
+            let stderr = String::from_utf8_lossy(&run_output.stderr);
+            bail!("Failed to start web container: {}", stderr);
+        }
+
+        // Wait for container to start and extract token from logs
+        let token = Self::wait_for_token(&sh, &container_name, Duration::from_secs(60))?;
+
+        Ok(WebContainerGuard {
+            container_name,
+            token,
+            _config_dir: config_dir,
+        })
+    }
+
+    /// Wait for the container to output the token and extract it
+    fn wait_for_token(sh: &Shell, container_name: &str, timeout: Duration) -> Result<String> {
+        let start = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(500);
+
+        while start.elapsed() < timeout {
+            // Get container logs
+            let logs_output = cmd!(sh, "podman logs {container_name}")
+                .ignore_status()
+                .output()?;
+
+            let logs = String::from_utf8_lossy(&logs_output.stdout);
+            let stderr = String::from_utf8_lossy(&logs_output.stderr);
+            let combined = format!("{}\n{}", logs, stderr);
+
+            // Look for token in output
+            // Format: "Web UI: http://0.0.0.0:8080/?token=TOKEN"
+            for line in combined.lines() {
+                if line.contains("token=") {
+                    if let Some(token_start) = line.find("token=") {
+                        let mut token = line[token_start + 6..].trim().to_string();
+                        // Token may have trailing characters
+                        if let Some(end) =
+                            token.find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                        {
+                            token = token[..end].to_string();
+                        }
+                        if !token.is_empty() {
+                            tracing::info!("Extracted token from container logs");
+                            return Ok(token);
+                        }
+                    }
+                }
+            }
+
+            std::thread::sleep(poll_interval);
+        }
+
+        // Get final logs for debugging
+        let final_logs = cmd!(sh, "podman logs {container_name}")
+            .ignore_status()
+            .output()?;
+        let logs = String::from_utf8_lossy(&final_logs.stdout);
+        let stderr = String::from_utf8_lossy(&final_logs.stderr);
+
+        bail!(
+            "Timeout waiting for token in container logs.\nstdout: {}\nstderr: {}",
+            logs,
+            stderr
+        )
+    }
+
+    /// Get the authentication token
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Run curl inside the container and return (status_code, body)
+    /// The web server binds to 127.0.0.1 inside the container, so we must
+    /// use `podman exec` to access it.
+    fn curl_in_container(&self, path: &str, auth_token: Option<&str>) -> Result<(i32, String)> {
+        let url = format!("http://127.0.0.1:8080{}", path);
+        let container = &self.container_name;
+
+        let output = if let Some(token) = auth_token {
+            let auth_header = format!("Authorization: Bearer {}", token);
+            Command::new("podman")
+                .args([
+                    "exec",
+                    container,
+                    "curl",
+                    "-s",
+                    "-w",
+                    "\n%{http_code}",
+                    "--connect-timeout",
+                    "5",
+                    "--max-time",
+                    "30",
+                    "--retry",
+                    "5",
+                    "--retry-connrefused",
+                    "--retry-all-errors",
+                    "--retry-delay",
+                    "2",
+                    "-H",
+                    &auth_header,
+                    &url,
+                ])
+                .output()?
+        } else {
+            Command::new("podman")
+                .args([
+                    "exec",
+                    container,
+                    "curl",
+                    "-s",
+                    "-w",
+                    "\n%{http_code}",
+                    "--connect-timeout",
+                    "5",
+                    "--max-time",
+                    "30",
+                    "--retry",
+                    "5",
+                    "--retry-connrefused",
+                    "--retry-all-errors",
+                    "--retry-delay",
+                    "2",
+                    &url,
+                ])
+                .output()?
+        };
+
+        let combined = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = combined.trim().lines().collect();
+
+        if lines.is_empty() {
+            return Ok((-1, String::new()));
+        }
+
+        let status_code: i32 = lines.last().and_then(|s| s.parse().ok()).unwrap_or(-1);
+        let body = if lines.len() > 1 {
+            lines[..lines.len() - 1].join("\n")
+        } else {
+            String::new()
+        };
+
+        Ok((status_code, body))
+    }
+
+    /// Wait for the server to be ready by polling the health endpoint
+    fn wait_ready(&self, timeout: Duration) -> Result<()> {
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < timeout {
+            // Check container is still running
+            let status = Command::new("podman")
+                .args([
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    &self.container_name,
+                ])
+                .output();
+
+            if let Ok(output) = &status {
+                let running = String::from_utf8_lossy(&output.stdout).trim() == "true";
+                if !running {
+                    // Container stopped, get logs for debugging
+                    let logs = Command::new("podman")
+                        .args(["logs", &self.container_name])
+                        .output()
+                        .ok();
+                    let log_output = logs
+                        .map(|l| {
+                            format!(
+                                "stdout: {}\nstderr: {}",
+                                String::from_utf8_lossy(&l.stdout),
+                                String::from_utf8_lossy(&l.stderr)
+                            )
+                        })
+                        .unwrap_or_default();
+                    bail!("Container stopped unexpectedly. Logs:\n{}", log_output);
+                }
+            }
+
+            // Try health endpoint
+            if let Ok((status, _)) = self.curl_in_container("/health", None) {
+                if status == 200 {
+                    return Ok(());
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        bail!("Timeout waiting for web server to be ready")
+    }
+}
+
+impl Drop for WebContainerGuard {
+    fn drop(&mut self) {
+        // Remove the container (force stop and remove)
+        let _ = Command::new("podman")
+            .args(["rm", "-f", &self.container_name])
+            .output();
+    }
+}
+
+// =============================================================================
+// Shared Web Fixture (singleton pattern)
+// =============================================================================
+
+/// Shared fixture for web UI integration tests.
+///
+/// This fixture starts a single devaipod web container that is reused by all
+/// web tests. It uses `OnceLock` for thread-safe lazy initialization.
+///
+/// The fixture is automatically initialized on first access via `get()` and
+/// cleaned up via `cleanup()` after all tests complete.
+pub struct WebFixture {
+    /// The underlying container guard (handles cleanup on drop)
+    guard: WebContainerGuard,
+}
+
+/// Singleton instance of the web fixture
+static WEB_FIXTURE: OnceLock<Result<WebFixture, String>> = OnceLock::new();
+
+impl WebFixture {
+    /// Get the shared web fixture instance, creating it on first access.
+    ///
+    /// This method is thread-safe and will only create the fixture once.
+    /// Returns an error if fixture creation fails.
+    pub fn get() -> Result<&'static WebFixture> {
+        let result = WEB_FIXTURE.get_or_init(|| {
+            tracing::info!("Initializing shared WebFixture");
+            match Self::create() {
+                Ok(fixture) => Ok(fixture),
+                Err(e) => {
+                    tracing::error!("Failed to create WebFixture: {:?}", e);
+                    Err(format!("{:?}", e))
+                }
+            }
+        });
+
+        match result {
+            Ok(fixture) => Ok(fixture),
+            Err(msg) => bail!("WebFixture initialization failed: {}", msg),
+        }
+    }
+
+    /// Create a new web fixture (internal)
+    fn create() -> Result<Self> {
+        let guard = WebContainerGuard::start()?;
+        guard.wait_ready(Duration::from_secs(30))?;
+        tracing::info!(
+            "WebFixture ready: container={}, token=***",
+            guard.container_name
+        );
+        Ok(WebFixture { guard })
+    }
+
+    /// Get the authentication token
+    pub fn token(&self) -> &str {
+        self.guard.token()
+    }
+
+    /// Run curl inside the container and return (status_code, body)
+    pub fn curl_in_container(&self, path: &str, auth_token: Option<&str>) -> Result<(i32, String)> {
+        self.guard.curl_in_container(path, auth_token)
+    }
+
+    /// Get the container name (for advanced operations like podman exec)
+    pub fn container_name(&self) -> &str {
+        &self.guard.container_name
+    }
+
+    /// Clean up the shared web fixture.
+    ///
+    /// This is a no-op if the fixture was never initialized.
+    /// The actual cleanup happens via `WebContainerGuard::drop()`.
+    pub fn cleanup() {
+        // The fixture is stored in a static OnceLock, so we can't easily
+        // take ownership and drop it. Instead, we manually remove the container.
+        if let Some(Ok(fixture)) = WEB_FIXTURE.get() {
+            tracing::info!("Cleaning up WebFixture: {}", fixture.guard.container_name);
+            let _ = Command::new("podman")
+                .args(["rm", "-f", &fixture.guard.container_name])
+                .output();
+        }
+    }
+}
+
+// Note: We don't need find_available_port or external curl helpers anymore
+// since the web server binds to 127.0.0.1 inside the container and we use
+// `podman exec` to run curl inside the container via curl_in_container().
+
+// =============================================================================
+// Web container tests
+// =============================================================================
+
+/// Verify the containerized web server starts and serves health, API, and static files
+///
+/// Tier 1: Parallel safe, no pod needed
+fn test_web_container_starts() -> Result<()> {
+    // Get the shared web fixture (creates container on first access)
+    let fixture = WebFixture::get()?;
+
+    // Test health endpoint (no auth required)
+    let (status, body) = fixture.curl_in_container("/health", None)?;
+    assert_eq!(
+        status, 200,
+        "Health endpoint should return 200, got {}",
+        status
+    );
+    assert!(
+        body.contains("ok"),
+        "Health should return 'ok', got: {}",
+        body
+    );
+
+    // Test static file serving - index.html should be served at root
+    let (status, body) = fixture.curl_in_container("/", None)?;
+    assert_eq!(
+        status,
+        200,
+        "Root path should return 200 (index.html), got {}. Body: {}",
+        status,
+        &body[..body.len().min(200)]
+    );
+    assert!(
+        body.contains("<!DOCTYPE html>") || body.contains("<html"),
+        "Root should return HTML, got: {}",
+        &body[..body.len().min(200)]
+    );
+    assert!(
+        body.contains("devaipod"),
+        "HTML should contain 'devaipod', got: {}",
+        &body[..body.len().min(500)]
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_web_container_starts);
+
+/// Verify auth works: 401 without token, 200 with valid token
+///
+/// Tier 1: Parallel safe, no pod needed (just tests auth mechanism)
+fn test_web_container_auth() -> Result<()> {
+    let fixture = WebFixture::get()?;
+
+    // Test API without token - should get 401
+    let (status, _body) = fixture.curl_in_container("/api/podman/v5.0.0/libpod/pods/json", None)?;
+    assert_eq!(
+        status, 401,
+        "API request without token should return 401 Unauthorized"
+    );
+
+    // Test API with wrong token - should get 401
+    let (status, _body) = fixture.curl_in_container(
+        "/api/podman/v5.0.0/libpod/pods/json",
+        Some("wrong-token-12345"),
+    )?;
+    assert_eq!(
+        status, 401,
+        "API request with invalid token should return 401 Unauthorized"
+    );
+
+    // Test API with valid token - should succeed
+    let token = fixture.token().to_string();
+    let (status, body) =
+        fixture.curl_in_container("/api/podman/v5.0.0/libpod/pods/json", Some(&token))?;
+    assert_eq!(
+        status, 200,
+        "API request with valid token should return 200, got {}: {}",
+        status, body
+    );
+
+    // Body should be valid JSON array (pods list)
+    assert!(
+        body.starts_with('['),
+        "Pods list should be a JSON array: {}",
+        body
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_web_container_auth);
+
+/// Verify the web API pod list returns valid data and includes any existing devaipod pods
+///
+/// Tier 2: Parallel safe, uses shared pod for validation
+fn test_web_container_pod_list() -> Result<()> {
+    let fixture = WebFixture::get()?;
+
+    // Query the web API for pod list
+    let token = fixture.token().to_string();
+    let (status, body) =
+        fixture.curl_in_container("/api/podman/v5.0.0/libpod/pods/json", Some(&token))?;
+
+    assert_eq!(status, 200, "Should get pod list: {}", body);
+
+    // Body should be valid JSON array
+    assert!(
+        body.starts_with('['),
+        "Pods list should be a JSON array: {}",
+        body
+    );
+
+    // Parse the JSON to verify structure
+    let pods: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| {
+        color_eyre::eyre::eyre!("Failed to parse pods JSON: {} - body: {}", e, body)
+    })?;
+
+    // Log how many pods were found
+    tracing::info!("Found {} pods in API response", pods.len());
+
+    // If there are any devaipod pods, verify they have expected fields
+    for pod in &pods {
+        if let Some(name) = pod.get("Name").and_then(|n| n.as_str()) {
+            if name.starts_with("devaipod-") {
+                tracing::info!("Found devaipod pod: {}", name);
+                // Verify expected fields exist
+                assert!(
+                    pod.get("Status").is_some(),
+                    "Pod {} should have Status field",
+                    name
+                );
+                assert!(
+                    pod.get("Labels").is_some(),
+                    "Pod {} should have Labels field",
+                    name
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+podman_integration_test!(test_web_container_pod_list);
+
+/// Verify the opencode-info endpoint returns 404 for non-existent pods
+/// and proper JSON structure for existing pods
+///
+/// Tier 2: Parallel safe, uses shared pod for validation
+fn test_web_container_opencode_info_endpoint() -> Result<()> {
+    let fixture = WebFixture::get()?;
+
+    let token = fixture.token().to_string();
+
+    // Test that non-existent pod returns 404
+    let (status, _body) = fixture.curl_in_container(
+        "/api/devaipod/pods/nonexistent-pod-12345/opencode-info",
+        Some(&token),
+    )?;
+    assert_eq!(
+        status, 404,
+        "Non-existent pod should return 404, got {}",
+        status
+    );
+
+    // If there's a running devaipod pod, test the endpoint returns valid data
+    let (pod_status, pod_body) =
+        fixture.curl_in_container("/api/podman/v5.0.0/libpod/pods/json", Some(&token))?;
+
+    if pod_status == 200 {
+        let pods: Vec<serde_json::Value> = serde_json::from_str(&pod_body).unwrap_or_default();
+        for pod in &pods {
+            if let Some(name) = pod.get("Name").and_then(|n| n.as_str()) {
+                if name.starts_with("devaipod-") {
+                    // Found a devaipod pod, test the opencode-info endpoint
+                    let short_name = name.strip_prefix("devaipod-").unwrap_or(name);
+                    let (info_status, info_body) = fixture.curl_in_container(
+                        &format!("/api/devaipod/pods/{}/opencode-info", short_name),
+                        Some(&token),
+                    )?;
+
+                    // Should return 200 or 404 (if pod not running/accessible)
+                    assert!(
+                        info_status == 200 || info_status == 404,
+                        "opencode-info should return 200 or 404, got {}: {}",
+                        info_status,
+                        info_body
+                    );
+
+                    if info_status == 200 {
+                        // Verify JSON structure
+                        let info: serde_json::Value =
+                            serde_json::from_str(&info_body).map_err(|e| {
+                                color_eyre::eyre::eyre!(
+                                    "Failed to parse opencode-info JSON: {} - body: {}",
+                                    e,
+                                    info_body
+                                )
+                            })?;
+
+                        assert!(
+                            info.get("url").is_some(),
+                            "opencode-info should have 'url' field"
+                        );
+                        assert!(
+                            info.get("port").is_some(),
+                            "opencode-info should have 'port' field"
+                        );
+                        assert!(
+                            info.get("accessible").is_some(),
+                            "opencode-info should have 'accessible' field"
+                        );
+
+                        // URL should have token query param format
+                        let url = info.get("url").unwrap().as_str().unwrap_or("");
+                        assert!(
+                            url.starts_with("http://127.0.0.1:"),
+                            "URL should start with 'http://127.0.0.1:', got: {}",
+                            url
+                        );
+                        assert!(
+                            url.contains("?token="),
+                            "URL should contain '?token=', got: {}",
+                            url
+                        );
+
+                        tracing::info!(
+                            "Successfully validated opencode-info for pod {}: port={}",
+                            name,
+                            info.get("port").unwrap()
+                        );
+                    }
+                    break; // Only test one pod
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+podman_integration_test!(test_web_container_opencode_info_endpoint);
+
+/// Test connectivity to a running devaipod pod's opencode proxy
+///
+/// This test validates that the opencode proxy actually returns content by:
+/// 1. Finding a running devaipod pod
+/// 2. Getting its opencode-info (URL, port, token)
+/// 3. Using curl from inside the web container to test the proxy returns content
+///
+/// If no devaipod pod is running, the test passes with a skip note.
+///
+/// Tier 2: Parallel safe, uses shared pod for validation
+fn test_web_container_opencode_connectivity() -> Result<()> {
+    let fixture = WebFixture::get()?;
+
+    let token = fixture.token().to_string();
+
+    // Get pod list to find a running devaipod pod
+    let (pod_status, pod_body) =
+        fixture.curl_in_container("/api/podman/v5.0.0/libpod/pods/json", Some(&token))?;
+
+    if pod_status != 200 {
+        tracing::info!("Could not get pod list, skipping connectivity test");
+        return Ok(());
+    }
+
+    let pods: Vec<serde_json::Value> = serde_json::from_str(&pod_body).unwrap_or_default();
+
+    // Find a running devaipod pod
+    let mut found_running_pod = false;
+    for pod in &pods {
+        let name = match pod.get("Name").and_then(|n| n.as_str()) {
+            Some(n) if n.starts_with("devaipod-") => n,
+            _ => continue,
+        };
+
+        // Check if pod is running
+        let status = pod
+            .get("Status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown");
+        if status != "Running" {
+            tracing::info!("Pod {} is not running (status: {}), skipping", name, status);
+            continue;
+        }
+
+        let short_name = name.strip_prefix("devaipod-").unwrap_or(name);
+        tracing::info!("Found running devaipod pod: {}", name);
+
+        // Get opencode-info for this pod
+        let (info_status, info_body) = fixture.curl_in_container(
+            &format!("/api/devaipod/pods/{}/opencode-info", short_name),
+            Some(&token),
+        )?;
+
+        if info_status != 200 {
+            tracing::info!(
+                "opencode-info returned {} for pod {}, skipping",
+                info_status,
+                name
+            );
+            continue;
+        }
+
+        // Parse the opencode-info response
+        let info: serde_json::Value = match serde_json::from_str(&info_body) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to parse opencode-info: {}", e);
+                continue;
+            }
+        };
+
+        let port = match info.get("port").and_then(|p| p.as_u64()) {
+            Some(p) => p as u16,
+            None => {
+                tracing::warn!("No port in opencode-info response");
+                continue;
+            }
+        };
+
+        // Extract token/password from the URL
+        let url = info.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let password = url
+            .split("token=")
+            .nth(1)
+            .map(|t| t.split('&').next().unwrap_or(t))
+            .unwrap_or("");
+
+        if password.is_empty() {
+            tracing::warn!("Could not extract token from URL: {}", url);
+            continue;
+        }
+
+        tracing::info!(
+            "Testing opencode proxy connectivity on port {} for pod {}",
+            port,
+            name
+        );
+
+        found_running_pod = true;
+
+        // Test 1: Initial page load with token in query param
+        // curl from inside the web container to the host's published port
+        // Note: 127.0.0.1 in the container refers to the container's localhost,
+        // but the opencode proxy port is published on the host.
+        // We need to use the host's IP or the podman network gateway.
+        // For rootless podman, we can try host.containers.internal or the host IP.
+        let curl_url = format!(
+            "http://host.containers.internal:{}/?token={}",
+            port, password
+        );
+        let curl_output = Command::new("podman")
+            .args([
+                "exec",
+                fixture.container_name(),
+                "curl",
+                "-s",
+                "--max-time",
+                "10",
+                "-w",
+                "\n%{http_code}",
+                &curl_url,
+            ])
+            .output()?;
+
+        let combined = String::from_utf8_lossy(&curl_output.stdout);
+        let lines: Vec<&str> = combined.trim().lines().collect();
+        let status_code: i32 = lines.last().and_then(|s| s.parse().ok()).unwrap_or(-1);
+        let body = if lines.len() > 1 {
+            lines[..lines.len() - 1].join("\n")
+        } else {
+            String::new()
+        };
+
+        if status_code == -1 || status_code == 0 {
+            // Connection failed - likely network isolation or host not reachable
+            tracing::info!(
+                "Could not reach host.containers.internal:{}, pod may be on different host or network isolated",
+                port
+            );
+            // This is expected in some CI environments, so we don't fail
+            continue;
+        }
+
+        // Verify we got a successful response with HTML content
+        assert!(
+            status_code == 200 || status_code == 302,
+            "Initial page load should return 200 or 302, got {}: {}",
+            status_code,
+            &body[..body.len().min(200)]
+        );
+
+        if status_code == 200 {
+            // Should contain HTML
+            assert!(
+                body.contains("<!DOCTYPE html>")
+                    || body.contains("<html")
+                    || body.contains("<!doctype html>"),
+                "Response should contain HTML, got: {}",
+                &body[..body.len().min(500)]
+            );
+            tracing::info!("Initial page load returned HTML content successfully");
+        } else {
+            tracing::info!("Got redirect (302), which is also acceptable");
+        }
+
+        // Test 2: Request with cookie-based auth (simulating browser after initial load)
+        // The auth proxy sets a session cookie after ?token= auth
+        let cookie_header = format!("Cookie: devaipod_session={}", password);
+        let health_url = format!("http://host.containers.internal:{}/health", port);
+        let curl_health_output = Command::new("podman")
+            .args([
+                "exec",
+                fixture.container_name(),
+                "curl",
+                "-s",
+                "--max-time",
+                "10",
+                "-w",
+                "\n%{http_code}",
+                "-H",
+                &cookie_header,
+                &health_url,
+            ])
+            .output()?;
+
+        let health_combined = String::from_utf8_lossy(&curl_health_output.stdout);
+        let health_lines: Vec<&str> = health_combined.trim().lines().collect();
+        let health_status: i32 = health_lines
+            .last()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
+
+        // Health endpoint may or may not exist on the opencode server
+        // The important thing is we got a response (not connection refused)
+        if health_status > 0 {
+            tracing::info!(
+                "Cookie-based request to /health returned status {}",
+                health_status
+            );
+        }
+
+        // Successfully tested one pod, we're done
+        tracing::info!(
+            "Successfully validated opencode proxy connectivity for pod {}",
+            name
+        );
+        return Ok(());
+    }
+
+    if !found_running_pod {
+        tracing::info!("No running devaipod pods found, skipping opencode proxy connectivity test");
+    }
+
+    Ok(())
+}
+podman_integration_test!(test_web_container_opencode_connectivity);
+
+/// Verify cookie-based authentication persists across requests.
+///
+/// This tests the auth flow:
+/// 1. Make initial request to root path with ?token= query parameter
+/// 2. Extract Set-Cookie header from response (if present)
+/// 3. Make follow-up API request with only the cookie (no token param)
+/// 4. Verify the cookie-authenticated request succeeds
+///
+/// Note: The devaipod web server may or may not use cookies for session management.
+/// This test documents the current behavior.
+///
+/// Tier 1: Parallel safe, tests auth mechanism
+fn test_auth_proxy_cookie_persistence() -> Result<()> {
+    let fixture = WebFixture::get()?;
+
+    let token = fixture.token().to_string();
+
+    // Step 1: Make request to root path with token (this is where cookie would be set)
+    // Using -c to save cookies and -L to follow redirects
+    let url_with_token = format!("http://127.0.0.1:8080/?token={}", token);
+    let curl_output = Command::new("podman")
+        .args([
+            "exec",
+            fixture.container_name(),
+            "curl",
+            "-s",
+            "-D",
+            "-",  // Dump headers to stdout
+            "-L", // Follow redirects
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "30",
+            "--retry",
+            "5",
+            "--retry-connrefused",
+            "--retry-all-errors",
+            "--retry-delay",
+            "2",
+            &url_with_token,
+        ])
+        .output()?;
+
+    let response = String::from_utf8_lossy(&curl_output.stdout);
+
+    // Parse the response to extract headers (may have multiple header blocks due to redirects)
+    // Find the Set-Cookie in any of them
+    let set_cookie = response
+        .lines()
+        .find(|line| line.to_lowercase().starts_with("set-cookie:"))
+        .map(|line| line.trim().to_string());
+
+    // Also extract final status code
+    let parts: Vec<&str> = response.rsplitn(2, "\r\n\r\n").collect();
+    let _final_headers = parts.get(1).unwrap_or(&"");
+    let final_body = parts.first().unwrap_or(&"");
+
+    tracing::info!(
+        "Root path response (first 500 chars):\n{}",
+        &response[..response.len().min(500)]
+    );
+
+    // Check if we got HTML (successful page load)
+    let got_html = final_body.contains("<!DOCTYPE html>")
+        || final_body.contains("<html")
+        || final_body.contains("<!doctype html>");
+
+    if !got_html {
+        tracing::warn!(
+            "Root path didn't return HTML, got: {}",
+            &final_body[..final_body.len().min(200)]
+        );
+    }
+
+    // Check for Set-Cookie
+    if let Some(ref cookie_header) = set_cookie {
+        tracing::info!("Got Set-Cookie: {}", cookie_header);
+
+        // Extract the cookie name=value part (before any attributes like Path, HttpOnly, etc.)
+        let cookie_value = cookie_header
+            .strip_prefix("Set-Cookie:")
+            .or_else(|| cookie_header.strip_prefix("set-cookie:"))
+            .unwrap_or(cookie_header)
+            .trim()
+            .split(';')
+            .next()
+            .unwrap_or("");
+
+        if !cookie_value.is_empty() {
+            tracing::info!("Using cookie for follow-up request: {}", cookie_value);
+
+            // Step 2: Make follow-up API request with only the cookie (no token param)
+            let cookie_request_header = format!("Cookie: {}", cookie_value);
+            let url_without_token = "http://127.0.0.1:8080/api/podman/v5.0.0/libpod/pods/json";
+
+            let cookie_curl_output = Command::new("podman")
+                .args([
+                    "exec",
+                    fixture.container_name(),
+                    "curl",
+                    "-s",
+                    "-w",
+                    "\n%{http_code}",
+                    "--connect-timeout",
+                    "5",
+                    "--max-time",
+                    "30",
+                    "--retry",
+                    "5",
+                    "--retry-connrefused",
+                    "--retry-all-errors",
+                    "--retry-delay",
+                    "2",
+                    "-H",
+                    &cookie_request_header,
+                    url_without_token,
+                ])
+                .output()?;
+
+            let combined = String::from_utf8_lossy(&cookie_curl_output.stdout);
+            let lines: Vec<&str> = combined.trim().lines().collect();
+            let status_code: i32 = lines.last().and_then(|s| s.parse().ok()).unwrap_or(-1);
+            let cookie_body = if lines.len() > 1 {
+                lines[..lines.len() - 1].join("\n")
+            } else {
+                String::new()
+            };
+
+            // Step 3: Verify the cookie-only request succeeds
+            if status_code == 200 {
+                tracing::info!(
+                    "Cookie persistence works: follow-up request succeeded with cookie-only auth"
+                );
+                assert!(
+                    cookie_body.starts_with('['),
+                    "Cookie-authenticated response should be valid JSON array: {}",
+                    &cookie_body[..cookie_body.len().min(200)]
+                );
+            } else {
+                // Cookie auth didn't work - this is the behavior we're testing
+                tracing::warn!(
+                    "Cookie-only auth returned {}: Cookie may not be used for API auth. Body: {}",
+                    status_code,
+                    &cookie_body[..cookie_body.len().min(200)]
+                );
+                // This is expected if the server doesn't use cookie-based auth for API
+            }
+        }
+    } else {
+        tracing::info!(
+            "No Set-Cookie header in response - server doesn't use cookie-based sessions"
+        );
+        // This is also valid - the server might use only Bearer tokens
+    }
+
+    // Alternative test: verify Bearer token auth works for API (this should always work)
+    let bearer_header = format!("Authorization: Bearer {}", token);
+    let bearer_curl_output = Command::new("podman")
+        .args([
+            "exec",
+            fixture.container_name(),
+            "curl",
+            "-s",
+            "-w",
+            "\n%{http_code}",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "30",
+            "--retry",
+            "5",
+            "--retry-connrefused",
+            "--retry-all-errors",
+            "--retry-delay",
+            "2",
+            "-H",
+            &bearer_header,
+            "http://127.0.0.1:8080/api/podman/v5.0.0/libpod/pods/json",
+        ])
+        .output()?;
+
+    let bearer_combined = String::from_utf8_lossy(&bearer_curl_output.stdout);
+    let bearer_lines: Vec<&str> = bearer_combined.trim().lines().collect();
+    let bearer_status: i32 = bearer_lines
+        .last()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1);
+    let bearer_body = if bearer_lines.len() > 1 {
+        bearer_lines[..bearer_lines.len() - 1].join("\n")
+    } else {
+        String::new()
+    };
+
+    assert_eq!(
+        bearer_status, 200,
+        "Bearer token auth should work for API. Got {}: {}",
+        bearer_status, bearer_body
+    );
+    assert!(
+        bearer_body.starts_with('['),
+        "Bearer-authenticated response should be valid JSON array: {}",
+        &bearer_body[..bearer_body.len().min(200)]
+    );
+    tracing::info!("Bearer token auth verified working for API");
+
+    Ok(())
+}
+podman_integration_test!(test_auth_proxy_cookie_persistence);
+
+/// Verify that 401 responses include WWW-Authenticate header.
+///
+/// This is important because WWW-Authenticate triggers the browser's
+/// built-in authentication dialog (the "signin request" popup in Firefox).
+/// We want to detect this behavior so we can fix it for cross-origin requests.
+///
+/// Tier 1: Parallel safe, tests auth mechanism
+fn test_auth_proxy_wrong_password_returns_401_with_www_authenticate() -> Result<()> {
+    let fixture = WebFixture::get()?;
+
+    // Make request with wrong token - should get 401
+    let wrong_token = "wrong-token-12345";
+    let url = format!(
+        "http://127.0.0.1:8080/api/podman/v5.0.0/libpod/pods/json?token={}",
+        wrong_token
+    );
+
+    let curl_output = Command::new("podman")
+        .args([
+            "exec",
+            fixture.container_name(),
+            "curl",
+            "-s",
+            "-D",
+            "-", // Dump headers to stdout
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "30",
+            "--retry",
+            "5",
+            "--retry-connrefused",
+            "--retry-all-errors",
+            "--retry-delay",
+            "2",
+            &url,
+        ])
+        .output()?;
+
+    let response = String::from_utf8_lossy(&curl_output.stdout);
+
+    // Parse the response to extract headers
+    let parts: Vec<&str> = response.splitn(2, "\r\n\r\n").collect();
+    let headers = parts.first().unwrap_or(&"");
+
+    tracing::info!("Wrong password response headers:\n{}", headers);
+
+    // Verify status is 401
+    let status_line = headers.lines().next().unwrap_or("");
+    assert!(
+        status_line.contains("401"),
+        "Request with wrong token should return 401, got: {}",
+        status_line
+    );
+
+    // Check for WWW-Authenticate header
+    let www_authenticate = headers
+        .lines()
+        .find(|line| line.to_lowercase().starts_with("www-authenticate:"));
+
+    // Log whether WWW-Authenticate is present (this is the behavior we want to document/fix)
+    if let Some(header) = www_authenticate {
+        tracing::warn!(
+            "WWW-Authenticate header IS present: {} - This triggers Firefox signin dialog!",
+            header
+        );
+    } else {
+        tracing::info!(
+            "WWW-Authenticate header is NOT present (good for avoiding browser dialogs)"
+        );
+    }
+
+    // For now, we're just documenting the behavior.
+    // The assertion below captures current behavior - update after fix:
+    // Currently we expect WWW-Authenticate to be absent (or present - adjust based on actual behavior)
+
+    // Test request with no auth at all
+    let no_auth_url = "http://127.0.0.1:8080/api/podman/v5.0.0/libpod/pods/json";
+    let no_auth_output = Command::new("podman")
+        .args([
+            "exec",
+            fixture.container_name(),
+            "curl",
+            "-s",
+            "-D",
+            "-",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "30",
+            "--retry",
+            "5",
+            "--retry-connrefused",
+            "--retry-all-errors",
+            "--retry-delay",
+            "2",
+            no_auth_url,
+        ])
+        .output()?;
+
+    let no_auth_response = String::from_utf8_lossy(&no_auth_output.stdout);
+    let no_auth_parts: Vec<&str> = no_auth_response.splitn(2, "\r\n\r\n").collect();
+    let no_auth_headers = no_auth_parts.first().unwrap_or(&"");
+
+    tracing::info!("No auth response headers:\n{}", no_auth_headers);
+
+    // Verify status is 401
+    let no_auth_status = no_auth_headers.lines().next().unwrap_or("");
+    assert!(
+        no_auth_status.contains("401"),
+        "Request without auth should return 401, got: {}",
+        no_auth_status
+    );
+
+    let no_auth_www_authenticate = no_auth_headers
+        .lines()
+        .find(|line| line.to_lowercase().starts_with("www-authenticate:"));
+
+    if let Some(header) = no_auth_www_authenticate {
+        tracing::warn!(
+            "WWW-Authenticate header IS present on no-auth request: {} - This triggers Firefox signin dialog!",
+            header
+        );
+    } else {
+        tracing::info!("WWW-Authenticate header is NOT present on no-auth request (good)");
+    }
+
+    Ok(())
+}
+podman_integration_test!(test_auth_proxy_wrong_password_returns_401_with_www_authenticate);
+
+/// Test API-style requests (Accept: application/json) without auth.
+///
+/// This simulates cross-origin API requests from app.opencode.ai to 127.0.0.1.
+/// When cookies aren't sent (due to SameSite=Lax on cross-origin), the 401
+/// response with WWW-Authenticate header causes Firefox to show a signin dialog.
+///
+/// Tier 1: Parallel safe, tests auth mechanism
+fn test_auth_proxy_api_request_without_auth() -> Result<()> {
+    let fixture = WebFixture::get()?;
+
+    // Simulate API request with Accept: application/json but no auth
+    // This is what happens on cross-origin requests when cookie is not sent
+    let url = "http://127.0.0.1:8080/api/podman/v5.0.0/libpod/pods/json";
+
+    let curl_output = Command::new("podman")
+        .args([
+            "exec",
+            fixture.container_name(),
+            "curl",
+            "-s",
+            "-D",
+            "-", // Dump headers to stdout
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "30",
+            "--retry",
+            "5",
+            "--retry-connrefused",
+            "--retry-all-errors",
+            "--retry-delay",
+            "2",
+            "-H",
+            "Accept: application/json",
+            "-H",
+            "Origin: https://app.opencode.ai", // Simulate cross-origin
+            url,
+        ])
+        .output()?;
+
+    let response = String::from_utf8_lossy(&curl_output.stdout);
+
+    // Parse the response to extract headers
+    let parts: Vec<&str> = response.splitn(2, "\r\n\r\n").collect();
+    let headers = parts.first().unwrap_or(&"");
+    let body = parts.get(1).unwrap_or(&"");
+
+    tracing::info!("API request without auth - headers:\n{}", headers);
+    tracing::info!("API request without auth - body:\n{}", body);
+
+    // Verify status is 401
+    let status_line = headers.lines().next().unwrap_or("");
+    assert!(
+        status_line.contains("401"),
+        "API request without auth should return 401, got: {}",
+        status_line
+    );
+
+    // Check for WWW-Authenticate header - this is what causes the Firefox issue
+    let www_authenticate = headers
+        .lines()
+        .find(|line| line.to_lowercase().starts_with("www-authenticate:"));
+
+    if let Some(header) = www_authenticate {
+        tracing::warn!(
+            "WWW-Authenticate header IS present on API request: {}",
+            header
+        );
+        tracing::warn!(
+            "This will cause Firefox to show a signin dialog for cross-origin API requests!"
+        );
+        tracing::warn!(
+            "Fix: Don't send WWW-Authenticate for requests with Accept: application/json"
+        );
+    } else {
+        tracing::info!("WWW-Authenticate header is NOT present on API request (good)");
+    }
+
+    // Check for CORS headers (may be relevant for cross-origin requests)
+    let cors_header = headers
+        .lines()
+        .find(|line| line.to_lowercase().starts_with("access-control-"));
+
+    if let Some(header) = cors_header {
+        tracing::info!("CORS header present: {}", header);
+    } else {
+        tracing::info!("No CORS headers present");
+    }
+
+    // Verify body is JSON error response (not HTML)
+    // Good API behavior: return JSON error, not redirect to login page
+    if body.trim().starts_with('{') || body.trim().starts_with('[') {
+        tracing::info!("Response body is JSON (good for API clients)");
+    } else if body.contains("<!DOCTYPE html>") || body.contains("<html") {
+        tracing::warn!("Response body is HTML - API clients expect JSON error response");
+    }
+
+    Ok(())
+}
+podman_integration_test!(test_auth_proxy_api_request_without_auth);

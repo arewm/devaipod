@@ -8,6 +8,7 @@
 
 use color_eyre::eyre::bail;
 use color_eyre::Result;
+use std::process::Command;
 use std::time::{Duration, Instant};
 use xshell::{cmd, Shell};
 
@@ -15,6 +16,41 @@ use crate::{
     podman_integration_test, readonly_test, run_devaipod, run_devaipod_in, shell, short_name,
     unique_test_name, PodGuard, SharedFixture, TestRepo,
 };
+
+/// Run podman inspect with a Go template format string.
+///
+/// This uses std::process::Command instead of xshell's cmd! macro
+/// to avoid issues with Go template brace escaping.
+fn podman_inspect(target: &str, format: &str) -> Result<String> {
+    let output = Command::new("podman")
+        .args(["inspect", "--format", format, target])
+        .output()
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to run podman inspect: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(color_eyre::eyre::eyre!(
+            "podman inspect failed: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Run podman pod inspect with a Go template format string.
+fn podman_pod_inspect(pod_name: &str, format: &str) -> Result<String> {
+    let output = Command::new("podman")
+        .args(["pod", "inspect", "--format", format, pod_name])
+        .output()
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to run podman pod inspect: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(color_eyre::eyre::eyre!(
+            "podman pod inspect failed: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
 /// Poll a condition until it succeeds or times out.
 /// Returns Ok(output) on success, Err on timeout.
@@ -1406,16 +1442,16 @@ fn test_gator_can_resolve_git_alternates() -> Result<()> {
 }
 podman_integration_test!(test_gator_can_resolve_git_alternates);
 
-/// Verify that service-gator uses JWT-based dynamic scopes.
+/// Verify that service-gator is configured correctly with scopes.
 ///
 /// This test verifies:
-/// 1. Pod labels contain the JWT secret and scopes
-/// 2. Gator container starts with JWT server mode (not static CLI args)
-/// 3. Agent container has MCP config with Authorization header
+/// 1. Pod labels contain the service-gator configuration
+/// 2. Gator container is running with the correct scope args
+/// 3. Agent container has MCP config for connecting to gator
 /// 4. `devaipod gator show` displays the configured scopes
-fn test_gator_jwt_dynamic_scopes() -> Result<()> {
+fn test_gator_scopes_configuration() -> Result<()> {
     let repo = TestRepo::new()?;
-    let pod_name = unique_test_name("test-gator-jwt");
+    let pod_name = unique_test_name("test-gator-cfg");
 
     let mut pods = PodGuard::new();
     pods.add(&pod_name);
@@ -1435,65 +1471,43 @@ fn test_gator_jwt_dynamic_scopes() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    let sh = shell()?;
-
     // Give containers time to start
     std::thread::sleep(std::time::Duration::from_secs(2));
 
-    // 1. Verify pod has JWT-related labels
-    let labels_output = cmd!(
-        sh,
-        "podman pod inspect {pod_name} --format '{{{{json .Labels}}}}'"
-    )
-    .output()?;
-    let labels_str = String::from_utf8_lossy(&labels_output.stdout);
+    // 1. Verify pod has service-gator label with scope config
+    let labels_str = podman_pod_inspect(&pod_name, "{{json .Labels}}")?;
 
     assert!(
-        labels_str.contains("io.devaipod.gator.jwt-secret"),
-        "Pod should have JWT secret label: {}",
+        labels_str.contains("io.devaipod.service-gator"),
+        "Pod should have service-gator label: {}",
         labels_str
     );
+    // The label should contain the requested repo scope
     assert!(
-        labels_str.contains("io.devaipod.gator.scopes"),
-        "Pod should have scopes label: {}",
+        labels_str.contains("myorg/myrepo"),
+        "Pod service-gator label should contain requested repo: {}",
         labels_str
     );
 
-    // 2. Verify gator container is running with JWT server mode
+    // 2. Verify gator container is running with --scope-file for live config reload
     let gator_container = format!("{}-gator", pod_name);
-    let gator_inspect = cmd!(
-        sh,
-        "podman inspect {gator_container} --format '{{{{json .Config.Cmd}}}}'"
-    )
-    .output()?;
-    let gator_cmd = String::from_utf8_lossy(&gator_inspect.stdout);
+    let gator_cmd = podman_inspect(&gator_container, "{{json .Config.Cmd}}")?;
 
-    // Should have --scope with server mode, not --gh-repo args
+    // Should use --scope-file for inotify-based live reload
     assert!(
-        gator_cmd.contains("--scope"),
-        "Gator should use --scope flag: {}",
+        gator_cmd.contains("--scope-file"),
+        "Gator should use --scope-file for live reload: {}",
         gator_cmd
     );
     assert!(
-        gator_cmd.contains("server"),
-        "Gator should have server mode in scope: {}",
-        gator_cmd
-    );
-    // Should NOT have the old-style --gh-repo flags (those are for static mode)
-    assert!(
-        !gator_cmd.contains("--gh-repo"),
-        "Gator should NOT use --gh-repo (that's static mode): {}",
+        gator_cmd.contains("gator-config.json"),
+        "Gator should reference gator-config.json: {}",
         gator_cmd
     );
 
-    // 3. Verify agent container has MCP config with Authorization header
+    // 3. Verify agent container has MCP config for service-gator
     let agent_container = format!("{}-agent", pod_name);
-    let agent_env = cmd!(
-        sh,
-        "podman inspect {agent_container} --format '{{{{json .Config.Env}}}}'"
-    )
-    .output()?;
-    let agent_env_str = String::from_utf8_lossy(&agent_env.stdout);
+    let agent_env_str = podman_inspect(&agent_container, "{{json .Config.Env}}")?;
 
     assert!(
         agent_env_str.contains("OPENCODE_CONFIG_CONTENT"),
@@ -1501,13 +1515,8 @@ fn test_gator_jwt_dynamic_scopes() -> Result<()> {
         agent_env_str
     );
     assert!(
-        agent_env_str.contains("Authorization"),
-        "Agent MCP config should have Authorization header: {}",
-        agent_env_str
-    );
-    assert!(
-        agent_env_str.contains("Bearer"),
-        "Agent should use Bearer token auth: {}",
+        agent_env_str.contains("service-gator"),
+        "Agent MCP config should reference service-gator: {}",
         agent_env_str
     );
 
@@ -1544,7 +1553,7 @@ fn test_gator_jwt_dynamic_scopes() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_gator_jwt_dynamic_scopes);
+podman_integration_test!(test_gator_scopes_configuration);
 
 /// Verify that gator scopes can be updated at runtime via the MCP API.
 ///

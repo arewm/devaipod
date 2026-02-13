@@ -480,7 +480,7 @@ pub fn mint_token_from_scopes(
 /// inotify and reloads automatically when it changes.
 pub const GATOR_CONFIG_PATH: &str = ".devaipod/gator-config.json";
 
-/// Persistent gator configuration stored in the agent home volume
+/// Persistent gator configuration stored in the workspace volume
 ///
 /// This is written at pod creation and updated by `devaipod gator add/edit`.
 /// Gator watches this file via inotify for live reload.

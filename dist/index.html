@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>devaipod - Control Plane</title>
+    <style>
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-card: #0f3460;
+            --text-primary: #e6e6e6;
+            --text-secondary: #a0a0a0;
+            --accent: #e94560;
+            --success: #4ade80;
+            --warning: #fbbf24;
+            --border: #2a2a4a;
+        }
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 1rem;
+        }
+        
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 1rem;
+        }
+        
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+        
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--success);
+        }
+        
+        .status-indicator.disconnected {
+            background: var(--accent);
+        }
+        
+        .pods-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+            gap: 1rem;
+        }
+        
+        .pod-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+            transition: border-color 0.2s;
+        }
+        
+        .pod-card:hover,
+        .pod-card:focus {
+            border-color: var(--accent);
+            outline: none;
+        }
+        
+        .pod-card:focus {
+            box-shadow: 0 0 0 2px var(--accent);
+        }
+        
+        .pod-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 0.75rem;
+        }
+        
+        .pod-name {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        
+        .pod-status {
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+        }
+        
+        .pod-status.running {
+            background: rgba(74, 222, 128, 0.2);
+            color: var(--success);
+        }
+        
+        .pod-status.stopped {
+            background: rgba(233, 69, 96, 0.2);
+            color: var(--accent);
+        }
+        
+        .pod-meta {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+        
+        .pod-meta-item {
+            margin-bottom: 0.25rem;
+        }
+        
+        .pod-meta-label {
+            color: var(--text-secondary);
+        }
+        
+        .pod-meta-value {
+            color: var(--text-primary);
+        }
+        
+        .pod-containers {
+            margin-top: 0.75rem;
+            padding-top: 0.75rem;
+            border-top: 1px solid var(--border);
+        }
+        
+        .container-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.25rem 0;
+            font-size: 0.85rem;
+        }
+        
+        .container-status {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        
+        .container-status.running {
+            background: var(--success);
+        }
+        
+        .container-status.stopped {
+            background: var(--accent);
+        }
+        
+        .container-name {
+            color: var(--text-secondary);
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-secondary);
+        }
+        
+        .error {
+            background: rgba(233, 69, 96, 0.2);
+            color: var(--accent);
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-secondary);
+        }
+        
+        .refresh-btn {
+            background: var(--bg-card);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.85rem;
+        }
+        
+        .refresh-btn:hover {
+            border-color: var(--accent);
+        }
+        
+        .pod-actions {
+            margin-top: 0.75rem;
+            padding-top: 0.75rem;
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        .open-btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.85rem;
+            text-decoration: none;
+            display: inline-block;
+        }
+        
+        .open-btn:hover {
+            opacity: 0.9;
+        }
+        
+        .open-btn:disabled {
+            background: var(--text-secondary);
+            cursor: not-allowed;
+        }
+        
+        /* Launch form styles */
+        .launch-section {
+            margin-bottom: 1.5rem;
+        }
+        
+        .launch-toggle-btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .launch-toggle-btn:hover {
+            opacity: 0.9;
+        }
+        
+        .launch-toggle-btn .shortcut {
+            font-size: 0.75rem;
+            opacity: 0.7;
+            background: rgba(255, 255, 255, 0.15);
+            padding: 0.15rem 0.4rem;
+            border-radius: 3px;
+        }
+        
+        .launch-form {
+            display: none;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.25rem;
+        }
+        
+        .launch-form.expanded {
+            display: block;
+        }
+        
+        .launch-form-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            color: var(--text-primary);
+        }
+        
+        .form-group {
+            margin-bottom: 1rem;
+        }
+        
+        .form-label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.4rem;
+        }
+        
+        .form-input {
+            width: 100%;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 0.65rem 0.85rem;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.9rem;
+        }
+        
+        .form-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .form-input::placeholder {
+            color: var(--text-secondary);
+            opacity: 0.6;
+        }
+        
+        .form-textarea {
+            min-height: 80px;
+            resize: vertical;
+        }
+        
+        .form-actions {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 1.25rem;
+        }
+        
+        .launch-btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 0.65rem 1.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+        
+        .launch-btn:hover:not(:disabled) {
+            opacity: 0.9;
+        }
+        
+        .launch-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .cancel-btn {
+            background: transparent;
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+            padding: 0.65rem 1.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.9rem;
+        }
+        
+        .cancel-btn:hover {
+            border-color: var(--text-secondary);
+            color: var(--text-primary);
+        }
+        
+        .form-error {
+            background: rgba(233, 69, 96, 0.2);
+            color: var(--accent);
+            padding: 0.75rem;
+            border-radius: 4px;
+            margin-top: 1rem;
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>devaipod</h1>
+        <div class="status">
+            <span id="connection-status" class="status-indicator"></span>
+            <span id="connection-text">Connecting...</span>
+            <button class="refresh-btn" onclick="refreshPods()">Refresh</button>
+        </div>
+    </header>
+    
+    <main>
+        <!-- Launch form section -->
+        <div class="launch-section">
+            <button id="launch-toggle" class="launch-toggle-btn" onclick="toggleLaunchForm()">
+                + New Workspace <span class="shortcut">n</span>
+            </button>
+            <div id="launch-form" class="launch-form">
+                <div class="launch-form-title">Launch New Workspace</div>
+                <form onsubmit="submitLaunchForm(event)">
+                    <div class="form-group">
+                        <label class="form-label" for="repo-url">Repository URL</label>
+                        <input 
+                            type="text" 
+                            id="repo-url" 
+                            class="form-input" 
+                            placeholder="https://github.com/org/repo or issue/PR URL"
+                            required
+                        >
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="task-input">Task (optional)</label>
+                        <textarea 
+                            id="task-input" 
+                            class="form-input form-textarea" 
+                            placeholder="Describe what the agent should work on..."
+                        ></textarea>
+                    </div>
+                    <div class="form-actions">
+                        <button type="submit" id="launch-submit-btn" class="launch-btn">Launch</button>
+                        <button type="button" class="cancel-btn" onclick="toggleLaunchForm()">Cancel</button>
+                    </div>
+                    <div id="launch-error" class="form-error" style="display: none;"></div>
+                </form>
+            </div>
+        </div>
+        
+        <div id="error-container"></div>
+        <div id="pods-container" class="loading">Loading pods...</div>
+    </main>
+
+    <script>
+        // Extract token from URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const token = urlParams.get('token');
+        
+        if (!token) {
+            document.getElementById('pods-container').innerHTML = `
+                <div class="error">
+                    No authentication token provided. 
+                    Use the URL provided by <code>devaipod web</code>.
+                </div>
+            `;
+        }
+        
+        // API helper
+        async function apiCall(path) {
+            const response = await fetch(`/api${path}`, {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            });
+            
+            if (!response.ok) {
+                throw new Error(`API error: ${response.status} ${response.statusText}`);
+            }
+            
+            return response.json();
+        }
+        
+        // Format date
+        function formatDate(dateStr) {
+            const date = new Date(dateStr);
+            return date.toLocaleString();
+        }
+        
+        // Open agent for a pod - opens wrapper page with iframe
+        async function openAgent(shortName) {
+            try {
+                const info = await apiCall(`/devaipod/pods/${shortName}/opencode-info`);
+                if (info.url) {
+                    // Build wrapper page URL with encoded parameters
+                    const consoleUrl = window.location.href;
+                    const wrapperUrl = `/agent.html?pod=${encodeURIComponent(shortName)}&url=${encodeURIComponent(info.url)}&console=${encodeURIComponent(consoleUrl)}`;
+                    window.open(wrapperUrl, '_blank');
+                }
+            } catch (err) {
+                alert(`Failed to get agent URL: ${err.message}`);
+            }
+        }
+        
+        // Render a pod card
+        function renderPod(pod) {
+            const status = pod.Status || 'unknown';
+            const statusClass = status.toLowerCase() === 'running' ? 'running' : 'stopped';
+            
+            // Extract devaipod labels
+            const labels = pod.Labels || {};
+            const task = labels['io.devaipod.task'] || '';
+            const repo = labels['io.devaipod.repo'] || '';
+            const mode = labels['io.devaipod.mode'] || '';
+            
+            // Render containers
+            const containers = (pod.Containers || [])
+                .filter(c => !c.Names.includes('-infra'))
+                .map(c => {
+                    const containerStatus = c.Status === 'running' ? 'running' : 'stopped';
+                    const shortName = c.Names.replace(pod.Name + '-', '');
+                    return `
+                        <div class="container-row">
+                            <span class="container-status ${containerStatus}"></span>
+                            <span class="container-name">${shortName}</span>
+                        </div>
+                    `;
+                }).join('');
+            
+            const shortName = pod.Name.replace('devaipod-', '');
+            const isRunning = status.toLowerCase() === 'running';
+            
+            return `
+                <div class="pod-card" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
+                    <div class="pod-header">
+                        <span class="pod-name">${shortName}</span>
+                        <span class="pod-status ${statusClass}">${status}</span>
+                    </div>
+                    <div class="pod-meta">
+                        ${repo ? `<div class="pod-meta-item"><span class="pod-meta-label">Repo:</span> <span class="pod-meta-value">${repo}</span></div>` : ''}
+                        ${task ? `<div class="pod-meta-item"><span class="pod-meta-label">Task:</span> <span class="pod-meta-value">${task.substring(0, 100)}${task.length > 100 ? '...' : ''}</span></div>` : ''}
+                        ${mode ? `<div class="pod-meta-item"><span class="pod-meta-label">Mode:</span> <span class="pod-meta-value">${mode}</span></div>` : ''}
+                        <div class="pod-meta-item"><span class="pod-meta-label">Created:</span> <span class="pod-meta-value">${formatDate(pod.Created)}</span></div>
+                    </div>
+                    ${containers ? `<div class="pod-containers">${containers}</div>` : ''}
+                    <div class="pod-actions">
+                        ${isRunning 
+                            ? `<button class="open-btn" onclick="openAgent('${shortName}')">Open Agent</button>`
+                            : `<button class="open-btn" disabled>Stopped</button>`
+                        }
+                    </div>
+                </div>
+            `;
+        }
+        
+        // Refresh pods list
+        async function refreshPods() {
+            const container = document.getElementById('pods-container');
+            const statusIndicator = document.getElementById('connection-status');
+            const statusText = document.getElementById('connection-text');
+            
+            try {
+                // Use the libpod API endpoint
+                const pods = await apiCall('/podman/v5.0.0/libpod/pods/json');
+                
+                statusIndicator.classList.remove('disconnected');
+                statusText.textContent = 'Connected';
+                
+                // Filter to only devaipod pods
+                const devaipodPods = pods.filter(p => p.Name && p.Name.startsWith('devaipod-'));
+                
+                if (devaipodPods.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <p>No devaipod workspaces found.</p>
+                            <p style="margin-top: 0.5rem; font-size: 0.85rem;">
+                                Create one with: <code>devaipod run https://github.com/org/repo</code>
+                            </p>
+                        </div>
+                    `;
+                } else {
+                    container.className = 'pods-grid';
+                    container.innerHTML = devaipodPods.map(renderPod).join('');
+                }
+                
+                document.getElementById('error-container').innerHTML = '';
+            } catch (err) {
+                statusIndicator.classList.add('disconnected');
+                statusText.textContent = 'Disconnected';
+                document.getElementById('error-container').innerHTML = `
+                    <div class="error">${err.message}</div>
+                `;
+            }
+        }
+        
+        // Toggle launch form visibility
+        function toggleLaunchForm() {
+            const form = document.getElementById('launch-form');
+            const toggle = document.getElementById('launch-toggle');
+            const isExpanded = form.classList.contains('expanded');
+            
+            if (isExpanded) {
+                form.classList.remove('expanded');
+                toggle.style.display = 'flex';
+                // Clear form
+                document.getElementById('repo-url').value = '';
+                document.getElementById('task-input').value = '';
+                document.getElementById('launch-error').style.display = 'none';
+            } else {
+                form.classList.add('expanded');
+                toggle.style.display = 'none';
+                // Focus the repo input
+                document.getElementById('repo-url').focus();
+            }
+        }
+        
+        // Submit launch form
+        async function submitLaunchForm(event) {
+            event.preventDefault();
+            
+            const repoUrl = document.getElementById('repo-url').value.trim();
+            const task = document.getElementById('task-input').value.trim();
+            const submitBtn = document.getElementById('launch-submit-btn');
+            const errorDiv = document.getElementById('launch-error');
+            
+            if (!repoUrl) {
+                errorDiv.textContent = 'Repository URL is required';
+                errorDiv.style.display = 'block';
+                return;
+            }
+            
+            // Show loading state
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Launching...';
+            errorDiv.style.display = 'none';
+            
+            try {
+                const body = { source: repoUrl };
+                if (task) {
+                    body.task = task;
+                }
+                
+                console.log('Launching workspace:', body);
+                
+                const response = await fetch('/api/devaipod/run', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(body)
+                });
+                
+                const result = await response.json();
+                console.log('Launch response:', result);
+                
+                if (!response.ok || !result.success) {
+                    throw new Error(result.message || `HTTP ${response.status}`);
+                }
+                
+                // Success - refresh pods and collapse form
+                console.log('Workspace created:', result.workspace);
+                await refreshPods();
+                toggleLaunchForm();
+            } catch (err) {
+                console.error('Launch failed:', err);
+                errorDiv.textContent = `Failed to launch: ${err.message}`;
+                errorDiv.style.display = 'block';
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Launch';
+            }
+        }
+        
+        // Handle keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            const activeElement = document.activeElement;
+            const tagName = activeElement.tagName.toLowerCase();
+            const isInputFocused = tagName === 'input' || tagName === 'textarea' || activeElement.isContentEditable;
+            
+            // 'n' key opens the new workspace form (when not in an input)
+            if (e.key === 'n' && !isInputFocused) {
+                const form = document.getElementById('launch-form');
+                if (!form.classList.contains('expanded')) {
+                    e.preventDefault();
+                    toggleLaunchForm();
+                }
+            }
+            
+            // Escape key closes the launch form
+            if (e.key === 'Escape') {
+                const form = document.getElementById('launch-form');
+                if (form.classList.contains('expanded')) {
+                    e.preventDefault();
+                    toggleLaunchForm();
+                }
+            }
+            
+            // Enter key opens the agent if a pod card is focused
+            if (e.key === 'Enter' && activeElement.classList.contains('pod-card')) {
+                const podName = activeElement.dataset.podName;
+                if (podName && activeElement.dataset.running === 'true') {
+                    openAgent(podName);
+                }
+            }
+        });
+        
+        // Initial load
+        if (token) {
+            refreshPods();
+            // Auto-refresh every 5 seconds
+            setInterval(refreshPods, 5000);
+        }
+    </script>
+</body>
+</html>

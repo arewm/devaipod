@@ -18,6 +18,9 @@ pub(crate) use integration_tests::{
 
 mod tests;
 
+// Re-export WebFixture for cleanup
+use tests::WebFixture;
+
 /// Create a new xshell Shell for running commands
 pub(crate) fn shell() -> Result<Shell> {
     Shell::new().map_err(|e| eyre!("Failed to create shell: {}", e))
@@ -36,11 +39,37 @@ fn find_workspace_root() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Get the path to the devaipod binary
+/// Check if the devaipod container is running
+fn devaipod_container_running() -> bool {
+    Command::new("podman")
+        .args(["container", "exists", "devaipod"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Describes how to run the devaipod command
+pub(crate) enum DevaipodCommand {
+    /// Run via podman exec into the devaipod container
+    Container,
+    /// Run the binary directly on the host (with DEVAIPOD_HOST_MODE=1)
+    Host(String),
+}
+
+/// Get the devaipod command configuration
 ///
-/// Checks DEVAIPOD_PATH env var first, then looks for the binary in target directories.
-/// Always returns an absolute path to ensure it works from any working directory.
-pub(crate) fn get_devaipod_command() -> Result<String> {
+/// If the devaipod container is running, returns Container mode.
+/// Otherwise checks DEVAIPOD_PATH env var, then looks for the binary in target directories.
+pub(crate) fn get_devaipod_command() -> Result<DevaipodCommand> {
+    // If DEVAIPOD_HOST_MODE is explicitly set, use host mode
+    let explicit_host_mode = std::env::var("DEVAIPOD_HOST_MODE").is_ok();
+
+    // Check if devaipod container is running (preferred for integration tests)
+    if !explicit_host_mode && devaipod_container_running() {
+        return Ok(DevaipodCommand::Container);
+    }
+
+    // Fall back to host mode with binary path
     if let Ok(path) = std::env::var("DEVAIPOD_PATH") {
         // Convert to absolute path if relative
         let path = std::path::PathBuf::from(&path);
@@ -49,18 +78,22 @@ pub(crate) fn get_devaipod_command() -> Result<String> {
             if let Some(workspace_root) = find_workspace_root() {
                 let abs_path = workspace_root.join(&path);
                 if abs_path.exists() {
-                    return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
+                    return Ok(DevaipodCommand::Host(
+                        abs_path.canonicalize()?.to_string_lossy().to_string(),
+                    ));
                 }
             }
             // Try current directory as fallback
             let cwd = std::env::current_dir()?;
             let abs_path = cwd.join(&path);
             if abs_path.exists() {
-                return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
+                return Ok(DevaipodCommand::Host(
+                    abs_path.canonicalize()?.to_string_lossy().to_string(),
+                ));
             }
             return Err(eyre!("Cannot find devaipod binary at {}", path.display()));
         }
-        return Ok(path.to_string_lossy().to_string());
+        return Ok(DevaipodCommand::Host(path.to_string_lossy().to_string()));
     }
 
     // Look for the binary in target directories relative to workspace root
@@ -82,7 +115,7 @@ pub(crate) fn get_devaipod_command() -> Result<String> {
     }
 
     // Fall back to hoping it's in PATH
-    Ok("devaipod".to_string())
+    Ok(DevaipodCommand::Host("devaipod".to_string()))
 }
 
 /// Check if podman is available
@@ -159,24 +192,122 @@ impl CapturedOutput {
 /// Run the devaipod command, capturing output
 ///
 /// This uses std::process::Command for consistent CapturedOutput handling.
+/// If the devaipod container is running, uses `podman exec devaipod devaipod <args>`.
+/// Otherwise runs the binary directly with DEVAIPOD_HOST_MODE=1.
 pub(crate) fn run_devaipod(args: &[&str]) -> Result<CapturedOutput> {
-    let devaipod = get_devaipod_command()?;
-    let output = Command::new(&devaipod)
+    let cmd = get_devaipod_command()?;
+    let output = match cmd {
+        DevaipodCommand::Container => Command::new("podman")
+            .arg("exec")
+            .arg("devaipod")
+            .arg("devaipod")
+            .args(args)
+            .output()
+            .with_context(|| format!("Failed to run podman exec devaipod devaipod {:?}", args))?,
+        DevaipodCommand::Host(binary) => Command::new(&binary)
+            .args(args)
+            .env("DEVAIPOD_HOST_MODE", "1")
+            .output()
+            .with_context(|| format!("Failed to run devaipod {:?}", args))?,
+    };
+    Ok(CapturedOutput::new(output))
+}
+
+/// Run the devaipod command in a specific directory
+///
+/// This always uses host mode with DEVAIPOD_HOST_MODE=1 because the directory
+/// is on the host filesystem and won't be accessible from within the container.
+pub(crate) fn run_devaipod_in(dir: &std::path::Path, args: &[&str]) -> Result<CapturedOutput> {
+    let binary = get_devaipod_binary_path()?;
+    let output = Command::new(&binary)
+        .current_dir(dir)
         .args(args)
+        .env("DEVAIPOD_HOST_MODE", "1")
+        .output()
+        .with_context(|| format!("Failed to run devaipod {:?} in {:?}", args, dir))?;
+    Ok(CapturedOutput::new(output))
+}
+
+/// Run the devaipod command in a specific directory with extra environment variables.
+///
+/// This always uses host mode with DEVAIPOD_HOST_MODE=1 because the directory
+/// is on the host filesystem and won't be accessible from within the container.
+pub(crate) fn run_devaipod_in_with_env(
+    dir: &std::path::Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<CapturedOutput> {
+    let binary = get_devaipod_binary_path()?;
+    let mut cmd = Command::new(&binary);
+    cmd.current_dir(dir)
+        .args(args)
+        .env("DEVAIPOD_HOST_MODE", "1");
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .with_context(|| format!("Failed to run devaipod {:?} in {:?}", args, dir))?;
+    Ok(CapturedOutput::new(output))
+}
+
+/// Run the devaipod command with extra environment variables.
+pub(crate) fn run_devaipod_with_env(
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<CapturedOutput> {
+    let binary = get_devaipod_binary_path()?;
+    let mut cmd = Command::new(&binary);
+    cmd.args(args).env("DEVAIPOD_HOST_MODE", "1");
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let output = cmd
         .output()
         .with_context(|| format!("Failed to run devaipod {:?}", args))?;
     Ok(CapturedOutput::new(output))
 }
 
-/// Run the devaipod command in a specific directory
-pub(crate) fn run_devaipod_in(dir: &std::path::Path, args: &[&str]) -> Result<CapturedOutput> {
-    let devaipod = get_devaipod_command()?;
-    let output = Command::new(&devaipod)
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .with_context(|| format!("Failed to run devaipod {:?} in {:?}", args, dir))?;
-    Ok(CapturedOutput::new(output))
+/// Get the path to the devaipod binary (for host mode only)
+///
+/// This is used when we need to run devaipod directly on the host,
+/// such as when the command needs access to host filesystem paths,
+/// or when spawning child processes that need to invoke devaipod.
+pub(crate) fn get_devaipod_binary_path() -> Result<String> {
+    if let Ok(path) = std::env::var("DEVAIPOD_PATH") {
+        let path = std::path::PathBuf::from(&path);
+        if path.is_relative() {
+            if let Some(workspace_root) = find_workspace_root() {
+                let abs_path = workspace_root.join(&path);
+                if abs_path.exists() {
+                    return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
+                }
+            }
+            let cwd = std::env::current_dir()?;
+            let abs_path = cwd.join(&path);
+            if abs_path.exists() {
+                return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
+            }
+            return Err(eyre!("Cannot find devaipod binary at {}", path.display()));
+        }
+        return Ok(path.to_string_lossy().to_string());
+    }
+
+    // Look for binary in target directories
+    let workspace_root = find_workspace_root();
+    let candidates = ["target/debug/devaipod", "target/release/devaipod"];
+    for candidate in candidates {
+        let path = if let Some(ref root) = workspace_root {
+            root.join(candidate)
+        } else {
+            std::path::PathBuf::from(candidate)
+        };
+        if path.exists() {
+            return Ok(path.canonicalize()?.to_string_lossy().to_string());
+        }
+    }
+
+    Ok("devaipod".to_string())
 }
 
 /// Create a temporary git repository for testing
@@ -453,9 +584,13 @@ fn main() {
     // Run the tests
     let conclusion = libtest_mimic::run(&args, all_tests);
 
-    // Clean up the shared fixture after all tests complete
-    if has_podman && !READONLY_INTEGRATION_TESTS.is_empty() {
-        SharedFixture::cleanup();
+    // Clean up the shared fixtures after all tests complete
+    if has_podman {
+        if !READONLY_INTEGRATION_TESTS.is_empty() {
+            SharedFixture::cleanup();
+        }
+        // Clean up web fixture (used by webui tests)
+        WebFixture::cleanup();
     }
 
     // Exit with the result

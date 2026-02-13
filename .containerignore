@@ -5,3 +5,4 @@
 !src/
 !crates/
 !scripts/
+!dist/

@@ -25,6 +25,7 @@ mod secrets;
 mod service_gator;
 mod ssh_server;
 mod tui;
+mod web;
 
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
@@ -242,6 +243,14 @@ struct HostCli {
     /// Quiet mode (only show warnings and errors)
     #[arg(short, long, global = true)]
     quiet: bool,
+
+    /// Allow running on the host instead of inside the devaipod container
+    ///
+    /// By default, devaipod requires running inside the official devaipod container
+    /// for proper isolation. Use this flag (or set DEVAIPOD_HOST_MODE=1) to run
+    /// directly on the host system.
+    #[arg(long, global = true)]
+    host: bool,
 
     #[command(subcommand)]
     command: HostCommand,
@@ -721,6 +730,26 @@ enum HostCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Start the web UI server
+    ///
+    /// Launches a web server that provides a browser-based UI for managing
+    /// devaipod workspaces. The server proxies podman API calls and provides
+    /// git operations endpoints.
+    ///
+    /// A random auth token is generated at startup (or loaded from a podman
+    /// secret). The full URL with token is printed to stdout.
+    ///
+    /// Examples:
+    ///   devaipod web                    # Start on default port 8080
+    ///   devaipod web --port 3000        # Start on port 3000
+    Web {
+        /// Port to bind the web server
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// Open browser automatically after starting
+        #[arg(long)]
+        open: bool,
+    },
     /// Manage service-gator scopes for a workspace
     ///
     /// Service-gator provides scope-restricted access to external services
@@ -958,7 +987,41 @@ fn command_requires_config(cmd: &HostCommand) -> bool {
     )
 }
 
+/// Commands that are allowed to run on the host without the devaipod container
+fn command_allowed_on_host(cmd: &HostCommand) -> bool {
+    matches!(
+        cmd,
+        HostCommand::Init { .. } | HostCommand::Completions { .. }
+    )
+}
+
 async fn run_host(cli: HostCli) -> Result<()> {
+    // Check if we're running inside the devaipod container (unless --host or exempt command)
+    if !is_inside_devaipod_container()
+        && !cli.host
+        && !is_host_mode_env()
+        && !command_allowed_on_host(&cli.command)
+    {
+        eprintln!("Error: devaipod is designed to run inside the devaipod container.");
+        eprintln!();
+        eprintln!("For proper isolation and security, devaipod should be run inside its");
+        eprintln!("container image (ghcr.io/cgwalters/devaipod).");
+        eprintln!();
+        eprintln!("To run inside the container:");
+        eprintln!("  podman run -d --name devaipod -p 8080:8080 --privileged \\");
+        eprintln!("    -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \\");
+        eprintln!("    -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \\");
+        eprintln!("    ghcr.io/cgwalters/devaipod");
+        eprintln!();
+        eprintln!("To bypass this check and run directly on the host:");
+        eprintln!("  devaipod --host <command>");
+        eprintln!("  # or");
+        eprintln!("  DEVAIPOD_HOST_MODE=1 devaipod <command>");
+        eprintln!();
+        eprintln!("See https://github.com/cgwalters/devaipod/blob/main/docs/src/container-mode.md");
+        std::process::exit(1);
+    }
+
     // Check if config file is required and exists
     if command_requires_config(&cli.command) {
         let config_path = cli
@@ -1159,6 +1222,24 @@ async fn run_host(cli: HostCli) -> Result<()> {
             json,
         } => cmd_controlplane(serve, port, list, json).await,
         HostCommand::Gator { action } => cmd_gator(action).await,
+        HostCommand::Web { port, open } => {
+            let token = crate::web::load_or_generate_token();
+            let url = format!("http://localhost:{}/?token={}", port, token);
+
+            println!("devaipod v{}", env!("CARGO_PKG_VERSION"));
+            println!("Web UI: {}", url);
+            println!();
+
+            if open {
+                // Try to open browser
+                #[cfg(target_os = "linux")]
+                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+            }
+
+            crate::web::run_web_server(port, token).await
+        }
         HostCommand::Helper { action } => run_helper_async(action).await,
     }
 }
@@ -2361,13 +2442,9 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
         .await
         .with_context(|| format!("Pod not found: {}", pod_name))?;
 
-    // Read gator config from the agent home volume (preferred)
+    // Read gator config from the workspace volume
     let agent_container = format!("{}-agent", pod_name);
-    let config_path = format!(
-        "{}/{}",
-        pod::AGENT_HOME_PATH,
-        service_gator::GATOR_CONFIG_PATH
-    );
+    let config_path = format!("/workspaces/{}", service_gator::GATOR_CONFIG_PATH);
 
     let config_content = podman
         .copy_from_container(&agent_container, &config_path)
@@ -2805,11 +2882,22 @@ fn is_using_container_ssh_export() -> bool {
     PathBuf::from(CONTAINER_SSH_CONFIG_DIR).exists()
 }
 
+/// Environment variable to override the SSH config directory.
+/// Primarily used for testing to avoid mutating the user's real ~/.ssh/config.d.
+const SSH_CONFIG_DIR_ENV: &str = "DEVAIPOD_SSH_CONFIG_DIR";
+
 /// Get the SSH config directory path.
 ///
-/// In container mode, if `/run/devaipod-ssh` exists (bind-mounted from host),
-/// uses that directory. Otherwise falls back to `~/.ssh/config.d`.
+/// Priority:
+/// 1. `DEVAIPOD_SSH_CONFIG_DIR` environment variable (for testing)
+/// 2. Container mode export directory `/run/devaipod-ssh` (if it exists)
+/// 3. Default `~/.ssh/config.d`
 fn get_ssh_config_dir() -> Result<PathBuf> {
+    // Check for explicit override (mainly for testing)
+    if let Ok(dir) = std::env::var(SSH_CONFIG_DIR_ENV) {
+        return Ok(PathBuf::from(dir));
+    }
+
     // Check for container mode export directory
     if is_using_container_ssh_export() {
         return Ok(PathBuf::from(CONTAINER_SSH_CONFIG_DIR));
@@ -3725,10 +3813,16 @@ async fn cmd_rebuild(
     } else if image_override.is_some() {
         tracing::info!("No devcontainer.json found, using defaults with image override");
         devcontainer::DevcontainerConfig::default()
+    } else if config.default_image.is_some() {
+        tracing::info!(
+            "No devcontainer.json found, using default-image from config: {}",
+            config.default_image.as_ref().unwrap()
+        );
+        devcontainer::DevcontainerConfig::default()
     } else {
         bail!(
             "No devcontainer.json found in repository.\n\
-             Use --image to specify a container image."
+             Use --image to specify a container image or set default-image in config."
         );
     };
 
@@ -3776,6 +3870,10 @@ async fn cmd_rebuild(
     // Note: We don't pass the task for rebuilds - the agent home volume persists
     // and contains the original task file, so it will be picked up on restart.
     tracing::info!("Recreating containers with new image...");
+
+    // Use image_override if provided, otherwise fall back to default_image from config
+    let effective_image_override = image_override.or(config.default_image.as_deref());
+
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         temp_path,
@@ -3786,7 +3884,7 @@ async fn cmd_rebuild(
         &source,
         &extra_labels,
         None,
-        image_override,
+        effective_image_override,
         None, // gator_image_override not yet supported for rebuild
         None, // task - agent home volume persists with original task
         config.orchestration.is_enabled(),
@@ -4719,6 +4817,23 @@ fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
 fn is_inside_devcontainer() -> bool {
     std::env::var("DEVPOD")
         .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Check if we're running inside the official devaipod container
+///
+/// The devaipod container sets `DEVAIPOD_CONTAINER=1` to indicate
+/// that we're running in the expected environment.
+fn is_inside_devaipod_container() -> bool {
+    std::env::var("DEVAIPOD_CONTAINER")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Check if host mode is enabled via environment variable
+fn is_host_mode_env() -> bool {
+    std::env::var("DEVAIPOD_HOST_MODE")
+        .map(|v| v == "1")
         .unwrap_or(false)
 }
 

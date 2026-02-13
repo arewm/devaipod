@@ -4,3 +4,7 @@ pub mod cli;
 pub mod container;
 pub mod orchestration;
 pub mod ssh;
+pub mod webui;
+
+// Re-export WebFixture for cleanup in main
+pub use webui::WebFixture;

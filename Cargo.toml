@@ -43,6 +43,15 @@ dialoguer = "0.11"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
+# Web UI server
+axum = "0.8"
+base64 = "0.22"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
 # SSH server for remote development (VSCode/Zed integration)
 russh = { version = "0.57", features = ["aws-lc-rs"] }
 russh-sftp = "2.1"

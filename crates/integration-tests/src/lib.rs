@@ -159,6 +159,9 @@ macro_rules! readonly_test {
     };
 }
 
+/// Environment variable name for overriding SSH config directory.
+const SSH_CONFIG_DIR_ENV: &str = "DEVAIPOD_SSH_CONFIG_DIR";
+
 /// Shared fixture for readonly integration tests.
 ///
 /// This fixture is created once and reused by all readonly tests.
@@ -173,6 +176,8 @@ pub struct SharedFixture {
     repo_path: PathBuf,
     /// Keep the temp dir alive
     _temp_dir: tempfile::TempDir,
+    /// Keep the SSH config dir alive (avoid mutating user's ~/.ssh/config.d)
+    _ssh_config_dir: tempfile::TempDir,
 }
 
 impl SharedFixture {
@@ -266,6 +271,9 @@ impl SharedFixture {
         // Get devaipod path
         let devaipod = Self::get_devaipod_command()?;
 
+        // Create a temp directory for SSH configs to avoid mutating user's ~/.ssh/config.d
+        let ssh_config_dir = tempfile::TempDir::new()?;
+
         // Remove any existing shared pod first (in case of previous failed run)
         let _ = Command::new("podman")
             .args(["pod", "rm", "-f", SHARED_POD_NAME])
@@ -283,6 +291,8 @@ impl SharedFixture {
         let output = Command::new(&devaipod)
             .current_dir(&repo_path)
             .args(["up", ".", "--name", short_name])
+            .env("DEVAIPOD_HOST_MODE", "1")
+            .env(SSH_CONFIG_DIR_ENV, ssh_config_dir.path())
             .output()
             .context("Failed to run devaipod up for shared fixture")?;
 
@@ -302,6 +312,7 @@ impl SharedFixture {
             pod_name: SHARED_POD_NAME.to_string(),
             repo_path,
             _temp_dir: temp_dir,
+            _ssh_config_dir: ssh_config_dir,
         })
     }
 
@@ -371,6 +382,19 @@ impl SharedFixture {
     /// Get the agent container name
     pub fn agent_container(&self) -> String {
         format!("{}-agent", self.pod_name)
+    }
+
+    /// Get the SSH config directory path (used for isolated testing)
+    pub fn ssh_config_dir(&self) -> &std::path::Path {
+        self._ssh_config_dir.path()
+    }
+
+    /// Get the environment variable tuple for SSH config directory
+    pub fn ssh_config_env(&self) -> (&'static str, &str) {
+        (
+            SSH_CONFIG_DIR_ENV,
+            self._ssh_config_dir.path().to_str().unwrap(),
+        )
     }
 
     /// Clean up the shared fixture (remove pod and volume)

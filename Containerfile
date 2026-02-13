@@ -7,13 +7,24 @@
 # Build:
 #   podman build --tag ghcr.io/cgwalters/devaipod -f Containerfile .
 #
-# Run (daemon mode):
-#   podman run -d --name devaipod --privileged \
+# Run (web UI mode - default):
+#   podman run -d --name devaipod -p 8080:8080 --privileged \
 #     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
 #     -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
 #     ghcr.io/cgwalters/devaipod
 #
-# Interact:
+#   # Get the web UI URL with auth token from logs:
+#   podman logs devaipod | grep "Web UI"
+#
+# Run with stable auth token (via podman secret):
+#   openssl rand -base64 32 | podman secret create devaipod-web-token -
+#   podman run -d --name devaipod -p 8080:8080 --privileged \
+#     --secret devaipod-web-token \
+#     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
+#     -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
+#     ghcr.io/cgwalters/devaipod
+#
+# Interact via CLI:
 #   podman exec devaipod devaipod run https://github.com/org/repo -c 'fix bug'
 #   podman exec -ti devaipod devaipod attach -l
 #   podman exec -ti devaipod devaipod tui
@@ -26,6 +37,31 @@
 # -- source snapshot (keeps layer graph clean) --
 FROM scratch AS src
 COPY . /src
+
+# -- opencode web UI build stage --
+# Build the opencode web UI from source for vendoring
+# This eliminates dependency on external app.opencode.ai
+ARG OPENCODE_VERSION=v1.1.65
+FROM docker.io/oven/bun:debian AS opencode-web
+ARG OPENCODE_VERSION=v1.1.65
+
+# Install git for cloning
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN git clone --depth 1 --branch ${OPENCODE_VERSION} \
+    https://github.com/anomalyco/opencode.git opencode
+
+# Install dependencies
+WORKDIR /build/opencode
+RUN bun install --frozen-lockfile
+
+# Build the web app
+# The app uses window.location.origin for API calls when not on opencode.ai
+WORKDIR /build/opencode/packages/app
+RUN bun run build
+
+# Output is in /build/opencode/packages/app/dist
 
 # -- build stage --
 FROM quay.io/centos/centos:stream10 AS build
@@ -74,8 +110,29 @@ RUN mkdir -p /root/.config
 
 COPY --from=build /usr/bin/devaipod /usr/bin/devaipod
 
-# Default: sleep forever, user runs commands via `podman exec`
+# Mark that we're running inside the official devaipod container
+# This is checked by `devaipod` to require running in container mode by default
+ENV DEVAIPOD_CONTAINER=1
+
+# Copy devaipod web UI static files directly from build context
+# (not from src stage, as that's a snapshot that may not include untracked files)
+COPY dist /usr/share/devaipod/dist
+
+# Copy vendored opencode web UI
+# This is served at /opencode/ and proxies API calls to the agent's opencode server
+COPY --from=opencode-web /build/opencode/packages/app/dist /usr/share/devaipod/opencode
+WORKDIR /usr/share/devaipod
+
+# Default: run web UI server
+# The web server prints a URL with auth token to stdout on startup.
 # Alternative entrypoints:
-#   - `devaipod tui` for interactive dashboard
+#   - `devaipod tui` for interactive TUI dashboard
+#   - `sleep infinity` then use `podman exec` for commands
 #   - Custom command for one-shot operations
-CMD ["sleep", "infinity"]
+#
+# Example:
+#   podman run -d -p 8080:8080 ... ghcr.io/cgwalters/devaipod
+#   # Copy the URL with token from logs:
+#   podman logs <container> | grep "Web UI"
+EXPOSE 8080
+CMD ["devaipod", "web", "--port", "8080"]

@@ -141,8 +141,9 @@ fn generate_api_password() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Path for the agent's home directory (mounted from a persistent volume)
-pub const AGENT_HOME_PATH: &str = "/home/agent";
+/// Path for the agent's home directory (mounted from a persistent volume).
+/// This matches the "devenv" user's home in the devenv-debian image.
+pub const AGENT_HOME_PATH: &str = "/home/devenv";
 
 /// Python script for auth proxy.
 /// Provides authenticated HTTP access to the opencode API from the host.
@@ -603,13 +604,18 @@ impl DevaipodPod {
         // Write scripts to agent home volume (auth_proxy.py for authenticated API access)
         Self::write_scripts_to_volume(podman, &image, &agent_home_volume).await?;
 
-        // Write gator config to agent home volume (if gator is enabled)
+        // Write gator config to workspace volume (if gator is enabled)
         // Gator watches this file via inotify for live scope updates
         if enable_gator {
             let sg_config = service_gator_config.unwrap_or(&global_config.service_gator);
             let jwt_scopes = crate::service_gator::config_to_jwt_scopes(sg_config);
-            Self::write_gator_config_to_volume(podman, &image, &agent_home_volume, &jwt_scopes)
-                .await?;
+            Self::write_gator_config_to_volume(
+                podman,
+                &image,
+                &agent_workspace_volume,
+                &jwt_scopes,
+            )
+            .await?;
         }
 
         // Clone dotfiles to agent home volume if configured
@@ -825,12 +831,11 @@ impl DevaipodPod {
             // Mount the AGENT workspace volume where the agent's commits are, plus
             // the main workspace volume at /mnt/main-workspace because the agent's
             // git clone uses alternates pointing there for object sharing.
-            // Also mount agent-home volume so gator can read the scope config file
+            // Gator reads the scope config file from the workspace volume.
             let gator_config = Self::gator_container_config(
                 &agent_workspace_volume,
                 "/workspaces",
                 &volume_name,
-                &agent_home_volume,
                 global_config,
             );
             podman
@@ -1387,14 +1392,14 @@ chmod +x {agent_home}/scripts/devaipod-workerctl
         Ok(())
     }
 
-    /// Write gator configuration to the agent home volume
+    /// Write gator configuration to the workspace volume
     ///
     /// This stores scopes persistently so they survive container restarts and can
     /// be updated via `devaipod gator add/edit`. Gator watches this file via inotify.
     async fn write_gator_config_to_volume(
         podman: &PodmanService,
         image: &str,
-        agent_home_volume: &str,
+        workspace_volume: &str,
         scopes: &crate::service_gator::JwtScopeConfig,
     ) -> Result<()> {
         let config = crate::service_gator::GatorConfigFile::new(scopes.clone());
@@ -1405,11 +1410,7 @@ chmod +x {agent_home}/scripts/devaipod-workerctl
         // Write the config file using a heredoc in the init container
         // Escape any single quotes in the JSON
         let escaped_json = config_json.replace('\'', "'\\''");
-        let config_path = format!(
-            "{}/{}",
-            AGENT_HOME_PATH,
-            crate::service_gator::GATOR_CONFIG_PATH
-        );
+        let config_path = format!("/workspaces/{}", crate::service_gator::GATOR_CONFIG_PATH);
 
         let script = format!(
             r#"set -e
@@ -1423,18 +1424,18 @@ chmod 644 '{config_path}'
             config_json = escaped_json,
         );
 
-        tracing::debug!("Writing gator config to agent home volume...");
+        tracing::debug!("Writing gator config to workspace volume...");
         // Run as root so the config file is owned by root and unmodifiable by the agent
         // This prevents the agent from escalating its own scopes
         let exit_code = podman
             .run_init_container_as_root(
                 image,
-                agent_home_volume,
-                AGENT_HOME_PATH,
+                workspace_volume,
+                "/workspaces",
                 &["/bin/sh", "-c", &script],
             )
             .await
-            .context("Failed to write gator config to agent volume")?;
+            .context("Failed to write gator config to workspace volume")?;
 
         if exit_code != 0 {
             tracing::warn!(
@@ -1442,7 +1443,10 @@ chmod 644 '{config_path}'
                 exit_code
             );
         } else {
-            tracing::debug!("Gator config written to {}", config_path);
+            tracing::debug!(
+                "Gator config written to workspace volume at {}",
+                config_path
+            );
         }
 
         Ok(())
@@ -1923,6 +1927,10 @@ fi
         // Note: agent container does NOT get these secrets for security.
         let secrets = global_config.trusted_env.secret_mounts();
 
+        // Get file-based secrets (mounted as files, env var points to path)
+        // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
+        let file_secrets = global_config.trusted_env.file_secret_mounts();
+
         ContainerConfig {
             mounts,
             env,
@@ -2027,6 +2035,7 @@ exec sleep infinity
                 ),
             ],
             secrets,
+            file_secrets,
             labels: labels.iter().cloned().collect(),
             ..Default::default()
         }
@@ -2070,7 +2079,7 @@ exec sleep infinity
         let agent_home = AGENT_HOME_PATH.to_string();
 
         let mut env = std::collections::HashMap::new();
-        env.insert("HOME".to_string(), agent_home.clone());
+        // HOME is already set correctly via the user's passwd entry
 
         // Set proxy password for authenticated host access via auth_proxy.py
         env.insert(
@@ -2209,6 +2218,10 @@ exec sleep infinity
             );
         }
 
+        // Get file-based secrets (mounted as files, env var points to path)
+        // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
+        let file_secrets = global_config.trusted_env.file_secret_mounts();
+
         let startup_script = format!(
             r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
 
@@ -2282,6 +2295,7 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
                 }
                 mounts
             },
+            file_secrets,
             ..Default::default()
         }
     }
@@ -2305,14 +2319,12 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
     /// The main workspace volume is also mounted at `/mnt/main-workspace` (read-only) because
     /// the agent's git clone uses alternates pointing there for object sharing.
     ///
-    /// The agent-home volume is mounted at `/gator-config` (read-only) so gator can read
-    /// the scope configuration file. Gator uses inotify to watch for changes, enabling
-    /// live scope updates via `devaipod gator add` without restart.
+    /// The gator config file is read from the workspace volume at /workspaces/.devaipod/gator-config.json.
+    /// Gator uses inotify to watch for changes, enabling live scope updates via `devaipod gator add`.
     fn gator_container_config(
         agent_workspace_volume: &str,
         workspace_folder: &str,
         main_workspace_volume: &str,
-        agent_home_volume: &str,
         global_config: &Config,
     ) -> ContainerConfig {
         let mut env = std::collections::HashMap::new();
@@ -2326,9 +2338,17 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
         // No need for *_FILE pattern; podman sets the env var from the secret value
         let secrets = global_config.trusted_env.secret_mounts();
 
+        // Get file-based secrets (mounted as files, env var points to path)
+        // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
+        let file_secrets = global_config.trusted_env.file_secret_mounts();
+
         // The scope config file path inside the gator container
-        // Agent-home volume is mounted at /gator-config, config is at .devaipod/gator-config.json
-        let scope_file_path = format!("/gator-config/{}", crate::service_gator::GATOR_CONFIG_PATH);
+        // Config is at /workspaces/.devaipod/gator-config.json (same path as where it's written)
+        let scope_file_path = format!(
+            "{}/{}",
+            workspace_folder,
+            crate::service_gator::GATOR_CONFIG_PATH
+        );
 
         // Build the command args (not including binary name since image has ENTRYPOINT)
         // Use --scope-file for inotify-based live reload of scopes
@@ -2345,18 +2365,13 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
 
         ContainerConfig {
             // Mount volumes:
-            // 1. Agent workspace at /workspaces - where the agent's commits are
+            // 1. Agent workspace at /workspaces - where the agent's commits are (also has gator config)
             // 2. Main workspace at /mnt/main-workspace - for git alternates object sharing
-            // 3. Agent home at /gator-config - for reading scope config (inotify watched)
             volume_mounts: vec![
                 (agent_workspace_volume.to_string(), agent_workspace_mount),
                 (
                     main_workspace_volume.to_string(),
                     "/mnt/main-workspace:ro".to_string(),
-                ),
-                (
-                    agent_home_volume.to_string(),
-                    "/gator-config:ro".to_string(),
                 ),
             ],
             env,
@@ -2368,6 +2383,7 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
             no_new_privileges: true,
             secrets,
+            file_secrets,
             ..Default::default()
         }
     }
@@ -2796,11 +2812,8 @@ mod tests {
         // When no devcontainer_config is provided, cap_add is empty
         assert!(container_config.cap_add.is_empty());
 
-        // Verify agent has persistent home directory
-        assert_eq!(
-            container_config.env.get("HOME"),
-            Some(&AGENT_HOME_PATH.to_string())
-        );
+        // Verify HOME is NOT overridden (it comes from passwd entry for devenv user)
+        assert_eq!(container_config.env.get("HOME"), None);
 
         // Verify proxy password is set for authenticated host access
         assert_eq!(
@@ -2905,23 +2918,57 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_container_config_with_file_secrets() {
+        // Test that file-based secrets are passed to agent container
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut global_config = crate::config::Config::default();
+        global_config.trusted_env.file_secrets =
+            vec!["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string()];
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false,                  // enable_gator
+            false,                  // enable_orchestration
+            "test-main-workspace",  // main workspace (read-only reference)
+            "test-agent-workspace", // agent's own workspace clone
+            "test-agent-home",
+            None, // worker_workspace_volume (no orchestration)
+            &global_config,
+            "test-password",
+        );
+
+        // Verify file_secrets are included for agent container
+        assert_eq!(container_config.file_secrets.len(), 1);
+        assert!(container_config.file_secrets.contains(&(
+            "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+            "gcloud_adc".to_string()
+        )));
+    }
+
+    #[test]
     fn test_gator_container_config() {
         let agent_workspace_volume = "test-agent-workspace";
         let workspace_folder = "/workspaces";
         let main_workspace_volume = "test-main-workspace";
-        let agent_home_volume = "test-agent-home";
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::gator_container_config(
             agent_workspace_volume,
             workspace_folder,
             main_workspace_volume,
-            agent_home_volume,
             &global_config,
         );
 
-        // Verify all three volumes are mounted read-only
-        assert_eq!(container_config.volume_mounts.len(), 3);
-        // Agent workspace at /workspaces
+        // Verify two volumes are mounted read-only
+        assert_eq!(container_config.volume_mounts.len(), 2);
+        // Agent workspace at /workspaces (also contains gator config)
         assert_eq!(container_config.volume_mounts[0].0, "test-agent-workspace");
         assert_eq!(container_config.volume_mounts[0].1, "/workspaces:ro");
         // Main workspace at /mnt/main-workspace (for git alternates)
@@ -2930,9 +2977,6 @@ mod tests {
             container_config.volume_mounts[1].1,
             "/mnt/main-workspace:ro"
         );
-        // Agent home at /gator-config (for scope config file with inotify watch)
-        assert_eq!(container_config.volume_mounts[2].0, "test-agent-home");
-        assert_eq!(container_config.volume_mounts[2].1, "/gator-config:ro");
 
         // Verify command uses --scope-file for inotify-based live reload
         let cmd = container_config.command.as_ref().unwrap();
@@ -2957,7 +3001,6 @@ mod tests {
         let agent_workspace_volume = "test-agent-workspace";
         let workspace_folder = "/workspaces";
         let main_workspace_volume = "test-main-workspace";
-        let agent_home_volume = "test-agent-home";
         let mut global_config = crate::config::Config::default();
         global_config.trusted_env.secrets = vec![
             "GH_TOKEN=gh_token".to_string(),
@@ -2968,7 +3011,6 @@ mod tests {
             agent_workspace_volume,
             workspace_folder,
             main_workspace_volume,
-            agent_home_volume,
             &global_config,
         );
 
@@ -2992,7 +3034,6 @@ mod tests {
         let agent_workspace_volume = "test-agent-workspace";
         let workspace_folder = "/workspaces";
         let main_workspace_volume = "test-main-workspace";
-        let agent_home_volume = "test-agent-home";
         let mut global_config = crate::config::Config::default();
 
         // Add a secret
@@ -3009,7 +3050,6 @@ mod tests {
             agent_workspace_volume,
             workspace_folder,
             main_workspace_volume,
-            agent_home_volume,
             &global_config,
         );
 
@@ -3027,6 +3067,66 @@ mod tests {
             container_config.env.get("JIRA_API_TOKEN"),
             Some(&"jira_value".to_string())
         );
+    }
+
+    #[test]
+    fn test_gator_container_config_with_file_secrets() {
+        // Test that file-based secrets are passed to gator container
+        let agent_workspace_volume = "test-agent-workspace";
+        let workspace_folder = "/workspaces";
+        let main_workspace_volume = "test-main-workspace";
+        let mut global_config = crate::config::Config::default();
+        global_config.trusted_env.file_secrets =
+            vec!["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string()];
+
+        let container_config = DevaipodPod::gator_container_config(
+            agent_workspace_volume,
+            workspace_folder,
+            main_workspace_volume,
+            &global_config,
+        );
+
+        // Verify file_secrets are listed as (env_var, secret_name) tuples
+        assert_eq!(container_config.file_secrets.len(), 1);
+        assert!(container_config.file_secrets.contains(&(
+            "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+            "gcloud_adc".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_workspace_container_config_with_file_secrets() {
+        // Test that file-based secrets are passed to workspace container
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let config = DevcontainerConfig::default();
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut global_config = crate::config::Config::default();
+        global_config.trusted_env.file_secrets =
+            vec!["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string()];
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+            "test-volume",
+            "test-agent-home",
+            "test-agent-workspace",
+            &global_config,
+            &[], // labels
+        );
+
+        // Verify file_secrets are included for workspace container
+        assert_eq!(container_config.file_secrets.len(), 1);
+        assert!(container_config.file_secrets.contains(&(
+            "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+            "gcloud_adc".to_string()
+        )));
     }
 
     #[test]
