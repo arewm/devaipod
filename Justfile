@@ -26,10 +26,100 @@ test:
 # Default test image (must have git installed)
 default_test_image := "ghcr.io/bootc-dev/devenv-debian:latest"
 
+# Go template for podman machine socket path (used in test-integration-container; literal braces)
+_podman_socket_format := "{" + "{" + ".ConnectionInfo.PodmanSocket.Path" + "}" + "}"
+
 # Run integration tests (requires podman)
+# On macOS set DEVAIPOD_PODMAN_SOCKET so the binary finds the podman machine socket.
 test-integration image=default_test_image:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo build
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] && command -v podman &>/dev/null; then
+        SOCKET=$(podman machine inspect --format '{{_podman_socket_format}}' 2>/dev/null || true)
+        if [ -n "$SOCKET" ] && [ -S "$SOCKET" ]; then
+            export DEVAIPOD_PODMAN_SOCKET="$SOCKET"
+        fi
+    fi
     DEVAIPOD_PATH=./target/debug/devaipod DEVAIPOD_TEST_IMAGE={{image}} cargo test -p integration-tests
+
+# Shared implementation for container integration tests.
+# Starts the devaipod container, then runs integration tests inside it.
+# On macOS the container runs in the VM; use VM socket path /run/podman/podman.sock.
+[private]
+_run-integration-container image threads:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SOCKET=""
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "${XDG_RUNTIME_DIR}/podman/podman.sock" ]; then
+        SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"
+    elif command -v podman &>/dev/null; then
+        SOCKET=$(podman machine inspect --format '{{_podman_socket_format}}' 2>/dev/null || true)
+    fi
+    if [ -z "$SOCKET" ] || [ ! -S "$SOCKET" ]; then
+        echo "Could not find podman socket. Set XDG_RUNTIME_DIR (Linux) or start podman machine (macOS)."
+        exit 1
+    fi
+    CONFIG=".ci/devaipod-test.toml"
+    if [ ! -f "$CONFIG" ]; then
+        echo "Missing $CONFIG (minimal config for container tests)"
+        exit 1
+    fi
+    PWD_ABS=$(cd . && pwd)
+    TMPDIR_ABS="${PWD_ABS}/tmp"
+    mkdir -p "$TMPDIR_ABS"
+    cleanup() { podman rm -f devaipod 2>/dev/null || true; }
+    trap cleanup EXIT
+    mkdir -p ~/.ssh/config.d/devaipod
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        VOL_MOUNT="-v $SOCKET:/run/podman/podman.sock"
+    else
+        VOL_MOUNT="-v /run/podman/podman.sock:/run/podman/podman.sock"
+    fi
+    echo "Starting devaipod container (socket, workspace at same path, test config)..."
+    if ! podman volume exists devaipod-state 2>/dev/null; then
+        podman volume create devaipod-state
+    fi
+    ADD_HOST=""
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        ADD_HOST="--add-host=host.containers.internal:host-gateway"
+    fi
+    podman run -d --name devaipod --privileged --replace \
+        $ADD_HOST \
+        $VOL_MOUNT \
+        -v devaipod-state:/var/lib/devaipod \
+        -v "$PWD_ABS:$PWD_ABS" \
+        -v "$(pwd)/$CONFIG:/root/.config/devaipod.toml:ro" \
+        -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
+        -w "$PWD_ABS" \
+        {{ CONTAINER_IMAGE }}:latest
+    echo "Waiting for devaipod container to be running..."
+    for i in $(seq 1 30); do
+        if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' devaipod 2>/dev/null)" = "true" ]; then
+            break
+        fi
+        sleep 1
+    done
+    if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' devaipod 2>/dev/null)" != "true" ]; then
+        echo "devaipod container failed to reach running state"
+        podman logs devaipod 2>&1 | tail -50
+        exit 1
+    fi
+    echo "Running integration tests against built container ({{ CONTAINER_IMAGE }}:latest)..."
+    cargo build -p integration-tests
+    export DEVAIPOD_CONTAINER_IMAGE="{{ CONTAINER_IMAGE }}:latest"
+    export DEVAIPOD_PODMAN_SOCKET="$SOCKET"
+    RUST_TEST_THREADS="${RUST_TEST_THREADS:-{{threads}}}" TMPDIR="$TMPDIR_ABS" DEVAIPOD_TEST_IMAGE={{image}} cargo test -p integration-tests
+
+# Run integration tests with a full --no-cache container rebuild.
+# Use for CI or when web routes / Containerfile have changed.
+# Override parallelism with RUST_TEST_THREADS env var (default: serial).
+test-integration-container image=default_test_image: container-build-for-integration (_run-integration-container image "1")
+
+# Fast variant for local iteration: uses cached container build.
+# Defaults to 4 test threads (web tests are parallel-safe).
+# Override with RUST_TEST_THREADS env var.
+test-integration-container-quick image=default_test_image: container-build (_run-integration-container image "4")
 
 # Run all tests (unit + integration)
 test-all: test test-integration
@@ -135,10 +225,17 @@ allow-repo-e2e repo=default_test_repo workspace=default_test_workspace:
 # Container image name (use localhost/ for local builds to avoid confusion with registry)
 CONTAINER_IMAGE := "localhost/devaipod"
 
-# Build the container image
+# Build the container image.
+# no_cache: set to "--no-cache" to force full rebuild (used by test-integration-container so image has latest routes).
 [group('container')]
-container-build:
-    podman build -t {{ CONTAINER_IMAGE }}:latest -f Containerfile .
+container-build no_cache="":
+    podman build {{ no_cache }} -t {{ CONTAINER_IMAGE }}:latest -f Containerfile .
+
+# Force full rebuild (no cache); ensures latest code changes are in the image, but slow.
+# Used by test-integration-container so the image has current web routes; use for CI or when web routes change.
+[group('container')]
+container-build-for-integration:
+    podman build --no-cache -t {{ CONTAINER_IMAGE }}:latest -f Containerfile .
 
 # Test the container image
 [group('container')]
@@ -164,22 +261,102 @@ container-push tag="latest": container-build
 
 # Run devaipod as a container daemon
 # Mounts podman socket, config, and SSH config export directory
-# Uses host network so devaipod can access workspace ports on localhost
+# Uses host gateway (host.containers.internal) to reach pod-published ports; avoids --network host
+# so port forwarding works on macOS. All pod services use auth (auth proxy).
+# Socket: Linux uses XDG_RUNTIME_DIR; macOS/Windows use VM path /run/podman/podman.sock (container runs in VM).
 [group('container')]
 container-run: container-build
     #!/usr/bin/env bash
     set -euo pipefail
+    SOCKET=""
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "${XDG_RUNTIME_DIR}/podman/podman.sock" ]; then
+        SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"
+    elif command -v podman &>/dev/null; then
+        SOCKET=$(podman machine inspect --format '{{_podman_socket_format}}' 2>/dev/null || true)
+    fi
+    if [ -z "$SOCKET" ] || [ ! -S "$SOCKET" ]; then
+        echo "Could not find podman socket. Linux: set XDG_RUNTIME_DIR. macOS/Windows: run 'podman machine start' and ensure default machine exists."
+        exit 1
+    fi
+    echo "Using podman socket: $SOCKET"
     mkdir -p ~/.ssh/config.d/devaipod
+    if [ ! -f ~/.config/devaipod.toml ]; then
+        echo "Warning: ~/.config/devaipod.toml not found; container may exit. Run 'devaipod init' on the host first."
+    fi
+    # Allocate devaipod-state volume if missing (auth token and other state stored there by default)
+    if ! podman volume exists devaipod-state 2>/dev/null; then
+        podman volume create devaipod-state
+        echo "Created volume devaipod-state"
+    fi
+    # Linux: mount the host socket (path is on the host). macOS/podman machine: the container runs in the VM,
+    # so the volume source must be the VM's path, not the Mac path. Use the VM's podman socket path so the
+    # daemon (in the VM) bind-mounts its own socket into the container. Rootful VM uses /run/podman/podman.sock.
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        VOL_MOUNT="-v $SOCKET:/run/podman/podman.sock"
+        ADD_HOST="--add-host=host.containers.internal:host-gateway"
+    else
+        VOL_MOUNT="-v /run/podman/podman.sock:/run/podman/podman.sock"
+        ADD_HOST=""
+    fi
     podman run -d --name devaipod --privileged --replace \
-        --network host \
-        -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
+        -p 8080:8080 \
+        $ADD_HOST \
+        $VOL_MOUNT \
+        -v devaipod-state:/var/lib/devaipod \
         -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
         -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
         {{ CONTAINER_IMAGE }}:latest
     echo "devaipod container started"
+    echo "Web UI: http://127.0.0.1:8080/"
     echo "SSH configs will be written to ~/.ssh/config.d/devaipod/"
     echo ""
     echo "Ensure your ~/.ssh/config has: Include config.d/devaipod/*"
+    echo ""
+    echo "If you cannot connect to 127.0.0.1:8080, run: just container-debug"
+
+# Debug connection to devaipod container (run after container-run)
+# Checks: container running, port mapping, recent logs, curl to /health
+[group('container')]
+container-debug:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== devaipod container connection debug ==="
+    echo ""
+    if ! podman container exists devaipod 2>/dev/null; then
+        echo "FAIL: Container 'devaipod' does not exist. Run 'just container-run' first."
+        exit 1
+    fi
+    echo "1. Container state:"
+    podman inspect devaipod --format '   State: {{ '{{' }}.State.Status{{ '}}' }} (Running={{ '{{' }}.State.Running{{ '}}' }})'
+    if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' devaipod 2>/dev/null)" != "true" ]; then
+        echo "   Container is not running. Last logs:"
+        podman logs devaipod 2>&1 | tail -30
+        exit 1
+    fi
+    echo ""
+    echo "2. Port mapping (host -> container):"
+    podman port devaipod 2>/dev/null || echo "   (no ports published)"
+    echo ""
+    echo "3. Process inside container (devaipod web):"
+    podman top devaipod 2>/dev/null || true
+    echo ""
+    echo "4. Last 15 lines of container logs:"
+    podman logs devaipod 2>&1 | tail -15
+    echo ""
+    echo "5. Curl from host to 127.0.0.1:8080/_devaipod/health:"
+    if curl -sf --connect-timeout 3 http://127.0.0.1:8080/_devaipod/health 2>/dev/null; then
+        echo ""
+        echo "   OK: Connection succeeded."
+    else
+        echo "   FAIL: Connection refused or timeout."
+        if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+            echo ""
+            echo "   On macOS with podman machine, port forwarding (-p 8080:8080) may not reach the host."
+            echo "   Workaround: use Podman Desktop port forwarding, or run devaipod on the host:"
+            echo "   cargo run -- web --port 8080"
+        fi
+        exit 1
+    fi
 
 # ============================================================================
 # Documentation

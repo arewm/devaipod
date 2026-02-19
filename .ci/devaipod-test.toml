@@ -1,0 +1,2 @@
+# Minimal config for integration tests (container mode).
+# All sections use defaults; add keys only when a test needs them.

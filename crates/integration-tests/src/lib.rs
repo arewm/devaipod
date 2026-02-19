@@ -15,6 +15,15 @@ pub const INTEGRATION_TEST_LABEL: &str = "io.devaipod.integration-test=1";
 /// Name used for the shared integration test pod
 pub const SHARED_POD_NAME: &str = "devaipod-integration-shared";
 
+/// Volume suffixes created by devaipod pods (used for cleanup)
+pub const POD_VOLUME_SUFFIXES: &[&str] = &[
+    "-workspace",
+    "-agent-home",
+    "-agent-workspace",
+    "-worker-home",
+    "-worker-workspace",
+];
+
 /// A test function that returns a Result
 pub type TestFn = fn() -> color_eyre::Result<()>;
 
@@ -278,10 +287,12 @@ impl SharedFixture {
         let _ = Command::new("podman")
             .args(["pod", "rm", "-f", SHARED_POD_NAME])
             .output();
-        let volume_name = format!("{}-workspace", SHARED_POD_NAME);
-        let _ = Command::new("podman")
-            .args(["volume", "rm", "-f", &volume_name])
-            .output();
+        for suffix in POD_VOLUME_SUFFIXES {
+            let volume_name = format!("{SHARED_POD_NAME}{suffix}");
+            let _ = Command::new("podman")
+                .args(["volume", "rm", "-f", &volume_name])
+                .output();
+        }
 
         // Create the shared pod
         // Note: We pass "integration-shared" since devaipod adds "devaipod-" prefix
@@ -410,11 +421,13 @@ impl SharedFixture {
             .args(["pod", "rm", "-f", SHARED_POD_NAME])
             .output();
 
-        // Remove associated volume
-        let volume_name = format!("{}-workspace", SHARED_POD_NAME);
-        let _ = Command::new("podman")
-            .args(["volume", "rm", "-f", &volume_name])
-            .output();
+        // Remove associated volumes
+        for suffix in POD_VOLUME_SUFFIXES {
+            let volume_name = format!("{SHARED_POD_NAME}{suffix}");
+            let _ = Command::new("podman")
+                .args(["volume", "rm", "-f", &volume_name])
+                .output();
+        }
 
         tracing::info!("Shared fixture cleanup complete");
     }

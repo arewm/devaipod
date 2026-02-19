@@ -8,18 +8,24 @@
 #   podman build --tag ghcr.io/cgwalters/devaipod -f Containerfile .
 #
 # Run (web UI mode - default):
+#   podman volume create devaipod-state   # optional; just container-run creates it
 #   podman run -d --name devaipod -p 8080:8080 --privileged \
+#     -v devaipod-state:/var/lib/devaipod \
 #     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
 #     -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
 #     ghcr.io/cgwalters/devaipod
 #
-#   # Get the web UI URL with auth token from logs:
+#   The devaipod-state volume stores the web auth token by default (at
+#   /var/lib/devaipod/web-token) so it persists across container restarts.
+#
+#   # Get the web UI URL with auth token from logs (first run only; later use same URL):
 #   podman logs devaipod | grep "Web UI"
 #
-# Run with stable auth token (via podman secret):
+# Run with stable auth token (via podman secret) instead of state volume:
 #   openssl rand -base64 32 | podman secret create devaipod-web-token -
 #   podman run -d --name devaipod -p 8080:8080 --privileged \
 #     --secret devaipod-web-token \
+#     -v devaipod-state:/var/lib/devaipod \
 #     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
 #     -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
 #     ghcr.io/cgwalters/devaipod
@@ -41,12 +47,23 @@ COPY . /src
 # -- opencode web UI build stage --
 # Build the opencode web UI from source for vendoring
 # This eliminates dependency on external app.opencode.ai
+# Uses bootc-dev/devenv-debian (same as integration tests) with bun installed.
 ARG OPENCODE_VERSION=v1.1.65
-FROM docker.io/oven/bun:debian AS opencode-web
+FROM ghcr.io/bootc-dev/devenv-debian:latest AS opencode-web
 ARG OPENCODE_VERSION=v1.1.65
+USER root
 
-# Install git for cloning
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+# Install git, curl, unzip for cloning and bun installer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    unzip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install bun (required for opencode frontend build)
+RUN curl -fsSL https://bun.sh/install | bash && \
+    ln -sf /root/.bun/bin/bun /usr/local/bin/bun
 
 WORKDIR /build
 RUN git clone --depth 1 --branch ${OPENCODE_VERSION} \
