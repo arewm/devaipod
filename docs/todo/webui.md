@@ -50,52 +50,23 @@ All `/api/*` endpoints require authentication via `?token=...` or `Authorization
 ### Future Work
 
 - [ ] Migrate static HTML to Leptos for full Rust/WASM frontend
-- [ ] Add pod actions (start/stop/delete) to UI
+- [x] Add pod actions (start/stop/delete) to UI
 - [ ] Add git diff viewer with syntax highlighting
 - [ ] Add code review workflow (accept/reject commits)
 - [ ] WebSocket for real-time updates
-- [ ] Drop `--net=host` requirement (see below)
+- [x] Drop `--net=host` requirement (done: use host gateway, all services have auth)
 
-## Dropping `--net=host` Requirement
+## Dropping `--net=host` Requirement (Done)
 
-With the web UI architecture (podman socket proxy + `podman exec`), we may be able to remove the `--net=host` requirement for the control plane container.
+We no longer use `--network host`. The control plane container uses
+`--add-host=host.containers.internal:host-gateway` and connects to pod-published
+ports (auth proxy) via `host.containers.internal:<port>`. All exposed pod services
+use auth. This keeps port forwarding working on macOS. See `host_for_pod_services()`
+in `podman.rs` and container-mode.md.
 
-### Current State
-
-The codebase already uses `podman exec curl` for API calls to workspace containers (see `opencode_api_get_port()` in `main.rs`). This works without host networking because:
-
-1. **Podman socket access**: The control plane accesses podman via the mounted Unix socket (`/run/podman/podman.sock`)
-2. **Exec-based API calls**: Rather than connecting to published ports, we exec into containers
-3. **Web UI proxy**: The new `web.rs` proxies through the socket and uses `exec_in_container()` for git operations
-
-### Recommended Approach
-
-**Option A: Pure `podman exec` (Already works)**
-- Use `podman exec` for all workspace container communication
-- Slower (exec overhead) but secure and network-independent
-
-**Option B: Container network + IP discovery**
-- Put control plane on same podman network as workspaces
-- Query container IPs via `podman inspect`
-- Faster, supports WebSockets
-
-**Option C: Unix socket communication** (requires opencode changes)
-- Shared volume with Unix sockets
-- Most secure, no network exposure
-
-### Security Benefits
-
-| Aspect | `--net=host` | Without |
-|--------|-------------|---------|
-| Host localhost access | Full | None |
-| Container isolation | Weak | Strong |
-| Attack surface | Host services exposed | Minimal |
-
-### Action Items
-
-1. **Test** running without `--network host` - the `podman exec` paths likely already work
-2. **Update** Justfile and container-mode.md
-3. **Optional**: Add container-IP-based networking for WebSocket performance
+**Future**: A [per-pod gateway sidecar](per-pod-gateway-sidecar.md) (Rust) could provide
+one authenticated gateway per pod (opencode + optional podman/LLM proxy), simplifying
+the central plane and keeping a single port per pod.
 
 ## Motivation
 
