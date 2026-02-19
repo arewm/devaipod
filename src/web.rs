@@ -3,7 +3,9 @@
 //! This module provides:
 //! - Token-based authentication for API access
 //! - Podman socket proxy at `/api/podman/*`
-//! - Git status endpoints for workspace containers
+//! - Agent view at `/_devaipod/agent/{name}/` (vendored opencode UI with injected back button)
+//! - Workspace recreate at `POST /api/devaipod/pods/{name}/recreate`
+//! - Git and opencode-info endpoints for workspace containers
 //! - Static file serving for web UI
 
 use std::path::PathBuf;
@@ -14,7 +16,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -24,12 +26,56 @@ use color_eyre::eyre::{bail, Context, Result};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
+use tower::ServiceExt;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
-use crate::podman::get_container_socket;
+use crate::pod::OPENCODE_AUTH_PROXY_PORT;
+use crate::podman::{get_container_socket, host_for_pod_services};
 
-/// Path to the token file in /run/secrets
+/// Path to the token file when using podman/Kubernetes secrets (highest priority).
 const TOKEN_SECRET_PATH: &str = "/run/secrets/devaipod-web-token";
+
+/// Default directory for persistent state when using the devaipod-state volume.
+/// Override with DEVAIPOD_STATE_DIR. Token is stored at {state_dir}/web-token.
+const DEFAULT_STATE_DIR: &str = "/var/lib/devaipod";
+
+/// Filename for the web auth token inside the state directory.
+const STATE_TOKEN_FILENAME: &str = "web-token";
+
+fn state_token_path() -> std::path::PathBuf {
+    let dir = std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    std::path::PathBuf::from(dir).join(STATE_TOKEN_FILENAME)
+}
+
+/// Cookie name for attributing root-level opencode API requests and /assets/* to a pod.
+/// The opencode app uses window.location.origin, so it requests /session, /rpc, /assets/* at root;
+/// we set this cookie when loading the agent page; with it we serve opencode assets at /assets/*.
+const DEVAIPOD_AGENT_POD_COOKIE: &str = "DEVAIPOD_AGENT_POD";
+
+/// Get pod name from DEVAIPOD_AGENT_POD cookie if present (URL-decoded).
+fn pod_name_from_cookie(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.split(';').find_map(|pair| {
+                let pair = pair.trim();
+                let prefix = format!("{}=", DEVAIPOD_AGENT_POD_COOKIE);
+                pair.starts_with(&prefix).then(|| pair[prefix.len()..].to_string())
+            })
+        })
+        .map(|s| urlencoding::decode(&s).unwrap_or(std::borrow::Cow::Borrowed(s.as_str())).into_owned())
+}
+
+/// Normalize pod name: ensure it has the "devaipod-" prefix.
+fn normalize_pod_name(name: &str) -> String {
+    if name.starts_with("devaipod-") {
+        name.to_string()
+    } else {
+        format!("devaipod-{name}")
+    }
+}
 
 /// Generate a cryptographically secure random token
 ///
@@ -42,12 +88,14 @@ pub fn generate_token() -> String {
     BASE64_URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Load token from secrets file or generate a new one
+/// Load token from secrets file, state volume, or generate a new one
 ///
-/// Checks `/run/secrets/devaipod-web-token` first (for Kubernetes/container secrets).
-/// If not found, generates a new random token.
+/// Priority: (1) `/run/secrets/devaipod-web-token` (podman secret / Kubernetes),
+/// (2) state dir `DEVAIPOD_STATE_DIR/web-token` (default `/var/lib/devaipod/web-token` when
+/// the devaipod-state volume is mounted). If a new token is generated and the state dir exists,
+/// it is written there so it persists across restarts.
 pub fn load_or_generate_token() -> String {
-    // Try to read from secrets file first
+    // 1. Podman/Kubernetes secret (highest priority)
     if let Ok(token) = std::fs::read_to_string(TOKEN_SECRET_PATH) {
         let trimmed = token.trim();
         if !trimmed.is_empty() {
@@ -56,9 +104,29 @@ pub fn load_or_generate_token() -> String {
         }
     }
 
-    // Generate a new token
+    // 2. State volume path (devaipod-state mounted at DEVAIPOD_STATE_DIR)
+    let state_path = state_token_path();
+    if let Ok(token) = std::fs::read_to_string(&state_path) {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            tracing::debug!("Loaded token from {}", state_path.display());
+            return trimmed.to_string();
+        }
+    }
+
+    // 3. Generate and persist to state dir if it exists
     let token = generate_token();
-    tracing::debug!("Generated new authentication token");
+    if let Some(parent) = state_path.parent() {
+        if parent.exists() {
+            if let Err(e) = std::fs::write(&state_path, &token) {
+                tracing::warn!("Could not persist token to {}: {}", state_path.display(), e);
+            } else {
+                tracing::debug!("Generated and saved token to {}", state_path.display());
+            }
+        }
+    } else {
+        tracing::debug!("Generated new authentication token");
+    }
     token
 }
 
@@ -69,6 +137,8 @@ struct AppState {
     token: String,
     /// Path to the podman/docker socket (None if not available at startup)
     socket_path: Option<PathBuf>,
+    /// Path to control-plane static files (fallback when /assets requested without agent cookie)
+    static_dir: String,
 }
 
 /// Query parameters for token authentication
@@ -237,12 +307,12 @@ async fn get_pod_opencode_info(pod_name: &str) -> Result<(u16, String), StatusCo
             StatusCode::NOT_FOUND
         })?;
 
-    let port_key = "4097/tcp";
+    let port_key = format!("{OPENCODE_AUTH_PROXY_PORT}/tcp");
     let bindings = ports
-        .get(port_key)
+        .get(&port_key)
         .and_then(|b| b.as_ref())
         .ok_or_else(|| {
-            tracing::error!("Port 4097 not published for {}", pod_name);
+            tracing::error!("Port {OPENCODE_AUTH_PROXY_PORT} not published for {pod_name}");
             StatusCode::NOT_FOUND
         })?;
 
@@ -294,22 +364,41 @@ struct OpencodeInfoResponse {
     accessible: bool,
 }
 
+/// JSON body for API errors (e.g. 404) so the frontend can show a clear message
+#[derive(Debug, Serialize)]
+struct ApiErrorBody {
+    error: String,
+}
+
 /// Path to vendored opencode web UI
 const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
+
+/// Opencode API path segments; used in tests and documentation.
+/// Root-level requests with the agent cookie are proxied via the catch-all fallback.
+#[cfg(test)]
+const OPENCODE_API_SEGMENTS: &[&str] = &[
+    "rpc", "event", "session", "global", "path", "project", "provider", "auth",
+];
 
 /// Get opencode connection info for a pod
 ///
 /// Returns the direct URL to access the opencode web UI.
 /// The URL includes a token query parameter for authentication.
-async fn opencode_info(Path(name): Path<String>) -> Result<Json<OpencodeInfoResponse>, StatusCode> {
-    // Normalize pod name (add devaipod- prefix if not present)
-    let pod_name = if name.starts_with("devaipod-") {
-        name.clone()
-    } else {
-        format!("devaipod-{}", name)
-    };
+/// On 404 returns JSON body so the frontend can show "Pod or agent not found".
+async fn opencode_info(
+    Path(name): Path<String>,
+) -> Result<Json<OpencodeInfoResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
 
-    let (port, password) = get_pod_opencode_info(&pod_name).await?;
+    let (port, password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
+        let msg = if code == StatusCode::NOT_FOUND {
+            "Pod or agent not found (agent container may not be running or port not published)"
+                .to_string()
+        } else {
+            code.to_string()
+        };
+        (code, Json(ApiErrorBody { error: msg }))
+    })?;
 
     // Build URL with token query parameter
     // The auth proxy accepts ?token=PASSWORD and sets a session cookie
@@ -358,25 +447,48 @@ async fn opencode_proxy_impl(
     path: String,
     request: Request,
 ) -> Result<Response, StatusCode> {
-    // Normalize pod name (add devaipod- prefix if not present)
-    let pod_name = if name.starts_with("devaipod-") {
-        name.clone()
-    } else {
-        format!("devaipod-{}", name)
-    };
+    let pod_name = normalize_pod_name(&name);
 
-    // Get the pod's opencode connection info
-    let (port, password) = get_pod_opencode_info(&pod_name).await?;
+    // Get the pod's opencode connection info.
+    // Map NOT_FOUND (pod/agent not running or port not published) to SERVICE_UNAVAILABLE
+    // so 404 is reserved for "route not found"; integration tests assert root proxy route exists (not 404).
+    let (port, password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
+        if code == StatusCode::NOT_FOUND {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            code
+        }
+    })?;
+
+    // When in container mode we use host gateway (e.g. host.containers.internal) so we
+    // reach ports published on the host; avoids --network host and works on macOS.
+    let host = host_for_pod_services();
 
     tracing::debug!(
-        "Proxying to opencode for pod {} on port {}, path: {}",
+        "Proxying to opencode for pod {} on {}:{}, path: {}",
         pod_name,
+        host,
         port,
         path
     );
 
-    // Connect to localhost:port (the published auth proxy port)
-    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+    proxy_to_upstream(&host, port, &password, path, request).await
+}
+
+/// Low-level HTTP proxy: connect to `host:port`, forward `request` with Basic Auth,
+/// and return the response with the HTTP version normalized to 1.1.
+///
+/// Separated from `opencode_proxy_impl` so it can be tested with a mock server
+/// (the caller handles pod discovery; this function handles the TCP connection).
+async fn proxy_to_upstream(
+    host: &str,
+    port: u16,
+    password: &str,
+    path: String,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    // Connect to the published auth proxy port (host:port)
+    let stream = tokio::net::TcpStream::connect(format!("{}:{}", host, port))
         .await
         .map_err(|e| {
             tracing::error!("Failed to connect to opencode auth proxy: {}", e);
@@ -404,7 +516,7 @@ async fn opencode_proxy_impl(
     let (parts, body) = request.into_parts();
 
     // Use root path if path is empty, otherwise prepend /
-    let uri = if path.is_empty() || path == "/" {
+    let mut uri = if path.is_empty() || path == "/" {
         "/".to_string()
     } else if path.starts_with('/') {
         path
@@ -412,13 +524,19 @@ async fn opencode_proxy_impl(
         format!("/{}", path)
     };
 
+    // Preserve query string (e.g. /file?path=src/main.rs) - opencode API requires it for /file, /find/file, etc.
+    if let Some(query) = parts.uri.query() {
+        uri.push('?');
+        uri.push_str(query);
+    }
+
     // Build Basic Auth header
     let auth = BASE64_STANDARD.encode(format!("opencode:{}", password));
 
     let mut builder = hyper::Request::builder()
         .method(parts.method)
         .uri(&uri)
-        .header(header::HOST, format!("127.0.0.1:{}", port))
+        .header(header::HOST, format!("{}:{}", host, port))
         .header(header::AUTHORIZATION, format!("Basic {}", auth));
 
     // Copy headers (except Host and Authorization which we set)
@@ -439,45 +557,375 @@ async fn opencode_proxy_impl(
         StatusCode::BAD_GATEWAY
     })?;
 
-    // Convert the response
-    let (parts, body) = response.into_parts();
+    // Convert the response, upgrading HTTP/1.0 from upstream to HTTP/1.1 so SSE
+    // streaming works correctly in browsers (HTTP/1.0 lacks chunked transfer encoding).
+    let (mut parts, body) = response.into_parts();
+    parts.version = hyper::Version::HTTP_11;
     let body = Body::new(body);
 
     Ok(Response::from_parts(parts, body))
 }
 
-/// Handler for agent UI routes
-///
-/// Serves the vendored opencode web UI for workspace agents.
-/// Routes:
-/// - Static assets (index.html, assets/*, *.js, favicon.*) -> serve from /usr/share/devaipod/opencode/
-/// - API paths (rpc, event, session) -> proxy to workspace's opencode server
-async fn agent_ui_handler(
-    Path((name, path)): Path<(String, String)>,
-    request: Request,
-) -> Result<Response, StatusCode> {
-    // Determine if this is an API path that should be proxied
-    let api_paths = ["rpc", "event", "session"];
-    let is_api = api_paths
-        .iter()
-        .any(|p| path == *p || path.starts_with(&format!("{}/", p)));
+/// Return a long-lived SSE stream that sends periodic keepalive comments.
+/// The opencode SDK (global-sdk) calls GET /global/event as a streaming SSE connection;
+/// if we close the response immediately the SDK reconnects in a tight loop, flooding the
+/// console with "event stream error". A keepalive stream keeps the connection open.
+fn sse_keepalive_stream(comment: &str) -> Body {
+    let initial = format!(": {comment}\n\n");
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(2);
+    tokio::spawn(async move {
+        if tx.send(Ok(initial)).await.is_err() {
+            return;
+        }
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if tx.send(Ok(": keepalive\n\n".to_string())).await.is_err() {
+                return;
+            }
+        }
+    });
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
 
-    if is_api {
-        // Proxy to workspace's opencode server
-        opencode_proxy_impl(name, path, request).await
-    } else {
-        // Serve static file from vendored opencode UI
-        serve_opencode_static(&name, &path).await
+/// Whether a path is an SSE event-stream endpoint (global-sdk, event listener).
+fn is_event_stream_path(path: &str) -> bool {
+    path == "event"
+        || path.starts_with("event/")
+        || path == "global"
+        || path.starts_with("global/")
+}
+
+/// Build a 200 OK SSE keepalive response with the given comment.
+fn sse_keepalive_response(comment: &str) -> Result<Response, StatusCode> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(sse_keepalive_stream(comment))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Middleware that logs every HTTP request and response (method, URI, status, duration, content-type).
+/// Query parameters are stripped to avoid leaking tokens into logs.
+async fn request_trace(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    let latency = start.elapsed();
+    let ct = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    tracing::info!(
+        %method,
+        path = %path,
+        status = %response.status(),
+        content_type = ct,
+        version = ?response.version(),
+        latency_ms = latency.as_millis(),
+    );
+    response
+}
+
+/// Frontend error report sent by the injected console.error interceptor.
+#[derive(Deserialize)]
+struct FrontendErrorReport {
+    message: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    stack: String,
+    #[serde(default)]
+    context: String,
+}
+
+/// Receives frontend error reports POSTed by the injected console.error interceptor.
+/// Logs them server-side so they appear in `RUST_LOG=devaipod=debug` output alongside
+/// request traces, making it possible to correlate client and server events.
+async fn frontend_error_report(
+    Json(report): Json<FrontendErrorReport>,
+) -> StatusCode {
+    tracing::warn!(
+        url = %report.url,
+        context = %report.context,
+        stack = %report.stack,
+        "[frontend] {}",
+        report.message,
+    );
+    StatusCode::NO_CONTENT
+}
+
+/// Proxy opencode API requests that hit the root (e.g. /session, /rpc, /global/event).
+/// The opencode app uses window.location.origin, so it requests these at root; we attribute
+/// the request to a pod via the DEVAIPOD_AGENT_POD cookie set when loading the agent page.
+///
+/// For event-stream paths (SSE), errors are returned as keepalive streams instead of HTTP
+/// error codes, because the opencode global-sdk reconnects aggressively on non-200 responses.
+async fn opencode_root_proxy(request: Request) -> Result<Response, StatusCode> {
+    let path = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .to_string();
+    if path.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let pod_name = match pod_name_from_cookie(request.headers()) {
+        Some(n) => n,
+        None => {
+            if is_event_stream_path(&path) {
+                return sse_keepalive_response("no agent context");
+            }
+            tracing::debug!("Root opencode API request without {} cookie", DEVAIPOD_AGENT_POD_COOKIE);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    match opencode_proxy_impl(pod_name, path.clone(), request).await {
+        Ok(resp) => Ok(resp),
+        Err(status) => {
+            if is_event_stream_path(&path) {
+                tracing::debug!("SSE proxy failed ({status}), returning keepalive stream");
+                sse_keepalive_response("agent not ready")
+            } else {
+                Err(status)
+            }
+        }
     }
 }
 
-/// Handler for agent UI root path (no trailing path)
-async fn agent_ui_root(Path(name): Path<String>) -> Result<Response, StatusCode> {
-    serve_opencode_static(&name, "").await
+/// Fallback handler: if the DEVAIPOD_AGENT_POD cookie is set, proxy the request to the
+/// opencode backend for that pod. Otherwise, serve from the control-plane static directory.
+/// This replaces a hardcoded list of opencode API routes with a cookie-based approach.
+///
+/// SSE event-stream paths (e.g. /event, /global/event) without a cookie get an SSE
+/// keepalive response instead of 404, so the opencode global-sdk doesn't error loop.
+async fn opencode_or_static_fallback(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let has_cookie = pod_name_from_cookie(request.headers()).is_some();
+    let path = request.uri().path();
+    let trimmed_path = path.trim_start_matches('/');
+
+    // SSE paths without a cookie: return a keepalive stream so the SDK doesn't error-loop
+    if !has_cookie && is_event_stream_path(trimmed_path) {
+        return sse_keepalive_response("no agent context")
+            .unwrap_or_else(|status| {
+                Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap()
+            });
+    }
+
+    // The root path is always the control plane, even with the agent cookie.
+    // The cookie persists across navigation (Path=/; Max-Age=86400) so the
+    // browser still sends it when the user clicks "back to pods".  The opencode
+    // API never uses "/" — its endpoints are /session, /rpc, /global, etc.
+    let is_root = trimmed_path.is_empty();
+
+    if has_cookie && !is_root {
+        match opencode_root_proxy(request).await {
+            Ok(resp) => resp,
+            Err(status) => Response::builder()
+                .status(status)
+                .body(Body::empty())
+                .unwrap(),
+        }
+    } else {
+        // Serve from control-plane static directory
+        let serve_dir = ServeDir::new(&state.static_dir);
+        match serve_dir.oneshot(request).await {
+            Ok(resp) => resp.into_response(),
+            Err(_) => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap(),
+        }
+    }
+}
+
+/// HTML snippet injected before </body> in the vendored opencode index.html.
+/// Provides a floating "back to pods" button so the user can return to the control plane.
+/// The script reads the auth token from sessionStorage (set by the control plane before navigating).
+/// Script injected right after <head> in the opencode index.html.
+/// Intercepts console.error/warn and forwards them to the server for correlation with
+/// request traces. Also suppresses the harmless "[global-sdk] event stream error" that
+/// the opencode SDK emits when an SSE fetch() is aborted during page navigation (the
+/// SDK uses AbortController cleanup in SolidJS; the next page load reconnects fine).
+const DEVAIPOD_HEAD_SCRIPT: &str = r#"<script>(function(){
+var _err=console.error;var _warn=console.warn;
+function report(level,args){
+  try{
+    var msg=Array.prototype.map.call(args,function(a){
+      return typeof a==='object'?JSON.stringify(a):String(a);
+    }).join(' ');
+    var stack='';try{throw new Error();}catch(e){stack=e.stack||'';}
+    fetch('/_devaipod/frontend-error',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:'['+level+'] '+msg,url:location.href,stack:stack,
+        context:navigator.userAgent})
+    }).catch(function(){});
+  }catch(e){}
+}
+console.error=function(){
+  var first=arguments[0];
+  if(typeof first==='string'&&first.indexOf('[global-sdk] event stream error')===0)return;
+  _err.apply(console,arguments);report('error',arguments);
+};
+console.warn=function(){_warn.apply(console,arguments);report('warn',arguments);};
+window.addEventListener('unhandledrejection',function(e){
+  report('unhandledrejection',[e.reason]);
+});
+})()</script>"#;
+
+/// Wrapper HTML page that embeds the opencode SPA in a full-screen iframe with a
+/// thin navigation bar. This avoids the fragile HTML/CSS rewriting that was previously
+/// used to inject a back button into the opencode index.html.  The opencode SPA runs
+/// unmodified inside the iframe at the same origin, so its API calls (/session, /rpc,
+/// /global/event, etc.) are handled by the cookie-based fallback proxy.
+fn agent_iframe_wrapper(name: &str) -> String {
+    let escaped_name = name.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>devaipod - {escaped_name}</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+html,body{{height:100%;overflow:hidden;background:#1c1717}}
+#dbar{{height:36px;display:flex;align-items:center;padding:0 12px;
+  background:#1c1717;border-bottom:1px solid rgba(255,255,255,0.08)}}
+#dbar a{{color:#b7b1b1;text-decoration:none;font-size:13px;
+  font-family:Inter,system-ui,sans-serif;opacity:0.7;transition:opacity 0.2s}}
+#dbar a:hover{{opacity:1;color:#f1ecec}}
+iframe{{width:100%;height:calc(100% - 36px);border:none}}
+</style></head><body>
+<div id="dbar"><a id="db" href="/">&#8592; Pods</a></div>
+<iframe src="/_devaipod/opencode-ui" allow="clipboard-read; clipboard-write"></iframe>
+<script>(function(){{var t=sessionStorage.getItem('devaipod_token');
+if(t)document.getElementById('db').href='/?token='+encodeURIComponent(t)}})()
+</script></body></html>"#
+    )
+}
+
+/// Redirect /_devaipod/agent/{name} to /_devaipod/agent/{name}/ and set the agent cookie.
+async fn agent_wrapper(
+    Path(name): Path<String>,
+) -> Result<Response, StatusCode> {
+    let location = format!("/_devaipod/agent/{}/", urlencoding::encode(&name));
+    let cookie_value = format!(
+        "{}={}; Path=/; SameSite=Lax; Max-Age=86400",
+        DEVAIPOD_AGENT_POD_COOKIE,
+        urlencoding::encode(&name)
+    );
+    Ok(Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, location)
+        .header(header::SET_COOKIE, cookie_value)
+        .body(Body::empty())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+}
+
+/// Serve the iframe wrapper page for a specific agent.
+/// The opencode SPA runs unmodified inside the iframe; the wrapper provides
+/// the "back to pods" navigation bar.
+async fn agent_ui_root(Path(name): Path<String>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(agent_iframe_wrapper(&name)))
+        .unwrap()
+}
+
+/// Handler for agent UI sub-paths (static assets under /_devaipod/agent/{name}/).
+/// With the iframe approach, the opencode SPA's API calls go to the root origin
+/// (handled by the cookie-based fallback proxy), so this only serves static files.
+async fn agent_ui_handler(
+    Path((name, path)): Path<(String, String)>,
+    _request: Request,
+) -> Result<Response, StatusCode> {
+    serve_opencode_static(&name, &path).await
+}
+
+/// Serve the raw opencode UI (index.html) for loading inside the agent iframe.
+/// Only the error interceptor script is injected; no URL rewriting or back button.
+async fn serve_opencode_raw_ui() -> Result<Response, StatusCode> {
+    let ui_path = std::path::Path::new(OPENCODE_UI_PATH).join("index.html");
+    let content = tokio::fs::read(&ui_path).await.map_err(|e| {
+        tracing::error!("Failed to read opencode index.html: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let html = String::from_utf8_lossy(&content);
+    let html = html.replacen("<head>", &format!("<head>\n{DEVAIPOD_HEAD_SCRIPT}"), 1);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(html))
+        .unwrap())
+}
+
+/// Serve /assets/* from opencode when DEVAIPOD_AGENT_POD cookie is set (agent UI context);
+/// otherwise serve from control-plane static dir so the main UI's assets still work.
+async fn serve_root_assets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Result<Response, StatusCode> {
+    if let Some(pod_name) = pod_name_from_cookie(&headers) {
+        let opencode_path = if path.is_empty() {
+            "assets".to_string()
+        } else {
+            format!("assets/{}", path)
+        };
+        return serve_opencode_static(&pod_name, &opencode_path).await;
+    }
+    // No cookie: serve from control-plane static dir (e.g. dist/assets/...)
+    let rel_path = if path.is_empty() {
+        "assets".to_string()
+    } else {
+        format!("assets/{}", path)
+    };
+    let file_path = std::path::Path::new(&state.static_dir).join(&rel_path);
+    let clean_path = file_path
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let static_base = std::path::Path::new(&state.static_dir)
+        .canonicalize()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !clean_path.starts_with(&static_base) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let content = tokio::fs::read(&clean_path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let content_type = match clean_path.extension().and_then(|e| e.to_str()) {
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ttf") => "font/ttf",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    };
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(Body::from(content))
+        .unwrap())
 }
 
 /// Serve a static file from the vendored opencode UI directory
-async fn serve_opencode_static(name: &str, path: &str) -> Result<Response, StatusCode> {
+async fn serve_opencode_static(_name: &str, path: &str) -> Result<Response, StatusCode> {
     use tokio::fs;
 
     let ui_path = std::path::Path::new(OPENCODE_UI_PATH);
@@ -531,14 +979,47 @@ async fn serve_opencode_static(name: &str, path: &str) -> Result<Response, Statu
                         Ok(content) => content,
                         Err(_) => {
                             tracing::error!(
-                                "index.html not found for agent {} at {:?}",
-                                name,
+                                "index.html not found at {:?}",
                                 ui_path.join("index.html")
                             );
                             return Err(StatusCode::NOT_FOUND);
                         }
                     }
                 } else {
+                    // Fallback: bare filenames (e.g. fonts) may be requested when CSS uses
+                    // url(font.woff2) and the document base is /agent/name/; opencode dist
+                    // typically puts assets under assets/ or assets/fonts/. Try both.
+                    let is_bare_filename = !path_str.contains('/');
+                    let fallbacks: [std::path::PathBuf; 2] = if is_bare_filename {
+                        [
+                            ui_path.join("assets").join(path_str),
+                            ui_path.join("assets").join("fonts").join(path_str),
+                        ]
+                    } else {
+                        [std::path::PathBuf::new(), std::path::PathBuf::new()]
+                    };
+                    for fallback in fallbacks.iter().filter(|p| !p.as_os_str().is_empty()) {
+                        if fallback.exists() {
+                            if let Ok(resolved) = fallback.canonicalize() {
+                                if resolved.starts_with(&ui_canonical) {
+                                    if let Ok(content) = fs::read(fallback).await {
+                                        let content_type = match fallback.extension().and_then(|e| e.to_str()) {
+                                            Some("woff2") => "font/woff2",
+                                            Some("woff") => "font/woff",
+                                            Some("ttf") => "font/ttf",
+                                            _ => "application/octet-stream",
+                                        };
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::OK)
+                                            .header(header::CONTENT_TYPE, content_type)
+                                            .header(header::CACHE_CONTROL, "public, max-age=3600")
+                                            .body(Body::from(content))
+                                            .unwrap());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     tracing::debug!("Static file not found: {:?}", file_path);
                     return Err(StatusCode::NOT_FOUND);
                 }
@@ -564,10 +1045,13 @@ async fn serve_opencode_static(name: &str, path: &str) -> Result<Response, Statu
         _ => "application/octet-stream",
     };
 
+    // With the iframe approach, static files are served unmodified.
+    // Content-hashed filenames (JS/CSS/fonts) can be cached aggressively.
+    let cache_control = "public, max-age=3600";
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .header(header::CACHE_CONTROL, cache_control)
         .body(Body::from(content))
         .unwrap())
 }
@@ -653,6 +1137,60 @@ async fn run_workspace(Json(req): Json<RunRequest>) -> Result<Json<RunResponse>,
         success: true,
         workspace: workspace.clone(),
         message: format!("Workspace '{}' created successfully", workspace),
+    }))
+}
+
+/// Recreate a workspace (delete and recreate with same repo)
+///
+/// Runs `devaipod rebuild <pod_name>`. Fixes issues like missing port 4097
+/// on pods created before the port was published. Requires pod to have
+/// io.devaipod.repo label.
+async fn recreate_workspace(
+    Path(name): Path<String>,
+) -> Result<Json<RunResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+
+    tracing::info!("Recreating workspace: {}", pod_name);
+
+    let output = tokio::process::Command::new("devaipod")
+        .arg("rebuild")
+        .arg(&pod_name)
+        .output()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to execute devaipod rebuild: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorBody {
+                    error: format!("Failed to run rebuild: {}", e),
+                }),
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("devaipod rebuild failed: {}", stderr);
+        let msg = stderr.trim();
+        let status = if msg.contains("no repository label") || msg.contains("Cannot determine source") {
+            StatusCode::BAD_REQUEST
+        } else if msg.contains("not found") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err((
+            status,
+            Json(ApiErrorBody {
+                error: msg.to_string(),
+            }),
+        ));
+    }
+
+    let short_name = pod_name.strip_prefix("devaipod-").unwrap_or(&pod_name);
+    Ok(Json(RunResponse {
+        success: true,
+        workspace: short_name.to_string(),
+        message: format!("Workspace '{}' recreated successfully", short_name),
     }))
 }
 
@@ -899,26 +1437,24 @@ async fn exec_in_container(container: &str, cmd: &[&str]) -> Result<(i64, Vec<u8
 ///
 /// Returns an error if the server fails to bind to the port.
 /// Podman socket availability is checked lazily when proxying requests.
-pub async fn run_web_server(port: u16, token: String) -> Result<()> {
-    // Try to get the podman socket path, but don't fail if not found
-    // (allows server to start for static file serving even without podman)
-    let socket_path = get_container_socket().ok();
 
-    if socket_path.is_none() {
-        tracing::warn!(
-            "No podman socket found. Podman API proxy will return 503 until socket is available."
-        );
-    }
-
+/// Build the web app router for a given token, socket path, and static dir.
+///
+/// Exposed for tests so we can hit the router with in-process requests (fast)
+/// without starting a server or container.
+pub(crate) fn build_app(
+    token: String,
+    socket_path: Option<PathBuf>,
+    static_dir: &str,
+) -> Router {
     let state = Arc::new(AppState {
         token: token.clone(),
         socket_path,
+        static_dir: static_dir.to_string(),
     });
 
     // Build the API router with authentication
     let api_router = Router::new()
-        // Podman socket proxy - capture the rest of the path
-        // axum 0.8 uses {*path} syntax for wildcard captures
         .route(
             "/podman/{*path}",
             get(podman_proxy)
@@ -926,8 +1462,6 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
                 .put(podman_proxy)
                 .delete(podman_proxy),
         )
-        // OpenCode proxy - forwards to pod's opencode server (which serves web UI from app.opencode.ai)
-        // Two routes: one for root path, one for sub-paths
         .route(
             "/devaipod/pods/{name}/opencode",
             get(opencode_proxy_root)
@@ -942,20 +1476,62 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
                 .put(opencode_proxy)
                 .delete(opencode_proxy),
         )
-        // OpenCode info endpoint - returns direct URL to access opencode
         .route("/devaipod/pods/{name}/opencode-info", get(opencode_info))
-        // Git endpoints for workspace pods
         .route("/devaipod/pods/{name}/git/status", get(git_status))
         .route("/devaipod/pods/{name}/git/diff", get(git_diff))
         .route("/devaipod/pods/{name}/git/commits", get(git_commits))
-        // Run endpoint - create a new workspace
         .route("/devaipod/run", post(run_workspace))
-        // Apply auth middleware to all API routes
+        .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ))
         .with_state(state.clone());
+
+    // CORS: allow webviews and cross-origin requests (e.g. IDE embedding control plane at 127.0.0.1:8080)
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    Router::new()
+        .route("/_devaipod/health", get(|| async { "ok" }))
+        .route("/_devaipod/frontend-error", post(frontend_error_report))
+        .nest("/api", api_router)
+        .route("/_devaipod/opencode-ui", get(serve_opencode_raw_ui))
+        .route("/_devaipod/agent/{name}", get(agent_wrapper))
+        .route("/_devaipod/agent/{name}/", get(agent_ui_root))
+        .route(
+            "/_devaipod/agent/{name}/{*path}",
+            get(agent_ui_handler)
+                .post(agent_ui_handler)
+                .put(agent_ui_handler)
+                .delete(agent_ui_handler)
+                .patch(agent_ui_handler),
+        )
+        // /assets/*: with agent cookie serve opencode assets; else control-plane static dir
+        .route("/assets", get(serve_root_assets))
+        .route("/assets/{*path}", get(serve_root_assets))
+        // Catch-all fallback: if the agent cookie is set, proxy to the opencode backend;
+        // otherwise serve control-plane static files. This avoids maintaining a hardcoded
+        // list of opencode API routes (the SPA uses window.location.origin for all its
+        // API calls: /session, /global/event, /agent, /config, /file, /find/file, etc.).
+        .fallback(opencode_or_static_fallback)
+        .layer(middleware::from_fn(request_trace))
+        .layer(cors)
+        .with_state(state)
+}
+
+pub async fn run_web_server(port: u16, token: String) -> Result<()> {
+    // Try to get the podman socket path, but don't fail if not found
+    // (allows server to start for static file serving even without podman)
+    let socket_path = get_container_socket().ok();
+
+    if socket_path.is_none() {
+        tracing::warn!(
+            "No podman socket found. Podman API proxy will return 503 until socket is available."
+        );
+    }
 
     // Find static files directory
     // Try installed location first, then fall back to development location
@@ -971,29 +1547,16 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
     };
     tracing::info!("Serving static files from: {}", static_dir);
 
-    // Build the main router
-    // Static files are served without authentication (fallback)
-    let app = Router::new()
-        // Health check endpoint (no auth required)
-        .route("/health", get(|| async { "ok" }))
-        .nest("/api", api_router)
-        // Agent UI routes - serve vendored opencode web UI and proxy API calls
-        // These routes are NOT authenticated (the opencode server handles auth via cookies)
-        .route("/agent/{name}", get(agent_ui_root))
-        .route("/agent/{name}/", get(agent_ui_root))
-        .route(
-            "/agent/{name}/{*path}",
-            get(agent_ui_handler)
-                .post(agent_ui_handler)
-                .put(agent_ui_handler)
-                .delete(agent_ui_handler)
-                .patch(agent_ui_handler),
-        )
-        // Serve static files from dist/ directory as fallback
-        .fallback_service(ServeDir::new(static_dir));
+    let app = build_app(token.clone(), socket_path, static_dir);
 
-    // Bind to localhost only
-    let addr = format!("127.0.0.1:{}", port);
+    // In container mode, bind to 0.0.0.0 so port-forwarded connections from the host (e.g. -p 8080:8080) are accepted.
+    // On the host we bind to 127.0.0.1 only for security.
+    let bind_host = if std::env::var("DEVAIPOD_CONTAINER").is_ok() {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    let addr = format!("{}:{}", bind_host, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind to {}", addr))?;
@@ -1014,6 +1577,69 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    /// Fast in-process test: GET /_devaipod/agent/{name} must return 307 redirect
+    /// to /_devaipod/agent/{name}/ and set the DEVAIPOD_AGENT_POD cookie.
+    #[tokio::test]
+    async fn test_agent_redirect() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let static_dir = temp.path().to_str().expect("path");
+        let app = build_app("test-token".into(), None, static_dir);
+
+        let req = Request::builder()
+            .uri("/_devaipod/agent/test-pod")
+            .body(Body::empty())
+            .expect("request");
+        let res = app.oneshot(req).await.expect("oneshot");
+        let status = res.status();
+        let headers = res.headers().clone();
+        let _body = to_bytes(res.into_body(), usize::MAX).await.expect("body");
+
+        assert_eq!(
+            status.as_u16(),
+            307,
+            "GET /_devaipod/agent/test-pod must return 307 redirect; got {}",
+            status
+        );
+        let location = headers
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("Location header must be set");
+        assert_eq!(location, "/_devaipod/agent/test-pod/", "Location must redirect to trailing-slash path");
+
+        let set_cookie = headers
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("Set-Cookie header must be set");
+        assert!(
+            set_cookie.contains("DEVAIPOD_AGENT_POD="),
+            "Set-Cookie must include DEVAIPOD_AGENT_POD; got: {}",
+            set_cookie
+        );
+        assert!(
+            set_cookie.contains("test-pod"),
+            "Set-Cookie must include pod name; got: {}",
+            set_cookie
+        );
+    }
+
+    /// Test the iframe wrapper HTML generation.
+    #[test]
+    fn test_agent_iframe_wrapper() {
+        let html = agent_iframe_wrapper("test-pod");
+        assert!(html.contains("test-pod"), "wrapper must include pod name");
+        assert!(html.contains("/_devaipod/opencode-ui"), "wrapper must contain iframe src to opencode-ui");
+        assert!(html.contains("Pods"), "wrapper must have back-to-pods link");
+        assert!(html.contains("devaipod_token"), "wrapper must read token from sessionStorage");
+
+        // HTML-escaping
+        let html = agent_iframe_wrapper("<script>alert(1)</script>");
+        assert!(!html.contains("<script>alert"), "pod name must be HTML-escaped");
+        assert!(html.contains("&lt;script&gt;"), "angle brackets must be escaped");
+    }
 
     #[test]
     fn test_generate_token() {
@@ -1068,12 +1694,9 @@ mod tests {
 
     #[test]
     fn test_agent_ui_api_path_detection() {
-        // Test the logic used in agent_ui_handler to determine API vs static paths
-        let api_paths = ["rpc", "event", "session"];
-
-        // API paths should be detected
+        // Test the logic used in agent_ui_handler to determine API vs static paths (OPENCODE_API_SEGMENTS)
         let is_api = |path: &str| {
-            api_paths
+            OPENCODE_API_SEGMENTS
                 .iter()
                 .any(|p| path == *p || path.starts_with(&format!("{}/", p)))
         };
@@ -1081,6 +1704,11 @@ mod tests {
         assert!(is_api("rpc"));
         assert!(is_api("event"));
         assert!(is_api("session"));
+        assert!(is_api("global"));
+        assert!(is_api("path"));
+        assert!(is_api("project"));
+        assert!(is_api("provider"));
+        assert!(is_api("auth"));
         assert!(is_api("rpc/some/path"));
 
         // Static paths should not be detected as API
@@ -1089,5 +1717,189 @@ mod tests {
         assert!(!is_api("assets/main.js"));
         assert!(!is_api("favicon.ico"));
         assert!(!is_api("some/other/path"));
+    }
+
+    /// Verify proxy_to_upstream upgrades HTTP/1.0 responses to HTTP/1.1.
+    ///
+    /// The opencode auth proxy (Python BaseHTTPServer) responds with HTTP/1.0.
+    /// Browsers require HTTP/1.1 for SSE (chunked transfer encoding). This test
+    /// starts a mock HTTP/1.0 server, proxies through proxy_to_upstream, and
+    /// asserts the response version is upgraded.
+    #[tokio::test]
+    async fn test_proxy_upgrades_http10_to_http11() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+
+        // Mock server: accept one connection, read the request, reply with HTTP/1.0
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.expect("read");
+            assert!(n > 0, "should receive request bytes");
+
+            let response = b"HTTP/1.0 200 OK\r\n\
+                content-type: text/event-stream\r\n\
+                cache-control: no-cache\r\n\
+                connection: keep-alive\r\n\
+                \r\n\
+                : mock-keepalive\n\n";
+            sock.write_all(response).await.expect("write");
+            drop(sock);
+        });
+
+        let request = Request::builder()
+            .uri("/global/event")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = proxy_to_upstream("127.0.0.1", port, "test-password", "global/event".into(), request)
+            .await
+            .expect("proxy_to_upstream should succeed");
+
+        assert_eq!(
+            response.version(),
+            hyper::Version::HTTP_11,
+            "proxy must upgrade HTTP/1.0 response to HTTP/1.1"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/event-stream"),
+            "Content-Type must be preserved; got: {ct}"
+        );
+    }
+
+    /// Verify proxy_to_upstream also upgrades non-SSE HTTP/1.0 responses.
+    #[tokio::test]
+    async fn test_proxy_upgrades_http10_json_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await.expect("read");
+            let body = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.0 200 OK\r\n\
+                 content-type: application/json\r\n\
+                 content-length: {}\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body
+            );
+            sock.write_all(response.as_bytes()).await.expect("write");
+            drop(sock);
+        });
+
+        let request = Request::builder()
+            .uri("/session")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = proxy_to_upstream("127.0.0.1", port, "pw", "session".into(), request)
+            .await
+            .expect("proxy should succeed");
+
+        assert_eq!(
+            response.version(),
+            hyper::Version::HTTP_11,
+            "JSON response must also be upgraded to HTTP/1.1"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("ok"),
+            "body must be forwarded"
+        );
+    }
+
+    /// Verify proxy_to_upstream preserves query string (required for /file?path=..., /find/file?path=..., etc.).
+    #[tokio::test]
+    async fn test_proxy_preserves_query_string() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<String>();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.expect("read");
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let first_line = request.lines().next().unwrap_or("").to_string();
+            let _ = tx.send(first_line);
+            let response = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+            sock.write_all(response.as_bytes()).await.expect("write");
+            drop(sock);
+        });
+
+        let request = Request::builder()
+            .uri("/file?path=src/main.rs")
+            .body(Body::empty())
+            .expect("request");
+
+        let _ = proxy_to_upstream("127.0.0.1", port, "pw", "file".into(), request)
+            .await
+            .expect("proxy should succeed");
+
+        let request_line = rx.await.expect("mock should send request line");
+        assert!(
+            request_line.contains("path="),
+            "proxy must forward query string; request line: {}",
+            request_line
+        );
+        assert!(
+            request_line.contains("src"),
+            "proxy must preserve path param value; request line: {}",
+            request_line
+        );
+    }
+
+    /// Document and assert the URL rewrite patterns used for agent UI (HTML and CSS).
+    /// If you add or change patterns, update docs/audit-agent-ui-rewriting.md and this test.
+    #[test]
+    fn test_agent_ui_rewrite_patterns() {
+        let base = "/agent/example-pod/";
+
+        // HTML patterns (index.html)
+        let html = r#"<script src="/assets/x.js"></script><link href="/assets/y.css">"#;
+        let rewritten_html = html
+            .replace(" src=\"/", &format!(" src=\"{base}"))
+            .replace(" href=\"/", &format!(" href=\"{base}"));
+        assert!(rewritten_html.contains(base), "HTML src/href must be rewritten");
+        assert!(!rewritten_html.contains("src=\"/assets/"), "HTML must not leave bare src=\"/");
+
+        // CSS patterns (fonts and assets)
+        let css = r#"url("/assets/font.woff2") url('/x.woff2') url(/unquoted.woff2) url( "/spaced.woff2")"#;
+        let rewritten_css = css
+            .replace("url(\"/", &format!("url(\"{base}"))
+            .replace("url('/", &format!("url('{base}"))
+            .replace("url( \"/", &format!("url( \"{base}"))
+            .replace("url( '/", &format!("url( '{base}"))
+            .replace("url(/", &format!("url({base}"));
+        assert!(rewritten_css.contains(base), "CSS url() must be rewritten");
+        assert!(!rewritten_css.contains("url(\"/assets/"), "CSS must not leave bare url(\"/");
     }
 }

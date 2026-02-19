@@ -4,17 +4,22 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>devaipod - Control Plane</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-primary: #1a1a2e;
-            --bg-secondary: #16213e;
-            --bg-card: #0f3460;
-            --text-primary: #e6e6e6;
-            --text-secondary: #a0a0a0;
-            --accent: #e94560;
-            --success: #4ade80;
-            --warning: #fbbf24;
-            --border: #2a2a4a;
+            --bg-primary: #131010;
+            --bg-secondary: #1c1717;
+            --bg-card: #1c1717;
+            --text-primary: #f1ecec;
+            --text-secondary: #b7b1b1;
+            --text-weak: #716c6b;
+            --accent: #89b5ff;
+            --success: #00bd00;
+            --warning: #ffdc17;
+            --error: #ef442a;
+            --border: rgba(255,255,255,0.12);
         }
         
         * {
@@ -24,7 +29,7 @@
         }
         
         body {
-            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            font-family: 'Inter', system-ui, sans-serif;
             background: var(--bg-primary);
             color: var(--text-primary);
             min-height: 100vh;
@@ -59,19 +64,19 @@
         }
         
         .status-indicator.disconnected {
-            background: var(--accent);
+            background: var(--error);
         }
         
-        .pods-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
-            gap: 1rem;
+        .pods-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
         }
         
         .pod-card {
             background: var(--bg-card);
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 6px;
             padding: 1rem;
             transition: border-color 0.2s;
         }
@@ -84,6 +89,7 @@
         
         .pod-card:focus {
             box-shadow: 0 0 0 2px var(--accent);
+            outline: none;
         }
         
         .pod-header {
@@ -107,13 +113,13 @@
         }
         
         .pod-status.running {
-            background: rgba(74, 222, 128, 0.2);
+            background: rgba(0, 189, 0, 0.2);
             color: var(--success);
         }
         
         .pod-status.stopped {
-            background: rgba(233, 69, 96, 0.2);
-            color: var(--accent);
+            background: rgba(239, 68, 42, 0.2);
+            color: var(--error);
         }
         
         .pod-meta {
@@ -132,6 +138,11 @@
         
         .pod-meta-value {
             color: var(--text-primary);
+        }
+        
+        code {
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
+            font-size: 0.9em;
         }
         
         .pod-containers {
@@ -159,7 +170,7 @@
         }
         
         .container-status.stopped {
-            background: var(--accent);
+            background: var(--error);
         }
         
         .container-name {
@@ -173,10 +184,10 @@
         }
         
         .error {
-            background: rgba(233, 69, 96, 0.2);
-            color: var(--accent);
+            background: rgba(239, 68, 42, 0.2);
+            color: var(--error);
             padding: 1rem;
-            border-radius: 8px;
+            border-radius: 6px;
             margin-bottom: 1rem;
         }
         
@@ -199,6 +210,10 @@
         
         .refresh-btn:hover {
             border-color: var(--accent);
+        }
+        .refresh-btn:focus {
+            outline: none;
+            box-shadow: 0 0 0 2px var(--accent);
         }
         
         .pod-actions {
@@ -229,6 +244,31 @@
         .open-btn:disabled {
             background: var(--text-secondary);
             cursor: not-allowed;
+        }
+        
+        .action-btn {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            padding: 0.4rem 0.75rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.8rem;
+        }
+        .action-btn:hover:not(:disabled) {
+            border-color: var(--accent);
+        }
+        .action-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .action-btn.danger {
+            border-color: var(--error);
+            color: var(--error);
+        }
+        .action-btn.danger:hover:not(:disabled) {
+            background: rgba(239, 68, 42, 0.15);
         }
         
         /* Launch form styles */
@@ -267,7 +307,7 @@
             display: none;
             background: var(--bg-card);
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 6px;
             padding: 1.25rem;
         }
         
@@ -295,7 +335,7 @@
         
         .form-input {
             width: 100%;
-            background: var(--bg-secondary);
+            background: #151313;
             border: 1px solid var(--border);
             border-radius: 4px;
             padding: 0.65rem 0.85rem;
@@ -307,6 +347,7 @@
         .form-input:focus {
             outline: none;
             border-color: var(--accent);
+            box-shadow: 0 0 0 2px var(--accent);
         }
         
         .form-input::placeholder {
@@ -363,8 +404,8 @@
         }
         
         .form-error {
-            background: rgba(233, 69, 96, 0.2);
-            color: var(--accent);
+            background: rgba(239, 68, 42, 0.2);
+            color: var(--error);
             padding: 0.75rem;
             border-radius: 4px;
             margin-top: 1rem;
@@ -436,19 +477,44 @@
             `;
         }
         
-        // API helper
+        const authHeader = { 'Authorization': `Bearer ${token}` };
+        
+        // API GET helper (on error, use server JSON body error message if present)
         async function apiCall(path) {
-            const response = await fetch(`/api${path}`, {
-                headers: {
-                    'Authorization': `Bearer ${token}`
-                }
-            });
-            
+            const response = await fetch(`/api${path}`, { headers: authHeader });
             if (!response.ok) {
-                throw new Error(`API error: ${response.status} ${response.statusText}`);
+                let msg = `${response.status} ${response.statusText}`;
+                try {
+                    const body = await response.json();
+                    if (body && typeof body.error === 'string') msg = body.error;
+                } catch (_) {}
+                throw new Error(msg);
             }
-            
             return response.json();
+        }
+        
+        // API POST (no body) - for start/stop
+        async function apiPost(path) {
+            const response = await fetch(`/api${path}`, {
+                method: 'POST',
+                headers: authHeader
+            });
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(text || `${response.status} ${response.statusText}`);
+            }
+        }
+        
+        // API DELETE - for pod remove
+        async function apiDelete(path) {
+            const response = await fetch(`/api${path}`, {
+                method: 'DELETE',
+                headers: authHeader
+            });
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(text || `${response.status} ${response.statusText}`);
+            }
         }
         
         // Format date
@@ -457,18 +523,92 @@
             return date.toLocaleString();
         }
         
-        // Open agent for a pod - opens wrapper page with iframe
+        const PODMAN_PODS = '/podman/v5.0.0/libpod/pods';
+        
+        async function podDelete(fullName, shortName) {
+            if (!confirm(`Delete workspace "${shortName}"? This cannot be undone.`)) return;
+            try {
+                await apiDelete(`${PODMAN_PODS}/${encodeURIComponent(fullName)}?force=true`);
+                await refreshPods();
+            } catch (err) {
+                alert(`Delete failed: ${err.message}`);
+            }
+        }
+        
+        // Handle pod action buttons via delegation (so Start/Stop/Delete work reliably)
+        document.getElementById('pods-container').addEventListener('click', async (e) => {
+            const btn = e.target.closest('button[data-action]');
+            if (!btn) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const action = btn.getAttribute('data-action');
+            const fullName = btn.getAttribute('data-pod-full');
+            const shortName = btn.getAttribute('data-pod-short');
+            if (action === 'open-agent' && shortName) {
+                openAgent(shortName);
+                return;
+            }
+            if (action === 'recreate' && shortName) {
+                recreatePod(shortName);
+                return;
+            }
+            if (action === 'start' && fullName) {
+                try {
+                    await apiPost(`${PODMAN_PODS}/${encodeURIComponent(fullName)}/start`);
+                    await refreshPods();
+                } catch (err) {
+                    alert(`Start failed: ${err.message}`);
+                }
+                return;
+            }
+            if (action === 'stop' && fullName) {
+                try {
+                    await apiPost(`${PODMAN_PODS}/${encodeURIComponent(fullName)}/stop`);
+                    await refreshPods();
+                } catch (err) {
+                    alert(`Stop failed: ${err.message}`);
+                }
+                return;
+            }
+            if (action === 'delete' && fullName && shortName) {
+                await podDelete(fullName, shortName);
+                return;
+            }
+        });
+        
+        // Open agent for a pod - navigate to agent view (opencode UI)
         async function openAgent(shortName) {
             try {
-                const info = await apiCall(`/devaipod/pods/${shortName}/opencode-info`);
-                if (info.url) {
-                    // Build wrapper page URL with encoded parameters
-                    const consoleUrl = window.location.href;
-                    const wrapperUrl = `/agent.html?pod=${encodeURIComponent(shortName)}&url=${encodeURIComponent(info.url)}&console=${encodeURIComponent(consoleUrl)}`;
-                    window.open(wrapperUrl, '_blank');
-                }
+                const path = `/devaipod/pods/${encodeURIComponent(shortName)}/opencode-info`;
+                await apiCall(path);
+                sessionStorage.setItem('devaipod_token', token);
+                window.location.href = `/_devaipod/agent/${encodeURIComponent(shortName)}/`;
             } catch (err) {
-                alert(`Failed to get agent URL: ${err.message}`);
+                alert(`Open Agent failed: ${err.message}`);
+            }
+        }
+        
+        // Recreate a workspace (delete and recreate with same repo)
+        async function recreatePod(shortName) {
+            if (!confirm(`Recreate workspace "${shortName}"? It will be deleted and recreated with the same repo (fixes missing port 4097, etc.).`)) return;
+            try {
+                const path = `/devaipod/pods/${encodeURIComponent(shortName)}/recreate`;
+                const response = await fetch(`/api${path}`, {
+                    method: 'POST',
+                    headers: authHeader
+                });
+                if (!response.ok) {
+                    let msg = `${response.status} ${response.statusText}`;
+                    try {
+                        const body = await response.json();
+                        if (body && typeof body.error === 'string') msg = body.error;
+                    } catch (_) {}
+                    throw new Error(msg);
+                }
+                await refreshPods();
+                alert('Workspace recreated successfully.');
+            } catch (err) {
+                alert(`Recreate failed: ${err.message}`);
             }
         }
         
@@ -499,7 +639,18 @@
             
             const shortName = pod.Name.replace('devaipod-', '');
             const isRunning = status.toLowerCase() === 'running';
-            
+            const safeFull = pod.Name.replace(/"/g, '&quot;');
+            const safeShort = shortName.replace(/"/g, '&quot;');
+            let actionsHtml;
+            if (isRunning) {
+                actionsHtml = '<button type="button" class="open-btn" data-action="open-agent" data-pod-short="' + safeShort + '">Open Agent</button>' +
+                    '<button type="button" class="action-btn" data-action="stop" data-pod-full="' + safeFull + '" title="Stop pod">Stop</button>';
+            } else {
+                actionsHtml = '<button type="button" class="action-btn" data-action="start" data-pod-full="' + safeFull + '" title="Start pod">Start</button>';
+            }
+            actionsHtml += '<button type="button" class="action-btn" data-action="recreate" data-pod-short="' + safeShort + '" title="Delete and recreate with same repo (fixes missing port 4097, etc.)">Recreate</button>';
+            actionsHtml += '<button type="button" class="action-btn danger" data-action="delete" data-pod-full="' + safeFull + '" data-pod-short="' + safeShort + '" title="Delete pod">Delete</button>';
+
             return `
                 <div class="pod-card" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
                     <div class="pod-header">
@@ -514,10 +665,7 @@
                     </div>
                     ${containers ? `<div class="pod-containers">${containers}</div>` : ''}
                     <div class="pod-actions">
-                        ${isRunning 
-                            ? `<button class="open-btn" onclick="openAgent('${shortName}')">Open Agent</button>`
-                            : `<button class="open-btn" disabled>Stopped</button>`
-                        }
+                        ${actionsHtml}
                     </div>
                 </div>
             `;
@@ -538,6 +686,13 @@
                 
                 // Filter to only devaipod pods
                 const devaipodPods = pods.filter(p => p.Name && p.Name.startsWith('devaipod-'));
+                // Sort by activity: running first, then by Created descending (newest first)
+                devaipodPods.sort((a, b) => {
+                    const aRunning = (a.Status || '').toLowerCase() === 'running' ? 1 : 0;
+                    const bRunning = (b.Status || '').toLowerCase() === 'running' ? 1 : 0;
+                    if (bRunning !== aRunning) return bRunning - aRunning;
+                    return (b.Created || '').localeCompare(a.Created || '');
+                });
                 
                 if (devaipodPods.length === 0) {
                     container.innerHTML = `
@@ -549,7 +704,7 @@
                         </div>
                     `;
                 } else {
-                    container.className = 'pods-grid';
+                    container.className = 'pods-list';
                     container.innerHTML = devaipodPods.map(renderPod).join('');
                 }
                 

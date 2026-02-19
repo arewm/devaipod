@@ -15,7 +15,7 @@ podman pull ghcr.io/cgwalters/devaipod:latest
 
 # Run as a daemon
 podman run -d --name devaipod --privileged \
-  --network host \
+  --add-host=host.containers.internal:host-gateway \
   -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
   -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
   ghcr.io/cgwalters/devaipod
@@ -35,14 +35,23 @@ podman exec devaipod devaipod list
 
 ## Requirements
 
-### Privileged Mode and Host Network
+### Privileged Mode and Host Gateway
 
 The `--privileged` flag is required for:
 1. Access to the mounted podman socket
 2. Spawning privileged workspace containers (needed for nested podman in devcontainers)
 
-The `--network host` flag is required so devaipod can access workspace container ports
-(e.g., the agent's opencode serve on localhost:4096).
+We do **not** use `--network host`. Instead, the container uses the host gateway
+(`--add-host=host.containers.internal:host-gateway`) to reach pod-published ports.
+Each pod exposes an auth proxy (with Basic Auth) on a random host port; devaipod
+connects to `host.containers.internal:&lt;port&gt;` to proxy to opencode. This keeps
+port forwarding working on macOS (where `--network host` would use the VM's network
+and break forwarding from the Mac). Override with `DEVAIPOD_HOST_GATEWAY` if needed
+(e.g. `host.docker.internal`). All pod services that are exposed use auth.
+
+A future option is a **per-pod gateway sidecar** (Rust): one small gateway container
+per pod that proxies opencode (and optionally other services) with auth, exposing
+a single port per pod. See [per-pod-gateway-sidecar.md](../todo/per-pod-gateway-sidecar.md).
 
 ### Podman Socket
 
@@ -53,6 +62,37 @@ The container needs access to the host's podman socket to spawn sibling containe
 ```
 
 On systems using podman machine (macOS, Windows), use the appropriate socket path from `podman machine inspect`.
+
+### macOS and Windows (podman machine)
+
+On macOS and Windows, podman runs containers inside a Linux VM. The **volume source for the socket must be the path inside the VM**, not the host path. The Mac path (e.g. from `podman machine inspect`) is for the Mac client; the container runs in the VM, so we mount the VM's podman socket. For a rootful machine that is `/run/podman/podman.sock` in the VM.
+
+The `just container-run` recipe does this automatically: on Linux it mounts `$XDG_RUNTIME_DIR/podman/podman.sock`; when that is unset (macOS/Windows) it uses `-v /run/podman/podman.sock:/run/podman/podman.sock` so the daemon in the VM bind-mounts its own socket into the container.
+
+To run manually on macOS:
+
+```bash
+podman run -d --name devaipod --privileged --replace \
+  --add-host=host.containers.internal:host-gateway \
+  -v /run/podman/podman.sock:/run/podman/podman.sock \
+  -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
+  ghcr.io/cgwalters/devaipod
+```
+
+(Rootless podman machine may use a different socket path in the VM; if `devaipod list` fails, check the VM's socket location.)
+
+## State Volume and Web Auth Token
+
+A **devaipod-state** volume can be used to persist the web UI auth token (and future state) across container restarts. Mount it at `/var/lib/devaipod`:
+
+```bash
+podman volume create devaipod-state   # once; just container-run does this automatically
+podman run -d --name devaipod ... \
+  -v devaipod-state:/var/lib/devaipod \
+  ...
+```
+
+Token lookup order: (1) podman secret `/run/secrets/devaipod-web-token` if provided, (2) `/var/lib/devaipod/web-token` from the state volume. If no token exists, one is generated and written to the state path when the directory is present, so the same URL works after restarts. Override the state directory with `DEVAIPOD_STATE_DIR`.
 
 ## Credentials and Secrets
 
@@ -144,6 +184,7 @@ mkdir -p ~/.ssh/config.d/devaipod
 
 # Run with the bind mount
 podman run -d --name devaipod --privileged \
+  --add-host=host.containers.internal:host-gateway \
   -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
   -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
   -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
