@@ -1406,6 +1406,18 @@ struct CreateResult {
     pod_name: String,
 }
 
+/// Normalize source string: fix common URL typos (e.g. https;// -> https://)
+/// so that git URLs are correctly dispatched to clone rather than local path.
+fn normalize_source(source: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = source.strip_prefix("https;//") {
+        std::borrow::Cow::Owned(format!("https://{rest}"))
+    } else if let Some(rest) = source.strip_prefix("http;//") {
+        std::borrow::Cow::Owned(format!("http://{rest}"))
+    } else {
+        std::borrow::Cow::Borrowed(source)
+    }
+}
+
 /// Create a workspace from a source (local path, remote URL, or PR)
 ///
 /// This is the inner "create" operation that handles all the common pod setup
@@ -1419,6 +1431,9 @@ async fn create_workspace(
     source: &str,
     opts: &CreateOptions,
 ) -> Result<CreateResult> {
+    let source = normalize_source(source);
+    let source = source.as_ref();
+
     // Dispatch based on source type
     let result = if let Some(pr_ref) = forge::parse_pr_url(source) {
         create_workspace_from_pr(config, pr_ref, opts).await?
@@ -1460,6 +1475,16 @@ async fn create_workspace_from_local(
     let project_path = match source_path {
         Some(ref p) => p,
         None => {
+            if source.contains("github.com")
+                || source.contains("gitlab.com")
+                || source.contains("http")
+            {
+                bail!(
+                    "Source looks like a git URL but was not recognized (e.g. use https:// not https;//).\n\
+                     Got: '{}'",
+                    source
+                );
+            }
             bail!("Path '{}' does not exist or is not accessible.", source);
         }
     };
@@ -3688,20 +3713,17 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
 
     tracing::info!("Pod '{}' deleted", pod_name);
 
-    // Clean up worker volumes if they exist
-    let worker_workspace_volume = format!("{}-worker-workspace", pod_name);
-    let worker_home_volume = format!("{}-worker-home", pod_name);
-
-    for volume in [&worker_workspace_volume, &worker_home_volume] {
+    // Clean up all devaipod volumes
+    for suffix in ["-workspace", "-agent-home", "-agent-workspace", "-worker-home", "-worker-workspace"] {
+        let volume = format!("{pod_name}{suffix}");
         let output = podman_command()
-            .args(["volume", "rm", "--force", "--", volume])
+            .args(["volume", "rm", "--force", "--", &volume])
             .output()
             .context("Failed to run podman volume rm")?;
 
         if output.status.success() {
             tracing::debug!("Removed volume '{}'", volume);
         } else {
-            // Volume might not exist, that's fine
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("no such volume") {
                 tracing::warn!("Failed to remove volume '{}': {}", volume, stderr.trim());

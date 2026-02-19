@@ -122,6 +122,20 @@ use crate::config::{Config, DotfilesConfig, WorkerGatorMode};
 use crate::devcontainer::DevcontainerConfig;
 use crate::podman::{ContainerConfig, PodmanService};
 
+/// Add devices from devcontainer runArgs (e.g. --device=/dev/kvm).
+/// Only adds devices that exist on the host and aren't already in the list.
+fn collect_config_devices(config: &DevcontainerConfig, devices: &mut Vec<String>) {
+    for device_spec in config.device_args() {
+        let path = device_spec.split(':').next().unwrap_or(&device_spec);
+        if !path.is_empty()
+            && Path::new(path).exists()
+            && !devices.contains(&path.to_string())
+        {
+            devices.push(path.to_string());
+        }
+    }
+}
+
 /// Port for the opencode server in the agent container (internal, no auth)
 pub const OPENCODE_PORT: u16 = 4096;
 
@@ -701,7 +715,8 @@ impl DevaipodPod {
 
             // Clone into worker workspace using --shared to share objects with task owner workspace
             if !worker_workspace_exists {
-                // Worker references the task owner's workspace (agent_workspace_volume)
+                // Worker references the task owner's workspace (agent_workspace_volume).
+                // Agent volume was mounted at /workspaces when cloned, so repo is at volume_root/project_name.
                 let project_name = workspace_folder
                     .strip_prefix("/workspaces/")
                     .unwrap_or(&workspace_folder);
@@ -1907,13 +1922,7 @@ fi
             .collect();
 
         // Add devices from runArgs (e.g., --device=/dev/kvm or --device /dev/kvm)
-        for device_spec in config.device_args() {
-            // Handle potential :options suffix (e.g., /dev/kvm:rwm)
-            let path = device_spec.split(':').next().unwrap_or(&device_spec);
-            if !path.is_empty() && !devices.contains(&path.to_string()) {
-                devices.push(path.to_string());
-            }
-        }
+        collect_config_devices(config, &mut devices);
 
         if !devices.is_empty() {
             tracing::debug!("Devices for workspace container: {:?}", devices);
@@ -2140,13 +2149,8 @@ exec sleep infinity
                     .map(|path| path.to_string())
                     .collect();
 
-                // Add devices from runArgs (e.g., --device=/dev/kvm or --device /dev/kvm)
-                for device_spec in config.device_args() {
-                    let path = device_spec.split(':').next().unwrap_or(&device_spec);
-                    if !path.is_empty() && !devices.contains(&path.to_string()) {
-                        devices.push(path.to_string());
-                    }
-                }
+                // Add devices from runArgs; only pass through if they exist on the host
+                collect_config_devices(config, &mut devices);
 
                 // Check if privileged mode is requested
                 let privileged = config.privileged || config.has_privileged_run_arg();
@@ -2476,12 +2480,7 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
                     .map(|path| path.to_string())
                     .collect();
 
-                for device_spec in config.device_args() {
-                    let path = device_spec.split(':').next().unwrap_or(&device_spec);
-                    if !path.is_empty() && !devices.contains(&path.to_string()) {
-                        devices.push(path.to_string());
-                    }
-                }
+                collect_config_devices(config, &mut devices);
 
                 let privileged = config.privileged || config.has_privileged_run_arg();
 

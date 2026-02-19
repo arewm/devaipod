@@ -31,12 +31,26 @@ const PODMAN_SOCKET: &str = "/run/podman/podman.sock";
 /// Docker socket path (fallback, often symlinked to podman)
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 
+/// Environment variable to override the podman socket path.
+/// Useful when the socket is mounted at a non-default path (e.g. macOS podman machine
+/// where the socket filename differs).
+pub const PODMAN_SOCKET_ENV: &str = "DEVAIPOD_PODMAN_SOCKET";
+
 /// Find the container socket path
 ///
 /// We expect to run inside a container with the host's podman/docker socket
 /// mounted at one of the well-known paths. Also supports running on a host
 /// system with rootless podman (XDG_RUNTIME_DIR).
 pub fn get_container_socket() -> Result<PathBuf> {
+    // Explicit override (e.g. for macOS podman machine when socket dir is mounted)
+    if let Ok(path) = std::env::var(PODMAN_SOCKET_ENV) {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            tracing::debug!("Using {} for podman connection (from {})", path.display(), PODMAN_SOCKET_ENV);
+            return Ok(path);
+        }
+    }
+
     // Prefer podman socket (container mount point)
     let podman_sock = PathBuf::from(PODMAN_SOCKET);
     if podman_sock.exists() {
@@ -114,6 +128,25 @@ pub fn is_container_mode() -> bool {
     // Check for standard container indicators
     std::path::Path::new("/.dockerenv").exists()
         || std::path::Path::new("/run/.containerenv").exists()
+}
+
+/// Host to use when connecting to pod-published ports (e.g. auth proxy).
+///
+/// When running on the host, published ports are on 127.0.0.1.
+/// When running inside the devaipod container (without --network host), we use the
+/// host gateway so we can reach ports published on the host. This allows the container
+/// to work on macOS where --network host breaks port forwarding.
+///
+/// Override with DEVAIPOD_HOST_GATEWAY (e.g. host.containers.internal or host.docker.internal).
+pub fn host_for_pod_services() -> String {
+    if let Ok(host) = std::env::var("DEVAIPOD_HOST_GATEWAY") {
+        return host;
+    }
+    if is_container_mode() {
+        "host.containers.internal".to_string()
+    } else {
+        "127.0.0.1".to_string()
+    }
 }
 
 impl PodmanService {
