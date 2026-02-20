@@ -797,12 +797,15 @@ fn agent_iframe_wrapper(name: &str) -> String {
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 html,body{{height:100%;overflow:hidden;background:#1c1717}}
-#dbar{{height:36px;display:flex;align-items:center;padding:0 12px;
-  background:#1c1717;border-bottom:1px solid rgba(255,255,255,0.08)}}
-#dbar a{{color:#b7b1b1;text-decoration:none;font-size:13px;
-  font-family:Inter,system-ui,sans-serif;opacity:0.7;transition:opacity 0.2s}}
-#dbar a:hover{{opacity:1;color:#f1ecec}}
-iframe{{width:100%;height:calc(100% - 36px);border:none}}
+#dbar{{height:44px;display:flex;align-items:center;padding:0 12px;
+  background:#1c1717;border-bottom:1px solid rgba(255,255,255,0.12)}}
+#dbar a{{color:#e8e2e2;text-decoration:none;font-size:14px;font-weight:500;
+  font-family:Inter,system-ui,sans-serif;
+  padding:6px 14px;border-radius:6px;
+  background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);
+  transition:background 0.15s,border-color 0.15s}}
+#dbar a:hover{{background:rgba(255,255,255,0.14);border-color:rgba(255,255,255,0.25)}}
+iframe{{width:100%;height:calc(100% - 44px);border:none}}
 </style></head><body>
 <div id="dbar"><a id="db" href="/">&#8592; Pods</a></div>
 <iframe src="/_devaipod/opencode-ui" allow="clipboard-read; clipboard-write"></iframe>
@@ -1059,16 +1062,19 @@ async fn serve_opencode_static(_name: &str, path: &str) -> Result<Response, Stat
 /// Request body for run endpoint
 #[derive(Debug, Deserialize)]
 struct RunRequest {
-    /// Source: git URL, local path, or issue/PR URL (optional, defaults to dotfiles)
     source: Option<String>,
-    /// Task description for the AI agent
     task: Option<String>,
-    /// Explicit pod name (optional, auto-generated if not provided)
     name: Option<String>,
-    /// Attach to agent after starting (ignored for web API, included for parity)
+    /// Override the container image (skip devcontainer.json build)
+    image: Option<String>,
+    /// Service-gator scopes (e.g. "github:org/repo", "github:org/*:write")
     #[serde(default)]
-    #[allow(dead_code)]
-    attach: bool,
+    service_gator_scopes: Vec<String>,
+    /// Custom service-gator container image
+    service_gator_image: Option<String>,
+    /// Suppress default write service-gator scopes
+    #[serde(default)]
+    service_gator_ro: bool,
 }
 
 /// Response for run endpoint
@@ -1100,9 +1106,24 @@ async fn run_workspace(Json(req): Json<RunRequest>) -> Result<Json<RunResponse>,
         cmd.arg(task);
     }
 
-    // Add explicit name if provided
     if let Some(ref name) = req.name {
         cmd.args(["--name", name]);
+    }
+
+    if let Some(ref image) = req.image {
+        cmd.args(["--image", image]);
+    }
+
+    for scope in &req.service_gator_scopes {
+        cmd.args(["--service-gator", scope]);
+    }
+
+    if let Some(ref gator_image) = req.service_gator_image {
+        cmd.args(["--service-gator-image", gator_image]);
+    }
+
+    if req.service_gator_ro {
+        cmd.arg("--service-gator-ro");
     }
 
     tracing::info!("Running devaipod: {:?}", cmd);
