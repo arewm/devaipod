@@ -137,7 +137,7 @@ struct AppState {
     token: String,
     /// Path to the podman/docker socket (None if not available at startup)
     socket_path: Option<PathBuf>,
-    /// Path to control-plane static files (fallback when /assets requested without agent cookie)
+    /// Path to control-plane static files (e.g. dist/index.html)
     static_dir: String,
 }
 
@@ -697,8 +697,9 @@ async fn opencode_root_proxy(request: Request) -> Result<Response, StatusCode> {
 }
 
 /// Fallback handler: if the DEVAIPOD_AGENT_POD cookie is set, proxy the request to the
-/// opencode backend for that pod. Otherwise, serve from the control-plane static directory.
-/// This replaces a hardcoded list of opencode API routes with a cookie-based approach.
+/// opencode backend for that pod. Otherwise, serve from the control-plane static directory
+/// or the vendored opencode UI directory (for root-level files like oc-theme-preload.js,
+/// favicons, etc. that the opencode index.html references with absolute paths).
 ///
 /// SSE event-stream paths (e.g. /event, /global/event) without a cookie get an SSE
 /// keepalive response instead of 404, so the opencode global-sdk doesn't error loop.
@@ -727,6 +728,29 @@ async fn opencode_or_static_fallback(
     // API never uses "/" — its endpoints are /session, /rpc, /global, etc.
     let is_root = trimmed_path.is_empty();
 
+    // If the path looks like a static file (has a file extension), check the vendored
+    // opencode UI directory first. The opencode index.html references root-level files
+    // like /oc-theme-preload.js and /favicon-v3.svg with absolute paths.
+    if !is_root && has_file_extension(trimmed_path) {
+        let opencode_file = std::path::Path::new(OPENCODE_UI_PATH).join(trimmed_path);
+        // Canonicalize first to verify the path is within bounds before reading
+        if let (Ok(resolved), Ok(base)) = (opencode_file.canonicalize(), std::path::Path::new(OPENCODE_UI_PATH).canonicalize()) {
+            if resolved.starts_with(&base) {
+                if let Ok(content) = tokio::fs::read(&resolved).await {
+                    let content_type = content_type_for_extension(
+                        resolved.extension().and_then(|e| e.to_str())
+                    );
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, content_type)
+                        .header(header::CACHE_CONTROL, "public, max-age=3600")
+                        .body(Body::from(content))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
     if has_cookie && !is_root {
         match opencode_root_proxy(request).await {
             Ok(resp) => resp,
@@ -745,6 +769,30 @@ async fn opencode_or_static_fallback(
                 .body(Body::empty())
                 .unwrap(),
         }
+    }
+}
+
+/// Check if a path has a file extension (e.g. "foo.js", "bar.css").
+fn has_file_extension(path: &str) -> bool {
+    path.rsplit_once('/').map_or(path, |(_dir, file)| file).contains('.')
+}
+
+/// Map file extension to content type.
+fn content_type_for_extension(ext: Option<&str>) -> &'static str {
+    match ext {
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ttf") => "font/ttf",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("json") => "application/json",
+        Some("webmanifest") => "application/manifest+json",
+        Some("html") => "text/html; charset=utf-8",
+        Some("aac") => "audio/aac",
+        _ => "application/octet-stream",
     }
 }
 
@@ -835,12 +883,19 @@ async fn agent_wrapper(
 
 /// Serve the iframe wrapper page for a specific agent.
 /// The opencode SPA runs unmodified inside the iframe; the wrapper provides
-/// the "back to pods" navigation bar.
+/// the "back to pods" navigation bar. Also sets the agent cookie so that
+/// subsequent requests from the iframe (API calls, assets) are routed correctly.
 async fn agent_ui_root(Path(name): Path<String>) -> Response {
+    let cookie_value = format!(
+        "{}={}; Path=/; SameSite=Lax; Max-Age=86400",
+        DEVAIPOD_AGENT_POD_COOKIE,
+        urlencoding::encode(&name)
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::SET_COOKIE, cookie_value)
         .body(Body::from(agent_iframe_wrapper(&name)))
         .unwrap()
 }
@@ -873,58 +928,22 @@ async fn serve_opencode_raw_ui() -> Result<Response, StatusCode> {
         .unwrap())
 }
 
-/// Serve /assets/* from opencode when DEVAIPOD_AGENT_POD cookie is set (agent UI context);
-/// otherwise serve from control-plane static dir so the main UI's assets still work.
+/// Serve /assets/* from the vendored opencode UI directory.
+///
+/// The control-plane UI (`dist/index.html`) uses inline styles and has no `/assets/`
+/// subdirectory. All `/assets/*` requests come from the opencode SPA, so we always
+/// serve from `OPENCODE_UI_PATH`. The cookie is only needed to distinguish which
+/// pod's opencode *backend* to proxy API calls to (handled by the fallback handler),
+/// not for static asset serving.
 async fn serve_root_assets(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Result<Response, StatusCode> {
-    if let Some(pod_name) = pod_name_from_cookie(&headers) {
-        let opencode_path = if path.is_empty() {
-            "assets".to_string()
-        } else {
-            format!("assets/{}", path)
-        };
-        return serve_opencode_static(&pod_name, &opencode_path).await;
-    }
-    // No cookie: serve from control-plane static dir (e.g. dist/assets/...)
-    let rel_path = if path.is_empty() {
+    let opencode_path = if path.is_empty() {
         "assets".to_string()
     } else {
         format!("assets/{}", path)
     };
-    let file_path = std::path::Path::new(&state.static_dir).join(&rel_path);
-    let clean_path = file_path
-        .canonicalize()
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-    let static_base = std::path::Path::new(&state.static_dir)
-        .canonicalize()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if !clean_path.starts_with(&static_base) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let content = tokio::fs::read(&clean_path)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-    let content_type = match clean_path.extension().and_then(|e| e.to_str()) {
-        Some("js") => "application/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("woff2") => "font/woff2",
-        Some("woff") => "font/woff",
-        Some("ttf") => "font/ttf",
-        Some("png") => "image/png",
-        Some("svg") => "image/svg+xml",
-        Some("ico") => "image/x-icon",
-        Some("json") => "application/json",
-        _ => "application/octet-stream",
-    };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "public, max-age=3600")
-        .body(Body::from(content))
-        .unwrap())
+    serve_opencode_static("_root", &opencode_path).await
 }
 
 /// Serve a static file from the vendored opencode UI directory
@@ -1006,12 +1025,7 @@ async fn serve_opencode_static(_name: &str, path: &str) -> Result<Response, Stat
                             if let Ok(resolved) = fallback.canonicalize() {
                                 if resolved.starts_with(&ui_canonical) {
                                     if let Ok(content) = fs::read(fallback).await {
-                                        let content_type = match fallback.extension().and_then(|e| e.to_str()) {
-                                            Some("woff2") => "font/woff2",
-                                            Some("woff") => "font/woff",
-                                            Some("ttf") => "font/ttf",
-                                            _ => "application/octet-stream",
-                                        };
+                                        let content_type = content_type_for_extension(fallback.extension().and_then(|e| e.to_str()));
                                         return Ok(Response::builder()
                                             .status(StatusCode::OK)
                                             .header(header::CONTENT_TYPE, content_type)
@@ -1034,19 +1048,7 @@ async fn serve_opencode_static(_name: &str, path: &str) -> Result<Response, Stat
     };
 
     // Determine content type from file extension
-    let content_type = match file_path.extension().and_then(|e| e.to_str()) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") => "application/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("json") => "application/json; charset=utf-8",
-        Some("png") => "image/png",
-        Some("svg") => "image/svg+xml",
-        Some("ico") => "image/x-icon",
-        Some("woff") => "font/woff",
-        Some("woff2") => "font/woff2",
-        Some("ttf") => "font/ttf",
-        _ => "application/octet-stream",
-    };
+    let content_type = content_type_for_extension(file_path.extension().and_then(|e| e.to_str()));
 
     // With the iframe approach, static files are served unmodified.
     // Content-hashed filenames (JS/CSS/fonts) can be cached aggressively.
@@ -1530,7 +1532,7 @@ pub(crate) fn build_app(
                 .delete(agent_ui_handler)
                 .patch(agent_ui_handler),
         )
-        // /assets/*: with agent cookie serve opencode assets; else control-plane static dir
+        // /assets/*: always serve from vendored opencode UI (control-plane UI uses inline styles)
         .route("/assets", get(serve_root_assets))
         .route("/assets/{*path}", get(serve_root_assets))
         // Catch-all fallback: if the agent cookie is set, proxy to the opencode backend;
