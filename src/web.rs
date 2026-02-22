@@ -362,6 +362,17 @@ struct OpencodeInfoResponse {
     port: u16,
     /// Whether the pod is accessible
     accessible: bool,
+    /// Most recent session info (if any sessions exist)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_session: Option<LatestSessionInfo>,
+}
+
+/// Info about the most recent session, used by the control plane to navigate
+/// directly to it (avoiding the empty new-session view).
+#[derive(Debug, Serialize)]
+struct LatestSessionInfo {
+    id: String,
+    directory: String,
 }
 
 /// JSON body for API errors (e.g. 404) so the frontend can show a clear message
@@ -405,11 +416,62 @@ async fn opencode_info(
     // This allows browsers to load dynamic ES modules (which can't use Basic Auth)
     let url = format!("http://127.0.0.1:{}/?token={}", port, password);
 
+    // Fetch the most recent session so the control plane can navigate directly to it
+    let latest_session = fetch_latest_session(port, &password).await;
+
     Ok(Json(OpencodeInfoResponse {
         url,
         port,
         accessible: true,
+        latest_session,
     }))
+}
+
+/// Fetch the most recent session from a pod's opencode backend.
+///
+/// Calls GET /session on the pod's auth proxy and returns the session with
+/// the most recent `time.updated` timestamp.  Returns None on any error
+/// (non-fatal: the control plane just won't deep-link into a session).
+async fn fetch_latest_session(port: u16, password: &str) -> Option<LatestSessionInfo> {
+    use base64::Engine;
+
+    let host = host_for_pod_services();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let auth = base64::engine::general_purpose::STANDARD
+        .encode(format!("opencode:{}", password));
+
+    let resp = client
+        .get(format!("http://{}:{}/session", host, port))
+        .header("Authorization", format!("Basic {}", auth))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let sessions: Vec<serde_json::Value> = resp.json().await.ok()?;
+
+    // Find the session with the most recent updated time
+    sessions
+        .iter()
+        .filter_map(|s| {
+            let id = s.get("id")?.as_str()?;
+            let dir = s.get("directory")?.as_str()?;
+            let updated = s.get("time")?.get("updated")?.as_u64()?;
+            Some((id, dir, updated))
+        })
+        .max_by_key(|&(_, _, updated)| updated)
+        .map(|(id, dir, _)| LatestSessionInfo {
+            id: id.to_string(),
+            directory: dir.to_string(),
+        })
 }
 
 /// Proxy handler for opencode server root path
@@ -771,14 +833,14 @@ fn has_file_extension(path: &str) -> bool {
 }
 
 
-/// HTML snippet injected before </body> in the vendored opencode index.html.
-/// Provides a floating "back to pods" button so the user can return to the control plane.
-/// The script reads the auth token from sessionStorage (set by the control plane before navigating).
 /// Script injected right after <head> in the opencode index.html.
-/// Intercepts console.error/warn and forwards them to the server for correlation with
-/// request traces. Also suppresses the harmless "[global-sdk] event stream error" that
-/// the opencode SDK emits when an SSE fetch() is aborted during page navigation (the
-/// SDK uses AbortController cleanup in SolidJS; the next page load reconnects fine).
+///
+/// Intercepts console.error/warn and POSTs them to the server for correlation
+/// with request traces.  Suppresses the harmless "[global-sdk] event stream
+/// error" emitted when an SSE fetch() is aborted during page navigation.
+///
+/// Note: localStorage scoping per pod is handled at build time by patching
+/// the opencode SPA's persist system (see `patches/opencode-scope-localstorage.patch`).
 const DEVAIPOD_HEAD_SCRIPT: &str = r#"<script>(function(){
 var _err=console.error;var _warn=console.warn;
 function report(level,args){
@@ -831,9 +893,21 @@ html,body{{height:100%;overflow:hidden;background:#1c1717}}
 iframe{{width:100%;height:calc(100% - 44px);border:none}}
 </style></head><body>
 <div id="dbar"><a id="db" href="/">&#8592; Pods</a></div>
-<iframe src="/_devaipod/opencode-ui" allow="clipboard-read; clipboard-write"></iframe>
-<script>(function(){{var t=sessionStorage.getItem('devaipod_token');
-if(t)document.getElementById('db').href='/?token='+encodeURIComponent(t)}})()
+<iframe id="oc" src="/_devaipod/opencode-ui" allow="clipboard-read; clipboard-write"></iframe>
+<script>(function(){{
+var t=sessionStorage.getItem('devaipod_token');
+if(t)document.getElementById('db').href='/?token='+encodeURIComponent(t);
+// Deep-link the iframe to the most recent session.
+// The control plane passes session route as a hash: #/<base64dir>/session/<id>.
+// After the SPA loads, we navigate it by dispatching the opencode deep-link
+// custom event with a direct URL.  Same-origin iframe access.
+var route=window.location.hash.slice(1);
+if(route){{var f=document.getElementById('oc');
+f.addEventListener('load',function(){{try{{
+f.contentWindow.history.pushState(null,'',route);
+f.contentWindow.dispatchEvent(new PopStateEvent('popstate'));
+}}catch(e){{}}}},{{once:true}})}}
+}})()
 </script></body></html>"#
     )
 }

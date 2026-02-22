@@ -675,9 +675,16 @@
         async function openAgent(shortName) {
             try {
                 const path = `/devaipod/pods/${encodeURIComponent(shortName)}/opencode-info`;
-                await apiCall(path);
+                const info = await apiCall(path);
                 sessionStorage.setItem('devaipod_token', token);
-                window.location.href = `/_devaipod/agent/${encodeURIComponent(shortName)}/`;
+                // If we have a latest session, deep-link directly to it via hash
+                // so the wrapper can navigate the iframe to the right SPA route.
+                let hash = '';
+                if (info.latest_session) {
+                    const dir = btoa(info.latest_session.directory);
+                    hash = `#/${dir}/session/${info.latest_session.id}`;
+                }
+                window.location.href = `/_devaipod/agent/${encodeURIComponent(shortName)}/${hash}`;
             } catch (err) {
                 alert(`Open Agent failed: ${err.message}`);
             }
