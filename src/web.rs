@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::pod::OPENCODE_AUTH_PROXY_PORT;
 use crate::podman::{get_container_socket, host_for_pod_services};
@@ -731,23 +731,16 @@ async fn opencode_or_static_fallback(
     // If the path looks like a static file (has a file extension), check the vendored
     // opencode UI directory first. The opencode index.html references root-level files
     // like /oc-theme-preload.js and /favicon-v3.svg with absolute paths.
+    // We use a separate ServeDir request so the original request is preserved for the
+    // proxy/static fallback below if the opencode dir doesn't have this file.
     if !is_root && has_file_extension(trimmed_path) {
-        let opencode_file = std::path::Path::new(OPENCODE_UI_PATH).join(trimmed_path);
-        // Canonicalize first to verify the path is within bounds before reading
-        if let (Ok(resolved), Ok(base)) = (opencode_file.canonicalize(), std::path::Path::new(OPENCODE_UI_PATH).canonicalize()) {
-            if resolved.starts_with(&base) {
-                if let Ok(content) = tokio::fs::read(&resolved).await {
-                    let content_type = content_type_for_extension(
-                        resolved.extension().and_then(|e| e.to_str())
-                    );
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, content_type)
-                        .header(header::CACHE_CONTROL, "public, max-age=3600")
-                        .body(Body::from(content))
-                        .unwrap();
-                }
-            }
+        let opencode_req = Request::builder()
+            .uri(request.uri().clone())
+            .body(Body::empty())
+            .unwrap();
+        let resp = ServeDir::new(OPENCODE_UI_PATH).oneshot(opencode_req).await.unwrap().into_response();
+        if resp.status() != StatusCode::NOT_FOUND {
+            return resp;
         }
     }
 
@@ -777,24 +770,6 @@ fn has_file_extension(path: &str) -> bool {
     path.rsplit_once('/').map_or(path, |(_dir, file)| file).contains('.')
 }
 
-/// Map file extension to content type.
-fn content_type_for_extension(ext: Option<&str>) -> &'static str {
-    match ext {
-        Some("js") => "application/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("woff2") => "font/woff2",
-        Some("woff") => "font/woff",
-        Some("ttf") => "font/ttf",
-        Some("png") => "image/png",
-        Some("svg") => "image/svg+xml",
-        Some("ico") => "image/x-icon",
-        Some("json") => "application/json",
-        Some("webmanifest") => "application/manifest+json",
-        Some("html") => "text/html; charset=utf-8",
-        Some("aac") => "audio/aac",
-        _ => "application/octet-stream",
-    }
-}
 
 /// HTML snippet injected before </body> in the vendored opencode index.html.
 /// Provides a floating "back to pods" button so the user can return to the control plane.
@@ -904,10 +879,10 @@ async fn agent_ui_root(Path(name): Path<String>) -> Response {
 /// With the iframe approach, the opencode SPA's API calls go to the root origin
 /// (handled by the cookie-based fallback proxy), so this only serves static files.
 async fn agent_ui_handler(
-    Path((name, path)): Path<(String, String)>,
+    Path((_name, path)): Path<(String, String)>,
     _request: Request,
 ) -> Result<Response, StatusCode> {
-    serve_opencode_static(&name, &path).await
+    serve_opencode_static(&path).await
 }
 
 /// Serve the raw opencode UI (index.html) for loading inside the agent iframe.
@@ -943,122 +918,31 @@ async fn serve_root_assets(
     } else {
         format!("assets/{}", path)
     };
-    serve_opencode_static("_root", &opencode_path).await
+    serve_opencode_static(&opencode_path).await
 }
 
-/// Serve a static file from the vendored opencode UI directory
-async fn serve_opencode_static(_name: &str, path: &str) -> Result<Response, StatusCode> {
-    use tokio::fs;
+/// Serve a static file from the vendored opencode UI directory.
+///
+/// Uses `tower_http::services::ServeDir` for mime type detection, path traversal
+/// protection, and SPA fallback (index.html for paths without file extensions).
+async fn serve_opencode_static(path: &str) -> Result<Response, StatusCode> {
+    let index_html = format!("{}/index.html", OPENCODE_UI_PATH);
+    let serve_dir = ServeDir::new(OPENCODE_UI_PATH)
+        .fallback(ServeFile::new(&index_html));
 
-    let ui_path = std::path::Path::new(OPENCODE_UI_PATH);
+    // Build a GET request for the path
+    let uri = format!("/{}", path.trim_start_matches('/'));
+    let request = Request::builder()
+        .uri(&uri)
+        .body(Body::empty())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Check if the UI directory exists
-    if !ui_path.exists() {
-        tracing::error!(
-            "Opencode UI not found at {}. Install the devaipod-opencode package.",
-            OPENCODE_UI_PATH
-        );
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    // Determine the file to serve
-    // Empty path or paths without extension -> index.html
-    // Otherwise, serve the requested file
-    let file_path = if path.is_empty() || path == "/" {
-        ui_path.join("index.html")
-    } else {
-        // Clean the path to prevent directory traversal
-        let clean_path = path.trim_start_matches('/');
-        ui_path.join(clean_path)
-    };
-
-    // Verify the resolved path is within the UI directory
-    let ui_canonical = ui_path
-        .canonicalize()
-        .unwrap_or_else(|_| ui_path.to_path_buf());
-    // For files that exist, verify they're within bounds
-    if file_path.exists() {
-        if let Ok(resolved) = file_path.canonicalize() {
-            if !resolved.starts_with(&ui_canonical) {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-    }
-
-    // Try to read the file
-    let content = match fs::read(&file_path).await {
-        Ok(content) => content,
-        Err(e) => {
-            // For SPA routing: if file not found and doesn't look like a static asset,
-            // serve index.html so client-side routing can handle it
-            if e.kind() == std::io::ErrorKind::NotFound {
-                let path_str = path.trim_start_matches('/');
-                let has_extension = path_str.contains('.') && !path_str.ends_with('/');
-
-                if !has_extension {
-                    // Try serving index.html for SPA routes
-                    match fs::read(ui_path.join("index.html")).await {
-                        Ok(content) => content,
-                        Err(_) => {
-                            tracing::error!(
-                                "index.html not found at {:?}",
-                                ui_path.join("index.html")
-                            );
-                            return Err(StatusCode::NOT_FOUND);
-                        }
-                    }
-                } else {
-                    // Fallback: bare filenames (e.g. fonts) may be requested when CSS uses
-                    // url(font.woff2) and the document base is /agent/name/; opencode dist
-                    // typically puts assets under assets/ or assets/fonts/. Try both.
-                    let is_bare_filename = !path_str.contains('/');
-                    let fallbacks: [std::path::PathBuf; 2] = if is_bare_filename {
-                        [
-                            ui_path.join("assets").join(path_str),
-                            ui_path.join("assets").join("fonts").join(path_str),
-                        ]
-                    } else {
-                        [std::path::PathBuf::new(), std::path::PathBuf::new()]
-                    };
-                    for fallback in fallbacks.iter().filter(|p| !p.as_os_str().is_empty()) {
-                        if fallback.exists() {
-                            if let Ok(resolved) = fallback.canonicalize() {
-                                if resolved.starts_with(&ui_canonical) {
-                                    if let Ok(content) = fs::read(fallback).await {
-                                        let content_type = content_type_for_extension(fallback.extension().and_then(|e| e.to_str()));
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::OK)
-                                            .header(header::CONTENT_TYPE, content_type)
-                                            .header(header::CACHE_CONTROL, "public, max-age=3600")
-                                            .body(Body::from(content))
-                                            .unwrap());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    tracing::debug!("Static file not found: {:?}", file_path);
-                    return Err(StatusCode::NOT_FOUND);
-                }
-            } else {
-                tracing::error!("Failed to read file {:?}: {}", file_path, e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        }
-    };
-
-    // Determine content type from file extension
-    let content_type = content_type_for_extension(file_path.extension().and_then(|e| e.to_str()));
-
-    // With the iframe approach, static files are served unmodified.
-    // Content-hashed filenames (JS/CSS/fonts) can be cached aggressively.
-    let cache_control = "public, max-age=3600";
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, cache_control)
-        .body(Body::from(content))
-        .unwrap())
+    // ServeDir with a fallback has error type Infallible, so unwrap is safe.
+    Ok(serve_dir
+        .oneshot(request)
+        .await
+        .unwrap()
+        .into_response())
 }
 
 /// Request body for run endpoint
