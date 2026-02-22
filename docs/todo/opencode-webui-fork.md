@@ -1,223 +1,164 @@
-# Agent UI: fork vs improved iframe
+# Agent UI: native integration vs iframe
 
-Two approaches for a better agent UI experience: (A) fork the opencode web UI and
-embed devaipod controls directly, or (B) clean up the current iframe approach to feel
-more like a single app.
+## Current state (Feb 2026)
 
-The desired UX is a "browser new-tab page" feel: a clean pod list (like
-bookmarks/recent pages), where clicking a pod goes fullscreen into that agent's view,
-with an easy way to get back.
+The vendored opencode web UI (pinned at v1.1.65, built from source in the
+Containerfile) runs inside an iframe at `/_devaipod/opencode-ui`. The control
+plane is a separate vanilla HTML/JS page (`dist/index.html`). Cookie-based
+routing (`DEVAIPOD_AGENT_POD`) directs root-level opencode API calls to the
+correct pod's backend.
 
-## Current architecture
+This works but requires ~450 lines of workaround code in `web.rs`:
 
-Today devaipod has three separate UI layers:
+- Cookie parsing and setting across two handlers
+- SSE keepalive streams to prevent the opencode SDK from error-looping
+  when there's no pod context
+- Console error interception injected into the vendored index.html
+- A complex fallback router that discriminates static files from API calls
+  from SSE streams, all arriving at the same root origin
+- Manual `/assets/*` routing since the opencode SPA uses absolute paths
 
-1. **Control plane** (`dist/index.html`): ~800 lines of hand-written HTML/CSS/JS
-   for listing pods, launching workspaces, start/stop/delete actions.
-2. **Leptos frontend** (`crates/devaipod-web/`): A Rust/WASM rewrite of (1), not yet
-   wired as default.
-3. **Vendored opencode** (`/usr/share/devaipod/opencode/`): Built from source at a
-   pinned tag (currently v1.1.65), served at `/agent/{name}/` inside an iframe. API
-   calls are proxied through the devaipod server to each pod's opencode instance.
+Static file serving was recently simplified to use `tower_http::ServeDir`
+instead of hand-rolled mime detection and path traversal checks, but the
+fundamental complexity comes from running two apps at one origin.
 
-The control plane and agent UI are entirely separate applications stitched together
-with an iframe and cookie-based routing. This creates friction:
+## Why we vendor the opencode UI
 
-- Two navigation contexts (users click "Open Agent" and land in a different app)
-- Duplicate auth patterns (Bearer token for control plane, cookie for agent proxy)
-- SSE keepalive hacks needed because the opencode SDK's global-sdk assumes it's
-  talking to its own server, not a proxy that may not have a pod context
-- No way to see pod status or switch pods from within the agent view
-- The Leptos frontend is a second codebase to maintain for the same control-plane
-  features
+`opencode serve` does not serve its own web UI. Non-API requests are proxied
+to `https://app.opencode.ai`. This is unsuitable for devaipod because:
 
-## API version coupling (key finding)
+1. Cross-origin iframes are blocked by `X-Frame-Options`/CSP headers
+2. The hosted UI would make API calls back to `app.opencode.ai`, not the
+   local opencode backend
+3. Air-gapped and sandboxed environments can't reach external services
 
-A fork means the web UI version could drift from the opencode backend running in each
-pod. Investigation of the opencode API shows this is **manageable but not zero-risk**:
+Vendoring the built SPA eliminates all three problems. The opencode SPA
+detects it's not on `opencode.ai` and uses `window.location.origin` for
+API calls.
 
-- **No explicit API versioning** — routes are bare (`/session`, `/rpc`, `/global/event`)
-  with no `/v1/` prefix.
-- **SDK v1/v2 are codegen variants, not API versions** — both target the same endpoints
-  from the same OpenAPI spec.
-- **No version negotiation** — the health endpoint returns a `version` field but the
-  SDK only uses it for display; there's no `minVersion` check or feature-flag handshake.
-- **Changes are mostly additive** — between v1.1.65 and v1.2.0 only schema additions
-  occurred (new `Event.message.part.delta` event, `Todo.id` made optional). No
-  endpoints were added or removed.
-- **Unknown events are ignored** — the SDK's event-reducer drops unrecognized types,
-  so a newer backend sending new events to an older UI is safe.
-- **Release cadence is fast** — several releases per week (v1.1.60 to v1.2.6 in ~5
-  days), so drift accumulates quickly if not tracked.
+## Recommended path: extend the vendored UI natively
 
-**Practical risk**: Low for minor version skew (a few weeks). Medium if the fork falls
-behind by many releases. The main danger is schema tightening (required fields added)
-or endpoint removal, neither of which was observed in recent history.
+Since we already build the opencode UI from source at a pinned tag, we can
+add devaipod-specific pages and components directly — no iframe needed. The
+opencode web app is SolidJS + TypeScript + Vite + Tailwind, and its layout
+already provides sidebar, routing, and theming infrastructure we can reuse.
 
-**Mitigation**: Pin the opencode version in pods to match the UI build tag, or add a
-version-mismatch warning using the health endpoint.
+### What this eliminates
 
-## Option A: Fork the opencode web UI
+The entire iframe/cookie/proxy workaround layer (~450 lines, ~25% of web.rs):
 
-### What opencode's web UI is built with
+- `DEVAIPOD_AGENT_POD` cookie infrastructure
+- `agent_iframe_wrapper()` and related HTML generation
+- `serve_opencode_raw_ui()` with injected JavaScript
+- SSE keepalive hack (`sse_keepalive_stream`, `is_event_stream_path`)
+- Console error interception (`DEVAIPOD_HEAD_SCRIPT`)
+- Frontend error report endpoint
+- Cookie-aware fallback router (`opencode_or_static_fallback` complexity)
+- Root-level opencode proxy (`opencode_root_proxy`)
+- `/assets/*` route hijacking
+- ~130 lines of related tests
 
-- **SolidJS** + TypeScript (fine-grained reactivity, same model as Leptos)
-- **Vite 7** build, **bun** package manager
-- **Tailwind CSS v4** for styling
-- **Kobalte** (`@kobalte/core`) for accessible headless UI primitives
-- **`@solidjs/router`** for client-side routing
-- **`@opencode-ai/sdk`** (workspace package) for typed API calls, OpenAPI-generated
-- **`@opencode-ai/ui`** (workspace package) for shared components (Button, Dialog, etc.)
+### Architecture
 
-Routes: `/` (home/server picker), `/:dir` (directory layout), `/:dir/session/:id?`
-(chat session). State management via SolidJS context providers and stores.
+The opencode SPA connects to its server via `window.location.origin`. For
+multi-pod support, the devaipod server would proxy pod-specific API paths:
 
-### What a fork would add
-
-Fork `anomalyco/opencode`, work in `packages/app/`. Add devaipod-specific pages and
-components using the same stack.
-
-New routes:
-- `/pods` — pod list (the "new tab page")
-- `/pods/new` — launch workspace form
-- `/pods/:name` — pod detail / agent view (replaces iframe wrapper)
-
-New context (`DevaipodProvider`): fetches pod list, tracks active pod, passes the
-pod's proxied opencode URL to the existing `ServerProvider`. Extend the sidebar to
-show pods with status indicators and actions.
-
-### Trade-offs
-
-Advantages:
-- Single unified UI, no iframe, one navigation flow
-- Eliminates the proxy workarounds (SSE keepalive, cookie routing, CORS)
-- Reuses opencode's polished components (terminal, markdown, command palette)
-- Faster UI iteration (TS/SolidJS devtools, hot-reload, larger ecosystem)
-- Can drop `dist/index.html` and `crates/devaipod-web/`
-
-Costs:
-- Upstream merge burden (opencode is actively developed, releases frequently)
-- TypeScript in a Rust project (though we already have inline JS)
-- Risk of upstream architecture changes spiking merge cost
-- Merge conflicts likely in `app.tsx`, `layout.tsx`, build config
-
-### Minimizing fork drift
-
-- Keep devaipod code in isolated files (`src/devaipod/`, new routes, new providers)
-- Use opencode's extension points (router, provider tree, sidebar) rather than
-  modifying existing components
-- Pin to release tags and merge forward periodically
-- Consider contributing multi-pod support upstream to reduce fork surface
-
-## Option B: Clean up the iframe approach
-
-The current iframe wrapper (`agent_wrapper` in `web.rs`) renders a 40px header with
-a "Back to control plane" link plus a fullscreen iframe. This can be improved
-significantly without forking opencode.
-
-### B1: Full-page navigation with injected back button (recommended)
-
-Instead of wrapping opencode in an iframe, navigate directly to `/agent/{name}/`
-which serves the vendored opencode SPA. Inject a small floating "back to pods" button
-into the served `index.html`.
-
-How it works:
-1. Control plane stores the auth token in `sessionStorage` before navigating
-2. `window.location.href = '/agent/{name}/'` (full page navigation, no iframe)
-3. When serving opencode's `index.html`, the Rust server injects a `<div>` and
-   `<script>` before `</body>`: a floating overlay button that reads the token from
-   `sessionStorage` and links back to `/?token=...`
-4. The opencode SPA loads normally at `/agent/{name}/`, uses `window.location.origin`
-   for API calls — routing already works via the existing proxy
-
-What changes in `web.rs`:
-- `serve_opencode_static` for `index.html`: read the file, inject the overlay HTML
-  before `</body>`, return the modified content
-- `agent_wrapper` becomes a redirect to `/agent/{name}/` (or is removed entirely)
-- Cookie is still set for root-level API routing
-
-The overlay:
-```html
-<div id="devaipod-nav" style="position:fixed;top:12px;left:12px;z-index:9999;">
-  <a id="devaipod-back" style="background:#16213e;color:#e6e6e6;padding:6px 12px;
-    border-radius:6px;text-decoration:none;font-size:13px;opacity:0.7;
-    font-family:system-ui;border:1px solid #2a2a4a;"
-    onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.7'">
-    ← Pods
-  </a>
-</div>
-<script>
-  (function(){
-    var t = sessionStorage.getItem('devaipod_token');
-    var a = document.getElementById('devaipod-back');
-    a.href = t ? '/?token=' + encodeURIComponent(t) : '/';
-  })();
-</script>
+```
+/pods/{name}/api/session    → pod's opencode backend (port 4097)
+/pods/{name}/api/rpc        → pod's opencode backend
+/pods/{name}/api/global/... → pod's opencode backend
 ```
 
-Advantages:
-- No iframe (opencode runs as a real full-page app, no viewport issues)
-- Minimal server-side change (~30 lines of Rust for the injection)
-- No opencode fork needed
-- The floating button is unobtrusive and doesn't interfere with opencode's layout
-- Works with any opencode version (just injects HTML, no JS coupling)
+The SPA would be configured with a per-pod `baseUrl` through the opencode
+`ServerProvider` context instead of relying on cookie-based dispatch at root.
+This eliminates the entire cookie routing layer.
 
-Costs:
-- Still two separate apps (control plane + opencode), just smoother transitions
-- The injected button could visually conflict with opencode's own UI (mitigated by
-  positioning and z-index; could also auto-hide after a few seconds)
-- No pod switching from within the agent view (must go back to pod list first)
+### Minimal file changes
 
-### B2: SPA shell with pre-created iframes
+Files to modify in the opencode source (at build time):
 
-A lightweight SPA shell (vanilla JS) that shows the pod list as the "home" view. On
-pod click, hides the pod list and shows a fullscreen iframe (no header bar). A small
-floating nav provides pod switching without full page reloads. Pre-created iframes
-enable instant switching between pods.
+| File | Change |
+|------|--------|
+| `packages/app/src/app.tsx` | Add `/pods` route before the `/:dir` catch-all |
+| `packages/app/src/pages/layout.tsx` | Add pods icon to sidebar bottom (near settings/help) |
+| `packages/app/src/pages/layout/sidebar-shell.tsx` | Add `onOpenPods` callback |
 
-This gives the best UX of the iframe approaches but is more code to maintain and
-still has the fundamental iframe limitations (no shared navigation, cookie juggling).
+New files:
 
-## Comparison
+| File | Purpose |
+|------|---------|
+| `packages/app/src/pages/pods.tsx` | Pod list/management (replaces `dist/index.html`) |
+| `packages/app/src/context/devaipod.tsx` | Devaipod state: pod list, auth token, active pod |
 
-| Approach | UX | Maintenance | Version coupling risk | Effort |
-|----------|-----|-------------|----------------------|--------|
-| Current (40px header + iframe) | Janky | Low | None (same tag) | Done |
-| B1: Full-page nav + injected back button | Good | Low | None (same tag) | Small |
-| B2: SPA shell + fullscreen iframes | Better | Medium | None (same tag) | Medium |
-| A: Fork opencode UI | Best | Higher | Low-medium (API drift) | Large |
+### Fork branch, not patches
 
-## Recommendation
+Rather than carrying patch files in the devaipod repo, maintain a fork with
+a `devaipod` branch (initially at `github.com/cgwalters/opencode`, eventually
+`github.com/devaipod/opencode`). The branch tracks upstream releases and
+carries the devaipod-specific changes on top. The Containerfile clones from
+the fork:
 
-**Start with B1** (full-page navigation + injected back button). It's the smallest
-change that gets the biggest UX improvement: no more visible iframe wrapper, opencode
-runs as a real fullscreen app, and there's a clean way back to the pod list. It
-requires no opencode fork and no version coupling concerns.
+```dockerfile
+ARG OPENCODE_REPO=https://github.com/cgwalters/opencode
+ARG OPENCODE_REF=devaipod  # branch tracking upstream + devaipod changes
+RUN git clone --depth=1 -b $OPENCODE_REF $OPENCODE_REPO /build/opencode
+RUN cd /build/opencode/packages/app && bun install --frozen-lockfile && bun run build
+```
 
-If B1 proves insufficient (e.g., users want pod switching without leaving the agent
-view, or we want devaipod controls integrated into the opencode sidebar), then
-escalate to option A (fork). The API stability investigation shows version drift is
-manageable, so the fork isn't blocked on technical grounds — it's a question of
-whether the UX benefit justifies the ongoing maintenance.
+Keeping devaipod code in isolated files (`src/devaipod/`) and only touching
+`app.tsx` and `layout.tsx` minimally keeps rebases on upstream tags clean.
+Automation (Dependabot, Renovate, or a simple CI job) can open PRs when
+upstream cuts a new release, rebasing the `devaipod` branch forward.
+
+### Reusable opencode components
+
+The opencode UI library (`@opencode-ai/ui`) provides Button, Dialog,
+DropdownMenu, Tooltip, Icon, and other accessible primitives. The pods page
+would use these directly, getting theme consistency for free.
+
+### Server-side changes
+
+The Rust web server simplifies significantly:
+
+- The fallback handler becomes a plain `ServeDir` for the opencode SPA
+- Pod-prefixed API proxy replaces the cookie-based root proxy
+- No SSE keepalive needed (the SPA only connects to a pod when one is active)
+- No HTML injection needed (devaipod controls are native SPA components)
+- Auth can use a single mechanism (bearer token in header or query param)
+
+### Key considerations
+
+**Pod switching**: The opencode `ServerProvider` holds the API base URL. When
+switching pods, the devaipod context would update the base URL and the
+`GlobalSDKProvider`/`GlobalSyncProvider` need to remount (reconnect SSE, reload
+session state). This can be done by keying the providers on the active pod name.
+
+**API version coupling**: The opencode API has no versioning (`/session`,
+`/rpc`, not `/v1/session`). Between v1.1.65 and v1.2.x, changes have been
+additive (new event types, optional fields). Unknown events are dropped by
+the SDK. Risk is low for minor version skew but increases if the fork falls
+behind by many releases. Pinning the opencode backend version in pods to match
+the UI build tag mitigates this.
+
+**Upstream merge burden**: The opencode project releases multiple times per
+week. The fork branch approach (rather than carrying patches) makes rebasing
+straightforward. Keeping devaipod code in isolated files (`src/devaipod/`)
+and only touching `app.tsx` and `layout.tsx` minimally keeps merge conflicts
+rare. Contributing multi-server/multi-pod support upstream would further
+reduce fork surface.
 
 ## Tasks
 
-### B1 (immediate, low-effort)
-
-- [ ] Modify `serve_opencode_static` in `web.rs` to inject the floating back button
-      when serving opencode's `index.html`
-- [ ] Store token in `sessionStorage` from control plane before navigation
-- [ ] Change control plane "Open Agent" to navigate to `/agent/{name}/` directly
-- [ ] Convert `agent_wrapper` to a redirect (or remove it)
-- [ ] Test that opencode's SPA routing, SSE, and API calls all work without iframe
-
-### A (future, if B1 isn't enough)
-
-- [ ] Spike: fork opencode, add a `/pods` route with pod list fetched from devaipod API
-- [ ] Evaluate: how invasive are the changes to `app.tsx` and `layout.tsx`?
-- [ ] Prototype sidebar pod list with status indicators
-- [ ] Wire pod selection to opencode's `ServerProvider` (dynamic server URL)
-- [ ] Remove iframe wrapper and cookie-based routing
-- [ ] Update Containerfile to build from fork instead of upstream
-- [ ] Establish upstream merge workflow (periodic rebase on release tags)
-- [ ] Drop `dist/index.html` and `crates/devaipod-web/` once fork is stable
+- [ ] Spike: create `src/devaipod/pods.tsx` with a basic pod list page,
+      patch `app.tsx` to add the route, verify it builds and renders
+- [ ] Wire pod list to devaipod REST API (`/api/podman/...`, `/api/devaipod/run`)
+- [ ] Add sidebar pod icon with navigation to `/pods`
+- [ ] Implement pod-prefixed API proxy in `web.rs`
+      (`/pods/{name}/api/{*path}` → pod's opencode backend)
+- [ ] Create `DevaipodProvider` context for pod state and auth
+- [ ] Wire pod selection to `ServerProvider` base URL
+- [ ] Remove iframe wrapper, cookie routing, SSE keepalive, and related code
+- [ ] Drop `dist/index.html` once the pods page is functional
+- [ ] Set up fork repo (cgwalters/opencode, `devaipod` branch) and update
+      Containerfile to clone from it
+- [ ] Set up automation to rebase `devaipod` branch on upstream releases
