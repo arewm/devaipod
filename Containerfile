@@ -69,9 +69,14 @@ WORKDIR /build
 RUN git clone --depth 1 --branch ${OPENCODE_VERSION} \
     https://github.com/anomalyco/opencode.git opencode
 
-# Install dependencies
+# Install dependencies (before patches so this layer stays cached)
 WORKDIR /build/opencode
 RUN bun install --frozen-lockfile
+
+# Apply devaipod patches (only touches source, not deps)
+# Scope localStorage per pod + auto-select existing sessions on fresh state
+COPY patches/opencode-devaipod.patch /tmp/
+RUN git apply /tmp/opencode-devaipod.patch
 
 # Build the web app
 # The app uses window.location.origin for API calls when not on opencode.ai
