@@ -751,7 +751,9 @@
                 actionsHtml = '<button type="button" class="action-btn" data-action="start" data-pod-full="' + safeFull + '" title="Start pod">Start</button>';
             }
             actionsHtml += '<button type="button" class="action-btn" data-action="recreate" data-pod-short="' + safeShort + '" title="Delete and recreate with same repo (fixes missing port 4097, etc.)">Recreate</button>';
-            actionsHtml += '<button type="button" class="action-btn danger" data-action="delete" data-pod-full="' + safeFull + '" data-pod-short="' + safeShort + '" title="Delete pod">Delete</button>';
+            if (!isRunning) {
+                actionsHtml += '<button type="button" class="action-btn danger" data-action="delete" data-pod-full="' + safeFull + '" data-pod-short="' + safeShort + '" title="Delete pod">Delete</button>';
+            }
 
             return `
                 <div class="pod-card" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
