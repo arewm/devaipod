@@ -682,16 +682,16 @@
         
         const authHeader = { 'Authorization': `Bearer ${token}` };
 
-        const expandedPods = new Set();
+        const collapsedPods = new Set();
 
         function togglePodCard(headerEl) {
             const card = headerEl.closest('.pod-card');
             const name = card.dataset.podName;
             card.classList.toggle('collapsed');
             if (card.classList.contains('collapsed')) {
-                expandedPods.delete(name);
+                collapsedPods.add(name);
             } else {
-                expandedPods.add(name);
+                collapsedPods.delete(name);
             }
         }
         
@@ -880,7 +880,7 @@
             const proposalsHtml = isAdvisor ? '<div id="advisor-proposals" class="advisor-proposals-inline"></div>' : '';
 
             return `
-                <div class="pod-card ${isAdvisor ? 'advisor-pod' : 'collapsed'}" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
+                <div class="pod-card ${isAdvisor ? 'advisor-pod' : ''}" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
                     <div class="pod-header" onclick="togglePodCard(this)">
                         <span class="pod-name">${shortName}</span>
                         <span class="expand-toggle">&#9660;</span>
@@ -968,8 +968,8 @@
                     // Restore collapsed/expanded state across refreshes
                     container.querySelectorAll('.pod-card').forEach(card => {
                         const name = card.dataset.podName;
-                        if (expandedPods.has(name)) {
-                            card.classList.remove('collapsed');
+                        if (collapsedPods.has(name)) {
+                            card.classList.add('collapsed');
                         }
                     });
                     const cards = container.querySelectorAll('.pod-card');
