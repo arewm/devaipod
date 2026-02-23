@@ -20,6 +20,7 @@ mod git;
 #[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
 mod gpu;
 mod init;
+mod mcp;
 mod pod;
 mod podman;
 mod prompt;
@@ -2882,11 +2883,14 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
     let image = advisor_image();
     let default_task = task.unwrap_or("You are the devaipod advisor agent. Wait for instructions.");
 
-    // TODO: attach the advisor MCP server once it's implemented.
-    // The advisor MCP server (port ADVISOR_MCP_PORT) will provide pod
-    // introspection and draft proposal tools. For now the advisor works
-    // with just service-gator for GitHub/issue access.
-    let mcp_servers: Vec<String> = vec![];
+    // The MCP server runs as a route on the devaipod web server.
+    // The advisor agent reaches it via host.containers.internal:8080
+    // (or 127.0.0.1:8080 on the host).
+    let mcp_url = format!(
+        "http://{}:8080/api/devaipod/mcp",
+        crate::podman::host_for_pod_services()
+    );
+    let mcp_servers: Vec<String> = vec![format!("devaipod={}", mcp_url)];
 
     // Use the dotfiles repo as the advisor's workspace source — same
     // fallback that `devaipod up` / `devaipod run` use when no source

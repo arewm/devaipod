@@ -29,6 +29,7 @@ use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::advisor;
 use crate::podman::{get_container_socket, host_for_pod_services};
 
 /// Path to the token file when using podman/Kubernetes secrets (highest priority).
@@ -1314,6 +1315,98 @@ async fn advisor_status() -> Result<Json<AdvisorStatusResponse>, StatusCode> {
     }
 }
 
+/// List draft proposals from the advisor
+///
+/// Reads the draft store JSON file and returns all proposals as a JSON array.
+/// Returns an empty array if the file doesn't exist or can't be parsed.
+async fn list_proposals_api() -> Json<serde_json::Value> {
+    let proposals = tokio::task::spawn_blocking(|| {
+        advisor::DraftStore::load(std::path::Path::new(advisor::DRAFTS_PATH))
+            .map(|s| s.proposals)
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(serde_json::to_value(&proposals).unwrap_or_default())
+}
+
+/// Dismiss a draft proposal by ID
+///
+/// Updates the proposal's status to Dismissed and persists the change.
+async fn dismiss_proposal(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
+    tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(advisor::DRAFTS_PATH);
+        let mut store = advisor::DraftStore::load(path).map_err(|_| StatusCode::NOT_FOUND)?;
+        store
+            .update_status(&id, advisor::ProposalStatus::Dismissed)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        store
+            .save(path)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok::<_, StatusCode>(())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+
+    Ok(Json(serde_json::json!({"success": true})))
+}
+
+/// Launch a pod from a draft proposal
+///
+/// Marks the proposal as approved and shells out to `devaipod run` with
+/// the proposal's repo and task.
+async fn launch_proposal(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let proposal = tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(advisor::DRAFTS_PATH);
+        let mut store = advisor::DraftStore::load(path).map_err(|_| StatusCode::NOT_FOUND)?;
+        let proposal = store
+            .proposals
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or(StatusCode::NOT_FOUND)?;
+        store.update_status(&id, advisor::ProposalStatus::Approved);
+        store
+            .save(path)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok::<_, StatusCode>(proposal)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+
+    // Ensure repo is a full URL
+    let repo = if proposal.repo.starts_with("http://") || proposal.repo.starts_with("https://") {
+        proposal.repo.clone()
+    } else {
+        format!("https://github.com/{}", proposal.repo)
+    };
+
+    let mut cmd = tokio::process::Command::new("devaipod");
+    cmd.arg("run").arg(&repo).arg(&proposal.task);
+    cmd.env("DEVAIPOD_NO_ATTACH", "1");
+
+    tracing::info!("Launching proposal '{}': {:?}", proposal.title, cmd);
+
+    let output = cmd.output().await.map_err(|e| {
+        tracing::error!("Failed to launch proposal: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "message": format!("Launch failed: {}", stderr.trim())
+        })));
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": format!("Launched agent for '{}'", proposal.title)
+    })))
+}
+
 /// Recreate a workspace (delete and recreate with same repo)
 ///
 /// Runs `devaipod rebuild <pod_name>`. Requires pod to have
@@ -1656,6 +1749,15 @@ pub(crate) fn build_app(
         .route("/devaipod/run", post(run_workspace))
         .route("/devaipod/advisor/launch", post(launch_advisor))
         .route("/devaipod/advisor/status", get(advisor_status))
+        .route("/devaipod/proposals", get(list_proposals_api))
+        .route(
+            "/devaipod/proposals/{id}/dismiss",
+            post(dismiss_proposal),
+        )
+        .route(
+            "/devaipod/proposals/{id}/launch",
+            post(launch_proposal),
+        )
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1672,6 +1774,11 @@ pub(crate) fn build_app(
     Router::new()
         .route("/_devaipod/health", get(|| async { "ok" }))
         .route("/_devaipod/frontend-error", post(frontend_error_report))
+        // MCP endpoint for advisor tools — outside auth since the advisor
+        // pod connects without a bearer token. Only exposes pod metadata
+        // and a local draft-proposals JSON file.
+        // TODO: add lightweight auth (e.g. shared secret) for production use
+        .route("/api/devaipod/mcp", post(crate::mcp::handle_mcp))
         .nest("/api", api_router)
         .route("/_devaipod/opencode-ui", get(serve_opencode_raw_ui))
         .route("/_devaipod/agent/{name}", get(agent_wrapper))
