@@ -1662,7 +1662,7 @@ async fn create_workspace_from_local(
         effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),
-        true, // orchestration always enabled
+        config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
     )
     .await
@@ -1858,7 +1858,7 @@ async fn create_workspace_from_remote(
         effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),
-        true, // orchestration always enabled
+        config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
     )
     .await
@@ -2040,7 +2040,7 @@ async fn create_workspace_from_pr(
         effective_image.as_deref(),
         opts.service_gator_image.as_deref(),
         opts.task.as_deref(),
-        true, // orchestration always enabled
+        config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
     )
     .await
@@ -2127,9 +2127,8 @@ async fn cmd_run(
     let result = create_workspace(config, source, &create_opts).await?;
 
     // If a task was provided, send the initial message to start the agent working
-    // Always include orchestration instructions since orchestration is always enabled
     if let Some(task) = command {
-        start_agent_task(&result.pod_name, task)?;
+        start_agent_task(&result.pod_name, task, config.orchestration.is_enabled())?;
     }
 
     Ok(result.pod_name)
@@ -2141,9 +2140,9 @@ async fn cmd_run(
 /// The task content is sent directly in the initial message to ensure the agent
 /// receives it even if opencode started before the config file was written.
 ///
-/// Includes mandatory orchestration instructions directly in the message to ensure
-/// the agent follows the delegation workflow.
-fn start_agent_task(pod_name: &str, task: &str) -> Result<()> {
+/// When orchestration is enabled, includes mandatory orchestration instructions
+/// directly in the message to ensure the agent follows the delegation workflow.
+fn start_agent_task(pod_name: &str, task: &str, enable_orchestration: bool) -> Result<()> {
     tracing::info!("Waiting for agent to be ready...");
 
     // Wait for the agent to be healthy (up to 60 seconds)
@@ -2183,10 +2182,11 @@ fn start_agent_task(pod_name: &str, task: &str) -> Result<()> {
     // before the config file (with instructions path) was written.
     tracing::info!("Starting agent on task...");
 
-    // Include orchestration instructions directly in the user message to ensure
-    // they have high priority. This is in addition to the instructions file for redundancy.
-    let orchestration_section = format!(
-        r#"
+    // Include orchestration instructions directly in the user message when enabled,
+    // to ensure they have high priority.
+    let orchestration_section = if enable_orchestration {
+        format!(
+            r#"
 
 ---
 
@@ -2195,8 +2195,11 @@ fn start_agent_task(pod_name: &str, task: &str) -> Result<()> {
 ---
 
 "#,
-        prompt::orchestration_instructions()
-    );
+            prompt::orchestration_instructions()
+        )
+    } else {
+        String::new()
+    };
 
     let initial_message = format!(
         r#"# Your Task

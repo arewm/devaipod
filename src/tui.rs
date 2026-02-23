@@ -617,7 +617,7 @@ impl App {
                 .and_then(|l| l.get("io.devaipod.service-gator"))
                 .cloned();
 
-            // Check worker container health (orchestration always enabled)
+            // Check worker container health (if orchestration is enabled)
             let worker_healthy = containers.iter().any(|c| {
                 c.names
                     .as_ref()

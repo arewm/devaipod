@@ -668,13 +668,14 @@ const DEFAULT_WORKER_TIMEOUT: &str = "30m";
 /// Configures hierarchical multi-agent workflows where a "task owner" agent
 /// orchestrates a "worker" agent running in an isolated container.
 ///
-/// Note: Orchestration is always enabled - every workspace includes a worker
-/// container. The `enabled` field is kept for backwards compatibility but is
-/// ignored (always treated as true).
+/// Orchestration is opt-in: set `enabled = true` to spawn a worker container
+/// alongside the agent. When disabled (the default), only a single agent
+/// container is created.
 ///
 /// Example configuration:
 /// ```toml
 /// [orchestration]
+/// enabled = true
 /// worker_timeout = "30m"
 ///
 /// [orchestration.worker]
@@ -684,8 +685,8 @@ const DEFAULT_WORKER_TIMEOUT: &str = "30m";
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[allow(dead_code)] // Fields parsed from config but not all used yet
 pub struct OrchestrationConfig {
-    /// Deprecated: Orchestration is always enabled.
-    /// This field is kept for backwards compatibility but is ignored.
+    /// Whether to enable multi-agent orchestration (default: false).
+    /// When true, a worker container is created alongside the agent.
     #[serde(default)]
     pub enabled: Option<bool>,
     /// Timeout for worker subtasks (default: "30m")
@@ -699,12 +700,12 @@ pub struct OrchestrationConfig {
 }
 
 impl OrchestrationConfig {
-    /// Check if orchestration is enabled (always returns true)
+    /// Check if orchestration is enabled.
     ///
-    /// Orchestration is always enabled in devaipod - every workspace includes
-    /// a worker container. This method is kept for backwards compatibility.
+    /// Defaults to false when not explicitly configured. Set `enabled = true`
+    /// in the `[orchestration]` config section to enable the worker container.
     pub fn is_enabled(&self) -> bool {
-        true
+        self.enabled.unwrap_or(false)
     }
 
     /// Get the worker timeout string (defaults to "30m")
@@ -1504,31 +1505,40 @@ target = "all"
     #[test]
     fn test_orchestration_config_default() {
         let config = OrchestrationConfig::default();
-        // Orchestration is always enabled
-        assert!(config.is_enabled());
+        // Orchestration is disabled by default
+        assert!(!config.is_enabled());
         assert_eq!(config.worker_timeout(), "30m");
         assert_eq!(config.worker.gator, WorkerGatorMode::Readonly);
     }
 
     #[test]
     fn test_parse_orchestration_minimal() {
-        // Orchestration is always enabled even with minimal config
+        // Orchestration is disabled by default when not configured
         let toml = "";
         let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.orchestration.is_enabled());
+        assert!(!config.orchestration.is_enabled());
         assert_eq!(config.orchestration.worker_timeout(), "30m");
         assert_eq!(config.orchestration.worker.gator, WorkerGatorMode::Readonly);
     }
 
     #[test]
-    fn test_parse_orchestration_with_settings() {
-        // The enabled field is ignored but should still parse
+    fn test_parse_orchestration_explicitly_enabled() {
         let toml = r#"
 [orchestration]
 enabled = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.orchestration.is_enabled());
+    }
+
+    #[test]
+    fn test_parse_orchestration_explicitly_disabled() {
+        let toml = r#"
+[orchestration]
+enabled = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.orchestration.is_enabled());
     }
 
     #[test]

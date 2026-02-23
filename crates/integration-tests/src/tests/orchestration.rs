@@ -176,15 +176,15 @@ integration_test!(test_worker_container_naming);
 // Container tests (require podman)
 // =============================================================================
 
-/// Verify that pods always have a worker container (orchestration is always enabled)
-fn test_pod_always_has_worker() -> Result<()> {
+/// Verify that pods do NOT have a worker container by default (orchestration is opt-in)
+fn test_pod_no_worker_by_default() -> Result<()> {
     let repo = TestRepo::new()?;
     let pod_name = unique_test_name("test-no-orch");
 
     let mut pods = PodGuard::new();
     pods.add(&pod_name);
 
-    // Create pod - orchestration is always enabled by default
+    // Create pod - orchestration is disabled by default
     let output = run_devaipod_in(
         &repo.repo_path,
         &["up", ".", "--name", short_name(&pod_name)],
@@ -210,7 +210,7 @@ fn test_pod_always_has_worker() -> Result<()> {
     )
     .read()?;
 
-    // Orchestration is always enabled, so all pods have worker containers
+    // Orchestration is disabled by default, so no worker container
     assert!(
         ps_output.contains("workspace"),
         "Pod should have workspace container: {}",
@@ -222,11 +222,11 @@ fn test_pod_always_has_worker() -> Result<()> {
         ps_output
     );
     assert!(
-        ps_output.contains("worker"),
-        "Pod should have worker container (orchestration is always enabled): {}",
+        !ps_output.contains("worker"),
+        "Pod should NOT have worker container by default: {}",
         ps_output
     );
 
     Ok(())
 }
-podman_integration_test!(test_pod_always_has_worker);
+podman_integration_test!(test_pod_no_worker_by_default);
