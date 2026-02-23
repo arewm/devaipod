@@ -587,7 +587,7 @@
         <div class="status">
             <span id="connection-status" class="status-indicator"></span>
             <span id="connection-text">Connecting...</span>
-            <button class="refresh-btn" onclick="refreshPods()">Refresh</button>
+            <button class="refresh-btn" onclick="refreshPods({force: true})">Refresh</button>
         </div>
     </header>
     
@@ -669,7 +669,7 @@
         // Extract token from URL
         const urlParams = new URLSearchParams(window.location.search);
         const token = urlParams.get('token');
-        let initialFocusDone = false;
+
         
         if (!token) {
             document.getElementById('pods-container').innerHTML = `
@@ -683,6 +683,7 @@
         const authHeader = { 'Authorization': `Bearer ${token}` };
 
         const collapsedPods = new Set();
+        let lastPodFingerprint = '';
 
         function togglePodCard(headerEl) {
             const card = headerEl.closest('.pod-card');
@@ -745,7 +746,7 @@
             if (!confirm(`Delete workspace "${shortName}"? This cannot be undone.`)) return;
             try {
                 await apiDelete(`${PODMAN_PODS}/${encodeURIComponent(fullName)}?force=true`);
-                await refreshPods();
+                await refreshPods({force: true});
             } catch (err) {
                 alert(`Delete failed: ${err.message}`);
             }
@@ -771,7 +772,7 @@
             if (action === 'start' && fullName) {
                 try {
                     await apiPost(`${PODMAN_PODS}/${encodeURIComponent(fullName)}/start`);
-                    await refreshPods();
+                    await refreshPods({force: true});
                 } catch (err) {
                     alert(`Start failed: ${err.message}`);
                 }
@@ -780,7 +781,7 @@
             if (action === 'stop' && fullName) {
                 try {
                     await apiPost(`${PODMAN_PODS}/${encodeURIComponent(fullName)}/stop`);
-                    await refreshPods();
+                    await refreshPods({force: true});
                 } catch (err) {
                     alert(`Stop failed: ${err.message}`);
                 }
@@ -828,7 +829,7 @@
                     } catch (_) {}
                     throw new Error(msg);
                 }
-                await refreshPods();
+                await refreshPods({force: true});
                 alert('Workspace recreated successfully.');
             } catch (err) {
                 alert(`Recreate failed: ${err.message}`);
@@ -902,7 +903,7 @@
         }
         
         // Refresh pods list
-        async function refreshPods() {
+        async function refreshPods({force = false} = {}) {
             const container = document.getElementById('pods-container');
             const statusIndicator = document.getElementById('connection-status');
             const statusText = document.getElementById('connection-text');
@@ -929,8 +930,23 @@
                     return (b.Created || '').localeCompare(a.Created || '');
                 });
                 
-                // Remember which card was focused before re-render
+                // Build a fingerprint of the pod list to detect actual changes.
+                // Only re-render the DOM when something changed.
+                const fingerprint = JSON.stringify(devaipodPods.map(p => ({
+                    n: p.Name, s: p.Status, c: p.Containers?.length
+                })));
+                if (!force && fingerprint === lastPodFingerprint) {
+                    // Data unchanged — skip DOM rebuild, just refresh proposals
+                    checkProposals();
+                    return;
+                }
+                lastPodFingerprint = fingerprint;
+
+                // Remember which card was focused before re-render.
+                // If focus is outside the pod list (e.g. an input field),
+                // don't steal it after re-render.
                 const prevFocused = document.activeElement;
+                const focusWasInsideContainer = container.contains(prevFocused);
                 const prevPodName = prevFocused && prevFocused.classList.contains('pod-card')
                     ? prevFocused.dataset.podName : null;
 
@@ -977,10 +993,10 @@
                         // Re-render destroyed focus — restore it to the same pod or nearest
                         const restore = Array.from(cards).find(c => c.dataset.podName === prevPodName);
                         (restore || cards[0])?.focus({preventScroll: true});
-                    } else if (!initialFocusDone && cards.length > 0) {
-                        // First load: auto-select the first card
-                        cards[0].focus({preventScroll: true});
-                        initialFocusDone = true;
+                    } else if (focusWasInsideContainer && cards.length > 0) {
+                        // Focus was on something inside the container (e.g. a button)
+                        // that got destroyed by innerHTML — fall back to first card
+                        cards[0]?.focus({preventScroll: true});
                     }
                 }
                 
@@ -1015,7 +1031,7 @@
                 }
                 
                 // Refresh to show updated status
-                await refreshPods();
+                await refreshPods({force: true});
             } catch (err) {
                 alert(`Advisor launch failed: ${err.message}`);
                 btn.disabled = false;
@@ -1223,7 +1239,7 @@
                 
                 // Success - refresh pods and collapse form
                 console.log('Workspace created:', result.workspace);
-                await refreshPods();
+                await refreshPods({force: true});
                 toggleLaunchForm();
             } catch (err) {
                 console.error('Launch failed:', err);
