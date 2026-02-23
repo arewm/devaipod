@@ -813,7 +813,7 @@
         
         // Recreate a workspace (delete and recreate with same repo)
         async function recreatePod(shortName) {
-            if (!confirm(`Recreate workspace "${shortName}"? It will be deleted and recreated with the same repo (fixes missing port 4097, etc.).`)) return;
+            if (!confirm(`Recreate workspace "${shortName}"? It will be deleted and recreated with the same repo.`)) return;
             try {
                 const path = `/devaipod/pods/${encodeURIComponent(shortName)}/recreate`;
                 const response = await fetch(`/api${path}`, {
@@ -872,7 +872,7 @@
             } else {
                 actionsHtml = '<button type="button" class="action-btn" data-action="start" data-pod-full="' + safeFull + '" title="Start pod">Start</button>';
             }
-            actionsHtml += '<button type="button" class="action-btn" data-action="recreate" data-pod-short="' + safeShort + '" title="Delete and recreate with same repo (fixes missing port 4097, etc.)">Recreate</button>';
+            actionsHtml += '<button type="button" class="action-btn" data-action="recreate" data-pod-short="' + safeShort + '" title="Delete and recreate with same repo">Recreate</button>';
             if (!isRunning) {
                 actionsHtml += '<button type="button" class="action-btn danger" data-action="delete" data-pod-full="' + safeFull + '" data-pod-short="' + safeShort + '" title="Delete pod">Delete</button>';
             }
@@ -1058,7 +1058,7 @@
                             <div class="proposal-meta">${escapeHtml(p.repo)}${p.source ? ' \u2014 ' + escapeHtml(p.source) : ''}</div>
                             <div class="proposal-rationale">${escapeHtml(p.rationale)}</div>
                             <div class="proposal-actions">
-                                <button class="open-btn" onclick="launchProposal('${escapeHtml(p.id)}', this)" style="padding:0.2rem 0.5rem;font-size:0.8rem;">Launch</button>
+                                <button class="open-btn" onclick="launchProposal('${escapeHtml(p.id)}')" style="padding:0.2rem 0.5rem;font-size:0.8rem;">Launch</button>
                                 <button class="dismiss-btn" onclick="dismissProposal('${escapeHtml(p.id)}')">Dismiss</button>
                             </div>
                         </div>
@@ -1083,24 +1083,48 @@
         }
 
         // Launch a proposal as a new pod
-        async function launchProposal(id, btn) {
-            btn.disabled = true;
-            btn.textContent = 'Launching...';
-            try {
-                const result = await fetch('/api/devaipod/proposals/' + encodeURIComponent(id) + '/launch', {
-                    method: 'POST',
-                    headers: authHeader
-                }).then(r => r.json());
-
-                if (!result.success) {
-                    throw new Error(result.message || 'Launch failed');
+        function launchProposal(id) {
+            // Find the proposal data from the rendered cards
+            const cards = document.querySelectorAll('.proposal-card');
+            let repo = '', task = '';
+            for (const card of cards) {
+                if (card.querySelector(`[onclick*="'${id}'"]`)) {
+                    const meta = card.querySelector('.proposal-meta');
+                    const rationale = card.querySelector('.proposal-rationale');
+                    const title = card.querySelector('.proposal-title');
+                    // Extract repo from meta text (first part before ' — ')
+                    if (meta) repo = meta.textContent.split(' — ')[0].trim();
+                    // Build task from title + rationale
+                    if (title) {
+                        // Strip the priority badge text
+                        const titleText = title.textContent.replace(/^(high|medium|low)\s*/i, '').trim();
+                        task = titleText;
+                    }
+                    if (rationale) task += '\n\n' + rationale.textContent.trim();
+                    break;
                 }
-                await refreshPods();
-            } catch (err) {
-                alert('Launch failed: ' + err.message);
-                btn.disabled = false;
-                btn.textContent = 'Launch';
             }
+
+            // Normalize repo to full URL if needed
+            if (repo && !repo.startsWith('http')) {
+                repo = 'https://github.com/' + repo;
+            }
+
+            // Pre-populate the launch form and open it
+            document.getElementById('repo-url').value = repo;
+            document.getElementById('task-input').value = task;
+            const form = document.getElementById('launch-form');
+            const toggle = document.getElementById('launch-toggle');
+            if (!form.classList.contains('expanded')) {
+                form.classList.add('expanded');
+                toggle.style.display = 'none';
+            }
+            // Scroll to the form
+            form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            document.getElementById('repo-url').focus();
+
+            // Dismiss the proposal since the user is acting on it
+            dismissProposal(id);
         }
 
         // Toggle launch form visibility

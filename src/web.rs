@@ -1352,61 +1352,6 @@ async fn dismiss_proposal(Path(id): Path<String>) -> Result<Json<serde_json::Val
     Ok(Json(serde_json::json!({"success": true})))
 }
 
-/// Launch a pod from a draft proposal
-///
-/// Marks the proposal as approved and shells out to `devaipod run` with
-/// the proposal's repo and task.
-async fn launch_proposal(Path(id): Path<String>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let proposal = tokio::task::spawn_blocking(move || {
-        let path = std::path::Path::new(advisor::DRAFTS_PATH);
-        let mut store = advisor::DraftStore::load(path).map_err(|_| StatusCode::NOT_FOUND)?;
-        let proposal = store
-            .proposals
-            .iter()
-            .find(|p| p.id == id)
-            .cloned()
-            .ok_or(StatusCode::NOT_FOUND)?;
-        store.update_status(&id, advisor::ProposalStatus::Approved);
-        store
-            .save(path)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Ok::<_, StatusCode>(proposal)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
-
-    // Ensure repo is a full URL
-    let repo = if proposal.repo.starts_with("http://") || proposal.repo.starts_with("https://") {
-        proposal.repo.clone()
-    } else {
-        format!("https://github.com/{}", proposal.repo)
-    };
-
-    let mut cmd = tokio::process::Command::new("devaipod");
-    cmd.arg("run").arg(&repo).arg(&proposal.task);
-    cmd.env("DEVAIPOD_NO_ATTACH", "1");
-
-    tracing::info!("Launching proposal '{}': {:?}", proposal.title, cmd);
-
-    let output = cmd.output().await.map_err(|e| {
-        tracing::error!("Failed to launch proposal: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Ok(Json(serde_json::json!({
-            "success": false,
-            "message": format!("Launch failed: {}", stderr.trim())
-        })));
-    }
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "message": format!("Launched agent for '{}'", proposal.title)
-    })))
-}
-
 /// Recreate a workspace (delete and recreate with same repo)
 ///
 /// Runs `devaipod rebuild <pod_name>`. Requires pod to have
@@ -1753,10 +1698,6 @@ pub(crate) fn build_app(
         .route(
             "/devaipod/proposals/{id}/dismiss",
             post(dismiss_proposal),
-        )
-        .route(
-            "/devaipod/proposals/{id}/launch",
-            post(launch_proposal),
         )
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
         .layer(middleware::from_fn_with_state(
