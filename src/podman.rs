@@ -130,7 +130,7 @@ pub fn is_container_mode() -> bool {
         || std::path::Path::new("/run/.containerenv").exists()
 }
 
-/// Host to use when connecting to pod-published ports (e.g. auth proxy).
+/// Host to use when connecting to pod-published ports (e.g. opencode server).
 ///
 /// When running on the host, published ports are on 127.0.0.1.
 /// When running inside the devaipod container (without --network host), we use the

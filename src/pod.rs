@@ -136,11 +136,8 @@ fn collect_config_devices(config: &DevcontainerConfig, devices: &mut Vec<String>
     }
 }
 
-/// Port for the opencode server in the agent container (internal, no auth)
+/// Port for the opencode server in the agent container
 pub const OPENCODE_PORT: u16 = 4096;
-
-/// Port for the auth proxy in the agent container (external, requires Basic Auth)
-pub const OPENCODE_AUTH_PROXY_PORT: u16 = 4097;
 
 /// Port for the worker's opencode server (internal, no auth)
 pub const WORKER_OPENCODE_PORT: u16 = 4098;
@@ -159,18 +156,9 @@ fn generate_api_password() -> String {
 /// This matches the "devenv" user's home in the devenv-debian image.
 pub const AGENT_HOME_PATH: &str = "/home/devenv";
 
-/// Python script for auth proxy.
-/// Provides authenticated HTTP access to the opencode API from the host.
-/// This is a workaround for https://github.com/anomalyco/opencode/issues/8458
-/// where `opencode attach` doesn't support password-based auth.
-const AUTH_PROXY_SCRIPT: &str = include_str!("../scripts/auth_proxy.py");
-
 /// Python script for worker control (send tasks, monitor, get status).
 /// Replaces `opencode run --attach --format json` which returns excessive JSON.
 const WORKER_CTL_SCRIPT: &str = include_str!("../scripts/devaipod-workerctl.py");
-
-/// Port for the auth proxy (published to host for authenticated access)
-pub const AUTH_PROXY_PORT: u16 = 4097;
 
 /// Default PATH for containers when we need to synthesize one.
 /// This covers the standard locations where utilities are typically found.
@@ -487,11 +475,8 @@ impl DevaipodPod {
         let api_password = generate_api_password();
         labels.push(("io.devaipod.api-password".to_string(), api_password.clone()));
 
-        // Publish the auth proxy port to a random localhost port for host access.
-        // The proxy handles Basic Auth and forwards to the opencode server.
-        // This is a workaround for https://github.com/anomalyco/opencode/issues/8458
-        // where `opencode attach` doesn't support password-based auth.
-        let publish_ports = vec![format!("127.0.0.1::{}", AUTH_PROXY_PORT)];
+        // Publish the opencode port to a random localhost port for host access.
+        let publish_ports = vec![format!("127.0.0.1::{}", OPENCODE_PORT)];
 
         podman
             .create_pod(pod_name, &labels, &publish_ports)
@@ -615,7 +600,7 @@ impl DevaipodPod {
             tracing::debug!("Agent workspace cloned successfully");
         }
 
-        // Write scripts to agent home volume (auth_proxy.py for authenticated API access)
+        // Write scripts to agent home volume (workerctl for orchestration)
         Self::write_scripts_to_volume(podman, &image, &agent_home_volume).await?;
 
         // Write gator config to workspace volume (if gator is enabled)
@@ -814,7 +799,6 @@ impl DevaipodPod {
             &agent_home_volume,
             worker_workspace_volume_name.as_deref(),
             global_config,
-            &api_password,
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -1355,8 +1339,7 @@ echo "Dotfiles installed successfully"
     /// Write scripts to the agent home volume before containers start
     ///
     /// This writes:
-    /// - auth_proxy.py: Authenticated HTTP access to the opencode API from the host
-    /// - worker_monitor.py: Monitor worker until idle or timeout (for orchestration)
+    /// - devaipod-workerctl: Worker control script for orchestration
     ///
     /// Uses a one-shot init container.
     async fn write_scripts_to_volume(
@@ -1368,18 +1351,12 @@ echo "Dotfiles installed successfully"
             r#"set -e
 mkdir -p {agent_home}/scripts
 
-cat > '{agent_home}/scripts/auth_proxy.py' << 'PROXY_EOF'
-{proxy_script}
-PROXY_EOF
-chmod +x {agent_home}/scripts/auth_proxy.py
-
 cat > '{agent_home}/scripts/devaipod-workerctl' << 'WORKERCTL_EOF'
 {worker_ctl_script}
 WORKERCTL_EOF
 chmod +x {agent_home}/scripts/devaipod-workerctl
 "#,
             agent_home = AGENT_HOME_PATH,
-            proxy_script = AUTH_PROXY_SCRIPT,
             worker_ctl_script = WORKER_CTL_SCRIPT,
         );
 
@@ -2082,7 +2059,6 @@ exec sleep infinity
         agent_home_volume: &str,
         worker_workspace_volume: Option<&str>,
         global_config: &crate::config::Config,
-        api_password: &str,
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
         let agent_home = AGENT_HOME_PATH.to_string();
@@ -2090,11 +2066,6 @@ exec sleep infinity
         let mut env = std::collections::HashMap::new();
         // HOME is already set correctly via the user's passwd entry
 
-        // Set proxy password for authenticated host access via auth_proxy.py
-        env.insert(
-            "DEVAIPOD_PROXY_PASSWORD".to_string(),
-            api_password.to_string(),
-        );
         // Ensure agent can find opencode in PATH
         env.insert(
             "PATH".to_string(),
@@ -2183,17 +2154,6 @@ exec sleep infinity
             }
         }
 
-        // Build the startup script that runs both opencode serve and the auth proxy.
-        // The auth proxy provides authenticated access from the host, working around
-        // https://github.com/anomalyco/opencode/issues/8458 where `opencode attach`
-        // doesn't support password-based auth.
-        //
-        // Architecture:
-        // - opencode serve: listens on localhost:4096 (no auth, internal only)
-        // - auth_proxy.py: listens on 0.0.0.0:4097, requires Basic Auth, forwards to :4096
-        // - Host access: published port -> 4097 -> auth checked -> 4096
-        // - Internal access: opencode attach -> localhost:4096 (no auth needed)
-        //
         // Build MCP config combining service-gator and any additional MCP servers
         let mut mcp_servers = serde_json::Map::new();
 
@@ -2257,12 +2217,8 @@ while [ ! -f {home}/.devaipod-ready ]; do
 done
 echo "Setup complete, starting opencode..."
 
-# Start auth proxy in background (provides authenticated host access)
-# The proxy reads DEVAIPOD_PROXY_PASSWORD for its Basic Auth check
-python3 {home}/scripts/auth_proxy.py &
-
-# Run opencode serve in foreground (no auth, internal access only)
-exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
+# Run opencode serve, bound to 0.0.0.0 so it's accessible from the published port
+exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             home = AGENT_HOME_PATH,
             opencode_port = OPENCODE_PORT
         );
@@ -2573,8 +2529,7 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             );
         }
 
-        // Worker startup script - runs opencode serve (no auth proxy needed since
-        // worker is not directly accessed from host)
+        // Worker startup script - runs opencode serve
         // Wait for agent setup to complete, then copy configs from agent home.
         let startup_script = format!(
             r#"set -e
@@ -2615,7 +2570,7 @@ fi
 # Run opencode serve in foreground
 exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             home = AGENT_HOME_PATH,
-            opencode_port = WORKER_OPENCODE_PORT // Worker uses a different port to avoid conflict with agent and auth proxy
+            opencode_port = WORKER_OPENCODE_PORT // Worker uses a different port to avoid conflict with agent
         );
 
         ContainerConfig {
@@ -2817,7 +2772,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            "test-password",
         );
 
         // Volume mounts: agent workspace, main workspace (readonly), and agent home
@@ -2851,12 +2805,6 @@ mod tests {
 
         // Verify HOME is NOT overridden (it comes from passwd entry for devenv user)
         assert_eq!(container_config.env.get("HOME"), None);
-
-        // Verify proxy password is set for authenticated host access
-        assert_eq!(
-            container_config.env.get("DEVAIPOD_PROXY_PASSWORD"),
-            Some(&"test-password".to_string())
-        );
     }
 
     #[test]
@@ -2881,7 +2829,6 @@ mod tests {
             "test-agent-home",
             Some("test-worker-workspace"), // worker_workspace_volume
             &global_config,
-            "test-password",
         );
 
         // With orchestration enabled, should have 4 volume mounts:
@@ -2942,7 +2889,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
-            "test-password",
         );
 
         // No bind mounts - we clone the repo into the container instead
@@ -2979,7 +2925,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            "test-password",
         );
 
         // Verify file_secrets are included for agent container
@@ -3343,7 +3288,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
-            "test-password",
         );
 
         // Agent should have no secrets
@@ -3724,7 +3668,7 @@ mod tests {
         assert_eq!(cmd[0], "/bin/sh");
         assert_eq!(cmd[1], "-c");
         assert!(cmd[2].contains("opencode serve"));
-        // Worker uses WORKER_OPENCODE_PORT to avoid conflict with task owner and auth proxy
+        // Worker uses WORKER_OPENCODE_PORT to avoid conflict with task owner
         assert!(cmd[2].contains(&format!("--port {}", WORKER_OPENCODE_PORT)));
 
         // Worker has same security settings as agent (not restricted)

@@ -3101,7 +3101,7 @@ exec tmux attach -t {session}
             // Worker container: connect to worker's opencode serve
             tracing::info!("Attaching to worker in '{}'...", strip_pod_prefix(pod_name));
 
-            // Worker uses WORKER_OPENCODE_PORT (4098), not OPENCODE_PORT+1 (4097 = auth proxy)
+            // Worker uses WORKER_OPENCODE_PORT (4098) to avoid conflict with agent's OPENCODE_PORT (4096)
             let worker_port = pod::WORKER_OPENCODE_PORT;
 
             // If no session specified, try to auto-detect an existing session

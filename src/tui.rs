@@ -594,8 +594,8 @@ impl App {
             let api_port = agent_container.and_then(|c| {
                 c.ports.as_ref().and_then(|ports| {
                     ports.iter().find_map(|p| {
-                        // Looking for the auth proxy port (4097) which is published to host
-                        if p.private_port == crate::pod::OPENCODE_AUTH_PROXY_PORT {
+                        // Looking for the opencode port which is published to host
+                        if p.private_port == crate::pod::OPENCODE_PORT {
                             p.public_port
                         } else {
                             None

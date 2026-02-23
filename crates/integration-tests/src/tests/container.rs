@@ -169,14 +169,14 @@ fn test_readonly_api_responds(fixture: &SharedFixture) -> Result<()> {
     let password = password.trim();
     assert!(!password.is_empty(), "Pod should have API password label");
 
-    // Get the published port (4097 is the auth proxy port)
+    // Get the published port (4096 is the opencode port)
     let agent_container = fixture.agent_container();
-    let port_output = cmd!(sh, "podman port {agent_container} 4097")
+    let port_output = cmd!(sh, "podman port {agent_container} 4096")
         .ignore_status()
         .read()?;
     assert!(
         port_output.contains("127.0.0.1:"),
-        "Port 4097 (auth proxy) should be published: {}",
+        "Port 4096 (opencode) should be published: {}",
         port_output
     );
 
@@ -188,15 +188,10 @@ fn test_readonly_api_responds(fixture: &SharedFixture) -> Result<()> {
         .unwrap_or(0);
     assert!(port > 0, "Should have a valid port number");
 
-    // Test authenticated request to /session endpoint
+    // Test request to /session endpoint (no auth needed, opencode serves directly)
     let url = format!("http://127.0.0.1:{}/session", port);
-    let response = cmd!(sh, "curl -sf -u opencode:{password} {url}")
-        .ignore_status()
-        .output()?;
-    assert!(
-        response.status.success(),
-        "Authenticated API request should succeed"
-    );
+    let response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
+    assert!(response.status.success(), "API request should succeed");
 
     Ok(())
 }
@@ -603,14 +598,14 @@ fn test_pod_has_api_credentials() -> Result<()> {
         password.len()
     );
 
-    // Verify auth proxy port is published (4097 is the auth proxy, 4096 is internal)
+    // Verify opencode port is published (4096)
     let agent_container = format!("{}-agent", pod_name);
-    let port_output = cmd!(sh, "podman port {agent_container} 4097")
+    let port_output = cmd!(sh, "podman port {agent_container} 4096")
         .ignore_status()
         .read()?;
     assert!(
         port_output.contains("127.0.0.1:"),
-        "Port 4097 (auth proxy) should be published to localhost: {}",
+        "Port 4096 (opencode) should be published to localhost: {}",
         port_output
     );
 
@@ -653,9 +648,9 @@ fn test_api_authentication_works() -> Result<()> {
     let password = cmd!(sh, "podman pod inspect {pod_name} --format {format_label}").read()?;
     let password = password.trim();
 
-    // Get the published auth proxy port (4097)
+    // Get the published opencode port (4096)
     let agent_container = format!("{}-agent", pod_name);
-    let port_output = cmd!(sh, "podman port {agent_container} 4097").read()?;
+    let port_output = cmd!(sh, "podman port {agent_container} 4096").read()?;
     let port: u16 = port_output
         .trim()
         .split(':')
@@ -663,25 +658,15 @@ fn test_api_authentication_works() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
 
-    // Test that authenticated request works (via auth proxy on published port)
+    // Test that request works via published port (opencode serves directly, no auth proxy)
     let url = format!("http://127.0.0.1:{}/session", port);
-    let auth_response = cmd!(sh, "curl -sf -u opencode:{password} {url}")
-        .ignore_status()
-        .output()?;
+    let response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
     assert!(
-        auth_response.status.success(),
-        "Authenticated API request to proxy should succeed"
+        response.status.success(),
+        "API request to opencode via published port should succeed"
     );
 
-    // Test that unauthenticated request to proxy fails (401)
-    let unauth_response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
-    assert!(
-        !unauth_response.status.success(),
-        "Unauthenticated API request to proxy should fail"
-    );
-
-    // Test that internal access (inside container) works without auth
-    // This verifies opencode serve is running without OPENCODE_SERVER_PASSWORD
+    // Test that internal access (inside container) also works
     let internal_response = cmd!(
         sh,
         "podman exec {agent_container} curl -sf http://localhost:4096/session"
@@ -690,7 +675,7 @@ fn test_api_authentication_works() -> Result<()> {
     .output()?;
     assert!(
         internal_response.status.success(),
-        "Internal API request (no auth) should succeed"
+        "Internal API request should succeed"
     );
 
     Ok(())
