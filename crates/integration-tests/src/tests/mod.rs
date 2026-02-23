@@ -1,5 +1,6 @@
 //! Integration test modules
 
+pub mod advisor;
 pub mod cli;
 pub mod container;
 pub mod orchestration;

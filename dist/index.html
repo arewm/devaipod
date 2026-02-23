@@ -472,6 +472,69 @@
             color: var(--text-secondary);
             cursor: pointer;
         }
+
+        .advisor-section {
+            margin-bottom: 1rem;
+        }
+        .advisor-banner {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem 1rem;
+            background: #1a1a2e;
+            border: 1px solid #333;
+            border-radius: 6px;
+            gap: 1rem;
+        }
+        .advisor-info {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: #ccc;
+            font-size: 0.9rem;
+        }
+        .advisor-icon {
+            color: #7c3aed;
+            font-size: 1.1rem;
+        }
+        .advisor-actions {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+        .advisor-launch-btn {
+            padding: 0.35rem 0.75rem;
+            background: #7c3aed;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-family: inherit;
+        }
+        .advisor-launch-btn:hover {
+            background: #6d28d9;
+        }
+        .advisor-launch-btn:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .advisor-open-btn {
+            padding: 0.35rem 0.75rem;
+            background: transparent;
+            color: #7c3aed;
+            border: 1px solid #7c3aed;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-family: inherit;
+        }
+        .advisor-open-btn:hover {
+            background: rgba(124, 58, 237, 0.1);
+        }
+        .pod-card.advisor-pod {
+            border-color: #7c3aed;
+        }
     </style>
 </head>
 <body>
@@ -550,6 +613,17 @@
                     </div>
                     <div id="launch-error" class="form-error" style="display: none;"></div>
                 </form>
+            </div>
+        </div>
+
+        <!-- Advisor section -->
+        <div id="advisor-section" class="advisor-section" style="display: none;">
+            <div id="advisor-banner" class="advisor-banner">
+                <div class="advisor-info">
+                    <span class="advisor-icon">&#9733;</span>
+                    <span id="advisor-status-text">Advisor</span>
+                </div>
+                <div class="advisor-actions" id="advisor-actions"></div>
             </div>
         </div>
         
@@ -740,6 +814,7 @@
                 }).join('');
             
             const shortName = pod.Name.replace('devaipod-', '');
+            const isAdvisor = shortName === 'advisor';
             const isRunning = status.toLowerCase() === 'running';
             const safeFull = pod.Name.replace(/"/g, '&quot;');
             const safeShort = shortName.replace(/"/g, '&quot;');
@@ -756,7 +831,7 @@
             }
 
             return `
-                <div class="pod-card" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
+                <div class="pod-card ${isAdvisor ? 'advisor-pod' : ''}" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
                     <div class="pod-header">
                         <span class="pod-name">${shortName}</span>
                         <span class="pod-status ${statusClass}">${status}</span>
@@ -828,12 +903,67 @@
                 }
                 
                 document.getElementById('error-container').innerHTML = '';
+                checkAdvisorStatus();
             } catch (err) {
                 statusIndicator.classList.add('disconnected');
                 statusText.textContent = 'Disconnected';
                 document.getElementById('error-container').innerHTML = `
                     <div class="error">${err.message}</div>
                 `;
+            }
+        }
+        
+        // Check advisor status and update the banner
+        async function checkAdvisorStatus() {
+            const section = document.getElementById('advisor-section');
+            const statusText = document.getElementById('advisor-status-text');
+            const actions = document.getElementById('advisor-actions');
+            
+            try {
+                const status = await apiCall('/devaipod/advisor/status');
+                section.style.display = 'block';
+                
+                if (status.state === 'running') {
+                    statusText.textContent = 'Advisor is running';
+                    actions.innerHTML = '<button class="advisor-open-btn" onclick="openAgent(\'advisor\')">Open Advisor</button>';
+                } else if (status.state === 'stopped' || status.exists) {
+                    statusText.textContent = 'Advisor is stopped';
+                    actions.innerHTML = '<button class="advisor-launch-btn" onclick="launchAdvisor(this)">Start Advisor</button>';
+                } else {
+                    statusText.textContent = 'No advisor running';
+                    actions.innerHTML = '<button class="advisor-launch-btn" onclick="launchAdvisor(this)">Launch Advisor</button>';
+                }
+            } catch (err) {
+                // Don't show advisor section if we can't check status
+                section.style.display = 'none';
+            }
+        }
+        
+        // Launch (or start) the advisor pod
+        async function launchAdvisor(btn) {
+            btn.disabled = true;
+            btn.textContent = 'Launching...';
+            
+            try {
+                const result = await fetch('/api/devaipod/advisor/launch', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({})
+                }).then(r => r.json());
+                
+                if (!result.success) {
+                    throw new Error(result.message || 'Launch failed');
+                }
+                
+                // Refresh to show updated status
+                await refreshPods();
+            } catch (err) {
+                alert(`Advisor launch failed: ${err.message}`);
+                btn.disabled = false;
+                btn.textContent = 'Launch Advisor';
             }
         }
         

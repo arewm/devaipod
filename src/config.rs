@@ -80,6 +80,10 @@ pub struct Config {
     /// SSH configuration for editor integration
     #[serde(default)]
     pub ssh: SshConfig,
+
+    /// Additional MCP servers to attach to agent pods
+    #[serde(default)]
+    pub mcp: McpServersConfig,
 }
 
 /// Configuration for binding paths from host home to container home
@@ -775,6 +779,86 @@ pub struct SshConfig {
 impl Default for SshConfig {
     fn default() -> Self {
         Self { auto_config: true }
+    }
+}
+
+// =============================================================================
+// MCP server configuration
+// =============================================================================
+
+/// Configuration for additional MCP servers attached to agent pods
+///
+/// These are HTTP-based MCP servers that run as sidecar containers or
+/// external services, connected to the agent via the opencode MCP config.
+///
+/// Example configuration:
+/// ```toml
+/// [mcp.advisor]
+/// url = "http://localhost:8766/mcp"
+/// enabled = true
+///
+/// [mcp.custom-tools]
+/// url = "http://my-server:9000/mcp"
+/// enabled = true
+/// ```
+#[derive(Debug, Deserialize, Default)]
+pub struct McpServersConfig {
+    /// Named MCP server configurations.
+    /// The key is the server name used in the opencode config.
+    #[serde(flatten)]
+    pub servers: HashMap<String, McpServerEntry>,
+}
+
+/// A single MCP server entry
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerEntry {
+    /// URL of the MCP server endpoint
+    pub url: String,
+    /// Whether this server is enabled (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl McpServersConfig {
+    /// Get all enabled MCP server entries
+    pub fn enabled_servers(&self) -> impl Iterator<Item = (&str, &McpServerEntry)> {
+        self.servers
+            .iter()
+            .filter(|(_, entry)| entry.enabled)
+            .map(|(name, entry)| (name.as_str(), entry))
+    }
+
+    /// Merge CLI-provided MCP servers into this config
+    ///
+    /// Parses `name=url` strings and adds them as enabled entries.
+    /// CLI entries override any existing config file entries with the same name.
+    pub fn merge_cli_servers(&mut self, cli_servers: &[String]) -> color_eyre::Result<()> {
+        for entry in cli_servers {
+            if let Some((name, url)) = entry.split_once('=') {
+                let name = name.trim();
+                let url = url.trim();
+                if name.is_empty() || url.is_empty() {
+                    color_eyre::eyre::bail!(
+                        "Invalid --mcp format: '{}'. Expected name=url (e.g., advisor=http://localhost:8766/mcp)",
+                        entry
+                    );
+                }
+                self.servers.insert(
+                    name.to_string(),
+                    McpServerEntry {
+                        url: url.to_string(),
+                        enabled: true,
+                    },
+                );
+            } else {
+                color_eyre::eyre::bail!(
+                    "Invalid --mcp format: '{}'. Expected name=url (e.g., advisor=http://localhost:8766/mcp)",
+                    entry
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2070,5 +2154,94 @@ auto-config = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ssh.auto_config);
+    }
+
+    // =========================================================================
+    // MCP server configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_mcp_config_default() {
+        let config = McpServersConfig::default();
+        assert!(config.servers.is_empty());
+        assert_eq!(config.enabled_servers().count(), 0);
+    }
+
+    #[test]
+    fn test_mcp_config_in_minimal_config() {
+        let toml = "";
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn test_parse_mcp_config() {
+        let toml = r#"
+[mcp.advisor]
+url = "http://localhost:8766/mcp"
+
+[mcp.custom-tools]
+url = "http://my-server:9000/mcp"
+enabled = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.mcp.servers.len(), 2);
+
+        let advisor = &config.mcp.servers["advisor"];
+        assert_eq!(advisor.url, "http://localhost:8766/mcp");
+        assert!(advisor.enabled); // default true
+
+        let custom = &config.mcp.servers["custom-tools"];
+        assert_eq!(custom.url, "http://my-server:9000/mcp");
+        assert!(!custom.enabled);
+    }
+
+    #[test]
+    fn test_mcp_enabled_servers() {
+        let toml = r#"
+[mcp.enabled-one]
+url = "http://localhost:1/mcp"
+
+[mcp.disabled-one]
+url = "http://localhost:2/mcp"
+enabled = false
+
+[mcp.enabled-two]
+url = "http://localhost:3/mcp"
+enabled = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let enabled: Vec<_> = config.mcp.enabled_servers().collect();
+        assert_eq!(enabled.len(), 2);
+        assert!(enabled.iter().any(|(name, _)| *name == "enabled-one"));
+        assert!(enabled.iter().any(|(name, _)| *name == "enabled-two"));
+    }
+
+    #[test]
+    fn test_mcp_merge_cli_servers() {
+        let mut config = McpServersConfig::default();
+        config
+            .merge_cli_servers(&[
+                "advisor=http://localhost:8766/mcp".to_string(),
+                "tools=http://localhost:9000/mcp".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(config.servers.len(), 2);
+        assert_eq!(config.servers["advisor"].url, "http://localhost:8766/mcp");
+        assert!(config.servers["advisor"].enabled);
+    }
+
+    #[test]
+    fn test_mcp_merge_cli_servers_invalid() {
+        let mut config = McpServersConfig::default();
+        assert!(config
+            .merge_cli_servers(&["no-equals-sign".to_string()])
+            .is_err());
+        assert!(config
+            .merge_cli_servers(&["=http://empty-name".to_string()])
+            .is_err());
+        assert!(config
+            .merge_cli_servers(&["empty-url=".to_string()])
+            .is_err());
     }
 }

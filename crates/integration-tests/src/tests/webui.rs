@@ -98,7 +98,10 @@ static BUILD_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 /// (e.g. via `just container-build`); we skip building and use that image.
 fn ensure_container_built() -> Result<()> {
     if std::env::var(DEVAIPOD_CONTAINER_IMAGE_ENV).is_ok() {
-        tracing::info!("Using pre-built image from {}", DEVAIPOD_CONTAINER_IMAGE_ENV);
+        tracing::info!(
+            "Using pre-built image from {}",
+            DEVAIPOD_CONTAINER_IMAGE_ENV
+        );
         return Ok(());
     }
     if std::env::var(DEVAIPOD_INTEGRATION_ALLOW_DIRECT_ENV).is_err() {
@@ -188,7 +191,8 @@ impl WebContainerGuard {
 
         // Socket for volume mount: on Linux use host path; on macOS/Windows podman runs in VM,
         // so we must use -v /run/podman/podman.sock:/run/podman/podman.sock (VM path), not the Mac path.
-        let (socket_mount, check_socket) = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        let (socket_mount, check_socket) = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR")
+        {
             let path = format!("{}/podman/podman.sock", xdg_runtime);
             (format!("{}:/run/podman/podman.sock", path), Some(path))
         } else {
@@ -202,10 +206,7 @@ impl WebContainerGuard {
         // Check podman is reachable (on macOS we may have Mac socket path for the binary, not for the mount)
         if let Some(ref path) = check_socket {
             if !std::path::Path::new(path).exists() {
-                bail!(
-                    "Podman socket not found at {}. Is podman running?",
-                    path
-                );
+                bail!("Podman socket not found at {}. Is podman running?", path);
             }
         }
 
@@ -225,7 +226,11 @@ impl WebContainerGuard {
         );
 
         let image = web_container_image();
-        tracing::info!("Starting web container {} from image {}", container_name, image);
+        tracing::info!(
+            "Starting web container {} from image {}",
+            container_name,
+            image
+        );
 
         // Run the container (no port forwarding needed - we use podman exec)
         let run_output = cmd!(
@@ -406,9 +411,7 @@ impl WebContainerGuard {
             args.push(format!("Cookie: {}", c));
         }
         args.push(url);
-        let output = Command::new("podman")
-            .args(&args)
-            .output()?;
+        let output = Command::new("podman").args(&args).output()?;
         let raw = String::from_utf8_lossy(&output.stdout);
         let (headers_str, body) = if let Some(pos) = raw.find("\r\n\r\n") {
             (raw[..pos].to_string(), raw[pos + 4..].trim().to_string())
@@ -693,7 +696,8 @@ fn test_web_agent_ui_index_rewrites_asset_urls() -> Result<()> {
     let (status, body) = fixture.curl_in_container(&path, None)?;
 
     assert_eq!(
-        status, 200,
+        status,
+        200,
         "GET /_devaipod/agent/{{name}}/ should return 200, got {}: {}",
         status,
         &body[..body.len().min(400)]
@@ -788,7 +792,11 @@ const DEVAIPOD_AGENT_POD_COOKIE_NAME: &str = "DEVAIPOD_AGENT_POD";
 /// Tier 1: Parallel safe, no pod needed
 fn test_web_agent_ui_root_api_with_cookie() -> Result<()> {
     let fixture = WebFixture::get()?;
-    let cookie = format!("{}={}", DEVAIPOD_AGENT_POD_COOKIE_NAME, urlencoding::encode("example-pod"));
+    let cookie = format!(
+        "{}={}",
+        DEVAIPOD_AGENT_POD_COOKIE_NAME,
+        urlencoding::encode("example-pod")
+    );
     let (status, _body) = fixture.curl_in_container_with_cookie("/session", &cookie)?;
     assert_ne!(
         status, 400,
@@ -809,7 +817,11 @@ podman_integration_test!(test_web_agent_ui_root_api_with_cookie);
 /// Tier 1: Parallel safe, no pod needed
 fn test_web_agent_ui_root_api_paths_proxied() -> Result<()> {
     let fixture = WebFixture::get()?;
-    let cookie = format!("{}={}", DEVAIPOD_AGENT_POD_COOKIE_NAME, urlencoding::encode("example-pod"));
+    let cookie = format!(
+        "{}={}",
+        DEVAIPOD_AGENT_POD_COOKIE_NAME,
+        urlencoding::encode("example-pod")
+    );
     for path in ["/path", "/project", "/provider", "/auth"] {
         let (status, _body) = fixture.curl_in_container_with_cookie(path, &cookie)?;
         assert_ne!(
@@ -834,8 +846,7 @@ podman_integration_test!(test_web_agent_ui_root_api_paths_proxied);
 fn test_web_event_stream_no_cookie_returns_http11_sse() -> Result<()> {
     let fixture = WebFixture::get()?;
     for path in ["/event", "/global", "/global/event"] {
-        let (http_ver, status, content_type, body) =
-            fixture.curl_full_headers(path, 2, None)?;
+        let (http_ver, status, content_type, body) = fixture.curl_full_headers(path, 2, None)?;
         assert_eq!(
             status, 200,
             "GET {} without cookie must return 200 (not 400) so event stream does not Load failed",
@@ -847,7 +858,10 @@ fn test_web_event_stream_no_cookie_returns_http11_sse() -> Result<()> {
             path
         );
         assert!(
-            content_type.trim().to_lowercase().contains("text/event-stream"),
+            content_type
+                .trim()
+                .to_lowercase()
+                .contains("text/event-stream"),
             "GET {} must return Content-Type: text/event-stream, got {:?}",
             path,
             content_type
@@ -891,7 +905,10 @@ fn test_web_event_stream_with_cookie_unreachable_pod_returns_http11_sse() -> Res
             path
         );
         assert!(
-            content_type.trim().to_lowercase().contains("text/event-stream"),
+            content_type
+                .trim()
+                .to_lowercase()
+                .contains("text/event-stream"),
             "GET {} with cookie must return text/event-stream, got {:?}",
             path,
             content_type
@@ -915,17 +932,18 @@ fn test_web_agent_ui_css_rewrites_urls() -> Result<()> {
     assert_eq!(status, 200, "opencode-ui must return 200");
 
     // Find a .css href
-    let css_path = body
-        .split("href=\"")
-        .skip(1)
-        .find_map(|after| {
-            let end = after.find('"')?;
-            let value = &after[..end];
-            value.contains(".css").then(|| {
-                let p = value.to_string();
-                if p.starts_with('/') { p } else { format!("/{}", p) }
-            })
-        });
+    let css_path = body.split("href=\"").skip(1).find_map(|after| {
+        let end = after.find('"')?;
+        let value = &after[..end];
+        value.contains(".css").then(|| {
+            let p = value.to_string();
+            if p.starts_with('/') {
+                p
+            } else {
+                format!("/{}", p)
+            }
+        })
+    });
     let css_path = match css_path {
         Some(p) => p,
         None => bail!(
@@ -936,7 +954,11 @@ fn test_web_agent_ui_css_rewrites_urls() -> Result<()> {
     // CSS needs the cookie to be served from the opencode dir
     let cookie = format!("{}=example-pod", DEVAIPOD_AGENT_POD_COOKIE_NAME);
     let (css_status, _css_body) = fixture.curl_in_container_with_cookie(&css_path, &cookie)?;
-    assert_eq!(css_status, 200, "GET {} (CSS from opencode) with cookie should return 200", css_path);
+    assert_eq!(
+        css_status, 200,
+        "GET {} (CSS from opencode) with cookie should return 200",
+        css_path
+    );
     Ok(())
 }
 podman_integration_test!(test_web_agent_ui_css_rewrites_urls);
@@ -951,12 +973,19 @@ podman_integration_test!(test_web_agent_ui_css_rewrites_urls);
 fn test_web_opencode_ui_full_critical_path() -> Result<()> {
     let fixture = WebFixture::get()?;
     let pod_name = "example-pod";
-    let cookie = format!("{}={}", DEVAIPOD_AGENT_POD_COOKIE_NAME, urlencoding::encode(pod_name));
+    let cookie = format!(
+        "{}={}",
+        DEVAIPOD_AGENT_POD_COOKIE_NAME,
+        urlencoding::encode(pod_name)
+    );
     // 1. Agent wrapper must be the iframe page
     let wrapper_path = format!("/_devaipod/agent/{}/", urlencoding::encode(pod_name));
     let (status, body) = fixture.curl_in_container(&wrapper_path, None)?;
     assert_eq!(status, 200, "Agent wrapper must return 200, got {}", status);
-    assert!(body.contains("/_devaipod/opencode-ui"), "Wrapper must contain iframe src");
+    assert!(
+        body.contains("/_devaipod/opencode-ui"),
+        "Wrapper must contain iframe src"
+    );
     assert!(body.contains("Pods"), "Wrapper must have back link");
 
     // 2. Opencode-ui must serve valid HTML with script/link tags
@@ -991,8 +1020,14 @@ fn test_web_opencode_ui_full_critical_path() -> Result<()> {
         let (s, _) = fixture.curl_in_container_with_cookie(p, &cookie)?;
         assert_eq!(s, 200, "CSS asset {} with cookie must return 200", p);
     }
-    assert!(js_path.is_some(), "opencode-ui must reference at least one JS asset");
-    assert!(css_path.is_some(), "opencode-ui must reference at least one CSS asset");
+    assert!(
+        js_path.is_some(),
+        "opencode-ui must reference at least one JS asset"
+    );
+    assert!(
+        css_path.is_some(),
+        "opencode-ui must reference at least one CSS asset"
+    );
 
     // 4. Root API with cookie — must not 400 or 404
     for api_path in ["/session", "/path"] {
@@ -1068,13 +1103,12 @@ fn test_web_agent_redirect_sets_cookie() -> Result<()> {
     let set_cookie = headers_str
         .lines()
         .find(|l| l.trim_start().to_lowercase().starts_with("set-cookie:"));
-    assert!(
-        set_cookie.is_some(),
-        "Set-Cookie header must be present"
-    );
+    assert!(set_cookie.is_some(), "Set-Cookie header must be present");
     let set_cookie_val = set_cookie.unwrap();
     assert!(
-        set_cookie_val.to_lowercase().contains(&DEVAIPOD_AGENT_POD_COOKIE_NAME.to_lowercase()),
+        set_cookie_val
+            .to_lowercase()
+            .contains(&DEVAIPOD_AGENT_POD_COOKIE_NAME.to_lowercase()),
         "Set-Cookie must contain {}, got: {}",
         DEVAIPOD_AGENT_POD_COOKIE_NAME,
         set_cookie_val
@@ -1097,7 +1131,8 @@ fn test_web_ui_root_with_token() -> Result<()> {
     let (status, body) = fixture.curl_in_container(&path, None)?;
 
     assert_eq!(
-        status, 200,
+        status,
+        200,
         "Root with token should return 200, got {}: {}",
         status,
         &body[..body.len().min(300)]
@@ -1175,7 +1210,11 @@ fn test_web_ui_run_endpoint() -> Result<()> {
         status_code, response_body
     );
     let parsed: serde_json::Value = serde_json::from_str(&response_body).map_err(|e| {
-        color_eyre::eyre::eyre!("Run endpoint should return JSON: {} - body: {}", e, response_body)
+        color_eyre::eyre::eyre!(
+            "Run endpoint should return JSON: {} - body: {}",
+            e,
+            response_body
+        )
     })?;
     assert!(
         parsed.get("success").is_some(),

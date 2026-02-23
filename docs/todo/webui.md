@@ -2,7 +2,7 @@
 
 This document describes a potential web-based UI for devaipod that mirrors the TUI experience.
 
-> **See also**: [controlplane.md](./controlplane.md) for related control plane design, which includes Phase 3 web UI plans.
+> **See also**: [opencode-web-enhancements.md](./opencode-web-enhancements.md) for planned enhancements to the review workflow built on the opencode web UI.
 
 ## Implementation Status
 
@@ -702,4 +702,4 @@ tokio = { version = "1", features = ["full"] }
 - [Yew Docs](https://yew.rs/docs/getting-started/introduction)
 - [Are We Web Yet?](https://www.arewewebyet.org/) - Rust web ecosystem overview
 - [OpenCode Web](https://opencode.ai/docs/web/)
-- [controlplane.md](./controlplane.md) - Related devaipod control plane design
+- [opencode-web-enhancements.md](./opencode-web-enhancements.md) - Review workflow enhancements

@@ -2194,17 +2194,35 @@ exec sleep infinity
         // - Host access: published port -> 4097 -> auth checked -> 4096
         // - Internal access: opencode attach -> localhost:4096 (no auth needed)
         //
-        // If service-gator is enabled, set OPENCODE_CONFIG_CONTENT with MCP config.
-        // No JWT auth needed - gator uses file-based scopes with inotify live reload.
+        // Build MCP config combining service-gator and any additional MCP servers
+        let mut mcp_servers = serde_json::Map::new();
+
         if enable_gator {
+            mcp_servers.insert(
+                "service-gator".to_string(),
+                serde_json::json!({
+                    "type": "remote",
+                    "url": format!("http://localhost:{}/mcp", GATOR_PORT),
+                    "enabled": true
+                }),
+            );
+        }
+
+        // Add any additional MCP servers from config
+        for (name, entry) in global_config.mcp.enabled_servers() {
+            mcp_servers.insert(
+                name.to_string(),
+                serde_json::json!({
+                    "type": "remote",
+                    "url": entry.url,
+                    "enabled": true
+                }),
+            );
+        }
+
+        if !mcp_servers.is_empty() {
             let mcp_config = serde_json::json!({
-                "mcp": {
-                    "service-gator": {
-                        "type": "remote",
-                        "url": format!("http://localhost:{}/mcp", GATOR_PORT),
-                        "enabled": true
-                    }
-                }
+                "mcp": mcp_servers
             });
             env.insert(
                 "OPENCODE_CONFIG_CONTENT".to_string(),
@@ -2509,6 +2527,9 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             }
         }
 
+        // Build MCP config combining service-gator and any additional MCP servers
+        let mut mcp_servers = serde_json::Map::new();
+
         // Configure service-gator access based on gator_mode
         if enable_gator && gator_mode != WorkerGatorMode::None {
             // Worker gets access to service-gator MCP server
@@ -2516,22 +2537,39 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             // by the gator container's scope configuration, not here.
             // For now, both Readonly and Inherit connect to the same gator instance.
             // Future: could use different gator instances or JWT scopes.
-            let mcp_config = serde_json::json!({
-                "mcp": {
-                    "service-gator": {
-                        "type": "remote",
-                        "url": format!("http://localhost:{}/mcp", GATOR_PORT),
-                        "enabled": true
-                    }
-                }
-            });
-            env.insert(
-                "OPENCODE_CONFIG_CONTENT".to_string(),
-                mcp_config.to_string(),
+            mcp_servers.insert(
+                "service-gator".to_string(),
+                serde_json::json!({
+                    "type": "remote",
+                    "url": format!("http://localhost:{}/mcp", GATOR_PORT),
+                    "enabled": true
+                }),
             );
             tracing::debug!(
                 "Worker gator mode: {:?} - connecting to service-gator",
                 gator_mode
+            );
+        }
+
+        // Add any additional MCP servers from config
+        for (name, entry) in global_config.mcp.enabled_servers() {
+            mcp_servers.insert(
+                name.to_string(),
+                serde_json::json!({
+                    "type": "remote",
+                    "url": entry.url,
+                    "enabled": true
+                }),
+            );
+        }
+
+        if !mcp_servers.is_empty() {
+            let mcp_config = serde_json::json!({
+                "mcp": mcp_servers
+            });
+            env.insert(
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                mcp_config.to_string(),
             );
         }
 

@@ -11,6 +11,8 @@ use std::process::Command as ProcessCommand;
 use clap::{Args, CommandFactory, Parser};
 use color_eyre::eyre::{bail, Context, Result};
 
+#[allow(dead_code)] // MCP server will use these in a follow-up
+mod advisor;
 mod config;
 mod devcontainer;
 mod forge;
@@ -326,6 +328,14 @@ struct UpOptions {
     ///   --service-gator-image localhost/service-gator:dev
     #[arg(long, value_name = "IMAGE")]
     service_gator_image: Option<String>,
+    /// Additional MCP servers to attach to the agent (name=url format)
+    ///
+    /// Can be specified multiple times. These are added to any servers
+    /// configured in the [mcp] section of the config file.
+    ///
+    /// Example: --mcp advisor=http://localhost:8766/mcp
+    #[arg(long = "mcp", value_name = "NAME=URL")]
+    mcp_servers: Vec<String>,
 }
 
 /// Internal options for workspace creation (like `podman create` vs `podman run`)
@@ -349,6 +359,8 @@ struct CreateOptions {
     mode: WorkspaceMode,
     /// Make service-gator read-only (no push, no draft PRs)
     service_gator_ro: bool,
+    /// Additional MCP servers (name=url format)
+    mcp_servers: Vec<String>,
 }
 
 impl CreateOptions {
@@ -363,6 +375,7 @@ impl CreateOptions {
             mode: opts.mode,
             // UpOptions doesn't have service_gator_ro, it's only for `run`
             service_gator_ro: false,
+            mcp_servers: opts.mcp_servers.clone(),
         }
     }
 }
@@ -656,6 +669,14 @@ enum HostCommand {
         /// no push-new-branch or create-draft permissions will be granted.
         #[arg(short = 'R', long = "service-gator-ro")]
         service_gator_ro: bool,
+        /// Additional MCP servers to attach to the agent (name=url format)
+        ///
+        /// Can be specified multiple times. These are added to any servers
+        /// configured in the [mcp] section of the config file.
+        ///
+        /// Example: --mcp advisor=http://localhost:8766/mcp
+        #[arg(long = "mcp", value_name = "NAME=URL")]
+        mcp_servers: Vec<String>,
     },
     /// Generate shell completions
     ///
@@ -763,6 +784,31 @@ enum HostCommand {
     Gator {
         #[command(subcommand)]
         action: GatorAction,
+    },
+
+    /// Launch or interact with the advisor agent
+    ///
+    /// The advisor is a special agent that observes running pods and external
+    /// services, then suggests actions for the human to approve. It runs in
+    /// a pod named 'devaipod-advisor' using devaipod's own container image.
+    ///
+    /// If no advisor pod exists, this command helps launch one. If one is
+    /// already running, it attaches to it.
+    ///
+    /// Examples:
+    ///   devaipod advisor                              # Launch or attach
+    ///   devaipod advisor 'check my github issues'     # Launch with task
+    ///   devaipod advisor --status                     # Show advisor status
+    ///   devaipod advisor --proposals                  # List draft proposals
+    Advisor {
+        /// Task for the advisor (e.g. "look at my assigned GitHub issues")
+        task: Option<String>,
+        /// Show advisor status and exit
+        #[arg(long)]
+        status: bool,
+        /// List current draft proposals
+        #[arg(long)]
+        proposals: bool,
     },
 
     /// Internal helper commands (not for direct user use)
@@ -939,7 +985,16 @@ enum HelperCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    color_eyre::install()?;
+    // Only emit ANSI color codes when stderr is a real terminal.
+    // When captured by the web handler or piped, raw escape sequences
+    // are noise.
+    color_eyre::config::HookBuilder::default()
+        .theme(if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            color_eyre::config::Theme::dark()
+        } else {
+            color_eyre::config::Theme::new()
+        })
+        .install()?;
 
     // Detect context BEFORE parsing args - this determines which CLI we use
     if is_inside_devcontainer() {
@@ -1130,6 +1185,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             service_gator_scopes,
             service_gator_image,
             service_gator_ro,
+            mcp_servers,
         } => {
             let source = resolve_source(source.as_deref(), &config)?;
 
@@ -1202,6 +1258,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 &service_gator_scopes,
                 service_gator_image.as_deref(),
                 service_gator_ro,
+                &mcp_servers,
             )
             .await?;
 
@@ -1240,6 +1297,11 @@ async fn run_host(cli: HostCli) -> Result<()> {
 
             crate::web::run_web_server(port, token).await
         }
+        HostCommand::Advisor {
+            task,
+            status,
+            proposals,
+        } => cmd_advisor(&config, task.as_deref(), status, proposals).await,
         HostCommand::Helper { action } => run_helper_async(action).await,
     }
 }
@@ -1418,6 +1480,24 @@ fn normalize_source(source: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Create a copy of the config with CLI --mcp servers merged in
+///
+/// Since `Config` doesn't implement `Clone`, we reload the config from disk
+/// and merge the CLI servers into the `[mcp]` section. This is only called
+/// when `--mcp` flags are present, so the reload cost is negligible.
+fn merge_cli_mcp_into_config(
+    _original: &config::Config,
+    cli_servers: &[String],
+) -> Result<config::Config> {
+    // Reload config from default path (same path the original was loaded from)
+    let mut config = config::load_config(None)?;
+    config
+        .mcp
+        .merge_cli_servers(cli_servers)
+        .context("Failed to parse --mcp arguments")?;
+    Ok(config)
+}
+
 /// Create a workspace from a source (local path, remote URL, or PR)
 ///
 /// This is the inner "create" operation that handles all the common pod setup
@@ -1433,6 +1513,18 @@ async fn create_workspace(
 ) -> Result<CreateResult> {
     let source = normalize_source(source);
     let source = source.as_ref();
+
+    // Merge CLI --mcp servers into config if any were provided.
+    // We need to create a modified config since Config doesn't derive Clone.
+    // Instead, we merge into a local McpServersConfig and swap it in via
+    // a helper that takes the effective config.
+    let effective_config;
+    let config = if !opts.mcp_servers.is_empty() {
+        effective_config = merge_cli_mcp_into_config(config, &opts.mcp_servers)?;
+        &effective_config
+    } else {
+        config
+    };
 
     // Dispatch based on source type
     let result = if let Some(pr_ref) = forge::parse_pr_url(source) {
@@ -2111,6 +2203,7 @@ async fn cmd_run(
     service_gator_scopes: &[String],
     service_gator_image: Option<&str>,
     service_gator_ro: bool,
+    mcp_servers: &[String],
 ) -> Result<String> {
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
@@ -2121,6 +2214,7 @@ async fn cmd_run(
         service_gator_image: service_gator_image.map(|s| s.to_string()),
         mode: WorkspaceMode::Run,
         service_gator_ro,
+        mcp_servers: mcp_servers.to_vec(),
     };
 
     // Create the workspace - no SSH by default (async execution)
@@ -2421,9 +2515,9 @@ async fn cmd_controlplane(serve: bool, _port: u16, list: bool, json: bool) -> Re
         eprintln!("Control plane HTTP server mode is not yet implemented.");
         eprintln!();
         eprintln!("This feature is planned for a future release. See:");
-        eprintln!("  https://github.com/cgwalters/devaipod/blob/main/docs/todo/controlplane.md");
+        eprintln!("  https://github.com/cgwalters/devaipod/blob/main/docs/todo/opencode-web-enhancements.md");
         eprintln!();
-        eprintln!("For now, use 'devaipod list' and 'devaipod attach' to manage pods.");
+        eprintln!("For now, use 'devaipod web' or 'devaipod list' and 'devaipod attach' to manage pods.");
         std::process::exit(1);
     }
 
@@ -2431,7 +2525,7 @@ async fn cmd_controlplane(serve: bool, _port: u16, list: bool, json: bool) -> Re
     eprintln!("Control plane TUI mode is not yet implemented.");
     eprintln!();
     eprintln!("This feature is planned for a future release. See:");
-    eprintln!("  https://github.com/cgwalters/devaipod/blob/main/docs/todo/controlplane.md");
+    eprintln!("  https://github.com/cgwalters/devaipod/blob/main/docs/todo/opencode-web-enhancements.md");
     eprintln!();
     eprintln!("For now, use these commands to manage pods:");
     eprintln!("  devaipod list              # List all workspaces");
@@ -2636,6 +2730,229 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// =============================================================================
+// Advisor Command
+// =============================================================================
+
+/// State of the advisor pod
+enum AdvisorPodState {
+    Running,
+    Stopped,
+    NotFound,
+}
+
+/// Check whether the advisor pod exists and its state
+fn check_advisor_pod_state(pod_name: &str) -> AdvisorPodState {
+    let output = podman_command()
+        .args(["pod", "inspect", pod_name, "--format", "{{.State}}"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let state = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
+            if state == "running" {
+                AdvisorPodState::Running
+            } else {
+                AdvisorPodState::Stopped
+            }
+        }
+        _ => AdvisorPodState::NotFound,
+    }
+}
+
+/// Handle the advisor command
+///
+/// Checks if a devaipod-advisor pod exists:
+/// - If running: attach to it (or send task if provided)
+/// - If stopped: start it and attach
+/// - If not found: create it
+async fn cmd_advisor(
+    config: &config::Config,
+    task: Option<&str>,
+    show_status: bool,
+    show_proposals: bool,
+) -> Result<()> {
+    const ADVISOR_POD: &str = "devaipod-advisor";
+
+    let existing = check_advisor_pod_state(ADVISOR_POD);
+
+    if show_status {
+        return cmd_advisor_status(ADVISOR_POD, &existing);
+    }
+
+    if show_proposals {
+        return cmd_advisor_proposals(ADVISOR_POD);
+    }
+
+    // When called from the web handler, DEVAIPOD_NO_ATTACH is set to
+    // prevent blocking on cmd_attach (which would hang the HTTP request).
+    let no_attach = std::env::var("DEVAIPOD_NO_ATTACH").is_ok();
+
+    match existing {
+        AdvisorPodState::Running => {
+            if let Some(task) = task {
+                eprintln!("Advisor is running. Sending task...");
+                start_agent_task(ADVISOR_POD, task, false)?;
+            } else {
+                eprintln!("Advisor is running.");
+            }
+            if no_attach {
+                return Ok(());
+            }
+            cmd_attach(ADVISOR_POD, None, AttachTarget::Agent).await
+        }
+        AdvisorPodState::Stopped => {
+            eprintln!("Starting stopped advisor pod...");
+            cmd_start(ADVISOR_POD)?;
+            if let Some(task) = task {
+                start_agent_task(ADVISOR_POD, task, false)?;
+            }
+            if no_attach {
+                return Ok(());
+            }
+            cmd_attach(ADVISOR_POD, None, AttachTarget::Agent).await
+        }
+        AdvisorPodState::NotFound => {
+            eprintln!("No advisor pod found. Creating one...");
+            create_advisor_pod(config, task).await?;
+            if no_attach {
+                return Ok(());
+            }
+            cmd_attach(ADVISOR_POD, None, AttachTarget::Agent).await
+        }
+    }
+}
+
+/// Default fallback image for the advisor pod (used only when auto-detection fails)
+const ADVISOR_IMAGE_FALLBACK: &str = "ghcr.io/cgwalters/devaipod:latest";
+
+/// Get the container image to use for the advisor pod.
+///
+/// When running inside the devaipod container, queries podman for the
+/// image of the running `devaipod` container so the advisor uses the
+/// exact same image as the control plane. This avoids pulling a remote
+/// image when a locally-built one is available. Falls back to the
+/// published image if detection fails.
+fn advisor_image() -> String {
+    if is_inside_devaipod_container() {
+        if let Some(image) = detect_own_container_image() {
+            tracing::debug!("Detected own container image: {}", image);
+            return image;
+        }
+        tracing::warn!(
+            "Could not detect own container image, falling back to {}",
+            ADVISOR_IMAGE_FALLBACK
+        );
+    }
+    ADVISOR_IMAGE_FALLBACK.to_string()
+}
+
+/// Detect the image of the running devaipod control plane container.
+///
+/// The control plane container is named `devaipod` (by convention from
+/// `just container-run`). We inspect it via the podman CLI to find
+/// the image name. Returns `None` if detection fails.
+fn detect_own_container_image() -> Option<String> {
+    let output = std::process::Command::new("podman")
+        .args(["inspect", "devaipod", "--format", "{{.ImageName}}"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if image.is_empty() {
+        return None;
+    }
+    Some(image)
+}
+
+/// Create the advisor pod using cmd_run with advisor-specific settings.
+///
+/// The advisor doesn't work on a specific repo — it's a meta-agent that
+/// observes other pods and suggests actions. We use the dotfiles repo as
+/// the workspace source (same default as `devaipod up` with no args),
+/// and override the image to use our own container which has opencode
+/// installed.
+async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Result<()> {
+    let image = advisor_image();
+    let default_task = task.unwrap_or("You are the devaipod advisor agent. Wait for instructions.");
+
+    // TODO: attach the advisor MCP server once it's implemented.
+    // The advisor MCP server (port ADVISOR_MCP_PORT) will provide pod
+    // introspection and draft proposal tools. For now the advisor works
+    // with just service-gator for GitHub/issue access.
+    let mcp_servers: Vec<String> = vec![];
+
+    // Use the dotfiles repo as the advisor's workspace source — same
+    // fallback that `devaipod up` / `devaipod run` use when no source
+    // is given. This satisfies the requirement that every pod has a git
+    // repo to clone, and gives the advisor a familiar dev environment.
+    let source = resolve_source(None, config)?;
+
+    let pod_name = cmd_run(
+        config,
+        source,
+        Some(default_task),
+        Some(&image),
+        Some("advisor"), // Becomes devaipod-advisor via normalize_pod_name
+        &[],             // service-gator scopes from config
+        None,
+        true, // read-only service-gator
+        &mcp_servers,
+    )
+    .await?;
+
+    eprintln!("Created advisor pod: {}", strip_pod_prefix(&pod_name));
+    Ok(())
+}
+
+/// Show the advisor pod status
+fn cmd_advisor_status(pod_name: &str, state: &AdvisorPodState) -> Result<()> {
+    match state {
+        AdvisorPodState::Running => {
+            eprintln!("Advisor pod: running");
+            if let Some(healthy) = check_agent_health(pod_name) {
+                eprintln!(
+                    "Agent health: {}",
+                    if healthy { "healthy" } else { "unhealthy" }
+                );
+            }
+        }
+        AdvisorPodState::Stopped => eprintln!("Advisor pod: stopped"),
+        AdvisorPodState::NotFound => eprintln!("Advisor pod: not found"),
+    }
+    Ok(())
+}
+
+/// List current draft proposals from the advisor pod
+fn cmd_advisor_proposals(pod_name: &str) -> Result<()> {
+    let agent_container = get_attach_container_name(pod_name, AttachTarget::Agent);
+    let output = ProcessCommand::new("podman")
+        .args(["exec", &agent_container, "cat", advisor::DRAFTS_PATH])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let store: advisor::DraftStore =
+                serde_json::from_slice(&o.stdout).context("Failed to parse proposals")?;
+            if store.proposals.is_empty() {
+                eprintln!("No proposals.");
+            } else {
+                for p in &store.proposals {
+                    eprintln!(
+                        "[{:?}] {} - {} ({:?})",
+                        p.priority, p.title, p.repo, p.status
+                    );
+                }
+            }
+        }
+        _ => eprintln!("No proposals (advisor may not be running or no proposals yet)."),
+    }
     Ok(())
 }
 

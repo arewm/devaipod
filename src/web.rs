@@ -1035,6 +1035,9 @@ struct RunRequest {
     /// Suppress default write service-gator scopes
     #[serde(default)]
     service_gator_ro: bool,
+    /// Additional MCP servers to attach (name=url format)
+    #[serde(default)]
+    mcp_servers: Vec<String>,
 }
 
 /// Response for run endpoint
@@ -1086,6 +1089,10 @@ async fn run_workspace(Json(req): Json<RunRequest>) -> Result<Json<RunResponse>,
         cmd.arg("--service-gator-ro");
     }
 
+    for mcp in &req.mcp_servers {
+        cmd.args(["--mcp", mcp]);
+    }
+
     tracing::info!("Running devaipod: {:?}", cmd);
 
     let output = cmd.output().await.map_err(|e| {
@@ -1119,6 +1126,142 @@ async fn run_workspace(Json(req): Json<RunRequest>) -> Result<Json<RunResponse>,
         workspace: workspace.clone(),
         message: format!("Workspace '{}' created successfully", workspace),
     }))
+}
+
+/// Request body for advisor launch endpoint
+#[derive(Debug, Deserialize)]
+struct AdvisorLaunchRequest {
+    /// Optional task for the advisor (e.g. "check my GitHub issues")
+    task: Option<String>,
+}
+
+/// Launch or check the advisor pod
+///
+/// If the advisor pod already exists and is running, returns its status.
+/// If it doesn't exist, creates it with the appropriate image and MCP config.
+async fn launch_advisor(
+    Json(req): Json<AdvisorLaunchRequest>,
+) -> Result<Json<RunResponse>, StatusCode> {
+    // Check if advisor pod already exists
+    let check = std::process::Command::new("podman")
+        .args([
+            "pod",
+            "inspect",
+            "devaipod-advisor",
+            "--format",
+            "{{.State}}",
+        ])
+        .output();
+
+    if let Ok(output) = check {
+        if output.status.success() {
+            let state = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_lowercase();
+            if state == "running" {
+                // Advisor already running — if task provided, send it
+                if let Some(ref task) = req.task {
+                    let mut cmd = tokio::process::Command::new("devaipod");
+                    cmd.args(["opencode", "advisor", "send", task]);
+                    let _ = cmd.output().await;
+                }
+                return Ok(Json(RunResponse {
+                    success: true,
+                    workspace: "advisor".to_string(),
+                    message: "Advisor is already running".to_string(),
+                }));
+            } else {
+                // Advisor exists but stopped — start it
+                let start = tokio::process::Command::new("podman")
+                    .args(["pod", "start", "devaipod-advisor"])
+                    .output()
+                    .await;
+                if let Ok(o) = start {
+                    if o.status.success() {
+                        return Ok(Json(RunResponse {
+                            success: true,
+                            workspace: "advisor".to_string(),
+                            message: "Advisor pod started".to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Advisor doesn't exist — create it via `devaipod advisor`.
+    // This reuses the CLI command which handles dotfiles fallback,
+    // image selection, and MCP setup internally. We pass --no-attach
+    // (via an env var) so it doesn't block trying to attach.
+    let mut cmd = tokio::process::Command::new("devaipod");
+    cmd.arg("advisor");
+    // Prevent the advisor command from trying to attach to the pod
+    // (which would block the web handler indefinitely). Setting
+    // DEVAIPOD_NO_ATTACH=1 is checked by cmd_advisor.
+    cmd.env("DEVAIPOD_NO_ATTACH", "1");
+    if let Some(ref task) = req.task {
+        cmd.arg(task);
+    }
+
+    tracing::info!("Launching advisor: {:?}", cmd);
+
+    let output = cmd.output().await.map_err(|e| {
+        tracing::error!("Failed to launch advisor: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("Advisor launch failed: {}", stderr);
+        return Ok(Json(RunResponse {
+            success: false,
+            workspace: String::new(),
+            message: format!("Failed to launch advisor: {}", stderr.trim()),
+        }));
+    }
+
+    Ok(Json(RunResponse {
+        success: true,
+        workspace: "advisor".to_string(),
+        message: "Advisor pod created".to_string(),
+    }))
+}
+
+/// Advisor status response
+#[derive(Debug, Serialize)]
+struct AdvisorStatusResponse {
+    /// Whether the advisor pod exists
+    exists: bool,
+    /// Pod state: "running", "stopped", or "not_found"
+    state: String,
+}
+
+async fn advisor_status() -> Result<Json<AdvisorStatusResponse>, StatusCode> {
+    let check = std::process::Command::new("podman")
+        .args([
+            "pod",
+            "inspect",
+            "devaipod-advisor",
+            "--format",
+            "{{.State}}",
+        ])
+        .output();
+
+    match check {
+        Ok(output) if output.status.success() => {
+            let state = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_lowercase();
+            Ok(Json(AdvisorStatusResponse {
+                exists: true,
+                state,
+            }))
+        }
+        _ => Ok(Json(AdvisorStatusResponse {
+            exists: false,
+            state: "not_found".to_string(),
+        })),
+    }
 }
 
 /// Recreate a workspace (delete and recreate with same repo)
@@ -1462,6 +1605,8 @@ pub(crate) fn build_app(
         .route("/devaipod/pods/{name}/git/diff", get(git_diff))
         .route("/devaipod/pods/{name}/git/commits", get(git_commits))
         .route("/devaipod/run", post(run_workspace))
+        .route("/devaipod/advisor/launch", post(launch_advisor))
+        .route("/devaipod/advisor/status", get(advisor_status))
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
         .layer(middleware::from_fn_with_state(
             state.clone(),

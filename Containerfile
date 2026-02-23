@@ -85,6 +85,20 @@ RUN bun run build
 
 # Output is in /build/opencode/packages/app/dist
 
+# -- opencode CLI binary --
+# Download the opencode CLI for use in advisor pods (where this image is the agent image).
+# Release artifacts are tarballs; select the right architecture at build time.
+# TARGETARCH is set by buildx/podman (amd64 or arm64); opencode uses x64/arm64.
+FROM quay.io/centos/centos:stream10 AS opencode-cli
+ARG OPENCODE_VERSION=v1.1.65
+ARG TARGETARCH
+RUN ARCH="${TARGETARCH}"; \
+    if [ "$ARCH" = "amd64" ] || [ -z "$ARCH" ]; then ARCH="x64"; fi; \
+    curl -fsSL \
+      "https://github.com/anomalyco/opencode/releases/download/${OPENCODE_VERSION}/opencode-linux-${ARCH}.tar.gz" \
+      | tar xzf - -C /usr/local/bin/ opencode && \
+    chmod +x /usr/local/bin/opencode
+
 # -- build stage --
 FROM quay.io/centos/centos:stream10 AS build
 
@@ -131,6 +145,10 @@ RUN dnf install -y \
 RUN mkdir -p /root/.config
 
 COPY --from=build /usr/bin/devaipod /usr/bin/devaipod
+
+# Install the opencode CLI agent binary; needed when this image is used as
+# the agent container for advisor pods.
+COPY --from=opencode-cli /usr/local/bin/opencode /usr/local/bin/opencode
 
 # Mark that we're running inside the official devaipod container
 # This is checked by `devaipod` to require running in container mode by default
