@@ -3529,8 +3529,9 @@ mod tests {
         let container_home = "/home/vscode";
 
         let mut config = DevcontainerConfig::default();
-        // Add a device via runArgs
-        config.run_args = vec!["--device=/dev/custom".to_string()];
+        // Use /dev/null which exists on all platforms; non-existent devices
+        // are filtered out at runtime (see commit 5bcf785).
+        config.run_args = vec!["--device=/dev/null".to_string()];
 
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::workspace_container_config(
@@ -3551,8 +3552,8 @@ mod tests {
         assert!(
             container_config
                 .devices
-                .contains(&"/dev/custom".to_string()),
-            "devices should include /dev/custom from runArgs"
+                .contains(&"/dev/null".to_string()),
+            "devices should include /dev/null from runArgs"
         );
     }
 
