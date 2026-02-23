@@ -20,7 +20,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::prelude::*;
 use color_eyre::eyre::{bail, Context, Result};
 use hyper_util::rt::TokioIo;
@@ -30,7 +29,6 @@ use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::pod::OPENCODE_AUTH_PROXY_PORT;
 use crate::podman::{get_container_socket, host_for_pod_services};
 
 /// Path to the token file when using podman/Kubernetes secrets (highest priority).
@@ -268,7 +266,7 @@ async fn podman_proxy(
 
 /// Get opencode connection info for a pod
 ///
-/// Returns (published_port, api_password) for the pod's auth proxy.
+/// Returns (published_port, api_password) for the pod's opencode server.
 async fn get_pod_opencode_info(pod_name: &str) -> Result<(u16, String), StatusCode> {
     use bollard::Docker;
 
@@ -297,7 +295,7 @@ async fn get_pod_opencode_info(pod_name: &str) -> Result<(u16, String), StatusCo
             StatusCode::NOT_FOUND
         })?;
 
-    // Get the published port for 4097 (auth proxy)
+    // Get the published port for opencode
     let ports = pod_info
         .network_settings
         .as_ref()
@@ -307,12 +305,13 @@ async fn get_pod_opencode_info(pod_name: &str) -> Result<(u16, String), StatusCo
             StatusCode::NOT_FOUND
         })?;
 
-    let port_key = format!("{OPENCODE_AUTH_PROXY_PORT}/tcp");
+    let opencode_port = crate::pod::OPENCODE_PORT;
+    let port_key = format!("{}/tcp", opencode_port);
     let bindings = ports
         .get(&port_key)
         .and_then(|b| b.as_ref())
         .ok_or_else(|| {
-            tracing::error!("Port {OPENCODE_AUTH_PROXY_PORT} not published for {pod_name}");
+            tracing::error!("Port {} not published for {}", opencode_port, pod_name);
             StatusCode::NOT_FOUND
         })?;
 
@@ -401,7 +400,7 @@ async fn opencode_info(
 ) -> Result<Json<OpencodeInfoResponse>, (StatusCode, Json<ApiErrorBody>)> {
     let pod_name = normalize_pod_name(&name);
 
-    let (port, password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
+    let (port, _password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
         let msg = if code == StatusCode::NOT_FOUND {
             "Pod or agent not found (agent container may not be running or port not published)"
                 .to_string()
@@ -411,13 +410,11 @@ async fn opencode_info(
         (code, Json(ApiErrorBody { error: msg }))
     })?;
 
-    // Build URL with token query parameter
-    // The auth proxy accepts ?token=PASSWORD and sets a session cookie
-    // This allows browsers to load dynamic ES modules (which can't use Basic Auth)
-    let url = format!("http://127.0.0.1:{}/?token={}", port, password);
+    // Build URL for the opencode web UI
+    let url = format!("http://127.0.0.1:{}/", port);
 
     // Fetch the most recent session so the control plane can navigate directly to it
-    let latest_session = fetch_latest_session(port, &password).await;
+    let latest_session = fetch_latest_session(port).await;
 
     Ok(Json(OpencodeInfoResponse {
         url,
@@ -429,12 +426,10 @@ async fn opencode_info(
 
 /// Fetch the most recent session from a pod's opencode backend.
 ///
-/// Calls GET /session on the pod's auth proxy and returns the session with
+/// Calls GET /session on the pod's opencode server and returns the session with
 /// the most recent `time.updated` timestamp.  Returns None on any error
 /// (non-fatal: the control plane just won't deep-link into a session).
-async fn fetch_latest_session(port: u16, password: &str) -> Option<LatestSessionInfo> {
-    use base64::Engine;
-
+async fn fetch_latest_session(port: u16) -> Option<LatestSessionInfo> {
     let host = host_for_pod_services();
 
     let client = reqwest::Client::builder()
@@ -442,12 +437,8 @@ async fn fetch_latest_session(port: u16, password: &str) -> Option<LatestSession
         .build()
         .ok()?;
 
-    let auth = base64::engine::general_purpose::STANDARD
-        .encode(format!("opencode:{}", password));
-
     let resp = client
         .get(format!("http://{}:{}/session", host, port))
-        .header("Authorization", format!("Basic {}", auth))
         .send()
         .await
         .ok()?;
@@ -492,7 +483,7 @@ async fn opencode_proxy_root(
 
 /// Proxy handler for opencode server with path
 ///
-/// Forwards requests to a pod's opencode server via its auth proxy.
+/// Forwards requests to a pod's opencode server.
 /// The opencode server itself proxies non-API paths to app.opencode.ai for the web UI.
 ///
 /// Path: `/api/devaipod/pods/{name}/opencode/{*path}`
@@ -514,7 +505,7 @@ async fn opencode_proxy_impl(
     // Get the pod's opencode connection info.
     // Map NOT_FOUND (pod/agent not running or port not published) to SERVICE_UNAVAILABLE
     // so 404 is reserved for "route not found"; integration tests assert root proxy route exists (not 404).
-    let (port, password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
+    let (port, _password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
         if code == StatusCode::NOT_FOUND {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
@@ -534,30 +525,36 @@ async fn opencode_proxy_impl(
         path
     );
 
-    proxy_to_upstream(&host, port, &password, path, request).await
+    proxy_to_upstream(&host, port, path, request).await
 }
 
-/// Low-level HTTP proxy: connect to `host:port`, forward `request` with Basic Auth,
+/// Low-level HTTP proxy: connect to `host:port`, forward `request`,
 /// and return the response with the HTTP version normalized to 1.1.
+///
+/// Supports HTTP Upgrade (WebSocket): when the request contains an `Upgrade` header,
+/// the proxy negotiates the upgrade with upstream and then bidirectionally copies
+/// raw bytes between the client and upstream connections.
 ///
 /// Separated from `opencode_proxy_impl` so it can be tested with a mock server
 /// (the caller handles pod discovery; this function handles the TCP connection).
 async fn proxy_to_upstream(
     host: &str,
     port: u16,
-    password: &str,
     path: String,
     request: Request,
 ) -> Result<Response, StatusCode> {
-    // Connect to the published auth proxy port (host:port)
+    // Connect to the published opencode port (host:port)
     let stream = tokio::net::TcpStream::connect(format!("{}:{}", host, port))
         .await
         .map_err(|e| {
-            tracing::error!("Failed to connect to opencode auth proxy: {}", e);
+            tracing::error!("Failed to connect to opencode server: {}", e);
             StatusCode::BAD_GATEWAY
         })?;
 
     let io = TokioIo::new(stream);
+
+    // Check if this is an HTTP Upgrade request (e.g. WebSocket for /pty/*)
+    let is_upgrade = request.headers().get(header::UPGRADE).is_some();
 
     // Create HTTP client
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
@@ -567,17 +564,24 @@ async fn proxy_to_upstream(
             StatusCode::BAD_GATEWAY
         })?;
 
-    // Spawn connection handler
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::error!("Connection to opencode server failed: {}", e);
-        }
-    });
+    // Spawn connection handler. For upgrade requests, use with_upgrades()
+    // so hyper keeps the connection alive after the 101 response.
+    if is_upgrade {
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                // Upgrade connections normally close cleanly
+                tracing::debug!("Upgrade connection closed: {}", e);
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::error!("Connection to opencode server failed: {}", e);
+            }
+        });
+    }
 
-    // Build the request
-    let (parts, body) = request.into_parts();
-
-    // Use root path if path is empty, otherwise prepend /
+    // Build the upstream URI
     let mut uri = if path.is_empty() || path == "/" {
         "/".to_string()
     } else if path.starts_with('/') {
@@ -586,24 +590,24 @@ async fn proxy_to_upstream(
         format!("/{}", path)
     };
 
-    // Preserve query string (e.g. /file?path=src/main.rs) - opencode API requires it for /file, /find/file, etc.
-    if let Some(query) = parts.uri.query() {
+    // Preserve query string (e.g. /file?path=src/main.rs, /pty/.../connect?directory=...)
+    if let Some(query) = request.uri().query() {
         uri.push('?');
         uri.push_str(query);
     }
 
-    // Build Basic Auth header
-    let auth = BASE64_STANDARD.encode(format!("opencode:{}", password));
+    // Decompose the request. For upgrade requests, we reconstruct a Request
+    // from the parts so hyper::upgrade::on() can extract the upgrade future.
+    let (parts, body) = request.into_parts();
 
     let mut builder = hyper::Request::builder()
-        .method(parts.method)
+        .method(parts.method.clone())
         .uri(&uri)
-        .header(header::HOST, format!("{}:{}", host, port))
-        .header(header::AUTHORIZATION, format!("Basic {}", auth));
+        .header(header::HOST, format!("{}:{}", host, port));
 
-    // Copy headers (except Host and Authorization which we set)
+    // Copy headers (except Host which we set)
     for (key, value) in parts.headers.iter() {
-        if key != header::HOST && key != header::AUTHORIZATION {
+        if key != header::HOST {
             builder = builder.header(key, value);
         }
     }
@@ -614,14 +618,60 @@ async fn proxy_to_upstream(
     })?;
 
     // Send request and get response
-    let response = sender.send_request(proxy_request).await.map_err(|e| {
+    let upstream_response = sender.send_request(proxy_request).await.map_err(|e| {
         tracing::error!("Failed to send request to opencode: {}", e);
         StatusCode::BAD_GATEWAY
     })?;
 
-    // Convert the response, upgrading HTTP/1.0 from upstream to HTTP/1.1 so SSE
-    // streaming works correctly in browsers (HTTP/1.0 lacks chunked transfer encoding).
-    let (mut parts, body) = response.into_parts();
+    // Handle HTTP Upgrade (WebSocket) responses
+    if is_upgrade && upstream_response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        // Build the 101 response to send back to the client.
+        // Reconstruct a Request from the decomposed parts so hyper can
+        // extract the upgrade future (it's stored in the extensions).
+        let mut response_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+        for (key, value) in upstream_response.headers() {
+            response_builder = response_builder.header(key, value);
+        }
+
+        // Reconstruct the inbound request from parts — the upgrade future
+        // lives in `parts.extensions` and survives the round-trip.
+        let inbound_request = Request::from_parts(parts, Body::empty());
+
+        // Spawn a task to bridge the upgraded connections once both sides
+        // have completed the upgrade handshake
+        tokio::spawn(async move {
+            let client_upgraded = hyper::upgrade::on(inbound_request).await;
+            let upstream_upgraded = hyper::upgrade::on(upstream_response).await;
+
+            match (client_upgraded, upstream_upgraded) {
+                (Ok(client), Ok(upstream)) => {
+                    let mut client_io = TokioIo::new(client);
+                    let mut upstream_io = TokioIo::new(upstream);
+                    if let Err(e) =
+                        tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
+                    {
+                        tracing::debug!("WebSocket proxy connection closed: {}", e);
+                    }
+                }
+                (Err(e), _) => {
+                    tracing::error!("Client upgrade failed: {}", e);
+                }
+                (_, Err(e)) => {
+                    tracing::error!("Upstream upgrade failed: {}", e);
+                }
+            }
+        });
+
+        return response_builder
+            .body(Body::empty())
+            .map_err(|e| {
+                tracing::error!("Failed to build upgrade response: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            });
+    }
+
+    // Normal (non-upgrade) response: normalize HTTP version for SSE/chunked support
+    let (mut parts, body) = upstream_response.into_parts();
     parts.version = hyper::Version::HTTP_11;
     let body = Body::new(body);
 
@@ -1266,8 +1316,7 @@ async fn advisor_status() -> Result<Json<AdvisorStatusResponse>, StatusCode> {
 
 /// Recreate a workspace (delete and recreate with same repo)
 ///
-/// Runs `devaipod rebuild <pod_name>`. Fixes issues like missing port 4097
-/// on pods created before the port was published. Requires pod to have
+/// Runs `devaipod rebuild <pod_name>`. Requires pod to have
 /// io.devaipod.repo label.
 async fn recreate_workspace(
     Path(name): Path<String>,
@@ -1847,7 +1896,6 @@ mod tests {
 
     /// Verify proxy_to_upstream upgrades HTTP/1.0 responses to HTTP/1.1.
     ///
-    /// The opencode auth proxy (Python BaseHTTPServer) responds with HTTP/1.0.
     /// Browsers require HTTP/1.1 for SSE (chunked transfer encoding). This test
     /// starts a mock HTTP/1.0 server, proxies through proxy_to_upstream, and
     /// asserts the response version is upgraded.
@@ -1882,7 +1930,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let response = proxy_to_upstream("127.0.0.1", port, "test-password", "global/event".into(), request)
+        let response = proxy_to_upstream("127.0.0.1", port, "global/event".into(), request)
             .await
             .expect("proxy_to_upstream should succeed");
 
@@ -1937,7 +1985,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let response = proxy_to_upstream("127.0.0.1", port, "pw", "session".into(), request)
+        let response = proxy_to_upstream("127.0.0.1", port, "session".into(), request)
             .await
             .expect("proxy should succeed");
 
@@ -1986,7 +2034,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let _ = proxy_to_upstream("127.0.0.1", port, "pw", "file".into(), request)
+        let _ = proxy_to_upstream("127.0.0.1", port, "file".into(), request)
             .await
             .expect("proxy should succeed");
 
