@@ -473,67 +473,111 @@
             cursor: pointer;
         }
 
-        .advisor-section {
-            margin-bottom: 1rem;
+        .pod-card.advisor-pod {
+            border-color: #7c3aed;
         }
-        .advisor-banner {
+        .advisor-proposals-inline {
+            margin-top: 0.5rem;
+            border-top: 1px solid var(--border);
+            padding-top: 0.5rem;
+        }
+        .advisor-proposals-inline:empty {
+            display: none;
+        }
+        .advisor-launch-prompt .pod-meta-item {
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        .proposals-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0.75rem 1rem;
-            background: #1a1a2e;
-            border: 1px solid #333;
-            border-radius: 6px;
-            gap: 1rem;
-        }
-        .advisor-info {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
+            margin-bottom: 0.5rem;
             color: #ccc;
             font-size: 0.9rem;
         }
-        .advisor-icon {
-            color: #7c3aed;
-            font-size: 1.1rem;
+        .proposal-card {
+            padding: 0.75rem 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            margin-bottom: 0.5rem;
         }
-        .advisor-actions {
+        .proposal-card .proposal-title {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 0.25rem;
+        }
+        .proposal-card .proposal-meta {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.25rem;
+        }
+        .proposal-card .proposal-rationale {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+        .proposal-card .proposal-actions {
             display: flex;
             gap: 0.5rem;
-            align-items: center;
         }
-        .advisor-launch-btn {
-            padding: 0.35rem 0.75rem;
-            background: #7c3aed;
-            color: #fff;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 0.85rem;
-            font-family: inherit;
+        .proposal-priority {
+            display: inline-block;
+            padding: 0.1rem 0.4rem;
+            border-radius: 3px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-right: 0.4rem;
         }
-        .advisor-launch-btn:hover {
-            background: #6d28d9;
-        }
-        .advisor-launch-btn:disabled {
-            background: #555;
-            cursor: not-allowed;
-        }
-        .advisor-open-btn {
-            padding: 0.35rem 0.75rem;
+        .proposal-priority.high { background: rgba(239, 68, 42, 0.2); color: #ef442a; }
+        .proposal-priority.medium { background: rgba(255, 220, 23, 0.15); color: #ffdc17; }
+        .proposal-priority.low { background: rgba(137, 181, 255, 0.15); color: #89b5ff; }
+        .dismiss-btn {
+            padding: 0.2rem 0.5rem;
             background: transparent;
-            color: #7c3aed;
-            border: 1px solid #7c3aed;
-            border-radius: 4px;
+            color: var(--text-weak);
+            border: 1px solid var(--border);
+            border-radius: 3px;
             cursor: pointer;
-            font-size: 0.85rem;
+            font-size: 0.8rem;
             font-family: inherit;
         }
-        .advisor-open-btn:hover {
-            background: rgba(124, 58, 237, 0.1);
+        .dismiss-btn:hover { color: var(--error); border-color: var(--error); }
+
+        .pod-card.collapsed .pod-meta,
+        .pod-card.collapsed .pod-containers,
+        .pod-card.collapsed .pod-actions,
+        .pod-card.collapsed .advisor-proposals-inline {
+            display: none;
         }
-        .pod-card.advisor-pod {
-            border-color: #7c3aed;
+        .pod-header {
+            cursor: pointer;
+            user-select: none;
+        }
+        .expand-toggle {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 1.4rem;
+            height: 1.4rem;
+            margin-left: auto;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-weak);
+            font-size: 0.65rem;
+            cursor: pointer;
+            transition: transform 0.15s, background 0.15s;
+            flex-shrink: 0;
+        }
+        .expand-toggle:hover {
+            background: rgba(255,255,255,0.12);
+            color: var(--text-secondary);
+        }
+        .pod-card.collapsed .expand-toggle {
+            transform: rotate(-90deg);
         }
     </style>
 </head>
@@ -616,16 +660,6 @@
             </div>
         </div>
 
-        <!-- Advisor section -->
-        <div id="advisor-section" class="advisor-section" style="display: none;">
-            <div id="advisor-banner" class="advisor-banner">
-                <div class="advisor-info">
-                    <span class="advisor-icon">&#9733;</span>
-                    <span id="advisor-status-text">Advisor</span>
-                </div>
-                <div class="advisor-actions" id="advisor-actions"></div>
-            </div>
-        </div>
         
         <div id="error-container"></div>
         <div id="pods-container" class="loading">Loading pods...</div>
@@ -647,6 +681,19 @@
         }
         
         const authHeader = { 'Authorization': `Bearer ${token}` };
+
+        const expandedPods = new Set();
+
+        function togglePodCard(headerEl) {
+            const card = headerEl.closest('.pod-card');
+            const name = card.dataset.podName;
+            card.classList.toggle('collapsed');
+            if (card.classList.contains('collapsed')) {
+                expandedPods.delete(name);
+            } else {
+                expandedPods.add(name);
+            }
+        }
         
         // API GET helper (on error, use server JSON body error message if present)
         async function apiCall(path) {
@@ -830,10 +877,13 @@
                 actionsHtml += '<button type="button" class="action-btn danger" data-action="delete" data-pod-full="' + safeFull + '" data-pod-short="' + safeShort + '" title="Delete pod">Delete</button>';
             }
 
+            const proposalsHtml = isAdvisor ? '<div id="advisor-proposals" class="advisor-proposals-inline"></div>' : '';
+
             return `
-                <div class="pod-card ${isAdvisor ? 'advisor-pod' : ''}" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
-                    <div class="pod-header">
+                <div class="pod-card ${isAdvisor ? 'advisor-pod' : 'collapsed'}" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
+                    <div class="pod-header" onclick="togglePodCard(this)">
                         <span class="pod-name">${shortName}</span>
+                        <span class="expand-toggle">&#9660;</span>
                         <span class="pod-status ${statusClass}">${status}</span>
                     </div>
                     <div class="pod-meta">
@@ -846,6 +896,7 @@
                     <div class="pod-actions">
                         ${actionsHtml}
                     </div>
+                    ${proposalsHtml}
                 </div>
             `;
         }
@@ -867,6 +918,11 @@
                 const devaipodPods = pods.filter(p => p.Name && p.Name.startsWith('devaipod-'));
                 // Sort by activity: running first, then by Created descending (newest first)
                 devaipodPods.sort((a, b) => {
+                    // Pin advisor to top
+                    const aAdvisor = a.Name === 'devaipod-advisor' ? 1 : 0;
+                    const bAdvisor = b.Name === 'devaipod-advisor' ? 1 : 0;
+                    if (bAdvisor !== aAdvisor) return bAdvisor - aAdvisor;
+                    // Then running pods first
                     const aRunning = (a.Status || '').toLowerCase() === 'running' ? 1 : 0;
                     const bRunning = (b.Status || '').toLowerCase() === 'running' ? 1 : 0;
                     if (bRunning !== aRunning) return bRunning - aRunning;
@@ -888,8 +944,34 @@
                         </div>
                     `;
                 } else {
+                    const hasAdvisor = devaipodPods.some(p => p.Name === 'devaipod-advisor');
                     container.className = 'pods-list';
-                    container.innerHTML = devaipodPods.map(renderPod).join('');
+                    let html = '';
+                    if (!hasAdvisor) {
+                        html += `
+                            <div class="pod-card advisor-pod advisor-launch-prompt" tabindex="0" data-pod-name="advisor" data-running="false">
+                                <div class="pod-header">
+                                    <span class="pod-name">advisor</span>
+                                    <span class="pod-status stopped">not running</span>
+                                </div>
+                                <div class="pod-meta">
+                                    <div class="pod-meta-item">The advisor agent observes your pods and suggests actions.</div>
+                                </div>
+                                <div class="pod-actions">
+                                    <button type="button" class="open-btn" onclick="launchAdvisor(this)">Launch Advisor</button>
+                                </div>
+                            </div>
+                        `;
+                    }
+                    html += devaipodPods.map(renderPod).join('');
+                    container.innerHTML = html;
+                    // Restore collapsed/expanded state across refreshes
+                    container.querySelectorAll('.pod-card').forEach(card => {
+                        const name = card.dataset.podName;
+                        if (expandedPods.has(name)) {
+                            card.classList.remove('collapsed');
+                        }
+                    });
                     const cards = container.querySelectorAll('.pod-card');
                     if (prevPodName) {
                         // Re-render destroyed focus — restore it to the same pod or nearest
@@ -903,39 +985,13 @@
                 }
                 
                 document.getElementById('error-container').innerHTML = '';
-                checkAdvisorStatus();
+                checkProposals();
             } catch (err) {
                 statusIndicator.classList.add('disconnected');
                 statusText.textContent = 'Disconnected';
                 document.getElementById('error-container').innerHTML = `
                     <div class="error">${err.message}</div>
                 `;
-            }
-        }
-        
-        // Check advisor status and update the banner
-        async function checkAdvisorStatus() {
-            const section = document.getElementById('advisor-section');
-            const statusText = document.getElementById('advisor-status-text');
-            const actions = document.getElementById('advisor-actions');
-            
-            try {
-                const status = await apiCall('/devaipod/advisor/status');
-                section.style.display = 'block';
-                
-                if (status.state === 'running') {
-                    statusText.textContent = 'Advisor is running';
-                    actions.innerHTML = '<button class="advisor-open-btn" onclick="openAgent(\'advisor\')">Open Advisor</button>';
-                } else if (status.state === 'stopped' || status.exists) {
-                    statusText.textContent = 'Advisor is stopped';
-                    actions.innerHTML = '<button class="advisor-launch-btn" onclick="launchAdvisor(this)">Start Advisor</button>';
-                } else {
-                    statusText.textContent = 'No advisor running';
-                    actions.innerHTML = '<button class="advisor-launch-btn" onclick="launchAdvisor(this)">Launch Advisor</button>';
-                }
-            } catch (err) {
-                // Don't show advisor section if we can't check status
-                section.style.display = 'none';
             }
         }
         
@@ -967,6 +1023,86 @@
             }
         }
         
+        // Escape HTML to prevent XSS in rendered proposal content
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Check for advisor proposals and render them inline in the advisor card
+        async function checkProposals() {
+            const target = document.getElementById('advisor-proposals');
+            if (!target) return; // No advisor pod card rendered
+
+            try {
+                const proposals = await apiCall('/devaipod/proposals');
+                const pending = proposals.filter(p => p.status === 'pending');
+
+                if (pending.length === 0) {
+                    target.innerHTML = '';
+                    return;
+                }
+
+                target.innerHTML = `
+                    <div class="proposals-header">
+                        <span>Proposals</span>
+                        <span>${pending.length} pending</span>
+                    </div>
+                    ${pending.map(p => `
+                        <div class="proposal-card">
+                            <div class="proposal-title">
+                                <span class="proposal-priority ${escapeHtml(p.priority)}">${escapeHtml(p.priority)}</span>
+                                ${escapeHtml(p.title)}
+                            </div>
+                            <div class="proposal-meta">${escapeHtml(p.repo)}${p.source ? ' \u2014 ' + escapeHtml(p.source) : ''}</div>
+                            <div class="proposal-rationale">${escapeHtml(p.rationale)}</div>
+                            <div class="proposal-actions">
+                                <button class="open-btn" onclick="launchProposal('${escapeHtml(p.id)}', this)" style="padding:0.2rem 0.5rem;font-size:0.8rem;">Launch</button>
+                                <button class="dismiss-btn" onclick="dismissProposal('${escapeHtml(p.id)}')">Dismiss</button>
+                            </div>
+                        </div>
+                    `).join('')}
+                `;
+            } catch (err) {
+                target.innerHTML = '';
+            }
+        }
+
+        // Dismiss a proposal
+        async function dismissProposal(id) {
+            try {
+                await fetch('/api/devaipod/proposals/' + encodeURIComponent(id) + '/dismiss', {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                await checkProposals();
+            } catch (err) {
+                console.error('Failed to dismiss proposal:', err);
+            }
+        }
+
+        // Launch a proposal as a new pod
+        async function launchProposal(id, btn) {
+            btn.disabled = true;
+            btn.textContent = 'Launching...';
+            try {
+                const result = await fetch('/api/devaipod/proposals/' + encodeURIComponent(id) + '/launch', {
+                    method: 'POST',
+                    headers: authHeader
+                }).then(r => r.json());
+
+                if (!result.success) {
+                    throw new Error(result.message || 'Launch failed');
+                }
+                await refreshPods();
+            } catch (err) {
+                alert('Launch failed: ' + err.message);
+                btn.disabled = false;
+                btn.textContent = 'Launch';
+            }
+        }
+
         // Toggle launch form visibility
         function toggleLaunchForm() {
             const form = document.getElementById('launch-form');
