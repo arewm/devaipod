@@ -1916,6 +1916,40 @@ struct GitCommit {
     message: String,
 }
 
+/// Query parameters for the git log endpoint
+#[derive(Debug, Deserialize)]
+struct GitLogQuery {
+    /// Base ref for range (optional)
+    base: Option<String>,
+    /// Head ref for range (optional)
+    head: Option<String>,
+}
+
+/// A detailed commit entry from git log
+#[derive(Debug, Serialize, Deserialize)]
+struct GitLogEntry {
+    /// Full commit SHA
+    sha: String,
+    /// Short commit SHA
+    short_sha: String,
+    /// Commit message (full, not just first line)
+    message: String,
+    /// Author name
+    author: String,
+    /// Author email
+    author_email: String,
+    /// Commit timestamp (ISO 8601)
+    timestamp: String,
+    /// Parent commit SHAs
+    parents: Vec<String>,
+}
+
+/// Response for the git log endpoint
+#[derive(Debug, Serialize)]
+struct GitLogResponse {
+    commits: Vec<GitLogEntry>,
+}
+
 /// Get git status for a workspace pod
 ///
 /// Runs `git status --porcelain` in the workspace container and returns
@@ -2000,6 +2034,376 @@ async fn git_commits(Path(name): Path<String>) -> Result<Json<GitCommitsResponse
         .collect();
 
     Ok(Json(GitCommitsResponse { exit_code, commits }))
+}
+
+/// Validate that a string looks like a safe git ref (no shell metacharacters).
+fn is_valid_git_ref(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | '.' | '_' | '~' | '^'))
+}
+
+/// Get structured git log for an agent pod
+///
+/// Runs `git log` in the agent container with a structured format string,
+/// supporting optional `base` and `head` query parameters for range filtering.
+async fn git_log(
+    Path(name): Path<String>,
+    Query(params): Query<GitLogQuery>,
+) -> Result<Json<GitLogResponse>, (StatusCode, String)> {
+    // Validate ref parameters if provided
+    if let Some(ref base) = params.base {
+        if !is_valid_git_ref(base) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid git ref for 'base': {base}"),
+            ));
+        }
+    }
+    if let Some(ref head) = params.head {
+        if !is_valid_git_ref(head) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid git ref for 'head': {head}"),
+            ));
+        }
+    }
+
+    // Use agent container — that's where the agent's commits live
+    let container_name = format!("{name}-agent");
+
+    // Use %x00 (NUL) as field separator, %x1e (record separator) between commits.
+    // Fields: full SHA, short SHA, subject+body, author name, author email,
+    //         author date ISO, parent hashes (space-separated).
+    let format_arg =
+        "--format=%H%x00%h%x00%s%n%b%x00%an%x00%ae%x00%aI%x00%P%x1e".to_string();
+    let range_arg: String;
+
+    let mut cmd: Vec<&str> = vec!["git", "log", &format_arg];
+
+    match (&params.base, &params.head) {
+        (Some(base), Some(head)) => {
+            range_arg = format!("{base}..{head}");
+            cmd.push(&range_arg);
+            cmd.push("-500");
+        }
+        (None, Some(head)) => {
+            cmd.push(head.as_str());
+            cmd.push("-50");
+        }
+        (Some(_base), None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "'base' requires 'head' to also be specified".to_string(),
+            ));
+        }
+        (None, None) => {
+            cmd.push("-50");
+        }
+    }
+
+    let (exit_code, stdout, stderr) =
+        exec_in_container(&container_name, &cmd)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to run git log in {container_name}: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to exec in container: {e}"),
+                )
+            })?;
+
+    if exit_code != 0 {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("git log failed: {}", stderr_text),
+        ));
+    }
+
+    let output = String::from_utf8_lossy(&stdout);
+
+    // If git produced no output, return empty list (e.g. empty repo or empty range)
+    if output.trim().is_empty() {
+        return Ok(Json(GitLogResponse {
+            commits: Vec::new(),
+        }));
+    }
+
+    let commits: Vec<GitLogEntry> = output
+        .split('\x1e')
+        .filter(|record| !record.trim().is_empty())
+        .filter_map(|record| {
+            let fields: Vec<&str> = record.trim().splitn(7, '\0').collect();
+            if fields.len() < 7 {
+                tracing::warn!(
+                    "Skipping malformed git log record ({} fields): {:?}",
+                    fields.len(),
+                    record
+                );
+                return None;
+            }
+            Some(GitLogEntry {
+                sha: fields[0].to_string(),
+                short_sha: fields[1].to_string(),
+                message: fields[2].trim().to_string(),
+                author: fields[3].to_string(),
+                author_email: fields[4].to_string(),
+                timestamp: fields[5].to_string(),
+                parents: fields[6]
+                    .split_whitespace()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect(),
+            })
+        })
+        .collect();
+
+    Ok(Json(GitLogResponse { commits }))
+}
+
+/// Query parameters for the git diff-range endpoint
+#[derive(Debug, Deserialize)]
+struct GitDiffRangeQuery {
+    /// Base commit SHA (required)
+    base: String,
+    /// Head commit SHA (required)
+    head: String,
+}
+
+/// A single file's diff in structured form, compatible with opencode's FileDiff type
+#[derive(Debug, Serialize)]
+struct FileDiff {
+    /// File path
+    file: String,
+    /// File content before (at base commit). Empty string for added files.
+    before: String,
+    /// File content after (at head commit). Empty string for deleted files.
+    after: String,
+    /// Number of lines added
+    additions: u32,
+    /// Number of lines deleted
+    deletions: u32,
+    /// Change status: "added", "deleted", or "modified"
+    status: &'static str,
+}
+
+/// Response for the git diff-range endpoint
+#[derive(Debug, Serialize)]
+struct GitDiffRangeResponse {
+    files: Vec<FileDiff>,
+}
+
+/// Maximum number of files allowed in a diff-range response.
+/// Large changesets would require too many per-file exec calls.
+const DIFF_RANGE_MAX_FILES: usize = 100;
+
+/// Get structured per-file diffs for a commit range in an agent pod.
+///
+/// Returns before/after file content, addition/deletion counts, and change
+/// status for each file changed between `base` and `head`. Compatible with
+/// the opencode SDK's `FileDiff` type.
+async fn git_diff_range(
+    Path(name): Path<String>,
+    Query(params): Query<GitDiffRangeQuery>,
+) -> Result<Json<GitDiffRangeResponse>, (StatusCode, String)> {
+    // Validate refs
+    if !is_valid_git_ref(&params.base) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid git ref for 'base': {}", params.base),
+        ));
+    }
+    if !is_valid_git_ref(&params.head) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid git ref for 'head': {}", params.head),
+        ));
+    }
+
+    // Use agent container — that's where the agent's commits live
+    let container_name = format!("{name}-agent");
+
+    // Step 1+2: Get changed files with statuses and numstat in one pass each.
+    // --no-renames treats renames as delete+add which simplifies handling.
+    let name_status_cmd = [
+        "git",
+        "diff",
+        "--name-status",
+        "--no-renames",
+        &params.base,
+        &params.head,
+    ];
+    let numstat_cmd = [
+        "git",
+        "diff",
+        "--numstat",
+        "--no-renames",
+        &params.base,
+        &params.head,
+    ];
+
+    let (ns_result, num_result) = tokio::join!(
+        exec_in_container(&container_name, &name_status_cmd),
+        exec_in_container(&container_name, &numstat_cmd),
+    );
+
+    let (ns_exit, ns_stdout, ns_stderr) = ns_result.map_err(|e| {
+        tracing::error!("Failed to run git diff --name-status in {container_name}: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to exec in container: {e}"),
+        )
+    })?;
+
+    if ns_exit != 0 {
+        let stderr_text = String::from_utf8_lossy(&ns_stderr);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("git diff --name-status failed: {}", stderr_text),
+        ));
+    }
+
+    let (num_exit, num_stdout, num_stderr) = num_result.map_err(|e| {
+        tracing::error!("Failed to run git diff --numstat in {container_name}: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to exec in container: {e}"),
+        )
+    })?;
+
+    if num_exit != 0 {
+        let stderr_text = String::from_utf8_lossy(&num_stderr);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("git diff --numstat failed: {}", stderr_text),
+        ));
+    }
+
+    let ns_output = String::from_utf8_lossy(&ns_stdout);
+    let num_output = String::from_utf8_lossy(&num_stdout);
+
+    // If name-status produced nothing, return empty
+    if ns_output.trim().is_empty() {
+        return Ok(Json(GitDiffRangeResponse { files: Vec::new() }));
+    }
+
+    // Parse --name-status: each line is "STATUS\tFILENAME"
+    let mut file_statuses: Vec<(&str, &'static str)> = Vec::new(); // (path, status)
+    for line in ns_output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, '\t');
+        let status_char = parts.next().unwrap_or("").trim();
+        let file_path = match parts.next() {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        let status: &'static str = match status_char {
+            "A" => "added",
+            "D" => "deleted",
+            _ => "modified",
+        };
+        file_statuses.push((file_path, status));
+    }
+
+    if file_statuses.len() > DIFF_RANGE_MAX_FILES {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "Too many changed files ({}, max {})",
+                file_statuses.len(),
+                DIFF_RANGE_MAX_FILES
+            ),
+        ));
+    }
+
+    // Parse --numstat: each line is "ADDS\tDELS\tFILENAME"
+    // Binary files show "-\t-\tFILENAME"
+    let mut numstat_map: std::collections::HashMap<&str, (u32, u32)> =
+        std::collections::HashMap::new();
+    for line in num_output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.splitn(3, '\t').collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let adds = fields[0].parse::<u32>().unwrap_or(0);
+        let dels = fields[1].parse::<u32>().unwrap_or(0);
+        numstat_map.insert(fields[2].trim(), (adds, dels));
+    }
+
+    // Step 3: Fetch before/after content for each file.
+    // We spawn all fetches concurrently for better performance.
+    let mut tasks = Vec::with_capacity(file_statuses.len());
+    for &(file_path, status) in &file_statuses {
+        let container = container_name.clone();
+        let base = params.base.clone();
+        let head = params.head.clone();
+        let path_owned = file_path.to_string();
+        let (adds, dels) = numstat_map.get(file_path).copied().unwrap_or((0, 0));
+
+        tasks.push(tokio::spawn(async move {
+            // Get "before" content (empty for added files)
+            let before = if status == "added" {
+                String::new()
+            } else {
+                let show_ref = format!("{base}:{path_owned}");
+                match exec_in_container(&container, &["git", "show", &show_ref]).await {
+                    Ok((_code, stdout, _stderr)) => match String::from_utf8(stdout) {
+                        Ok(s) => s,
+                        Err(_) => "(binary file)".to_string(),
+                    },
+                    Err(_) => String::new(),
+                }
+            };
+
+            // Get "after" content (empty for deleted files)
+            let after = if status == "deleted" {
+                String::new()
+            } else {
+                let show_ref = format!("{head}:{path_owned}");
+                match exec_in_container(&container, &["git", "show", &show_ref]).await {
+                    Ok((_code, stdout, _stderr)) => match String::from_utf8(stdout) {
+                        Ok(s) => s,
+                        Err(_) => "(binary file)".to_string(),
+                    },
+                    Err(_) => String::new(),
+                }
+            };
+
+            FileDiff {
+                file: path_owned,
+                before,
+                after,
+                additions: adds,
+                deletions: dels,
+                status,
+            }
+        }));
+    }
+
+    let mut files = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        match task.await {
+            Ok(diff) => files.push(diff),
+            Err(e) => {
+                tracing::error!("File diff task panicked: {e}");
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error fetching file content".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(Json(GitDiffRangeResponse { files }))
 }
 
 /// Execute a command in a container and return output
@@ -2127,6 +2531,8 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         .route("/devaipod/pods/{name}/git/status", get(git_status))
         .route("/devaipod/pods/{name}/git/diff", get(git_diff))
         .route("/devaipod/pods/{name}/git/commits", get(git_commits))
+        .route("/devaipod/pods/{name}/git/log", get(git_log))
+        .route("/devaipod/pods/{name}/git/diff-range", get(git_diff_range))
         .route("/devaipod/run", post(run_workspace))
         .route("/devaipod/launches", get(list_launches))
         .route(
