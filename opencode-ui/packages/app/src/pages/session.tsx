@@ -50,6 +50,7 @@ import {
   type DiffStyle,
   type SessionReviewTabProps,
 } from "@/pages/session/review-tab"
+import { GitReviewTab } from "@/pages/session/git-review-tab"
 import { TerminalPanel } from "@/pages/session/terminal-panel"
 import { terminalTabLabel } from "@/pages/session/terminal-label"
 import { MessageTimeline } from "@/pages/session/message-timeline"
@@ -85,6 +86,8 @@ const setSessionHandoff = (key: string, patch: Partial<HandoffSession>) => {
   const prev = handoff.session.get(key) ?? { prompt: "", files: {} }
   touch(handoff.session, key, { ...prev, ...patch })
 }
+
+const isDevaipod = () => document.cookie.includes("DEVAIPOD_AGENT_POD=")
 
 export default function Page() {
   const layout = useLayout()
@@ -978,75 +981,92 @@ export default function Page() {
     loadingClass: string
     emptyClass: string
   }) => (
-    <Switch>
-      <Match when={store.changes === "turn" && !!params.id}>
-        <SessionReviewTab
-          title={changesTitle()}
-          empty={emptyTurn()}
-          diffs={reviewDiffs}
-          view={view}
-          diffStyle={input.diffStyle}
-          onDiffStyleChange={input.onDiffStyleChange}
-          onScrollRef={(el) => setTree("reviewScroll", el)}
-          focusedFile={tree.activeDiff}
-          onLineComment={(comment) => addCommentToContext({ ...comment, origin: "review" })}
-          comments={comments.all()}
-          focusedComment={comments.focus()}
-          onFocusedCommentChange={comments.setFocus}
-          onViewFile={openReviewFile}
-          classes={input.classes}
-        />
-      </Match>
-      <Match when={hasReview()}>
-        <Show
-          when={diffsReady()}
-          fallback={<div class={input.loadingClass}>{language.t("session.review.loadingChanges")}</div>}
-        >
-          <SessionReviewTab
-            title={changesTitle()}
-            diffs={reviewDiffs}
-            view={view}
-            diffStyle={input.diffStyle}
-            onDiffStyleChange={input.onDiffStyleChange}
-            onScrollRef={(el) => setTree("reviewScroll", el)}
-            focusedFile={tree.activeDiff}
-            onLineComment={(comment) => addCommentToContext({ ...comment, origin: "review" })}
-            comments={comments.all()}
-            focusedComment={comments.focus()}
-            onFocusedCommentChange={comments.setFocus}
-            onViewFile={openReviewFile}
-            classes={input.classes}
-          />
-        </Show>
-      </Match>
-      <Match when={true}>
-        <SessionReviewTab
-          title={changesTitle()}
-          empty={
-            store.changes === "turn" ? (
-              emptyTurn()
-            ) : (
-              <div class={input.emptyClass}>
-                <Mark class="w-14 opacity-10" />
-                <div class="text-14-regular text-text-weak max-w-56">{language.t("session.review.empty")}</div>
-              </div>
-            )
-          }
-          diffs={reviewDiffs}
-          view={view}
-          diffStyle={input.diffStyle}
-          onDiffStyleChange={input.onDiffStyleChange}
-          onScrollRef={(el) => setTree("reviewScroll", el)}
-          focusedFile={tree.activeDiff}
-          onLineComment={(comment) => addCommentToContext({ ...comment, origin: "review" })}
-          comments={comments.all()}
-          focusedComment={comments.focus()}
-          onFocusedCommentChange={comments.setFocus}
-          onViewFile={openReviewFile}
-          classes={input.classes}
-        />
-      </Match>
-    </Switch>
+    <Show
+      when={isDevaipod()}
+      fallback={
+        <Switch>
+          <Match when={store.changes === "turn" && !!params.id}>
+            <SessionReviewTab
+              title={changesTitle()}
+              empty={emptyTurn()}
+              diffs={reviewDiffs}
+              view={view}
+              diffStyle={input.diffStyle}
+              onDiffStyleChange={input.onDiffStyleChange}
+              onScrollRef={(el) => setTree("reviewScroll", el)}
+              focusedFile={tree.activeDiff}
+              onLineComment={(comment) => addCommentToContext({ ...comment, origin: "review" })}
+              comments={comments.all()}
+              focusedComment={comments.focus()}
+              onFocusedCommentChange={comments.setFocus}
+              onViewFile={openReviewFile}
+              classes={input.classes}
+            />
+          </Match>
+          <Match when={hasReview()}>
+            <Show
+              when={diffsReady()}
+              fallback={<div class={input.loadingClass}>{language.t("session.review.loadingChanges")}</div>}
+            >
+              <SessionReviewTab
+                title={changesTitle()}
+                diffs={reviewDiffs}
+                view={view}
+                diffStyle={input.diffStyle}
+                onDiffStyleChange={input.onDiffStyleChange}
+                onScrollRef={(el) => setTree("reviewScroll", el)}
+                focusedFile={tree.activeDiff}
+                onLineComment={(comment) => addCommentToContext({ ...comment, origin: "review" })}
+                comments={comments.all()}
+                focusedComment={comments.focus()}
+                onFocusedCommentChange={comments.setFocus}
+                onViewFile={openReviewFile}
+                classes={input.classes}
+              />
+            </Show>
+          </Match>
+          <Match when={true}>
+            <SessionReviewTab
+              title={changesTitle()}
+              empty={
+                store.changes === "turn" ? (
+                  emptyTurn()
+                ) : (
+                  <div class={input.emptyClass}>
+                    <Mark class="w-14 opacity-10" />
+                    <div class="text-14-regular text-text-weak max-w-56">{language.t("session.review.empty")}</div>
+                  </div>
+                )
+              }
+              diffs={reviewDiffs}
+              view={view}
+              diffStyle={input.diffStyle}
+              onDiffStyleChange={input.onDiffStyleChange}
+              onScrollRef={(el) => setTree("reviewScroll", el)}
+              focusedFile={tree.activeDiff}
+              onLineComment={(comment) => addCommentToContext({ ...comment, origin: "review" })}
+              comments={comments.all()}
+              focusedComment={comments.focus()}
+              onFocusedCommentChange={comments.setFocus}
+              onViewFile={openReviewFile}
+              classes={input.classes}
+            />
+          </Match>
+        </Switch>
+      }
+    >
+      <GitReviewTab
+        diffStyle={input.diffStyle}
+        onDiffStyleChange={input.onDiffStyleChange}
+        onScrollRef={(el) => setTree("reviewScroll", el)}
+        focusedFile={tree.activeDiff}
+        onLineComment={(comment) => addCommentToContext({ ...comment, origin: "review" })}
+        comments={comments.all()}
+        focusedComment={comments.focus()}
+        onFocusedCommentChange={comments.setFocus}
+        classes={input.classes}
+      />
+    </Show>
   )
 
   const reviewPanel = () => (
