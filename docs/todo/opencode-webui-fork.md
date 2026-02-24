@@ -213,10 +213,14 @@ shows the commit log for the workspace branch. For each commit: hash, author,
 message, timestamp. Clicking a commit shows its diff using the existing
 `@pierre/diffs` renderer and `SessionReview` accordion.
 
-Data source: new devaipod control plane endpoint
-`GET /api/devaipod/pods/{name}/git/log` returning structured commit objects
-(the existing `/git/commits` endpoint returns recent commits but may need
-richer output — parent SHAs, full diff per commit).
+Data source: the control plane runs `git fetch agent` in the workspace
+container to pull agent commits, then serves them via
+`GET /api/devaipod/pods/{name}/git/log` returning structured commit objects.
+The workspace already has the agent's git set up as a remote called `agent`
+(see `REMOTE_AGENT` in `src/git.rs`), and git's content-addressed hashing
+ensures fetched data is trustworthy. The existing `/git/commits` endpoint
+returns recent commits but may need richer output — parent SHAs, full diff
+per commit.
 
 ### Commit-range diff view
 
@@ -248,8 +252,9 @@ inline comment system already works — what's missing is:
 ### Upstream sync
 
 A "Push" / "Create PR" button visible only for approved commit ranges.
-Calls the control plane which delegates to service-gator (which has the
-push credentials). The agent container never sees this flow.
+Calls the control plane which runs `git push origin {branch}` in the
+workspace container (which has GH_TOKEN). The agent container never sees
+this flow.
 
 ### Upstream-ability
 
@@ -283,10 +288,12 @@ core (or is easily proposed upstream) while review/sync lives in
 - [ ] Wire pod selection to `ServerProvider` base URL
 
 ### Phase 2: Git browser and commit-range review
-- [ ] Add `GET /api/devaipod/pods/{name}/git/log` endpoint (structured
-      commit objects with parent SHAs)
+- [ ] Add `GET /api/devaipod/pods/{name}/git/log` endpoint — runs
+      `git fetch agent` then `git log` in the workspace container, returns
+      structured commit objects with parent SHAs
 - [ ] Add `GET /api/devaipod/pods/{name}/git/diff?base={sha}&head={sha}`
-      endpoint returning `FileDiff[]`-compatible output
+      endpoint — reads from workspace's copy of agent commits, returns
+      `FileDiff[]`-compatible output
 - [ ] Create `src/devaipod/git-browser.tsx` — commit log panel using
       `@opencode-ai/ui` components
 - [ ] Create `src/devaipod/commit-review.tsx` — commit-range diff view
@@ -296,15 +303,14 @@ core (or is easily proposed upstream) while review/sync lives in
 
 ### Phase 3: Review state and sync
 - [ ] Add review state endpoints (`GET/POST /api/devaipod/pods/{name}/review`)
-- [ ] Add sync endpoint (`POST /api/devaipod/pods/{name}/sync`) that calls
-      service-gator to push
+- [ ] Add sync endpoint (`POST /api/devaipod/pods/{name}/sync`) — control
+      plane runs `git push origin {branch}` in workspace container (which
+      has GH_TOKEN) after verifying commits are in "approved" state
 - [ ] Create `src/devaipod/review-controls.tsx` — approve/reject/sync buttons
 - [ ] Review state persistence in control plane (SQLite or JSON per pod)
-- [ ] Service-gator approval enforcement: control plane pushes approved
-      commit SHAs to service-gator when human approves in the review UI.
-      Service-gator maintains a local allow-list and refuses to create any
-      upstream PR unless all commits are on the list. (Requires service-gator
-      protocol extension: dynamic config update channel for approved commits.)
+- [ ] Push gate enforcement: control plane only triggers `git push` in the
+      workspace when commits are in "approved" state. No service-gator
+      callback needed — the workspace pushes directly after human approval.
 
 ### Phase 4: Cleanup
 - [ ] Remove iframe wrapper, cookie routing, SSE keepalive, and related code

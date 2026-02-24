@@ -13,7 +13,8 @@ The core requirements are:
 2. Inline comments on specific lines route back to the agent as context
 3. Accept/reject controls per commit or per batch
 4. Approved changes can be synced upstream (push, create PR, etc.)
-5. The agent container never holds push credentials (only service-gator does)
+5. The workspace container has GH_TOKEN for pushing (it's trusted; the
+   human controls the review UI)
 
 OpenCode today already has a "changes" interface where clicking a change
 sends file+line context plus a comment to the agent. That's a real foundation.
@@ -41,6 +42,15 @@ that feeds back to the agent. Extend it with commit-level review:
   in turn talks to service-gator to push
 
 **Architecture:**
+
+The workspace container already has the agent's git set up as a remote
+called `agent` (see `REMOTE_AGENT` in `src/git.rs`). The control plane
+runs `git fetch agent` in the workspace to pull agent commits, then reads
+from the workspace's copy. Git's content-addressed hashing ensures data
+fetched from the untrusted agent is trustworthy. The workspace has
+GH_TOKEN and pushes directly after human approval — no service-gator
+mediation needed for the push itself.
+
 ```
 ┌─────────────────────────────────────────────┐
 │ Browser: OpenCode web UI                    │
@@ -55,15 +65,17 @@ that feeds back to the agent. Extend it with commit-level review:
 │ devaipod control plane                      │
 │  • Proxies opencode API (already exists)    │
 │  • + Review state endpoints                 │
-│  • + Push/sync endpoint (calls gator)       │
+│  • + git fetch agent / git log / git diff   │
+│  • + git push origin (after approval)       │
 └──────────────────┬──────────────────────────┘
                    │
           ┌────────┴────────┐
           ▼                 ▼
-   ┌─────────────┐  ┌──────────────┐
-   │ agent pod   │  │ service-gator│
-   │ (opencode)  │  │ (has creds)  │
-   └─────────────┘  └──────────────┘
+   ┌─────────────┐  ┌──────────────────────┐
+   │ agent pod   │  │ workspace container  │
+   │ (opencode)  │  │ (has GH_TOKEN,       │
+   └─────────────┘  │  agent git remote)   │
+                    └──────────────────────┘
 ```
 
 **Pros:**
@@ -184,7 +196,7 @@ POST /api/devaipod/pods/{name}/review
      Body: { "action": "approve|reject|request-changes", "commits": [...], "comment": "..." }
 
 POST /api/devaipod/pods/{name}/sync
-     Triggers push of approved commits upstream via service-gator
+     Triggers git push in workspace container (which has GH_TOKEN)
 ```
 
 ### Review State
@@ -218,45 +230,27 @@ struct ReviewState {
 Human clicks "Sync" in UI
   → POST /api/devaipod/pods/{name}/sync
   → Control plane verifies commits are in "approved" state
-  → Control plane calls service-gator to push branch
-  → Optionally: service-gator creates upstream PR via forge API
+  → Control plane runs `git push origin {branch}` in workspace container
+  → Workspace has GH_TOKEN, push goes directly to upstream
   → UI shows sync status
 ```
 
-### Service-gator Enforcement
+### Push Enforcement
 
-The review approval state should be enforced at the service-gator level,
-not just in the UI. Service-gator already has fine-grained permissions
-(`read`, `create-draft`, `pending-review`, `push-new-branch`, `write` — see
-`GhRepoPermission` in `config.rs`). The default for agent pods is
-`read + create-draft`.
+Since the workspace container has GH_TOKEN and the human controls the
+review UI, the push gate is straightforward: the control plane only runs
+`git push` when the commits being pushed are in "approved" state. The
+agent container has no push credentials and no direct access to the
+upstream remote — it can only produce commits locally.
 
-The key insight: service-gator should **refuse to create any PR — even a
-draft — unless the control plane confirms human approval** for the commits
-in question. PR creation is the privileged action that requires human
-sign-off.
+The control plane is the sole actor that triggers pushes, and it only
+does so after explicit human approval in the review UI. This makes the
+review UI a hard gate, not a suggestion, without requiring service-gator
+to mediate the push flow or maintain an allow-list of approved SHAs.
 
-```
-Human approves commits abc123..def456 in the review UI
-  → control plane pushes approved SHAs to service-gator
-  → service-gator updates its local allow-list
-
-Agent calls service-gator: "create PR for branch X"
-  → service-gator checks its local allow-list for the commits on branch X
-  → If all commits are approved: create the PR
-  → If any commit is not approved: reject (403)
-```
-
-The agent can still iterate freely — push branches, make commits, run
-local tests — but it cannot create any upstream PR until a human has
-reviewed and approved the commits in the opencode UI. This makes the
-review UI a hard gate, not a suggestion.
-
-Service-gator's authorization stays self-contained — no synchronous
-callback to the control plane on each request. The control plane pushes
-state updates to service-gator (which already receives configuration at
-pod creation time; this extends that with a dynamic update channel for
-approved commits).
+Service-gator's role is limited to its existing credential scoping for
+agent-initiated API calls (e.g. read access, draft PR creation). It does
+not participate in the push-after-review flow.
 
 ## Open Questions
 
