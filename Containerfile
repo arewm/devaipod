@@ -158,6 +158,17 @@ ENV DEVAIPOD_CONTAINER=1
 # (not from src stage, as that's a snapshot that may not include untracked files)
 COPY dist /usr/share/devaipod/dist
 
+# Vendor xterm.js for the web terminal (avoids CDN dependency at runtime)
+ARG XTERM_VERSION=5.5.0
+ARG XTERM_FIT_VERSION=0.10.0
+RUN mkdir -p /usr/share/devaipod/dist/vendor/xterm && \
+    curl -fsSL "https://unpkg.com/@xterm/xterm@${XTERM_VERSION}/css/xterm.css" \
+      -o /usr/share/devaipod/dist/vendor/xterm/xterm.css && \
+    curl -fsSL "https://unpkg.com/@xterm/xterm@${XTERM_VERSION}/lib/xterm.js" \
+      -o /usr/share/devaipod/dist/vendor/xterm/xterm.js && \
+    curl -fsSL "https://unpkg.com/@xterm/addon-fit@${XTERM_FIT_VERSION}/lib/addon-fit.js" \
+      -o /usr/share/devaipod/dist/vendor/xterm/addon-fit.js
+
 # Copy vendored opencode web UI
 # This is served at /opencode/ and proxies API calls to the agent's opencode server
 COPY --from=opencode-web /build/opencode/packages/app/dist /usr/share/devaipod/opencode

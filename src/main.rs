@@ -29,6 +29,7 @@ mod service_gator;
 mod ssh_server;
 mod tui;
 mod web;
+mod web_terminal;
 
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";

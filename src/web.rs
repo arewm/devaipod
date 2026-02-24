@@ -131,13 +131,15 @@ pub fn load_or_generate_token() -> String {
 
 /// Shared state for the web server
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     /// Authentication token for API access
     token: String,
     /// Path to the podman/docker socket (None if not available at startup)
     socket_path: Option<PathBuf>,
     /// Path to control-plane static files (e.g. dist/index.html)
     static_dir: String,
+    /// PTY session manager for web terminal access
+    pub(crate) pty_sessions: crate::web_terminal::PtySessionManager,
 }
 
 /// Query parameters for token authentication
@@ -1662,6 +1664,7 @@ pub(crate) fn build_app(
         token: token.clone(),
         socket_path,
         static_dir: static_dir.to_string(),
+        pty_sessions: crate::web_terminal::PtySessionManager::new(),
     });
 
     // Build the API router with authentication
@@ -1700,6 +1703,10 @@ pub(crate) fn build_app(
             post(dismiss_proposal),
         )
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
+        .nest(
+            "/devaipod/pods/{name}/pty",
+            crate::web_terminal::pty_router(),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

@@ -44,7 +44,7 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 # Web UI server
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }

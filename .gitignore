@@ -2,3 +2,5 @@ target/
 .devaipod/
 __pycache__/
 tmp/
+# Vendored at container build time, not in git
+dist/vendor/
