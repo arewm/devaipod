@@ -2046,8 +2046,11 @@ fn is_valid_git_ref(s: &str) -> bool {
 
 /// Get structured git log for an agent pod
 ///
-/// Runs `git log` in the agent container with a structured format string,
+/// Runs `git log` in the workspace container with a structured format string,
 /// supporting optional `base` and `head` query parameters for range filtering.
+///
+/// Use workspace container — it has the agent remote and is trusted.
+/// Agent commits are available after `git fetch agent`.
 async fn git_log(
     Path(name): Path<String>,
     Query(params): Query<GitLogQuery>,
@@ -2070,8 +2073,9 @@ async fn git_log(
         }
     }
 
-    // Use agent container — that's where the agent's commits live
-    let container_name = format!("{name}-agent");
+    // Use workspace container — it has the agent remote and is trusted.
+    // Agent commits are available after `git fetch agent`.
+    let container_name = format!("{name}-workspace");
 
     // Use %x00 (NUL) as field separator, %x1e (record separator) between commits.
     // Fields: full SHA, short SHA, subject+body, author name, author email,
@@ -2098,7 +2102,9 @@ async fn git_log(
                 "'base' requires 'head' to also be specified".to_string(),
             ));
         }
+        // Default: show agent's commits via the agent remote ref
         (None, None) => {
+            cmd.push("agent/HEAD");
             cmd.push("-50");
         }
     }
@@ -2199,11 +2205,14 @@ struct GitDiffRangeResponse {
 /// Large changesets would require too many per-file exec calls.
 const DIFF_RANGE_MAX_FILES: usize = 100;
 
-/// Get structured per-file diffs for a commit range in an agent pod.
+/// Get structured per-file diffs for a commit range in a workspace pod.
 ///
 /// Returns before/after file content, addition/deletion counts, and change
 /// status for each file changed between `base` and `head`. Compatible with
 /// the opencode SDK's `FileDiff` type.
+///
+/// Use workspace container — it has the agent remote and is trusted.
+/// Agent commits are available after `git fetch agent`.
 async fn git_diff_range(
     Path(name): Path<String>,
     Query(params): Query<GitDiffRangeQuery>,
@@ -2222,8 +2231,9 @@ async fn git_diff_range(
         ));
     }
 
-    // Use agent container — that's where the agent's commits live
-    let container_name = format!("{name}-agent");
+    // Use workspace container — it has the agent remote and is trusted.
+    // Agent commits are available after `git fetch agent`.
+    let container_name = format!("{name}-workspace");
 
     // Step 1+2: Get changed files with statuses and numstat in one pass each.
     // --no-renames treats renames as delete+add which simplifies handling.
@@ -2406,6 +2416,101 @@ async fn git_diff_range(
     Ok(Json(GitDiffRangeResponse { files }))
 }
 
+#[derive(Debug, Serialize)]
+struct GitFetchResponse {
+    /// Whether new commits were fetched
+    success: bool,
+    /// Human-readable summary
+    message: String,
+}
+
+/// Fetch latest commits from the agent remote
+///
+/// Runs `git fetch agent` in the workspace container to pull
+/// the agent's latest commits for review.
+async fn git_fetch_agent(
+    Path(name): Path<String>,
+) -> Result<Json<GitFetchResponse>, (StatusCode, String)> {
+    let container_name = format!("{name}-workspace");
+
+    let (exit_code, _stdout, stderr) =
+        exec_in_container(&container_name, &["git", "fetch", "agent"])
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to run git fetch agent in {container_name}: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to exec in container: {e}"),
+                )
+            })?;
+
+    if exit_code != 0 {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        return Ok(Json(GitFetchResponse {
+            success: false,
+            message: format!("git fetch agent failed: {}", stderr_text),
+        }));
+    }
+
+    Ok(Json(GitFetchResponse {
+        success: true,
+        message: "Fetched latest agent commits".to_string(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct GitPushRequest {
+    branch: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GitPushResponse {
+    success: bool,
+    message: String,
+}
+
+/// Push a branch to origin from the workspace
+///
+/// Used after human approves agent commits — the workspace has GH_TOKEN
+/// and can push directly.
+async fn git_push(
+    Path(name): Path<String>,
+    Json(body): Json<GitPushRequest>,
+) -> Result<Json<GitPushResponse>, (StatusCode, String)> {
+    if !is_valid_git_ref(&body.branch) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid branch name: {}", body.branch),
+        ));
+    }
+
+    let container_name = format!("{name}-workspace");
+
+    let (exit_code, _stdout, stderr) =
+        exec_in_container(&container_name, &["git", "push", "origin", &body.branch])
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to run git push in {container_name}: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to exec in container: {e}"),
+                )
+            })?;
+
+    if exit_code != 0 {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        return Ok(Json(GitPushResponse {
+            success: false,
+            message: format!("git push failed: {}", stderr_text),
+        }));
+    }
+
+    Ok(Json(GitPushResponse {
+        success: true,
+        message: format!("Pushed branch '{}' to origin", body.branch),
+    }))
+}
+
 /// Execute a command in a container and return output
 ///
 /// Uses bollard to execute the command and capture stdout/stderr.
@@ -2533,6 +2638,8 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         .route("/devaipod/pods/{name}/git/commits", get(git_commits))
         .route("/devaipod/pods/{name}/git/log", get(git_log))
         .route("/devaipod/pods/{name}/git/diff-range", get(git_diff_range))
+        .route("/devaipod/pods/{name}/git/fetch-agent", post(git_fetch_agent))
+        .route("/devaipod/pods/{name}/git/push", post(git_push))
         .route("/devaipod/run", post(run_workspace))
         .route("/devaipod/launches", get(list_launches))
         .route(
