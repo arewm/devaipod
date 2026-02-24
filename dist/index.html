@@ -550,7 +550,35 @@
         }
         .dismiss-btn:hover { color: var(--error); border-color: var(--error); }
 
+        .agent-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.4rem 0.75rem;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border);
+        }
+        .agent-activity-icon {
+            font-size: 0.9rem;
+        }
+        .agent-activity-icon.working { color: var(--success); }
+        .agent-activity-icon.idle { color: var(--accent); }
+        .agent-activity-icon.stopped { color: var(--text-muted, var(--text-weak)); }
+        .agent-activity-icon.unknown { color: var(--text-muted, var(--text-weak)); }
+        .agent-status-text {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .agent-session-count {
+            font-size: 0.75rem;
+            color: var(--text-muted, var(--text-weak));
+        }
+
         .pod-card.collapsed .pod-meta,
+        .pod-card.collapsed .agent-status,
         .pod-card.collapsed .pod-containers,
         .pod-card.collapsed .pod-actions,
         .pod-card.collapsed .advisor-proposals-inline {
@@ -942,6 +970,12 @@
 
             const proposalsHtml = isAdvisor ? '<div id="advisor-proposals" class="advisor-proposals-inline"></div>' : '';
 
+            // Agent status placeholder (populated async by refreshAgentStatus)
+            var agentStatusHtml = '';
+            if (isRunning) {
+                agentStatusHtml = '<div class="agent-status" id="agent-status-' + safeShort + '"><span class="agent-activity-icon unknown">\u2026</span><span class="agent-status-text">Loading...</span></div>';
+            }
+
             return `
                 <div class="pod-card ${isAdvisor ? 'advisor-pod' : ''}" tabindex="0" data-pod-name="${shortName}" data-running="${isRunning}">
                     <div class="pod-header" onclick="togglePodCard(this)">
@@ -955,6 +989,7 @@
                         ${mode ? `<div class="pod-meta-item"><span class="pod-meta-label">Mode:</span> <span class="pod-meta-value">${mode}</span></div>` : ''}
                         <div class="pod-meta-item"><span class="pod-meta-label">Created:</span> <span class="pod-meta-value">${formatDate(pod.Created)}</span></div>
                     </div>
+                    ${agentStatusHtml}
                     ${containers ? `<div class="pod-containers">${containers}</div>` : ''}
                     <div class="pod-actions">
                         ${actionsHtml}
@@ -1544,11 +1579,63 @@
             document.getElementById('terminal-container').innerHTML = '';
         }
 
+        // Refresh agent status for all running pods (parallel fetch, setTimeout chaining)
+        var iconMap = {
+            'Working': { icon: '\u25CF', cls: 'working' },
+            'Idle': { icon: '\u25CB', cls: 'idle' },
+            'Stopped': { icon: '\u25CC', cls: 'stopped' },
+            'Unknown': { icon: '\u2026', cls: 'unknown' }
+        };
+
+        function updateAgentStatusEl(podName, data) {
+            // Re-query DOM after async fetch (DOM may have been rebuilt by refreshPods)
+            var el = document.getElementById('agent-status-' + podName.replace(/"/g, ''));
+            if (!el) return;
+            var info = iconMap[data.activity] || iconMap['Unknown'];
+            var statusText = data.activity;
+            if (data.current_tool) {
+                statusText = '\u2192 ' + data.current_tool;
+            } else if (data.status_line) {
+                statusText = data.status_line;
+            }
+            var sessionBadge = '';
+            if (data.session_count > 1) {
+                sessionBadge = '<span class="agent-session-count" title="Active sessions">(' + data.session_count + ' sessions)</span>';
+            }
+            el.innerHTML = '<span class="agent-activity-icon ' + info.cls + '">' + info.icon + '</span>' +
+                '<span class="agent-status-text">' + escapeHtml(statusText) + '</span>' +
+                sessionBadge;
+        }
+
+        async function refreshAgentStatus() {
+            var cards = document.querySelectorAll('.pod-card[data-running="true"]');
+            var podNames = [];
+            for (var i = 0; i < cards.length; i++) {
+                var name = cards[i].dataset.podName;
+                if (name) podNames.push(name);
+            }
+            // Fetch all in parallel
+            await Promise.allSettled(podNames.map(function(podName) {
+                return apiCall('/devaipod/pods/' + encodeURIComponent(podName) + '/agent-status')
+                    .then(function(data) { updateAgentStatusEl(podName, data); })
+                    .catch(function() { /* leave placeholder */ });
+            }));
+        }
+
+        // Schedule next agent status refresh after current one completes (avoids stacking)
+        function scheduleAgentRefresh() {
+            refreshAgentStatus().finally(function() {
+                setTimeout(scheduleAgentRefresh, 3000);
+            });
+        }
+
         // Initial load
         if (token) {
             refreshPods();
             // Auto-refresh every 5 seconds
             setInterval(refreshPods, 5000);
+            // Agent status: initial fetch + chained refresh every 3s
+            scheduleAgentRefresh();
         }
     </script>
 </body>
