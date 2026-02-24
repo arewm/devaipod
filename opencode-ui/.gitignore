@@ -1,0 +1,4 @@
+node_modules/
+packages/app/dist/
+# Fonts are large binary files (~60MB). Use system monospace fonts or CDN links instead.
+packages/ui/src/assets/fonts/
