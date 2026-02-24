@@ -844,16 +844,30 @@ async fn opencode_or_static_fallback(
     let is_root = trimmed_path.is_empty();
 
     // If the path looks like a static file (has a file extension), check the vendored
-    // opencode UI directory first. The opencode index.html references root-level files
-    // like /oc-theme-preload.js and /favicon-v3.svg with absolute paths.
-    // We use a separate ServeDir request so the original request is preserved for the
-    // proxy/static fallback below if the opencode dir doesn't have this file.
+    // opencode UI directory first, then the control-plane static directory.
+    // The opencode index.html references root-level files like /oc-theme-preload.js
+    // and /favicon-v3.svg with absolute paths; the control-plane index.html references
+    // vendor/xterm/*.js for the web terminal.
+    //
+    // We must resolve static files before the opencode proxy fallback below,
+    // otherwise the agent cookie causes requests like /vendor/xterm/xterm.js to be
+    // proxied to the opencode backend which returns its SPA index.html (HTML, not JS),
+    // breaking the terminal.
     if !is_root && has_file_extension(trimmed_path) {
         let opencode_req = Request::builder()
             .uri(request.uri().clone())
             .body(Body::empty())
             .unwrap();
         let resp = ServeDir::new(OPENCODE_UI_PATH).oneshot(opencode_req).await.unwrap().into_response();
+        if resp.status() != StatusCode::NOT_FOUND {
+            return resp;
+        }
+        // Also check the control-plane static directory (e.g. dist/vendor/xterm/).
+        let static_req = Request::builder()
+            .uri(request.uri().clone())
+            .body(Body::empty())
+            .unwrap();
+        let resp = ServeDir::new(&state.static_dir).oneshot(static_req).await.unwrap().into_response();
         if resp.status() != StatusCode::NOT_FOUND {
             return resp;
         }
