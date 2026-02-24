@@ -156,6 +156,11 @@ fn generate_api_password() -> String {
 /// This matches the "devenv" user's home in the devenv-debian image.
 pub const AGENT_HOME_PATH: &str = "/home/devenv";
 
+/// JSON state file written after agent setup (dotfiles, task config) is complete.
+/// Lives on the container overlay so it survives stop/start but is absent
+/// after a container rebuild (which re-runs the full setup flow).
+const AGENT_STATE_PATH: &str = "/var/lib/devaipod-state.json";
+
 /// Python script for worker control (send tasks, monitor, get status).
 /// Replaces `opencode run --attach --format json` which returns excessive JSON.
 const WORKER_CTL_SCRIPT: &str = include_str!("../scripts/devaipod-workerctl.py");
@@ -1084,20 +1089,72 @@ echo "Dotfiles installed successfully"
 
     /// Signal that the agent container setup is complete
     ///
-    /// Creates a marker file that the agent startup script waits for before
+    /// Writes a JSON state file that the agent startup script waits for before
     /// starting opencode serve. This prevents a race condition where opencode
-    /// reads its config before dotfiles (with model settings) are installed.
-    pub async fn signal_agent_ready(&self, podman: &PodmanService) -> Result<()> {
+    /// reads its config before dotfiles/task config are installed.
+    ///
+    /// The state file records dotfiles git metadata (URL and commit SHA) for
+    /// debugging and staleness detection. It is written to both the container
+    /// overlay (for the agent's own startup script) and the agent home volume
+    /// (so worker containers that mount it at /mnt/agent-home can see it too).
+    pub async fn signal_agent_ready(
+        &self,
+        podman: &PodmanService,
+        dotfiles: Option<&DotfilesConfig>,
+    ) -> Result<()> {
         tracing::debug!("Signaling agent ready...");
-        let marker_path = format!("{}/.devaipod-ready", AGENT_HOME_PATH);
-        let cmd = format!("touch '{}'", marker_path);
 
+        // Query the dotfiles commit SHA if dotfiles were installed
+        let dotfiles_json = if let Some(df) = dotfiles {
+            let dotfiles_dir = format!("{}/.dotfiles", AGENT_HOME_PATH);
+            let sha = match podman
+                .exec_output(
+                    &self.agent_container,
+                    &["git", "-C", &dotfiles_dir, "rev-parse", "HEAD"],
+                )
+                .await
+            {
+                Ok((_exit, stdout, _stderr)) => {
+                    String::from_utf8_lossy(&stdout).trim().to_string()
+                }
+                Err(_) => String::new(),
+            };
+            let sha_json = if sha.is_empty() {
+                "null".to_string()
+            } else {
+                format!("\"{}\"", sha)
+            };
+            format!(
+                r#", "dotfiles": {{"url": "{}", "commit": {}}}"#,
+                df.url, sha_json,
+            )
+        } else {
+            String::new()
+        };
+
+        let state_json = format!(
+            r#"{{"version": 1{dotfiles_json}}}"#,
+            dotfiles_json = dotfiles_json,
+        );
+
+        let home_state = format!("{}/.devaipod-state.json", AGENT_HOME_PATH);
+        // Write to both locations: overlay (agent reads) and home volume (worker reads).
+        // Run as root since /var/lib/ is not writable by the container user.
+        let cmd = format!(
+            "printf '%s' '{}' | tee {} > {}",
+            state_json, AGENT_STATE_PATH, home_state,
+        );
         podman
-            .exec(&self.agent_container, &["sh", "-c", &cmd], None, None)
+            .exec(
+                &self.agent_container,
+                &["sh", "-c", &cmd],
+                Some("root"),
+                None,
+            )
             .await
-            .context("Failed to create agent ready marker")?;
+            .context("Failed to write agent state file")?;
 
-        tracing::debug!("Agent ready marker created at {}", marker_path);
+        tracing::debug!("Agent state written to {}", AGENT_STATE_PATH);
         Ok(())
     }
 
@@ -2207,19 +2264,17 @@ exec sleep infinity
         let startup_script = format!(
             r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
 
-# Wait for dotfiles installation to complete before starting opencode.
-# This prevents a race condition where opencode reads its config before
-# dotfiles (containing opencode.json with model settings) are installed.
-# The marker file is created by devaipod after install_dotfiles_agent().
-echo "Waiting for devaipod setup to complete..."
-while [ ! -f {home}/.devaipod-ready ]; do
+# Wait for devaipod to finish setup (dotfiles, task config) before starting
+# opencode.  The state file lives on the container overlay so it persists
+# across stop/start but is absent after a container rebuild.
+while [ ! -f {state} ]; do
     sleep 0.1
 done
-echo "Setup complete, starting opencode..."
 
 # Run opencode serve, bound to 0.0.0.0 so it's accessible from the published port
 exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             home = AGENT_HOME_PATH,
+            state = AGENT_STATE_PATH,
             opencode_port = OPENCODE_PORT
         );
 
@@ -2535,10 +2590,10 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             r#"set -e
 mkdir -p {home}/.config {home}/.local/share {home}/.local/bin {home}/.cache
 
-# Wait for agent dotfiles installation to complete before copying configs.
-# The marker file is created by devaipod after install_dotfiles_agent().
+# Wait for agent setup (dotfiles, task config) to complete before copying configs.
+# The state file is written by devaipod after install_dotfiles_agent().
 echo "Waiting for agent setup to complete..."
-while [ ! -f /mnt/agent-home/.devaipod-ready ]; do
+while [ ! -f /mnt/agent-home/.devaipod-state.json ]; do
     sleep 0.1
 done
 echo "Agent setup complete, copying configs..."

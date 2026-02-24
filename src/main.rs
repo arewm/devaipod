@@ -1420,9 +1420,9 @@ async fn finalize_pod_with_mode(
     }
 
     // Signal that agent setup is complete - this unblocks opencode serve
-    // which is waiting for the .devaipod-ready marker file
+    // which is waiting for the state file
     devaipod_pod
-        .signal_agent_ready(podman)
+        .signal_agent_ready(podman, config.dotfiles.as_ref())
         .await
         .context("Failed to signal agent ready")?;
 
