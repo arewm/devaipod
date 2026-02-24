@@ -10,9 +10,13 @@ This document tracks enhancements to build on top of that foundation.
 
 > **See also**: [opencode-webui-fork.md](./opencode-webui-fork.md) for the
 > plan to extend the vendored opencode SPA with devaipod-specific pages
-> (pod management, multi-pod switching).
+> (pod management, git browser, commit-range review, sync controls).
 
 ## Improved Code Review
+
+> **Note**: [lightweight-review.md](./lightweight-review.md) expands on these
+> ideas with a concrete implementation sketch (API endpoints, review state
+> model, sync flow). That document is the current active design for this area.
 
 The opencode web UI shows file changes and supports commenting inline. This
 is already useful for reviewing what an agent has done before approving it.

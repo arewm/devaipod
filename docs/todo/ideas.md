@@ -40,15 +40,14 @@ more time and ask it to say complete or not.
 
 # Really awesome review process
 
-**Status: Spec complete, see [forgejo-integration.md](./forgejo-integration.md)**
+**Status: Active design. See:**
+- [lightweight-review.md](./lightweight-review.md) — lightweight options starting with extending the OpenCode web UI (recommended starting point)
+- [forgejo-integration.md](./forgejo-integration.md) — full local Forgejo spec (longer-term / when CI/CD is needed)
 
-The plan is to integrate a local Forgejo instance as the review UI:
-- Agent creates PRs in local Forgejo (not GitHub directly)
-- Forgejo Actions run CI/CD locally
-- Human reviews in Forgejo web UI with proper diff viewer
-- Approved changes sync to GitHub
-
-This leverages existing forge UI rather than building a custom TUI/web.
+The lightweight approach extends opencode's existing changes UI with commit-range
+review, approve/reject controls, and upstream sync via service-gator. The full
+Forgejo integration remains the plan for when we need local CI/CD or a multi-repo
+dashboard.
 
 # Remote devcontainer integration
 
@@ -58,10 +57,11 @@ Support connecting via Zed/VSCode remote
 
 Should we have an AutoClaude like frontend?
 
-With Forgejo integration, the Forgejo web UI becomes the primary GUI.
-For additional features beyond code review, consider:
-- Custom Forgejo frontend (fork/theme)
-- Separate dashboard for pod management only
+The current path is extending the opencode web UI via a fork — see
+[opencode-webui-fork.md](./opencode-webui-fork.md). This gives us a git
+browser, commit-range review, and pod management in a single SPA built on
+opencode's existing SolidJS/TS stack. Forgejo remains an option for when
+we need local CI/CD.
 
 # Kubernetes support
 

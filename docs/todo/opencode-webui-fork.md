@@ -90,25 +90,70 @@ New files:
 | `packages/app/src/pages/pods.tsx` | Pod list/management (replaces `dist/index.html`) |
 | `packages/app/src/context/devaipod.tsx` | Devaipod state: pod list, auth token, active pod |
 
-### Fork branch, not patches
+### Vendored frontend, not a separate repo
 
-Rather than carrying patch files in the devaipod repo, maintain a fork with
-a `devaipod` branch (initially at `github.com/cgwalters/opencode`, eventually
-`github.com/devaipod/opencode`). The branch tracks upstream releases and
-carries the devaipod-specific changes on top. The Containerfile clones from
-the fork:
+Rather than maintaining a separate fork repo or carrying patch files, vendor
+the opencode frontend source directly into the devaipod repo under
+`opencode-ui/`. This keeps everything in one repo and makes changes normal
+commits.
+
+The opencode web frontend is part of a bun workspace monorepo. The minimal
+set of packages needed to build it:
+
+| Directory | Purpose |
+|---|---|
+| `packages/app/` | The SPA itself (SolidJS + Vite + Tailwind) |
+| `packages/ui/` | Shared component library (`@opencode-ai/ui`) |
+| `packages/sdk/js/` | API client/types (`@opencode-ai/sdk`) — no runtime deps |
+| `packages/util/` | Small utility library (`@opencode-ai/util`) — just zod |
+
+Plus the root `package.json` (for workspace config and bun's `catalog:`
+version resolution) and `bun.lock`.
+
+The remaining ~13 packages in the opencode monorepo (CLI, desktop, docs,
+extensions, etc.) are not needed and are not vendored.
+
+**Initial import**: Extract the 4 packages + root config from the opencode
+repo at the pinned tag, commit as a single "vendor opencode frontend
+v1.1.65" commit. Inline any `catalog:` version references that would break
+without the full monorepo, or keep the root `package.json` catalog section
+intact (bun should tolerate missing workspace members).
+
+**Devaipod changes**: Normal commits on top, isolated in
+`packages/app/src/devaipod/` where possible. Modifications to upstream
+files (`app.tsx`, `layout.tsx`) kept minimal.
+
+**Upstream sync**: A script (or manual process) to pull updates from a new
+opencode release:
+1. Fetch the new tag
+2. Extract the same 4 packages + root config
+3. Apply as a commit, resolve conflicts with our changes
+4. Verify the build
+
+This is slightly more work than a `git subtree pull` but avoids the subtree
+limitation of requiring a single prefix path. It also avoids maintaining a
+second git repository.
+
+**Containerfile change**: Instead of cloning opencode at build time, build
+from the vendored source:
 
 ```dockerfile
-ARG OPENCODE_REPO=https://github.com/cgwalters/opencode
-ARG OPENCODE_REF=devaipod  # branch tracking upstream + devaipod changes
-RUN git clone --depth=1 -b $OPENCODE_REF $OPENCODE_REPO /build/opencode
-RUN cd /build/opencode/packages/app && bun install --frozen-lockfile && bun run build
+# -- opencode web UI build stage --
+FROM ghcr.io/bootc-dev/devenv-debian:latest AS opencode-web
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://bun.sh/install | bash && \
+    ln -sf /root/.bun/bin/bun /usr/local/bin/bun
+COPY opencode-ui/ /build/opencode/
+WORKDIR /build/opencode
+RUN bun install --frozen-lockfile
+WORKDIR /build/opencode/packages/app
+RUN bun run build
 ```
 
-Keeping devaipod code in isolated files (`src/devaipod/`) and only touching
-`app.tsx` and `layout.tsx` minimally keeps rebases on upstream tags clean.
-Automation (Dependabot, Renovate, or a simple CI job) can open PRs when
-upstream cuts a new release, rebasing the `devaipod` branch forward.
+This eliminates the network clone, the patch application step, and the
+pinned `OPENCODE_VERSION` ARG. The vendored source is the single source of
+truth.
 
 ### Reusable opencode components
 
@@ -140,25 +185,127 @@ the SDK. Risk is low for minor version skew but increases if the fork falls
 behind by many releases. Pinning the opencode backend version in pods to match
 the UI build tag mitigates this.
 
-**Upstream merge burden**: The opencode project releases multiple times per
-week. The fork branch approach (rather than carrying patches) makes rebasing
-straightforward. Keeping devaipod code in isolated files (`src/devaipod/`)
+**Upstream sync burden**: The opencode project releases frequently.
+Keeping devaipod code in isolated files (`packages/app/src/devaipod/`)
 and only touching `app.tsx` and `layout.tsx` minimally keeps merge conflicts
-rare. Contributing multi-server/multi-pod support upstream would further
-reduce fork surface.
+rare when pulling new upstream releases into the vendored directory.
+Contributing multi-server/multi-pod support upstream would further reduce
+the diff we carry.
+
+## Git browser and commit-range review
+
+> See also: [lightweight-review.md](./lightweight-review.md) for the full
+> rationale on why we're building this in the opencode UI rather than
+> running a local Forgejo.
+
+OpenCode today has a "changes" view (`SessionReview` / `review-tab.tsx`)
+that shows session-level file diffs and supports inline line comments that
+feed back into the agent's prompt context. This is genuinely useful but
+operates at the wrong abstraction level for reviewing agent work: it shows
+uncommitted changes relative to session start, not commits.
+
+What we need for a proper review workflow:
+
+### Git commit browser
+
+A new tab/panel (sibling to the existing "Changes" and "Files" tabs) that
+shows the commit log for the workspace branch. For each commit: hash, author,
+message, timestamp. Clicking a commit shows its diff using the existing
+`@pierre/diffs` renderer and `SessionReview` accordion.
+
+Data source: new devaipod control plane endpoint
+`GET /api/devaipod/pods/{name}/git/log` returning structured commit objects
+(the existing `/git/commits` endpoint returns recent commits but may need
+richer output — parent SHAs, full diff per commit).
+
+### Commit-range diff view
+
+Select two commits (or a base ref + HEAD) and see the combined diff, exactly
+like a GitHub PR "Files changed" view. This is the core review primitive.
+
+The opencode `Diff` component already supports rendering arbitrary before/after
+content pairs. The new piece is a control plane endpoint that returns the
+diff for a commit range:
+
+```
+GET /api/devaipod/pods/{name}/git/diff?base={sha}&head={sha}
+```
+
+returning an array of `FileDiff` objects compatible with the existing
+`sync.data.session_diff` format.
+
+### Review actions
+
+Approve/reject/request-changes controls attached to a commit range. The
+inline comment system already works — what's missing is:
+
+- A per-range review state (pending → approved/rejected → synced)
+- An "approve" action that marks the range and enables the sync button
+- A "request changes" action that sends the review comments to the agent
+  (the inline comment → prompt context flow already exists; we just need
+  to also inject a top-level "changes requested" message)
+
+### Upstream sync
+
+A "Push" / "Create PR" button visible only for approved commit ranges.
+Calls the control plane which delegates to service-gator (which has the
+push credentials). The agent container never sees this flow.
+
+### Upstream-ability
+
+The git browser and commit-range diff are genuinely useful features for any
+opencode user, not just devaipod. The review state and sync controls are
+devaipod-specific. Structuring the code so the git browser lives in opencode
+core (or is easily proposed upstream) while review/sync lives in
+`src/devaipod/` keeps the fork surface minimal.
 
 ## Tasks
 
+### Phase 0: Vendor the frontend
+- [ ] Extract the 4 packages + root config from opencode v1.1.65 into
+      `opencode-ui/` (packages/app, packages/ui, packages/sdk/js,
+      packages/util, root package.json, bun.lock)
+- [ ] Verify the vendored source builds: `cd opencode-ui && bun install && cd packages/app && bun run build`
+- [ ] Apply existing `opencode-devaipod.patch` changes as a normal commit
+- [ ] Update Containerfile to `COPY opencode-ui/` instead of cloning from GitHub
+- [ ] Remove `patches/opencode-devaipod.patch` and `OPENCODE_VERSION` ARG
+- [ ] Write an `update-opencode-ui.sh` script for pulling new upstream releases
+
+### Phase 1: Pod management in SPA (replaces dist/index.html)
+- [ ] Implement pod-prefixed API proxy in `web.rs`
+      (`/pods/{name}/api/{*path}` → pod's opencode backend) — needed before
+      the SPA can talk to pod backends without the cookie hack
 - [ ] Spike: create `src/devaipod/pods.tsx` with a basic pod list page,
       patch `app.tsx` to add the route, verify it builds and renders
 - [ ] Wire pod list to devaipod REST API (`/api/podman/...`, `/api/devaipod/run`)
 - [ ] Add sidebar pod icon with navigation to `/pods`
-- [ ] Implement pod-prefixed API proxy in `web.rs`
-      (`/pods/{name}/api/{*path}` → pod's opencode backend)
 - [ ] Create `DevaipodProvider` context for pod state and auth
 - [ ] Wire pod selection to `ServerProvider` base URL
+
+### Phase 2: Git browser and commit-range review
+- [ ] Add `GET /api/devaipod/pods/{name}/git/log` endpoint (structured
+      commit objects with parent SHAs)
+- [ ] Add `GET /api/devaipod/pods/{name}/git/diff?base={sha}&head={sha}`
+      endpoint returning `FileDiff[]`-compatible output
+- [ ] Create `src/devaipod/git-browser.tsx` — commit log panel using
+      `@opencode-ai/ui` components
+- [ ] Create `src/devaipod/commit-review.tsx` — commit-range diff view
+      reusing the existing `Diff` and `SessionReview` components
+- [ ] Wire inline comments from commit-range view back to agent prompt
+      context (extend `CommentsProvider` to support commit-scoped comments)
+
+### Phase 3: Review state and sync
+- [ ] Add review state endpoints (`GET/POST /api/devaipod/pods/{name}/review`)
+- [ ] Add sync endpoint (`POST /api/devaipod/pods/{name}/sync`) that calls
+      service-gator to push
+- [ ] Create `src/devaipod/review-controls.tsx` — approve/reject/sync buttons
+- [ ] Review state persistence in control plane (SQLite or JSON per pod)
+- [ ] Service-gator approval enforcement: control plane pushes approved
+      commit SHAs to service-gator when human approves in the review UI.
+      Service-gator maintains a local allow-list and refuses to create any
+      upstream PR unless all commits are on the list. (Requires service-gator
+      protocol extension: dynamic config update channel for approved commits.)
+
+### Phase 4: Cleanup
 - [ ] Remove iframe wrapper, cookie routing, SSE keepalive, and related code
 - [ ] Drop `dist/index.html` once the pods page is functional
-- [ ] Set up fork repo (cgwalters/opencode, `devaipod` branch) and update
-      Containerfile to clone from it
-- [ ] Set up automation to rebase `devaipod` branch on upstream releases
