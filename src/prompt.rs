@@ -6,6 +6,17 @@
 
 use crate::pod::{AGENT_HOME_PATH, WORKER_OPENCODE_PORT};
 
+/// Format git context section for inclusion in prompts.
+///
+/// When a repo URL is available, produces a line like:
+/// `## Context\n\ngit: https://github.com/owner/repo.git`
+fn format_git_context(repo_url: Option<&str>) -> String {
+    match repo_url {
+        Some(url) => format!("\n## Context\n\ngit: {url}\n", url = url,),
+        None => String::new(),
+    }
+}
+
 /// Generate orchestration-specific instructions for the task owner agent.
 ///
 /// These instructions explain to the task owner:
@@ -187,7 +198,7 @@ git log --oneline -5  # Show recent commits
 ///
 /// The worker is the leaf executor -- it should implement changes directly,
 /// not try to delegate further. This prompt omits all orchestration instructions.
-pub fn generate_worker_prompt(task: &str, enable_gator: bool) -> String {
+pub fn generate_worker_prompt(task: &str, enable_gator: bool, repo_url: Option<&str>) -> String {
     let gator_instructions = if enable_gator {
         r#"
 ## IMPORTANT: GitHub/GitLab Operations
@@ -200,12 +211,14 @@ The `gh` and `glab` CLI tools are NOT available in this environment.
         String::new()
     };
 
+    let git_context = format_git_context(repo_url);
+
     format!(
         r#"# devaipod Worker Task
 
 You are running as a **worker agent** in a **devaipod** sandboxed environment.
 You are the implementer -- make the requested changes directly.
-
+{git_context}
 ## Your Task
 
 {task}
@@ -217,6 +230,7 @@ You are the implementer -- make the requested changes directly.
 3. When done, ensure all changes are committed
 {gator_instructions}
 "#,
+        git_context = git_context,
         task = task,
         gator_instructions = gator_instructions
     )
@@ -238,6 +252,7 @@ pub fn generate_system_prompt(
     task: &str,
     enable_gator: bool,
     enable_orchestration: bool,
+    repo_url: Option<&str>,
 ) -> String {
     // Build service-gator instructions if enabled
     let gator_instructions = if enable_gator {
@@ -259,11 +274,13 @@ The `gh` and `glab` CLI tools are NOT available in this environment.
         String::new()
     };
 
+    let git_context = format_git_context(repo_url);
+
     format!(
         r#"# devaipod Task
 
 You are running as an AI agent in a **devaipod** sandboxed environment.
-
+{git_context}
 ## Your Task
 
 {task}
@@ -275,6 +292,7 @@ You are running as an AI agent in a **devaipod** sandboxed environment.
 3. When done, summarize what you accomplished
 {gator_instructions}{orchestration_section}
 "#,
+        git_context = git_context,
         task = task,
         gator_instructions = gator_instructions,
         orchestration_section = orchestration_section
@@ -368,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_generate_system_prompt_basic() {
-        let prompt = generate_system_prompt("Fix the bug", false, false);
+        let prompt = generate_system_prompt("Fix the bug", false, false, None);
         assert!(prompt.contains("Fix the bug"), "Should contain task");
         assert!(prompt.contains("# devaipod Task"), "Should have header");
         assert!(
@@ -379,11 +397,30 @@ mod tests {
             !prompt.contains("Multi-Agent Orchestration"),
             "Should not mention orchestration when disabled"
         );
+        assert!(
+            !prompt.contains("## Context"),
+            "Should not have context section without repo URL"
+        );
+    }
+
+    #[test]
+    fn test_generate_system_prompt_with_repo_url() {
+        let prompt = generate_system_prompt(
+            "Fix the bug",
+            false,
+            false,
+            Some("https://github.com/owner/repo.git"),
+        );
+        assert!(prompt.contains("## Context"), "Should have context section");
+        assert!(
+            prompt.contains("git: https://github.com/owner/repo.git"),
+            "Should contain repo URL"
+        );
     }
 
     #[test]
     fn test_generate_system_prompt_with_gator() {
-        let prompt = generate_system_prompt("Fix the bug", true, false);
+        let prompt = generate_system_prompt("Fix the bug", true, false, None);
         assert!(
             prompt.contains("service-gator"),
             "Should mention service-gator when enabled"
@@ -396,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_generate_system_prompt_with_orchestration() {
-        let prompt = generate_system_prompt("Implement feature", false, true);
+        let prompt = generate_system_prompt("Implement feature", false, true, None);
         assert!(
             prompt.contains("Multi-Agent Orchestration"),
             "Should include orchestration section"
@@ -413,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_generate_system_prompt_with_both() {
-        let prompt = generate_system_prompt("Complex task", true, true);
+        let prompt = generate_system_prompt("Complex task", true, true, None);
         assert!(
             prompt.contains("service-gator"),
             "Should mention service-gator"
@@ -421,6 +458,19 @@ mod tests {
         assert!(
             prompt.contains("Multi-Agent Orchestration"),
             "Should include orchestration section"
+        );
+    }
+
+    #[test]
+    fn test_generate_worker_prompt_with_repo_url() {
+        let prompt = generate_worker_prompt(
+            "Implement feature",
+            false,
+            Some("https://github.com/org/project.git"),
+        );
+        assert!(
+            prompt.contains("git: https://github.com/org/project.git"),
+            "Worker prompt should contain repo URL"
         );
     }
 }

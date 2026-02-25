@@ -54,6 +54,15 @@ impl WorkspaceSource {
         }
     }
 
+    /// Get the upstream repository URL (origin remote)
+    pub fn upstream_url(&self) -> Option<String> {
+        match self {
+            WorkspaceSource::LocalRepo(git_info) => git_info.remote_url.clone(),
+            WorkspaceSource::RemoteRepo(remote_info) => Some(remote_info.remote_url.clone()),
+            WorkspaceSource::PullRequest(pr_info) => Some(pr_info.pr_ref.upstream_url()),
+        }
+    }
+
     /// Get a short description for logging
     pub fn description(&self) -> String {
         match self {
@@ -263,6 +272,8 @@ pub struct DevaipodPod {
     pub enable_gator: bool,
     /// Whether orchestration mode is enabled
     pub enable_orchestration: bool,
+    /// Upstream repository URL (for prompt context)
+    pub repo_url: Option<String>,
 }
 
 impl DevaipodPod {
@@ -921,6 +932,7 @@ impl DevaipodPod {
             task: task.map(|s| s.to_string()),
             enable_gator,
             enable_orchestration,
+            repo_url: source.upstream_url(),
         })
     }
 
@@ -1581,8 +1593,12 @@ chmod 644 '{config_path}'
         let config_file = ".config/opencode/opencode.json";
 
         // Generate the complete system prompt using the prompt module
-        let task_content =
-            crate::prompt::generate_system_prompt(task, enable_gator, self.enable_orchestration);
+        let task_content = crate::prompt::generate_system_prompt(
+            task,
+            enable_gator,
+            self.enable_orchestration,
+            self.repo_url.as_deref(),
+        );
 
         let task_file_path = format!("{}/{}", AGENT_HOME_PATH, task_file);
         let config_file_path = format!("{}/{}", AGENT_HOME_PATH, config_file);
@@ -1678,7 +1694,8 @@ CONFIG_EOF"#,
         // that omits orchestration instructions (the worker is the leaf executor).
         if self.enable_orchestration {
             let worker_task_file = ".config/opencode/devaipod-task-worker.md";
-            let worker_task_content = crate::prompt::generate_worker_prompt(task, enable_gator);
+            let worker_task_content =
+                crate::prompt::generate_worker_prompt(task, enable_gator, self.repo_url.as_deref());
             let worker_task_script = format!(
                 r#"cat > '{agent_home}/{worker_task_file}' << 'TASK_EOF'
 {worker_task_content}
