@@ -22,7 +22,8 @@ use std::process::Command;
 /// The main upstream repository (where PRs merge to, the source of truth)
 pub const REMOTE_ORIGIN: &str = "origin";
 
-/// The user's fork (only present when working on a PR from a fork)
+/// The user's fork (present when working on a PR from a fork, or when the
+/// authenticated user has a fork of the upstream repository)
 pub const REMOTE_FORK: &str = "fork";
 
 // Cross-container remotes for collaboration:
@@ -143,6 +144,8 @@ pub struct GitRepoInfo {
     pub is_dirty: bool,
     /// List of uncommitted file paths (for warning messages)
     pub dirty_files: Vec<String>,
+    /// URL of the authenticated user's fork, if detected
+    pub fork_url: Option<String>,
 }
 
 /// Information about a remote git repository (URL only, no local clone)
@@ -154,6 +157,8 @@ pub struct RemoteRepoInfo {
     pub default_branch: String,
     /// Repository name (extracted from URL)
     pub repo_name: String,
+    /// URL of the authenticated user's fork, if detected
+    pub fork_url: Option<String>,
 }
 
 /// Detect git repository information from a local path
@@ -230,6 +235,7 @@ pub fn detect_git_info(project_path: &Path) -> Result<GitRepoInfo> {
         branch,
         is_dirty,
         dirty_files,
+        fork_url: None,
     })
 }
 
@@ -361,6 +367,20 @@ git remote set-url {REMOTE_ORIGIN} "{url}" 2>/dev/null || git remote add {REMOTE
         String::new()
     };
 
+    // Add fork remote if the user has a fork of this repo
+    let fork_remote_setup = if let Some(ref fork_url) = git_info.fork_url {
+        format!(
+            r#"
+# Add '{REMOTE_FORK}' remote pointing to user's fork
+git remote add {REMOTE_FORK} "{fork_url}" 2>/dev/null || git remote set-url {REMOTE_FORK} "{fork_url}"
+"#,
+            REMOTE_FORK = REMOTE_FORK,
+            fork_url = fork_url
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"
 set -e
@@ -379,13 +399,14 @@ cd "{workspace}"
 # Checkout the exact commit
 git checkout "{commit}" 2>&1
 {setup_remote}
-{chown_cmd}
+{fork_remote_setup}{chown_cmd}
 echo "Repository cloned successfully at commit {short_commit}"
 "#,
         workspace = workspace_folder,
         commit = git_info.commit_sha,
         short_commit = &git_info.commit_sha[..git_info.commit_sha.len().min(8)],
         setup_remote = setup_remote,
+        fork_remote_setup = fork_remote_setup,
         chown_cmd = target_user
             .map(|u| format!(
                 "# Set ownership to target user\nchown -R {u}:{u} \"{workspace_folder}\""
@@ -492,6 +513,20 @@ pub fn clone_remote_script(
         String::new()
     };
 
+    // Add fork remote if the user has a fork of this repo
+    let fork_remote_setup = if let Some(ref fork_url) = remote_info.fork_url {
+        format!(
+            r#"
+# Add '{REMOTE_FORK}' remote pointing to user's fork
+git remote add {REMOTE_FORK} "{fork_url}" 2>/dev/null || git remote set-url {REMOTE_FORK} "{fork_url}"
+"#,
+            REMOTE_FORK = REMOTE_FORK,
+            fork_url = fork_url
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"
 set -e
@@ -502,7 +537,7 @@ mkdir -p "$(dirname "{workspace}")"
 git clone --branch "{branch}" "{clone_url}" "{workspace}" 2>&1
 
 cd "{workspace}"
-{reset_remote}{chown_cmd}
+{reset_remote}{fork_remote_setup}{chown_cmd}
 echo "Repository cloned successfully"
 "#,
         display_url = remote_info.remote_url, // Don't log the token
@@ -510,6 +545,7 @@ echo "Repository cloned successfully"
         workspace = workspace_folder,
         branch = remote_info.default_branch,
         reset_remote = reset_remote,
+        fork_remote_setup = fork_remote_setup,
         chown_cmd = target_user
             .map(|u| format!(
                 "# Set ownership to target user\nchown -R {u}:{u} \"{workspace_folder}\""
@@ -941,6 +977,7 @@ mod tests {
             branch: None,
             is_dirty: false,
             dirty_files: vec![],
+            fork_url: None,
         };
 
         let result = clone_script(&info, "/workspaces/test");
@@ -957,6 +994,7 @@ mod tests {
             branch: Some("main".to_string()),
             is_dirty: false,
             dirty_files: vec![],
+            fork_url: None,
         };
 
         let script = clone_script(&info, "/workspaces/test").unwrap();
@@ -976,6 +1014,7 @@ mod tests {
             branch: Some("feature".to_string()),
             is_dirty: false,
             dirty_files: vec![],
+            fork_url: None,
         };
 
         let script = clone_from_local_script(&info, "/workspaces/test", Some("devenv"));
@@ -997,6 +1036,7 @@ mod tests {
             branch: Some("feature".to_string()),
             is_dirty: false,
             dirty_files: vec![],
+            fork_url: None,
         };
 
         let script = clone_from_local_script(&info, "/workspaces/test", None);
@@ -1043,6 +1083,7 @@ mod tests {
             remote_url: "https://github.com/owner/repo.git".to_string(),
             default_branch: "main".to_string(),
             repo_name: "repo".to_string(),
+            fork_url: None,
         };
 
         let script = clone_remote_script(&info, "/workspaces/repo", Some("devenv"), None);
@@ -1060,6 +1101,7 @@ mod tests {
             remote_url: "https://github.com/owner/repo.git".to_string(),
             default_branch: "main".to_string(),
             repo_name: "repo".to_string(),
+            fork_url: None,
         };
 
         let script = clone_remote_script(&info, "/workspaces/repo", None, Some("ghp_secret123"));
@@ -1071,6 +1113,70 @@ mod tests {
         assert!(script.contains("https://github.com/owner/repo.git"));
         // Display message should NOT contain the token
         assert!(script.contains("Cloning repository from https://github.com/owner/repo.git"));
+    }
+
+    #[test]
+    fn test_clone_remote_script_with_fork() {
+        let info = RemoteRepoInfo {
+            remote_url: "https://github.com/upstream/repo.git".to_string(),
+            default_branch: "main".to_string(),
+            repo_name: "repo".to_string(),
+            fork_url: Some("https://github.com/myuser/repo.git".to_string()),
+        };
+
+        let script = clone_remote_script(&info, "/workspaces/repo", None, None);
+
+        // Should add the fork remote
+        assert!(
+            script.contains("git remote add fork"),
+            "should add fork remote"
+        );
+        assert!(
+            script.contains("https://github.com/myuser/repo.git"),
+            "should use the fork URL"
+        );
+    }
+
+    #[test]
+    fn test_clone_remote_script_without_fork() {
+        let info = RemoteRepoInfo {
+            remote_url: "https://github.com/owner/repo.git".to_string(),
+            default_branch: "main".to_string(),
+            repo_name: "repo".to_string(),
+            fork_url: None,
+        };
+
+        let script = clone_remote_script(&info, "/workspaces/repo", None, None);
+
+        // Should NOT add a fork remote
+        assert!(
+            !script.contains("git remote add fork"),
+            "should not add fork remote when no fork detected"
+        );
+    }
+
+    #[test]
+    fn test_clone_from_local_script_with_fork() {
+        let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/home/user/project"),
+            remote_url: Some("https://github.com/upstream/repo.git".to_string()),
+            commit_sha: "abc123def456".to_string(),
+            branch: Some("main".to_string()),
+            is_dirty: false,
+            dirty_files: vec![],
+            fork_url: Some("https://github.com/myuser/repo.git".to_string()),
+        };
+
+        let script = clone_from_local_script(&info, "/workspaces/test", None);
+
+        assert!(
+            script.contains("git remote add fork"),
+            "should add fork remote"
+        );
+        assert!(
+            script.contains("https://github.com/myuser/repo.git"),
+            "should use the fork URL"
+        );
     }
 
     #[test]
@@ -1144,6 +1250,7 @@ mod tests {
             branch: Some("main".to_string()),
             is_dirty: false,
             dirty_files: vec![],
+            fork_url: None,
         };
 
         let script = clone_agent_workspace_script(
@@ -1200,6 +1307,7 @@ mod tests {
             branch: None,
             is_dirty: false,
             dirty_files: vec![],
+            fork_url: None,
         };
 
         let script =
@@ -1231,6 +1339,7 @@ mod tests {
             branch: Some("feature".to_string()),
             is_dirty: false,
             dirty_files: vec![],
+            fork_url: None,
         };
 
         let script = clone_agent_workspace_script(
@@ -1258,6 +1367,7 @@ mod tests {
             branch: Some("main".to_string()),
             is_dirty: false,
             dirty_files: vec![],
+            fork_url: None,
         };
 
         let script = clone_worker_workspace_script(
@@ -1322,6 +1432,7 @@ mod tests {
             branch: None,
             is_dirty: false,
             dirty_files: vec![],
+            fork_url: None,
         };
 
         let script = clone_worker_workspace_script(

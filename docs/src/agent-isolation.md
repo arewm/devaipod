@@ -114,7 +114,7 @@ Devaipod sets up consistent git remote names across all containers.
 | Remote | Description |
 |--------|-------------|
 | `origin` | The main upstream repository (where PRs merge to, the source of truth) |
-| `fork` | The PR author's fork (only present when working on a PR from a fork) |
+| `fork` | The user's fork of the upstream repository (auto-detected via GitHub API when a `GH_TOKEN` is available, or set from the PR author's fork when working on a PR from a fork) |
 
 ### Cross-container collaboration remotes
 

@@ -1584,7 +1584,7 @@ async fn create_workspace_from_local(
     };
 
     // Detect git repository info for cloning into containers
-    let git_info =
+    let mut git_info =
         git::detect_git_info(project_path).context("Failed to detect git repository info")?;
 
     // Require a remote URL for cloning
@@ -1615,6 +1615,19 @@ async fn create_workspace_from_local(
             &git_info.commit_sha[..8]
         );
         eprintln!("   Consider committing or stashing your changes first.\n");
+    }
+
+    // Detect if the user has a fork of the repository and add it as a remote
+    if let Some(ref remote_url) = git_info.remote_url {
+        if let Some(repo_ref) = forge::parse_repo_url(remote_url) {
+            if repo_ref.forge_type == forge::ForgeType::GitHub {
+                if let Some(fork_info) =
+                    forge::fetch_github_user_fork(&repo_ref, Some(config)).await
+                {
+                    git_info.fork_url = Some(fork_info.clone_url);
+                }
+            }
+        }
     }
 
     // Find and load devcontainer.json (optional when --image or default-image is provided)
@@ -1919,11 +1932,25 @@ async fn create_workspace_from_remote(
 
     let enable_gator = service_gator_config.is_enabled();
 
+    // Detect if the user has a fork of the repository
+    let fork_url = if let Some(repo_ref) = forge::parse_repo_url(remote_url) {
+        if repo_ref.forge_type == forge::ForgeType::GitHub {
+            forge::fetch_github_user_fork(&repo_ref, Some(config))
+                .await
+                .map(|info| info.clone_url)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Create source from remote repo info
     let remote_info = git::RemoteRepoInfo {
         remote_url: remote_url.to_string(),
         default_branch: default_branch.clone(),
         repo_name: repo_name.clone(),
+        fork_url,
     };
     let source = pod::WorkspaceSource::RemoteRepo(remote_info);
 
@@ -4192,11 +4219,25 @@ async fn cmd_rebuild(
     // Extract repo name from URL
     let repo_name = git::extract_repo_name(&remote_url).unwrap_or_else(|| "workspace".to_string());
 
+    // Detect if the user has a fork of the repository
+    let fork_url = if let Some(repo_ref) = forge::parse_repo_url(&remote_url) {
+        if repo_ref.forge_type == forge::ForgeType::GitHub {
+            forge::fetch_github_user_fork(&repo_ref, Some(config))
+                .await
+                .map(|info| info.clone_url)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Create remote info for workspace source
     let remote_info = git::RemoteRepoInfo {
         remote_url: remote_url.clone(),
         default_branch,
         repo_name,
+        fork_url,
     };
     let source = pod::WorkspaceSource::RemoteRepo(remote_info);
 

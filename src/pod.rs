@@ -552,6 +552,7 @@ impl DevaipodPod {
                         branch: Some(remote_info.default_branch.clone()),
                         is_dirty: false,
                         dirty_files: vec![],
+                        fork_url: remote_info.fork_url.clone(),
                     };
                     crate::git::clone_agent_workspace_script(
                         &workspace_folder,
@@ -569,6 +570,7 @@ impl DevaipodPod {
                         branch: Some(pr_info.head_ref.clone()),
                         is_dirty: false,
                         dirty_files: vec![],
+                        fork_url: None, // Fork remote is handled by clone_pr_script
                     };
                     crate::git::clone_agent_workspace_script(
                         &workspace_folder,
@@ -729,6 +731,7 @@ impl DevaipodPod {
                             branch: Some(remote_info.default_branch.clone()),
                             is_dirty: false,
                             dirty_files: vec![],
+                            fork_url: remote_info.fork_url.clone(),
                         };
                         crate::git::clone_worker_workspace_script(
                             &workspace_folder,
@@ -745,6 +748,7 @@ impl DevaipodPod {
                             branch: Some(pr_info.head_ref.clone()),
                             is_dirty: false,
                             dirty_files: vec![],
+                            fork_url: None,
                         };
                         crate::git::clone_worker_workspace_script(
                             &workspace_folder,

@@ -642,6 +642,105 @@ async fn fetch_forgejo_pr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
     })
 }
 
+/// Information about a user's fork of a repository
+#[derive(Debug, Clone)]
+pub struct UserForkInfo {
+    /// Clone URL for the fork (HTTPS)
+    pub clone_url: String,
+}
+
+/// Check if the authenticated GitHub user has a fork of the given repository.
+///
+/// Uses the GitHub GraphQL API to query `repository.forks(affiliations: [OWNER])`
+/// which returns forks owned by the authenticated user. This handles renamed forks
+/// correctly (unlike the REST approach of checking `GET /repos/{login}/{repo}`).
+///
+/// Returns `None` if no token is available, the user has no fork, or the API call fails.
+/// Errors are logged but not propagated since fork detection is best-effort.
+pub async fn fetch_github_user_fork(
+    repo_ref: &RepoRef,
+    config: Option<&crate::config::Config>,
+) -> Option<UserForkInfo> {
+    let token = if let Some(cfg) = config {
+        crate::git::get_github_token_with_secret(cfg)
+    } else {
+        crate::git::get_github_token()
+    };
+    let token = token?;
+
+    let graphql_url = if repo_ref.host == "github.com" {
+        "https://api.github.com/graphql".to_string()
+    } else {
+        format!("https://{}/api/graphql", repo_ref.host)
+    };
+
+    // GraphQL query: find forks of this repo that the authenticated user owns.
+    // affiliations: [OWNER] filters to repos the viewer owns, so this handles
+    // renamed forks and is a single API call.
+    let query = serde_json::json!({
+        "query": r#"query($owner: String!, $repo: String!) {
+            repository(owner: $owner, name: $repo) {
+                forks(affiliations: [OWNER], first: 1) {
+                    nodes {
+                        nameWithOwner
+                        url
+                    }
+                }
+            }
+        }"#,
+        "variables": {
+            "owner": repo_ref.owner,
+            "repo": repo_ref.repo,
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&graphql_url)
+        .header("User-Agent", "devaipod")
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&query)
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        tracing::debug!(
+            "GitHub GraphQL API returned {}, skipping fork detection",
+            response.status()
+        );
+        return None;
+    }
+
+    let json: serde_json::Value = response.json().await.ok()?;
+
+    // Check for GraphQL errors
+    if let Some(errors) = json.get("errors") {
+        tracing::debug!("GitHub GraphQL returned errors: {errors}");
+        return None;
+    }
+
+    let nodes = json
+        .get("data")?
+        .get("repository")?
+        .get("forks")?
+        .get("nodes")?
+        .as_array()?;
+
+    let fork = nodes.first()?;
+    let name_with_owner = fork.get("nameWithOwner")?.as_str()?;
+    // The GraphQL `url` field returns the HTML URL; construct the clone URL from it
+    let html_url = fork.get("url")?.as_str()?;
+    let clone_url = format!("{html_url}.git");
+
+    tracing::info!(
+        "Found user fork: {name_with_owner} -> adding as '{}' remote",
+        crate::git::REMOTE_FORK
+    );
+
+    Some(UserForkInfo { clone_url })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
