@@ -2362,68 +2362,103 @@ async fn git_diff_range(
         numstat_map.insert(fields[2].trim(), (adds, dels));
     }
 
-    // Step 3: Fetch before/after content for each file.
-    // We spawn all fetches concurrently for better performance.
-    let mut tasks = Vec::with_capacity(file_statuses.len());
-    for &(file_path, status) in &file_statuses {
-        let container = container_name.clone();
-        let base = params.base.clone();
-        let head = params.head.clone();
-        let path_owned = file_path.to_string();
-        let (adds, dels) = numstat_map.get(file_path).copied().unwrap_or((0, 0));
+    // Step 3: Fetch before/after content for all files in two batched execs
+    // (one for base, one for head) instead of per-file execs.  Each exec
+    // runs a shell loop that outputs file contents separated by a NUL byte
+    // delimiter.  This reduces 2N exec calls to 2, which matters because
+    // each exec has ~200-500ms overhead through the podman VM on macOS.
+    const FILE_SEPARATOR: &str = "\x00DEVAIPOD_FILE_SEP\x00";
 
-        tasks.push(tokio::spawn(async move {
-            // Get "before" content (empty for added files)
-            let before = if status == "added" {
-                String::new()
-            } else {
-                let show_ref = format!("{base}:{path_owned}");
-                match exec_in_container(&container, &["git", "show", &show_ref]).await {
-                    Ok((_code, stdout, _stderr)) => match String::from_utf8(stdout) {
-                        Ok(s) => s,
-                        Err(_) => "(binary file)".to_string(),
-                    },
-                    Err(_) => String::new(),
-                }
-            };
+    let base_files: Vec<&str> = file_statuses
+        .iter()
+        .filter(|(_, status)| *status != "added")
+        .map(|(path, _)| *path)
+        .collect();
+    let head_files: Vec<&str> = file_statuses
+        .iter()
+        .filter(|(_, status)| *status != "deleted")
+        .map(|(path, _)| *path)
+        .collect();
 
-            // Get "after" content (empty for deleted files)
-            let after = if status == "deleted" {
-                String::new()
-            } else {
-                let show_ref = format!("{head}:{path_owned}");
-                match exec_in_container(&container, &["git", "show", &show_ref]).await {
-                    Ok((_code, stdout, _stderr)) => match String::from_utf8(stdout) {
-                        Ok(s) => s,
-                        Err(_) => "(binary file)".to_string(),
-                    },
-                    Err(_) => String::new(),
-                }
-            };
-
-            FileDiff {
-                file: path_owned,
-                before,
-                after,
-                additions: adds,
-                deletions: dels,
-                status,
+    // Build a shell script that cats each file at the given ref, separated
+    // by the delimiter.  Using printf to avoid echo interpreting escapes.
+    fn build_batch_script(ref_name: &str, files: &[&str], sep: &str) -> String {
+        let mut script = String::new();
+        for (i, file) in files.iter().enumerate() {
+            if i > 0 {
+                script.push_str(&format!("printf '{sep}';")); // delimiter between files
             }
-        }));
+            script.push_str(&format!(
+                "git show '{ref_name}:{file}' 2>/dev/null || true;",
+            ));
+        }
+        script
     }
 
-    let mut files = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        match task.await {
-            Ok(diff) => files.push(diff),
-            Err(e) => {
-                tracing::error!("File diff task panicked: {e}");
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal error fetching file content".to_string(),
-                ));
+    let (base_contents, head_contents) = tokio::join!(
+        async {
+            if base_files.is_empty() {
+                return std::collections::HashMap::new();
             }
-        }
+            let script = build_batch_script(&params.base, &base_files, FILE_SEPARATOR);
+            match exec_in_container(&container_name, &["sh", "-c", &script]).await {
+                Ok((_code, stdout, _stderr)) => {
+                    let output = String::from_utf8(stdout)
+                        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
+                    let parts: Vec<&str> = output.split(FILE_SEPARATOR).collect();
+                    let mut map = std::collections::HashMap::new();
+                    for (i, file) in base_files.iter().enumerate() {
+                        map.insert(
+                            file.to_string(),
+                            parts.get(i).unwrap_or(&"").to_string(),
+                        );
+                    }
+                    map
+                }
+                Err(e) => {
+                    tracing::error!("Failed to batch-fetch base content: {e}");
+                    std::collections::HashMap::new()
+                }
+            }
+        },
+        async {
+            if head_files.is_empty() {
+                return std::collections::HashMap::new();
+            }
+            let script = build_batch_script(&params.head, &head_files, FILE_SEPARATOR);
+            match exec_in_container(&container_name, &["sh", "-c", &script]).await {
+                Ok((_code, stdout, _stderr)) => {
+                    let output = String::from_utf8(stdout)
+                        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
+                    let parts: Vec<&str> = output.split(FILE_SEPARATOR).collect();
+                    let mut map = std::collections::HashMap::new();
+                    for (i, file) in head_files.iter().enumerate() {
+                        map.insert(
+                            file.to_string(),
+                            parts.get(i).unwrap_or(&"").to_string(),
+                        );
+                    }
+                    map
+                }
+                Err(e) => {
+                    tracing::error!("Failed to batch-fetch head content: {e}");
+                    std::collections::HashMap::new()
+                }
+            }
+        },
+    );
+
+    let mut files = Vec::with_capacity(file_statuses.len());
+    for &(file_path, status) in &file_statuses {
+        let (adds, dels) = numstat_map.get(file_path).copied().unwrap_or((0, 0));
+        files.push(FileDiff {
+            file: file_path.to_string(),
+            before: base_contents.get(file_path).cloned().unwrap_or_default(),
+            after: head_contents.get(file_path).cloned().unwrap_or_default(),
+            additions: adds,
+            deletions: dels,
+            status,
+        });
     }
 
     Ok(Json(GitDiffRangeResponse { files }))
