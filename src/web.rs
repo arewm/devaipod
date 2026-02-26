@@ -571,7 +571,7 @@ async fn proxy_to_upstream(
     let stream = tokio::net::TcpStream::connect(format!("{}:{}", host, port))
         .await
         .map_err(|e| {
-            tracing::error!("Failed to connect to opencode server: {}", e);
+            tracing::error!("Failed to connect to opencode server at {}:{}: {}", host, port, e);
             StatusCode::BAD_GATEWAY
         })?;
 
@@ -2221,14 +2221,10 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
 
     let app = build_app(token.clone(), socket_path, static_dir);
 
-    // In container mode, bind to 0.0.0.0 so port-forwarded connections from the host (e.g. -p 8080:8080) are accepted.
-    // On the host we bind to 127.0.0.1 only for security.
-    let bind_host = if std::env::var("DEVAIPOD_CONTAINER").is_ok() {
-        "0.0.0.0"
-    } else {
-        "127.0.0.1"
-    };
-    let addr = format!("{}:{}", bind_host, port);
+    // Bind to [::] which accepts both IPv4 and IPv6 connections via dual-stack
+    // (the Linux default).  Browsers typically try IPv6 first when resolving
+    // "localhost", so binding IPv4-only would cause connection resets.
+    let addr = format!("[::]:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind to {}", addr))?;

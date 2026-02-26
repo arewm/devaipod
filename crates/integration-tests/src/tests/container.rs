@@ -604,8 +604,8 @@ fn test_pod_has_api_credentials() -> Result<()> {
         .ignore_status()
         .read()?;
     assert!(
-        port_output.contains("127.0.0.1:"),
-        "Port 4096 (opencode) should be published to localhost: {}",
+        port_output.contains("0.0.0.0:"),
+        "Port 4096 (opencode) should be published on all interfaces: {}",
         port_output
     );
 

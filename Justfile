@@ -261,8 +261,8 @@ container-push tag="latest": container-build
 
 # Run devaipod as a container daemon
 # Mounts podman socket, config, and SSH config export directory
-# Uses host gateway (host.containers.internal) to reach pod-published ports; avoids --network host
-# so port forwarding works on macOS. All pod services use auth (auth proxy).
+# Uses host gateway (host.containers.internal) to reach pod-published ports.
+# Agent pods publish ports on 0.0.0.0 so they are reachable from the container network.
 # Socket: Linux uses XDG_RUNTIME_DIR; macOS/Windows use VM path /run/podman/podman.sock (container runs in VM).
 [group('container')]
 container-run: container-build
