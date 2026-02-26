@@ -2102,8 +2102,14 @@ async fn git_log(
                 "'base' requires 'head' to also be specified".to_string(),
             ));
         }
-        // Default: show agent's commits via the agent remote ref
+        // Default: fetch latest agent commits then show them.
+        // The fetch is fast (local volume mount, no network) and ensures
+        // the user always sees the agent's current state.
         (None, None) => {
+            if let Err(e) = exec_in_container(&container_name, &["git", "fetch", "agent"]).await {
+                tracing::warn!("git fetch agent in {container_name} failed: {e}");
+                // Non-fatal: agent remote may not exist yet for fresh pods.
+            }
             cmd.push("agent/HEAD");
             cmd.push("-50");
         }
@@ -2122,6 +2128,13 @@ async fn git_log(
 
     if exit_code != 0 {
         let stderr_text = String::from_utf8_lossy(&stderr);
+        // If the ref doesn't exist yet (e.g. agent remote has no commits),
+        // return an empty commit list rather than a 500.
+        if stderr_text.contains("unknown revision") || stderr_text.contains("bad default revision") {
+            return Ok(Json(GitLogResponse {
+                commits: Vec::new(),
+            }));
+        }
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("git log failed: {}", stderr_text),
