@@ -51,6 +51,8 @@ import {
   type SessionReviewTabProps,
 } from "@/pages/session/review-tab"
 import { GitReviewTab } from "@/pages/session/git-review-tab"
+import { createWorkspaceTerminals, type WorkspaceTerminals } from "@/context/workspace-terminal"
+import { isDevaipod } from "@/utils/devaipod-api"
 import { TerminalPanel } from "@/pages/session/terminal-panel"
 import { terminalTabLabel } from "@/pages/session/terminal-label"
 import { MessageTimeline } from "@/pages/session/message-timeline"
@@ -87,14 +89,13 @@ const setSessionHandoff = (key: string, patch: Partial<HandoffSession>) => {
   touch(handoff.session, key, { ...prev, ...patch })
 }
 
-const isDevaipod = () => document.cookie.includes("DEVAIPOD_AGENT_POD=")
-
 export default function Page() {
   const layout = useLayout()
   const local = useLocal()
   const file = useFile()
   const sync = useSync()
   const terminal = useTerminal()
+  const wsTerminal = isDevaipod() ? createWorkspaceTerminals() : undefined
   const dialog = useDialog()
   const codeComponent = useCodeComponent()
   const command = useCommand()
@@ -1791,6 +1792,7 @@ export default function Page() {
         handleTerminalDragOver={handleTerminalDragOver}
         handleTerminalDragEnd={handleTerminalDragEnd}
         onCloseTab={() => setUi("autoCreated", false)}
+        workspaceTerminal={wsTerminal}
       />
     </div>
   )

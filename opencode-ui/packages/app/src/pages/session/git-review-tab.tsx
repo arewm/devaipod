@@ -5,6 +5,7 @@ import { SessionReview } from "@opencode-ai/ui/session-review"
 import { Select } from "@opencode-ai/ui/select"
 import type { SelectedLineRange } from "@/context/file"
 import type { LineComment } from "@/context/comments"
+import { getPodName, apiFetch } from "@/utils/devaipod-api"
 
 export type DiffStyle = "unified" | "split"
 
@@ -43,29 +44,6 @@ interface ApiFileDiff {
   status: "added" | "deleted" | "modified"
 }
 
-function getPodName(): string | undefined {
-  const match = document.cookie.match(/(?:^|;\s*)DEVAIPOD_AGENT_POD=([^;]*)/)
-  return match?.[1] ? decodeURIComponent(match[1]) : undefined
-}
-
-function getAuthToken(): string | undefined {
-  const stored = sessionStorage.getItem("devaipod_token")
-  if (stored) return stored
-  const params = new URLSearchParams(window.location.search)
-  return params.get("token") ?? undefined
-}
-
-async function apiFetch<T>(path: string, token: string | undefined): Promise<T> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" }
-  if (token) headers["Authorization"] = `Bearer ${token}`
-  const res = await fetch(path, { headers })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`API ${res.status}: ${text}`)
-  }
-  return res.json()
-}
-
 function commitLabel(entry: GitLogEntry): string {
   const firstLine = entry.message.split("\n", 1)[0] ?? ""
   const subject = firstLine.length > 60 ? firstLine.slice(0, 57) + "..." : firstLine
@@ -74,7 +52,6 @@ function commitLabel(entry: GitLogEntry): string {
 
 export function GitReviewTab(props: GitReviewTabProps) {
   const podName = getPodName()
-  const token = getAuthToken()
 
   const [state, setState] = createStore({
     baseCommit: undefined as string | undefined,
@@ -85,7 +62,6 @@ export function GitReviewTab(props: GitReviewTabProps) {
     async (pod) => {
       const data = await apiFetch<{ commits: GitLogEntry[] }>(
         `/api/devaipod/pods/${encodeURIComponent(pod)}/git/log`,
-        token,
       )
       return data.commits
     },
@@ -118,7 +94,6 @@ export function GitReviewTab(props: GitReviewTabProps) {
   const [diffData] = createResource(diffParams, async (params) => {
     const data = await apiFetch<{ files: ApiFileDiff[] }>(
       `/api/devaipod/pods/${encodeURIComponent(params.pod)}/git/diff-range?base=${encodeURIComponent(params.base)}&head=${encodeURIComponent(params.head)}`,
-      token,
     )
     return data.files
   })

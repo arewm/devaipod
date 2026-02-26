@@ -20,6 +20,10 @@ export interface TerminalProps extends ComponentProps<"div"> {
   onCleanup?: (pty: LocalPTY) => void
   onConnect?: () => void
   onConnectError?: (error: unknown) => void
+  /** Override the WebSocket URL (for workspace terminals that bypass the opencode SDK). */
+  wsUrl?: URL
+  /** Override the resize handler (for workspace terminals that bypass the opencode SDK). */
+  onPtyResize?: (ptyId: string, cols: number, rows: number) => Promise<void>
 }
 
 let shared: Promise<{ mod: typeof import("ghostty-web"); ghostty: Ghostty }> | undefined
@@ -149,7 +153,7 @@ export const Terminal = (props: TerminalProps) => {
   const theme = useTheme()
   const language = useLanguage()
   let container!: HTMLDivElement
-  const [local, others] = splitProps(props, ["pty", "class", "classList", "onConnect", "onConnectError"])
+  const [local, others] = splitProps(props, ["pty", "class", "classList", "onConnect", "onConnectError", "wsUrl", "onPtyResize"])
   let ws: WebSocket | undefined
   let term: Term | undefined
   let ghostty: Ghostty
@@ -176,6 +180,11 @@ export const Terminal = (props: TerminalProps) => {
   }
 
   const pushSize = (cols: number, rows: number) => {
+    if (local.onPtyResize) {
+      return local.onPtyResize(local.pty.id, cols, rows).catch((err) => {
+        debugTerminal("failed to sync terminal size", err)
+      })
+    }
     return sdk.client.pty
       .update({
         ptyID: local.pty.id,
@@ -263,13 +272,20 @@ export const Terminal = (props: TerminalProps) => {
 
       const once = { value: false }
 
-      const url = new URL(sdk.url + `/pty/${local.pty.id}/connect`)
-      url.searchParams.set("directory", sdk.directory)
-      url.searchParams.set("cursor", String(start !== undefined ? start : local.pty.buffer ? -1 : 0))
-      url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
-      if (window.__OPENCODE__?.serverPassword) {
-        url.username = "opencode"
-        url.password = window.__OPENCODE__?.serverPassword
+      let url: URL
+      if (local.wsUrl) {
+        url = new URL(local.wsUrl.toString())
+        url.searchParams.set("cursor", String(start !== undefined ? start : local.pty.buffer ? -1 : 0))
+        url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
+      } else {
+        url = new URL(sdk.url + `/pty/${local.pty.id}/connect`)
+        url.searchParams.set("directory", sdk.directory)
+        url.searchParams.set("cursor", String(start !== undefined ? start : local.pty.buffer ? -1 : 0))
+        url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
+        if (window.__OPENCODE__?.serverPassword) {
+          url.username = "opencode"
+          url.password = window.__OPENCODE__?.serverPassword
+        }
       }
       const socket = new WebSocket(url)
       socket.binaryType = "arraybuffer"
