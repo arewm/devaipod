@@ -266,14 +266,17 @@ core (or is easily proposed upstream) while review/sync lives in
 
 ## Tasks
 
-### Phase 0: Vendor the frontend
-- [ ] Extract the 4 packages + root config from opencode v1.1.65 into
-      `opencode-ui/` (packages/app, packages/ui, packages/sdk/js,
-      packages/util, root package.json, bun.lock)
-- [ ] Verify the vendored source builds: `cd opencode-ui && bun install && cd packages/app && bun run build`
-- [ ] Apply existing `opencode-devaipod.patch` changes as a normal commit
-- [ ] Update Containerfile to `COPY opencode-ui/` instead of cloning from GitHub
-- [ ] Remove `patches/opencode-devaipod.patch` and `OPENCODE_VERSION` ARG
+### Phase 0: Vendor the frontend — DONE
+
+- [x] Extract the 4 packages + root config from opencode v1.1.65 into
+      `opencode-ui/`
+- [x] Verify the vendored source builds
+- [x] Apply existing `opencode-devaipod.patch` changes as a normal commit
+- [x] Update Containerfile to build from `opencode-ui/` instead of cloning
+      from GitHub (uses `oven/bun` image, sparse-checkouts fonts from
+      upstream since they're gitignored at ~60MB)
+- [ ] Remove `patches/opencode-devaipod.patch` (still present but no longer
+      used by the Containerfile; keep until we're sure nothing references it)
 - [ ] Write an `update-opencode-ui.sh` script for pulling new upstream releases
 
 ### Phase 1: Pod management in SPA (replaces dist/index.html)
@@ -287,19 +290,34 @@ core (or is easily proposed upstream) while review/sync lives in
 - [ ] Create `DevaipodProvider` context for pod state and auth
 - [ ] Wire pod selection to `ServerProvider` base URL
 
-### Phase 2: Git browser and commit-range review
-- [ ] Add `GET /api/devaipod/pods/{name}/git/log` endpoint — runs
-      `git fetch agent` then `git log` in the workspace container, returns
-      structured commit objects with parent SHAs
-- [ ] Add `GET /api/devaipod/pods/{name}/git/diff?base={sha}&head={sha}`
-      endpoint — reads from workspace's copy of agent commits, returns
-      `FileDiff[]`-compatible output
-- [ ] Create `src/devaipod/git-browser.tsx` — commit log panel using
-      `@opencode-ai/ui` components
-- [ ] Create `src/devaipod/commit-review.tsx` — commit-range diff view
-      reusing the existing `Diff` and `SessionReview` components
-- [ ] Wire inline comments from commit-range view back to agent prompt
-      context (extend `CommentsProvider` to support commit-scoped comments)
+### Phase 2: Git browser and commit-range review — partially done
+
+- [x] Add `GET /git/log` endpoint with structured commit objects
+- [x] Add `GET /git/diff-range` endpoint with per-file before/after content
+- [x] Add `POST /git/fetch-agent` and `POST /git/push` endpoints
+- [x] Create `GitReviewTab` component reusing `SessionReview` diff renderer
+- [x] Wire into session.tsx (conditional on devaipod cookie)
+- [x] Extract shared API utils to `utils/devaipod-api.ts`
+- [ ] Add fetch button to GitReviewTab (currently never calls fetch-agent)
+- [ ] Add push/sync button to GitReviewTab
+- [ ] Wire inline comments from commit-range view back to agent prompt context
+
+### Phase 2.5: Workspace and agent terminals — partially done
+
+The opencode SPA's terminal connects to the agent container's opencode
+PTY. We added a parallel workspace terminal that connects to the devaipod
+control plane's PTY API (`/api/devaipod/pods/{name}/pty/*`), reusing the
+same `Terminal` component with custom WebSocket URL and resize handler.
+
+- [x] Add optional `wsUrl` and `onPtyResize` props to `Terminal` component
+- [x] Create `context/workspace-terminal.tsx` (devaipod PTY API client)
+- [x] Add Agent/Workspace type selector toggle to terminal panel
+- [x] Wire into session.tsx (conditional on `isDevaipod()`)
+- [x] Disable opencode's built-in git snapshotting (`"snapshot": false`)
+- [ ] Verify workspace terminal works end-to-end in deployed container
+- [ ] Rename existing terminal label to "Agent Terminal" in devaipod mode
+      (currently only the tab label supports `kind` prefix but it's not
+      passed through `SortableTerminalTab`)
 
 ### Phase 3: Review state and sync
 - [ ] Add review state endpoints (`GET/POST /api/devaipod/pods/{name}/review`)
@@ -315,3 +333,50 @@ core (or is easily proposed upstream) while review/sync lives in
 ### Phase 4: Cleanup
 - [ ] Remove iframe wrapper, cookie routing, SSE keepalive, and related code
 - [ ] Drop `dist/index.html` once the pods page is functional
+
+## Testing
+
+### Strategy
+
+Follow opencode upstream's testing approach. The vendored `opencode-ui/`
+ships with three test layers and we should use all of them:
+
+**Bun unit tests** (`bun test` with happy-dom): 46 existing test files.
+Fast, no infra needed. Good for testing our new modules in isolation:
+- `utils/devaipod-api.ts` — token/cookie parsing, `apiFetch` behavior
+- `context/workspace-terminal.tsx` — session lifecycle, ID generation
+- `pages/session/terminal-label.ts` — `kind` prefix formatting
+- `pages/session/terminal-panel.test.ts` — extend existing tab label tests
+
+**Playwright E2E tests** (`bun test:e2e`): 33 existing specs using
+Chromium. Require a running opencode backend. For devaipod-specific
+features (workspace terminal, git review tab, Agent/Workspace toggle),
+we need:
+- A fixture that sets the `DEVAIPOD_AGENT_POD` cookie so devaipod
+  code paths activate
+- Either a mock devaipod PTY/git API (simpler, test UI logic only)
+  or a real devaipod container (slower, full integration)
+- New specs: `e2e/devaipod/workspace-terminal.spec.ts`,
+  `e2e/devaipod/git-review.spec.ts`
+
+**Rust integration tests** (`cargo test -p integration-tests`): existing
+`webui.rs` tests verify HTTP endpoints, auth, static files, and proxying
+using curl inside a running devaipod container. Add:
+- Workspace PTY REST API smoke tests (create, resize, delete sessions)
+- Git API endpoint tests (log, diff-range, fetch-agent)
+- Verify opencode-ui assets contain expected devaipod markers (e.g.
+  built JS includes workspace terminal code)
+
+### What to add first
+
+1. **Bun unit tests** for `devaipod-api.ts` and `terminal-label.ts` with
+   `kind` — these are trivial to write and catch regressions in shared code.
+
+2. **Rust integration tests** for the workspace PTY API — the test infra
+   already runs a container and can make HTTP requests. No browser needed.
+   Test the create → resize → delete flow via curl.
+
+3. **Playwright specs** for the workspace terminal — requires the most
+   setup (cookie injection, devaipod API mocking or real container) but
+   gives the most confidence. Can start with a smoke test that verifies
+   the Agent/Workspace toggle renders when the cookie is set.

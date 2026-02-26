@@ -167,36 +167,100 @@ Reserve **Option D** (Forgejo) for when we need local CI/CD or when we have
 multiple repos and want a unified dashboard. It's not mutually exclusive —
 if we build commit-range review in OpenCode, that work is useful regardless.
 
-## Implementation Path
+## Implementation Status
 
-We're pursuing Option A via the opencode fork described in
-[opencode-webui-fork.md](./opencode-webui-fork.md). The fork adds a git
-browser, commit-range diff view, and review/sync controls as native SolidJS
-pages in the opencode SPA, reusing its existing diff renderer (`@pierre/diffs`)
-and inline comment system (`CommentsProvider`). See that document's Phase 2
-and Phase 3 tasks for the concrete implementation plan.
+We're pursuing Option A. The vendored opencode web UI has been extended
+with a `GitReviewTab` SolidJS component that replaces the default
+session-level review panel when a `DEVAIPOD_AGENT_POD` cookie is present.
+The component reuses the existing `SessionReview` diff renderer and
+inline comment system from `@opencode-ai/ui`.
 
-The backend endpoints below are needed regardless of frontend approach.
+### What's done
+
+**Backend (all in `src/web.rs`):**
+
+- `GET /git/log` — structured commit log with `base`/`head` range params,
+  defaults to `agent/HEAD`. Uses NUL/RS-delimited `git log` format. (line ~2054)
+- `GET /git/diff-range` — per-file diffs with before/after content via
+  `git show`, concurrent file fetching, max 100 files. (line ~2216)
+- `POST /git/fetch-agent` — runs `git fetch agent` in the workspace
+  container. (line ~2431)
+- `POST /git/push` — runs `git push origin <branch>` in the workspace
+  container. (line ~2476)
+- `exec_in_container()` helper for running commands in workspace via
+  bollard. (line ~2517)
+- Input validation (`is_valid_git_ref`) to block shell injection. (line ~2040)
+- Older/simpler endpoints: `GET /git/status`, `GET /git/diff`,
+  `GET /git/commits` (lines ~1957-2037).
+- Git remote setup during pod creation (`src/pod.rs` `setup_git_remotes()`)
+  configures bidirectional `agent`/`workspace` remotes between containers,
+  using read-only volume mounts — no network needed for fetch.
+
+**Frontend:**
+
+- `GitReviewTab` component (`opencode-ui/.../git-review-tab.tsx`, ~210 lines):
+  fetches commit log, provides a base-commit selector dropdown, fetches
+  per-file diffs for the selected range, and delegates rendering to
+  `SessionReview` (which provides unified/split diff view, line commenting).
+- Wired into `session.tsx`: conditionally replaces the standard opencode
+  review panel when the devaipod cookie is detected.
+
+### What's remaining
+
+1. **Fetch trigger in UI** — The `GitReviewTab` reads `agent/HEAD` but
+   never calls `POST /git/fetch-agent`. The user has no way to refresh
+   agent commits from the UI. Need a "Refresh" button or auto-fetch on
+   tab open.
+
+2. **Push/sync button** — The `POST /git/push` endpoint exists but no
+   frontend button calls it. Need an "Approve & Push" or "Sync upstream"
+   control in the review panel.
+
+3. **Review state tracking** — No backend state machine for
+   approve/reject/sync. The push endpoint has no approval gate. The
+   design calls for a `ReviewState` struct tracking pending/approved/
+   rejected/synced commit ranges, but none of this is implemented yet.
+   This may be fine to defer — a simple "push what's visible" flow
+   (without formal state tracking) could be a useful first step.
+
+4. **Merge/cherry-pick flow** — The workspace container has the `agent`
+   remote, but there's no endpoint for merging or cherry-picking agent
+   commits into the workspace branch before pushing. Currently the
+   push just pushes whatever the workspace branch points to.
+
+### Implementation path forward
+
+The backend endpoints are complete for the core read path. The immediate
+next steps are frontend: add a fetch button and a push button to the
+`GitReviewTab`, then decide whether review state tracking is needed
+before we can ship a usable flow.
+
+The backend endpoints below are from the original design and remain relevant.
 
 ## Implementation Sketch (Option A)
 
-### New API Endpoints
+### API Endpoints
 
 ```
+# Implemented:
 GET  /api/devaipod/pods/{name}/git/log?base={sha}&head={sha}
      Returns commit list in range (structured objects with parent SHAs)
 
-GET  /api/devaipod/pods/{name}/git/diff?base={sha}&head={sha}
-     Returns unified diff for a commit range (like a PR diff)
+GET  /api/devaipod/pods/{name}/git/diff-range?base={sha}&head={sha}
+     Returns per-file diffs with before/after content
 
+POST /api/devaipod/pods/{name}/git/fetch-agent
+     Runs git fetch agent in workspace container
+
+POST /api/devaipod/pods/{name}/git/push
+     Runs git push origin <branch> in workspace container
+
+# Not yet implemented:
 GET  /api/devaipod/pods/{name}/review
      Returns current review state (pending commits, approved set, etc.)
 
 POST /api/devaipod/pods/{name}/review
      Body: { "action": "approve|reject|request-changes", "commits": [...], "comment": "..." }
-
-POST /api/devaipod/pods/{name}/sync
-     Triggers git push in workspace container (which has GH_TOKEN)
 ```
 
 ### Review State
