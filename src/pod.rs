@@ -1669,6 +1669,12 @@ TASK_EOF"#,
             }
         }
 
+        // Disable opencode's built-in git snapshotting — we use the real git
+        // history via the agent/workspace remote setup instead.
+        if let Some(obj) = config.as_object_mut() {
+            obj.insert("snapshot".to_string(), serde_json::json!(false));
+        }
+
         // Write merged config back to container
         let config_json = serde_json::to_string_pretty(&config).unwrap_or_else(|_| {
             format!(
