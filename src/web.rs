@@ -1955,7 +1955,7 @@ struct GitLogResponse {
 /// Runs `git status --porcelain` in the workspace container and returns
 /// parsed results as JSON.
 async fn git_status(Path(name): Path<String>) -> Result<Json<GitStatusResponse>, StatusCode> {
-    let container_name = format!("{}-workspace", name);
+    let container_name = format!("devaipod-{}-workspace", name);
 
     let (exit_code, stdout, _stderr) =
         exec_in_container(&container_name, &["git", "status", "--porcelain"])
@@ -1990,7 +1990,7 @@ async fn git_status(Path(name): Path<String>) -> Result<Json<GitStatusResponse>,
 ///
 /// Runs `git diff HEAD` in the workspace container.
 async fn git_diff(Path(name): Path<String>) -> Result<Json<GitDiffResponse>, StatusCode> {
-    let container_name = format!("{}-workspace", name);
+    let container_name = format!("devaipod-{}-workspace", name);
 
     let (exit_code, stdout, _stderr) = exec_in_container(&container_name, &["git", "diff", "HEAD"])
         .await
@@ -2008,7 +2008,7 @@ async fn git_diff(Path(name): Path<String>) -> Result<Json<GitDiffResponse>, Sta
 ///
 /// Runs `git log --oneline -20` in the workspace container.
 async fn git_commits(Path(name): Path<String>) -> Result<Json<GitCommitsResponse>, StatusCode> {
-    let container_name = format!("{}-workspace", name);
+    let container_name = format!("devaipod-{}-workspace", name);
 
     let (exit_code, stdout, _stderr) =
         exec_in_container(&container_name, &["git", "log", "--oneline", "-20"])
@@ -2075,7 +2075,7 @@ async fn git_log(
 
     // Use workspace container — it has the agent remote and is trusted.
     // Agent commits are available after `git fetch agent`.
-    let container_name = format!("{name}-workspace");
+    let container_name = format!("devaipod-{name}-workspace");
 
     // Use %x00 (NUL) as field separator, %x1e (record separator) between commits.
     // Fields: full SHA, short SHA, subject+body, author name, author email,
@@ -2233,7 +2233,7 @@ async fn git_diff_range(
 
     // Use workspace container — it has the agent remote and is trusted.
     // Agent commits are available after `git fetch agent`.
-    let container_name = format!("{name}-workspace");
+    let container_name = format!("devaipod-{name}-workspace");
 
     // Step 1+2: Get changed files with statuses and numstat in one pass each.
     // --no-renames treats renames as delete+add which simplifies handling.
@@ -2431,7 +2431,7 @@ struct GitFetchResponse {
 async fn git_fetch_agent(
     Path(name): Path<String>,
 ) -> Result<Json<GitFetchResponse>, (StatusCode, String)> {
-    let container_name = format!("{name}-workspace");
+    let container_name = format!("devaipod-{name}-workspace");
 
     let (exit_code, _stdout, stderr) =
         exec_in_container(&container_name, &["git", "fetch", "agent"])
@@ -2484,7 +2484,7 @@ async fn git_push(
         ));
     }
 
-    let container_name = format!("{name}-workspace");
+    let container_name = format!("devaipod-{name}-workspace");
 
     let (exit_code, _stdout, stderr) =
         exec_in_container(&container_name, &["git", "push", "origin", &body.branch])
