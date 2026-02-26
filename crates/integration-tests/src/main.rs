@@ -39,87 +39,39 @@ fn find_workspace_root() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Container name used by integration tests.
+///
+/// This is intentionally different from the default "devaipod" container name
+/// so that integration tests don't clash with a running devaipod instance.
+const INTEGRATION_CONTAINER_NAME: &str = "devaipod-integration";
+
 /// Check if the devaipod container is running (not just existing; exec requires running state)
 fn devaipod_container_running() -> bool {
     let output = Command::new("podman")
-        .args(["inspect", "--format", "{{.State.Running}}", "devaipod"])
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+            INTEGRATION_CONTAINER_NAME,
+        ])
         .output();
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim() == "true"
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "true",
         _ => false,
     }
 }
 
-/// Describes how to run the devaipod command
-pub(crate) enum DevaipodCommand {
-    /// Run via podman exec into the devaipod container
-    Container,
-    /// Run the binary directly on the host (with DEVAIPOD_HOST_MODE=1)
-    Host(String),
-}
-
-/// Get the devaipod command configuration
+/// Get the devaipod command configuration.
 ///
-/// If the devaipod container is running, returns Container mode.
-/// Otherwise checks DEVAIPOD_PATH env var, then looks for the binary in target directories.
-pub(crate) fn get_devaipod_command() -> Result<DevaipodCommand> {
-    // If DEVAIPOD_HOST_MODE is explicitly set, use host mode
-    let explicit_host_mode = std::env::var("DEVAIPOD_HOST_MODE").is_ok();
-
-    // Check if devaipod container is running (preferred for integration tests)
-    if !explicit_host_mode && devaipod_container_running() {
-        return Ok(DevaipodCommand::Container);
+/// Integration tests always run via `podman exec` into the integration container.
+pub(crate) fn get_devaipod_command() -> Result<()> {
+    if !devaipod_container_running() {
+        return Err(eyre!(
+            "Integration container '{}' is not running. Run: just test-integration-container",
+            INTEGRATION_CONTAINER_NAME
+        ));
     }
-
-    // Fall back to host mode with binary path
-    if let Ok(path) = std::env::var("DEVAIPOD_PATH") {
-        // Convert to absolute path if relative
-        let path = std::path::PathBuf::from(&path);
-        if path.is_relative() {
-            // Resolve relative to workspace root (where Cargo.lock is)
-            if let Some(workspace_root) = find_workspace_root() {
-                let abs_path = workspace_root.join(&path);
-                if abs_path.exists() {
-                    return Ok(DevaipodCommand::Host(
-                        abs_path.canonicalize()?.to_string_lossy().to_string(),
-                    ));
-                }
-            }
-            // Try current directory as fallback
-            let cwd = std::env::current_dir()?;
-            let abs_path = cwd.join(&path);
-            if abs_path.exists() {
-                return Ok(DevaipodCommand::Host(
-                    abs_path.canonicalize()?.to_string_lossy().to_string(),
-                ));
-            }
-            return Err(eyre!("Cannot find devaipod binary at {}", path.display()));
-        }
-        return Ok(DevaipodCommand::Host(path.to_string_lossy().to_string()));
-    }
-
-    // Look for the binary in target directories (e.g. container not running; fall back to host binary)
-    let workspace_root = find_workspace_root();
-    let candidates = ["target/debug/devaipod", "target/release/devaipod"];
-    for candidate in candidates {
-        let path = if let Some(ref root) = workspace_root {
-            root.join(candidate)
-        } else {
-            std::path::PathBuf::from(candidate)
-        };
-        if path.exists() {
-            return Ok(DevaipodCommand::Host(
-                path.canonicalize()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| path.to_string_lossy().to_string()),
-            ));
-        }
-    }
-
-    // Fall back to hoping it's in PATH
-    Ok(DevaipodCommand::Host("devaipod".to_string()))
+    Ok(())
 }
 
 /// Check if podman is available
@@ -193,122 +145,90 @@ impl CapturedOutput {
     }
 }
 
-/// Run the devaipod command, capturing output
-///
-/// This uses std::process::Command for consistent CapturedOutput handling.
-/// If the devaipod container is running, uses `podman exec devaipod devaipod <args>`.
-/// Otherwise runs the binary directly with DEVAIPOD_HOST_MODE=1.
+/// Run the devaipod command via `podman exec` into the integration container.
 pub(crate) fn run_devaipod(args: &[&str]) -> Result<CapturedOutput> {
-    let cmd = get_devaipod_command()?;
-    let output = match cmd {
-        DevaipodCommand::Container => Command::new("podman")
-            .arg("exec")
-            .arg("devaipod")
-            .arg("devaipod")
-            .args(args)
-            .output()
-            .with_context(|| format!("Failed to run podman exec devaipod devaipod {:?}", args))?,
-        DevaipodCommand::Host(binary) => Command::new(&binary)
-            .args(args)
-            .env("DEVAIPOD_HOST_MODE", "1")
-            .output()
-            .with_context(|| format!("Failed to run devaipod {:?}", args))?,
-    };
+    get_devaipod_command()?;
+    let output = Command::new("podman")
+        .arg("exec")
+        .arg(INTEGRATION_CONTAINER_NAME)
+        .arg("devaipod")
+        .args(args)
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to run podman exec {} devaipod {:?}",
+                INTEGRATION_CONTAINER_NAME, args
+            )
+        })?;
     Ok(CapturedOutput::new(output))
 }
 
-/// Run the devaipod command in a specific directory.
+/// Run the devaipod command in a specific directory via `podman exec -w`.
 ///
-/// When the devaipod container is running, uses `podman exec -w <dir> devaipod devaipod <args>`
-/// (the directory must be at the same path inside the container, e.g. via shared volume).
-/// Otherwise uses the host binary with DEVAIPOD_HOST_MODE=1.
+/// The directory must be at the same path inside the container (e.g. via shared volume).
 pub(crate) fn run_devaipod_in(dir: &std::path::Path, args: &[&str]) -> Result<CapturedOutput> {
-    let cmd = get_devaipod_command()?;
-    let output = match cmd {
-        DevaipodCommand::Container => Command::new("podman")
-            .arg("exec")
-            .arg("-w")
-            .arg(dir)
-            .arg("devaipod")
-            .arg("devaipod")
-            .args(args)
-            .output()
-            .with_context(|| format!("Failed to run podman exec devaipod devaipod {:?} in {:?}", args, dir))?,
-        DevaipodCommand::Host(binary) => Command::new(&binary)
-            .current_dir(dir)
-            .args(args)
-            .env("DEVAIPOD_HOST_MODE", "1")
-            .output()
-            .with_context(|| format!("Failed to run devaipod {:?} in {:?}", args, dir))?,
-    };
+    get_devaipod_command()?;
+    let output = Command::new("podman")
+        .arg("exec")
+        .arg("-w")
+        .arg(dir)
+        .arg(INTEGRATION_CONTAINER_NAME)
+        .arg("devaipod")
+        .args(args)
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to run podman exec {} devaipod {:?} in {:?}",
+                INTEGRATION_CONTAINER_NAME, args, dir
+            )
+        })?;
     Ok(CapturedOutput::new(output))
 }
 
 /// Run the devaipod command in a specific directory with extra environment variables.
-///
-/// When the devaipod container is running, uses podman exec with -w and -e.
-/// Otherwise uses the host binary with DEVAIPOD_HOST_MODE=1.
 pub(crate) fn run_devaipod_in_with_env(
     dir: &std::path::Path,
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> Result<CapturedOutput> {
-    let devaipod_cmd = get_devaipod_command()?;
-    let output = match devaipod_cmd {
-        DevaipodCommand::Container => {
-            let mut cmd = Command::new("podman");
-            cmd.arg("exec").arg("-w").arg(dir);
-            for (k, v) in envs {
-                cmd.arg("-e").arg(format!("{}={}", k, v));
-            }
-            cmd.arg("devaipod").arg("devaipod").args(args);
-            cmd.output()
-                .with_context(|| format!("Failed to run podman exec devaipod devaipod {:?} in {:?}", args, dir))?
-        }
-        DevaipodCommand::Host(binary) => {
-            let mut cmd = Command::new(&binary);
-            cmd.current_dir(dir)
-                .args(args)
-                .env("DEVAIPOD_HOST_MODE", "1");
-            for (key, value) in envs {
-                cmd.env(key, value);
-            }
-            cmd.output()
-                .with_context(|| format!("Failed to run devaipod {:?} in {:?}", args, dir))?
-        }
-    };
+    get_devaipod_command()?;
+    let mut cmd = Command::new("podman");
+    cmd.arg("exec").arg("-w").arg(dir);
+    for (k, v) in envs {
+        cmd.arg("-e").arg(format!("{}={}", k, v));
+    }
+    cmd.arg(INTEGRATION_CONTAINER_NAME)
+        .arg("devaipod")
+        .args(args);
+    let output = cmd.output().with_context(|| {
+        format!(
+            "Failed to run podman exec {} devaipod {:?} in {:?}",
+            INTEGRATION_CONTAINER_NAME, args, dir
+        )
+    })?;
     Ok(CapturedOutput::new(output))
 }
 
 /// Run the devaipod command with extra environment variables.
-///
-/// When the devaipod container is running, uses podman exec with -e for env vars.
 pub(crate) fn run_devaipod_with_env(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> Result<CapturedOutput> {
-    let devaipod_cmd = get_devaipod_command()?;
-    let output = match devaipod_cmd {
-        DevaipodCommand::Container => {
-            let mut cmd = Command::new("podman");
-            cmd.arg("exec");
-            for (k, v) in envs {
-                cmd.arg("-e").arg(format!("{}={}", k, v));
-            }
-            cmd.arg("devaipod").arg("devaipod").args(args);
-            cmd.output()
-                .with_context(|| format!("Failed to run podman exec devaipod devaipod {:?}", args))?
-        }
-        DevaipodCommand::Host(binary) => {
-            let mut cmd = Command::new(&binary);
-            cmd.args(args).env("DEVAIPOD_HOST_MODE", "1");
-            for (key, value) in envs {
-                cmd.env(key, value);
-            }
-            cmd.output()
-                .with_context(|| format!("Failed to run devaipod {:?}", args))?
-        }
-    };
+    get_devaipod_command()?;
+    let mut cmd = Command::new("podman");
+    cmd.arg("exec");
+    for (k, v) in envs {
+        cmd.arg("-e").arg(format!("{}={}", k, v));
+    }
+    cmd.arg(INTEGRATION_CONTAINER_NAME)
+        .arg("devaipod")
+        .args(args);
+    let output = cmd.output().with_context(|| {
+        format!(
+            "Failed to run podman exec {} devaipod {:?}",
+            INTEGRATION_CONTAINER_NAME, args
+        )
+    })?;
     Ok(CapturedOutput::new(output))
 }
 
@@ -557,7 +477,10 @@ fn main() {
     {
         eprintln!("error: integration tests must be run against the built container.");
         eprintln!("  Run: just test-integration-container");
-        eprintln!("  To allow direct runs (e.g. for debugging), set: {}=1", DEVAIPOD_ALLOW_DIRECT_TEST_ENV);
+        eprintln!(
+            "  To allow direct runs (e.g. for debugging), set: {}=1",
+            DEVAIPOD_ALLOW_DIRECT_TEST_ENV
+        );
         std::process::exit(1);
     }
 

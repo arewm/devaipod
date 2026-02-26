@@ -68,7 +68,9 @@ _run-integration-container image threads:
     PWD_ABS=$(cd . && pwd)
     TMPDIR_ABS="${PWD_ABS}/tmp"
     mkdir -p "$TMPDIR_ABS"
-    cleanup() { podman rm -f devaipod 2>/dev/null || true; }
+    # Use a dedicated container name so integration tests don't clash with a running devaipod instance.
+    CONTAINER_NAME="devaipod-integration"
+    cleanup() { podman rm -f "$CONTAINER_NAME" 2>/dev/null || true; }
     trap cleanup EXIT
     mkdir -p ~/.ssh/config.d/devaipod
     if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
@@ -76,7 +78,7 @@ _run-integration-container image threads:
     else
         VOL_MOUNT="-v /run/podman/podman.sock:/run/podman/podman.sock"
     fi
-    echo "Starting devaipod container (socket, workspace at same path, test config)..."
+    echo "Starting devaipod integration container ($CONTAINER_NAME)..."
     if ! podman volume exists devaipod-state 2>/dev/null; then
         podman volume create devaipod-state
     fi
@@ -84,7 +86,7 @@ _run-integration-container image threads:
     if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
         ADD_HOST="--add-host=host.containers.internal:host-gateway"
     fi
-    podman run -d --name devaipod --privileged --replace \
+    podman run -d --name "$CONTAINER_NAME" --privileged --replace \
         $ADD_HOST \
         $VOL_MOUNT \
         -v devaipod-state:/var/lib/devaipod \
@@ -93,16 +95,16 @@ _run-integration-container image threads:
         -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
         -w "$PWD_ABS" \
         {{ CONTAINER_IMAGE }}:latest
-    echo "Waiting for devaipod container to be running..."
+    echo "Waiting for $CONTAINER_NAME to be running..."
     for i in $(seq 1 30); do
-        if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' devaipod 2>/dev/null)" = "true" ]; then
+        if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' "$CONTAINER_NAME" 2>/dev/null)" = "true" ]; then
             break
         fi
         sleep 1
     done
-    if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' devaipod 2>/dev/null)" != "true" ]; then
-        echo "devaipod container failed to reach running state"
-        podman logs devaipod 2>&1 | tail -50
+    if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' "$CONTAINER_NAME" 2>/dev/null)" != "true" ]; then
+        echo "$CONTAINER_NAME failed to reach running state"
+        podman logs "$CONTAINER_NAME" 2>&1 | tail -50
         exit 1
     fi
     echo "Running integration tests against built container ({{ CONTAINER_IMAGE }}:latest)..."
