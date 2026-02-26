@@ -1,3 +1,16 @@
-target/
-docs/book/
-.git/
+# Podman uses .containerignore (which has the real allowlist).
+# This file exists for Docker compatibility; keep in sync.
+# Keep the build context small: exclude everything, then allowlist sources.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!crates/
+!scripts/
+!dist/
+!patches/
+!opencode-ui/
+# Re-exclude large generated/fetched dirs within opencode-ui
+opencode-ui/node_modules/
+opencode-ui/packages/app/dist/
+opencode-ui/packages/ui/src/assets/fonts/

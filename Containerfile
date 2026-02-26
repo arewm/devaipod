@@ -45,45 +45,30 @@ FROM scratch AS src
 COPY . /src
 
 # -- opencode web UI build stage --
-# Build the opencode web UI from source for vendoring
-# This eliminates dependency on external app.opencode.ai
-# Uses bootc-dev/devenv-debian (same as integration tests) with bun installed.
+# Build the vendored opencode UI fork (opencode-ui/) which includes devaipod
+# customizations: workspace terminal, git review tab, per-pod localStorage, etc.
 ARG OPENCODE_VERSION=v1.1.65
-FROM ghcr.io/bootc-dev/devenv-debian:latest AS opencode-web
+FROM docker.io/oven/bun:latest AS opencode-web
 ARG OPENCODE_VERSION=v1.1.65
-USER root
 
-# Install git, curl, unzip for cloning and bun installer
+# Fonts are gitignored (~60MB binary); fetch from upstream for the build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    curl \
-    unzip \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install bun (required for opencode frontend build)
-RUN curl -fsSL https://bun.sh/install | bash && \
-    ln -sf /root/.bun/bin/bun /usr/local/bin/bun
+    git ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --filter=blob:none --sparse \
+    --branch ${OPENCODE_VERSION} \
+    https://github.com/anomalyco/opencode.git /tmp/oc && \
+    cd /tmp/oc && git sparse-checkout set packages/ui/src/assets/fonts
 
 WORKDIR /build
-RUN git clone --depth 1 --branch ${OPENCODE_VERSION} \
-    https://github.com/anomalyco/opencode.git opencode
+COPY --from=src /src/opencode-ui /build
+RUN mkdir -p packages/ui/src/assets/fonts && \
+    cp /tmp/oc/packages/ui/src/assets/fonts/*.woff2 packages/ui/src/assets/fonts/
 
-# Install dependencies (before patches so this layer stays cached)
-WORKDIR /build/opencode
 RUN bun install --frozen-lockfile
-
-# Apply devaipod patches (only touches source, not deps)
-# Scope localStorage per pod + auto-select existing sessions on fresh state
-COPY patches/opencode-devaipod.patch /tmp/
-RUN git apply /tmp/opencode-devaipod.patch
-
-# Build the web app
-# The app uses window.location.origin for API calls when not on opencode.ai
-WORKDIR /build/opencode/packages/app
+WORKDIR /build/packages/app
 RUN bun run build
 
-# Output is in /build/opencode/packages/app/dist
+# Output is in /build/packages/app/dist
 
 # -- opencode CLI binary --
 # Download the opencode CLI for use in advisor pods (where this image is the agent image).
@@ -169,9 +154,9 @@ RUN mkdir -p /usr/share/devaipod/dist/vendor/xterm && \
     curl -fsSL "https://unpkg.com/@xterm/addon-fit@${XTERM_FIT_VERSION}/lib/addon-fit.js" \
       -o /usr/share/devaipod/dist/vendor/xterm/addon-fit.js
 
-# Copy vendored opencode web UI
+# Copy vendored opencode web UI fork (built from opencode-ui/ in the repo)
 # This is served at /opencode/ and proxies API calls to the agent's opencode server
-COPY --from=opencode-web /build/opencode/packages/app/dist /usr/share/devaipod/opencode
+COPY --from=opencode-web /build/packages/app/dist /usr/share/devaipod/opencode
 WORKDIR /usr/share/devaipod
 
 # Default: run web UI server

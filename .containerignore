@@ -7,3 +7,8 @@
 !scripts/
 !dist/
 !patches/
+!opencode-ui/
+# Re-exclude large generated/fetched dirs within opencode-ui
+opencode-ui/node_modules/
+opencode-ui/packages/app/dist/
+opencode-ui/packages/ui/src/assets/fonts/
