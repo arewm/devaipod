@@ -204,6 +204,28 @@
             color: var(--text-secondary);
         }
         
+        .pod-card.launching {
+            border-color: var(--accent);
+            opacity: 0.85;
+        }
+        .pod-card.launching .pod-status {
+            background: rgba(137, 181, 255, 0.2);
+            color: var(--accent);
+        }
+        .pod-card.launch-failed {
+            border-color: var(--error);
+        }
+        .pod-card.launch-failed .pod-status {
+            background: rgba(239, 68, 42, 0.2);
+            color: var(--error);
+        }
+        .launch-error-msg {
+            font-size: 0.85rem;
+            color: var(--error);
+            margin-top: 0.5rem;
+            word-break: break-word;
+        }
+        
         .refresh-btn {
             background: var(--bg-card);
             color: var(--text-primary);
@@ -769,6 +791,8 @@
 
         const collapsedPods = new Set();
         let lastPodFingerprint = '';
+        // In-flight launches: { podName: { state: "launching"|"failed", error?: string } }
+        let activeLaunches = {};
 
         function togglePodCard(headerEl) {
             const card = headerEl.closest('.pod-card');
@@ -999,6 +1023,47 @@
             `;
         }
         
+        // Dismiss a failed launch card
+        async function dismissLaunch(podName) {
+            try {
+                await fetch('/api/devaipod/launches/' + encodeURIComponent(podName), {
+                    method: 'DELETE',
+                    headers: authHeader
+                });
+            } catch (_) {}
+            delete activeLaunches[podName];
+            refreshPods({force: true});
+        }
+
+        // Poll launch states from the backend
+        async function pollLaunches() {
+            try {
+                const launches = await apiCall('/devaipod/launches');
+                const oldLaunches = activeLaunches;
+                activeLaunches = launches;
+
+                // If a launch that was "launching" is now gone, the pod was created
+                // successfully. Trigger a pod list refresh.
+                let needRefresh = false;
+                for (const podName of Object.keys(oldLaunches)) {
+                    if (oldLaunches[podName].state === 'launching' && !launches[podName]) {
+                        needRefresh = true;
+                    }
+                }
+                // Also refresh if any new failures appeared.
+                for (const [podName, info] of Object.entries(launches)) {
+                    if (info.state === 'failed' && (!oldLaunches[podName] || oldLaunches[podName].state !== 'failed')) {
+                        needRefresh = true;
+                    }
+                }
+                if (needRefresh) {
+                    refreshPods({force: true});
+                }
+            } catch (_) {
+                // Backend unavailable, ignore
+            }
+        }
+
         // Refresh pods list
         async function refreshPods({force = false} = {}) {
             const container = document.getElementById('pods-container');
@@ -1029,9 +1094,13 @@
                 
                 // Build a fingerprint of the pod list to detect actual changes.
                 // Only re-render the DOM when something changed.
-                const fingerprint = JSON.stringify(devaipodPods.map(p => ({
-                    n: p.Name, s: p.Status, c: p.Containers?.length
-                })));
+                // Include active launches so the UI updates when launches appear/disappear.
+                const fingerprint = JSON.stringify({
+                    pods: devaipodPods.map(p => ({
+                        n: p.Name, s: p.Status, c: p.Containers?.length
+                    })),
+                    launches: activeLaunches
+                });
                 if (!force && fingerprint === lastPodFingerprint) {
                     // Data unchanged — skip DOM rebuild, just refresh proposals
                     checkProposals();
@@ -1047,7 +1116,44 @@
                 const prevPodName = prevFocused && prevFocused.classList.contains('pod-card')
                     ? prevFocused.dataset.podName : null;
 
-                if (devaipodPods.length === 0) {
+                // Build launch cards for in-flight or failed launches,
+                // excluding any whose pod already appeared in the podman list.
+                const existingPodNames = new Set(devaipodPods.map(p => p.Name));
+                let filteredLaunchHtml = '';
+                for (const [podName, info] of Object.entries(activeLaunches)) {
+                    if (!existingPodNames.has(podName)) {
+                        const shortName = podName.replace('devaipod-', '');
+                        const safePod = podName.replace(/"/g, '&quot;');
+                        if (info.state === 'launching') {
+                            filteredLaunchHtml += `
+                                <div class="pod-card launching" data-pod-name="${escapeHtml(shortName)}">
+                                    <div class="pod-header">
+                                        <span class="pod-name">${escapeHtml(shortName)}</span>
+                                        <span class="pod-status">launching</span>
+                                    </div>
+                                    <div class="pod-meta">
+                                        <div class="pod-meta-item">Creating workspace...</div>
+                                    </div>
+                                </div>`;
+                        } else if (info.state === 'failed') {
+                            filteredLaunchHtml += `
+                                <div class="pod-card launch-failed" data-pod-name="${escapeHtml(shortName)}">
+                                    <div class="pod-header">
+                                        <span class="pod-name">${escapeHtml(shortName)}</span>
+                                        <span class="pod-status">failed</span>
+                                    </div>
+                                    <div class="pod-meta">
+                                        <div class="launch-error-msg">${escapeHtml(info.error || 'Unknown error')}</div>
+                                    </div>
+                                    <div class="pod-actions">
+                                        <button type="button" class="action-btn danger" onclick="dismissLaunch('${safePod}')">Dismiss</button>
+                                    </div>
+                                </div>`;
+                        }
+                    }
+                }
+
+                if (devaipodPods.length === 0 && !filteredLaunchHtml) {
                     container.innerHTML = `
                         <div class="empty-state">
                             <p>No devaipod workspaces found.</p>
@@ -1076,6 +1182,7 @@
                             </div>
                         `;
                     }
+                    html += filteredLaunchHtml;
                     html += devaipodPods.map(renderPod).join('');
                     container.innerHTML = html;
                     // Restore collapsed/expanded state across refreshes
@@ -1334,8 +1441,12 @@
                     throw new Error(result.message || `HTTP ${response.status}`);
                 }
                 
-                // Success - refresh pods and collapse form
-                console.log('Workspace created:', result.workspace);
+                // The launch is now async — the pod is being created in the background.
+                // Track it locally so we show a "launching" card immediately.
+                if (result.pod_name) {
+                    activeLaunches[result.pod_name] = { state: 'launching' };
+                }
+                console.log('Workspace launching:', result.workspace);
                 await refreshPods({force: true});
                 toggleLaunchForm();
             } catch (err) {
@@ -1636,6 +1747,12 @@
             setInterval(refreshPods, 5000);
             // Agent status: initial fetch + chained refresh every 3s
             scheduleAgentRefresh();
+            // Poll launch states every 3 seconds (only while launches are in-flight)
+            setInterval(function() {
+                if (Object.keys(activeLaunches).length > 0) {
+                    pollLaunches();
+                }
+            }, 3000);
         }
     </script>
 </body>

@@ -8,6 +8,7 @@
 //! - Git and opencode-info endpoints for workspace containers
 //! - Static file serving for web UI
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -129,6 +130,24 @@ pub fn load_or_generate_token() -> String {
     token
 }
 
+/// State of a background launch spawned by the web UI.
+///
+/// Completed launches are removed from the map immediately (the pod becomes
+/// visible via normal podman polling). Failed launches stay until dismissed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state")]
+enum LaunchState {
+    /// Subprocess is still running.
+    #[serde(rename = "launching")]
+    Launching,
+    /// Subprocess failed with an error message.
+    #[serde(rename = "failed")]
+    Failed { error: String },
+}
+
+/// In-flight launches tracked by the web server, keyed by pod name.
+type LaunchMap = Arc<tokio::sync::Mutex<HashMap<String, LaunchState>>>;
+
 /// Shared state for the web server
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -140,6 +159,8 @@ pub(crate) struct AppState {
     static_dir: String,
     /// PTY session manager for web terminal access
     pub(crate) pty_sessions: crate::web_terminal::PtySessionManager,
+    /// Background launch states so the UI can track in-flight launches.
+    launches: LaunchMap,
 }
 
 /// Query parameters for token authentication
@@ -1116,13 +1137,50 @@ struct RunResponse {
     workspace: String,
     /// Status message
     message: String,
+    /// Launch status for async launches ("launching", "completed", "failed")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    /// Full pod name (with devaipod- prefix)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_name: Option<String>,
 }
 
-/// Run a new devaipod workspace
+/// Compute a pod name for a web-initiated launch.
 ///
-/// Shells out to `devaipod run` with the provided arguments.
-/// Returns the workspace name on success.
-async fn run_workspace(Json(req): Json<RunRequest>) -> Result<Json<RunResponse>, StatusCode> {
+/// Uses the same sanitization and unique-suffix logic as `main.rs::make_pod_name`
+/// so the name we return to the UI matches what `devaipod run --name` will create.
+fn compute_pod_name(req: &RunRequest) -> String {
+    if let Some(ref name) = req.name {
+        // If the user gave an explicit name, normalize it.
+        normalize_pod_name(name)
+    } else {
+        // Derive from source URL: strip scheme, take last path component as project name.
+        let project = req
+            .source
+            .as_deref()
+            .and_then(|s| s.rsplit('/').next())
+            .map(|s| s.trim_end_matches(".git"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("workspace");
+        crate::make_pod_name(project)
+    }
+}
+
+/// Run a new devaipod workspace (non-blocking)
+///
+/// Computes the pod name up-front, spawns `devaipod run` in the background,
+/// and returns immediately with `{"status":"launching", "pod_name":"..."}`.
+/// The frontend polls `/api/devaipod/launches` to detect failures.
+async fn run_workspace(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RunRequest>,
+) -> Result<Json<RunResponse>, StatusCode> {
+    let pod_name = compute_pod_name(&req);
+    let short_name = pod_name
+        .strip_prefix("devaipod-")
+        .unwrap_or(&pod_name)
+        .to_string();
+
     let mut cmd = tokio::process::Command::new("devaipod");
     cmd.arg("run");
 
@@ -1136,9 +1194,8 @@ async fn run_workspace(Json(req): Json<RunRequest>) -> Result<Json<RunResponse>,
         cmd.arg(task);
     }
 
-    if let Some(ref name) = req.name {
-        cmd.args(["--name", name]);
-    }
+    // Always pass --name so the pod name matches what we told the UI.
+    cmd.args(["--name", &pod_name]);
 
     if let Some(ref image) = req.image {
         cmd.args(["--image", image]);
@@ -1160,39 +1217,95 @@ async fn run_workspace(Json(req): Json<RunRequest>) -> Result<Json<RunResponse>,
         cmd.args(["--mcp", mcp]);
     }
 
-    tracing::info!("Running devaipod: {:?}", cmd);
+    // Prevent stdin reads from blocking the server process
+    cmd.stdin(std::process::Stdio::null());
 
-    let output = cmd.output().await.map_err(|e| {
-        tracing::error!("Failed to execute devaipod run: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    tracing::info!("Running devaipod (async): {:?}", cmd);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::error!("devaipod run failed: {}", stderr);
-        return Ok(Json(RunResponse {
-            success: false,
-            workspace: String::new(),
-            message: format!("Failed to create workspace: {}", stderr.trim()),
-        }));
+    // Guard against duplicate launches (e.g. double-submit)
+    {
+        let mut launches = state.launches.lock().await;
+        if launches.contains_key(&pod_name) {
+            tracing::warn!("Duplicate launch rejected for {}", pod_name);
+            return Err(StatusCode::CONFLICT);
+        }
+        launches.insert(pod_name.clone(), LaunchState::Launching);
     }
 
-    // Parse the output to extract the workspace name
-    // The output typically contains lines like:
-    // "Created pod 'devaipod-repo-abc123'"
-    // or
-    // "devaipod-repo-abc123"
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let workspace = extract_workspace_name(&stdout).unwrap_or_else(|| {
-        // If we can't parse it, use the explicit name if provided
-        req.name.clone().unwrap_or_default()
+    // Spawn the subprocess in the background.
+    let launches = state.launches.clone();
+    let pod_name_bg = pod_name.clone();
+    tokio::spawn(async move {
+        let result = cmd.output().await;
+        let mut map = launches.lock().await;
+        match result {
+            Ok(output) if output.status.success() => {
+                tracing::info!("devaipod run completed for {}", pod_name_bg);
+                // Remove completed entries immediately; the pod is now visible
+                // in podman and the UI will pick it up via normal polling.
+                map.remove(&pod_name_bg);
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let msg = stderr.trim().to_string();
+                tracing::error!("devaipod run failed for {}: {}", pod_name_bg, msg);
+                map.insert(
+                    pod_name_bg.clone(),
+                    LaunchState::Failed {
+                        error: if msg.is_empty() {
+                            format!("Process exited with {}", output.status)
+                        } else {
+                            msg
+                        },
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to execute devaipod run for {}: {}",
+                    pod_name_bg,
+                    e
+                );
+                map.insert(
+                    pod_name_bg.clone(),
+                    LaunchState::Failed {
+                        error: format!("Failed to execute: {}", e),
+                    },
+                );
+            }
+        }
     });
 
     Ok(Json(RunResponse {
         success: true,
-        workspace: workspace.clone(),
-        message: format!("Workspace '{}' created successfully", workspace),
+        workspace: short_name,
+        message: "Launching workspace in background".to_string(),
+        status: Some("launching".to_string()),
+        pod_name: Some(pod_name),
     }))
+}
+
+/// Return current launch states.
+///
+/// The UI polls this to discover failures (and to show "launching" indicators
+/// before the pod appears in podman). Completed entries are removed eagerly
+/// in the spawn callback above; failed entries are kept until the UI
+/// acknowledges them via DELETE.
+async fn list_launches(
+    State(state): State<Arc<AppState>>,
+) -> Json<HashMap<String, LaunchState>> {
+    let map = state.launches.lock().await;
+    Json(map.clone())
+}
+
+/// Dismiss (remove) a launch entry so it stops showing in the UI.
+async fn dismiss_launch(
+    State(state): State<Arc<AppState>>,
+    Path(pod_name): Path<String>,
+) -> StatusCode {
+    let mut map = state.launches.lock().await;
+    map.remove(&pod_name);
+    StatusCode::NO_CONTENT
 }
 
 /// Request body for advisor launch endpoint
@@ -1236,6 +1349,8 @@ async fn launch_advisor(
                     success: true,
                     workspace: "advisor".to_string(),
                     message: "Advisor is already running".to_string(),
+                    status: None,
+                    pod_name: None,
                 }));
             } else {
                 // Advisor exists but stopped — start it
@@ -1249,6 +1364,8 @@ async fn launch_advisor(
                             success: true,
                             workspace: "advisor".to_string(),
                             message: "Advisor pod started".to_string(),
+                            status: None,
+                            pod_name: None,
                         }));
                     }
                 }
@@ -1284,6 +1401,8 @@ async fn launch_advisor(
             success: false,
             workspace: String::new(),
             message: format!("Failed to launch advisor: {}", stderr.trim()),
+            status: None,
+            pod_name: None,
         }));
     }
 
@@ -1291,6 +1410,8 @@ async fn launch_advisor(
         success: true,
         workspace: "advisor".to_string(),
         message: "Advisor pod created".to_string(),
+        status: None,
+        pod_name: None,
     }))
 }
 
@@ -1418,12 +1539,17 @@ async fn recreate_workspace(
         success: true,
         workspace: short_name.to_string(),
         message: format!("Workspace '{}' recreated successfully", short_name),
+        status: None,
+        pod_name: None,
     }))
 }
 
 /// Extract workspace name from devaipod run output
 ///
 /// Looks for the short workspace name (without devaipod- prefix) in the output.
+/// Currently unused (run_workspace computes the name upfront) but kept for
+/// potential use by other callers.
+#[allow(dead_code)]
 fn extract_workspace_name(output: &str) -> Option<String> {
     // Look for patterns like "devaipod-foo-abc123" or just the workspace name in output
     for line in output.lines() {
@@ -1974,6 +2100,7 @@ pub(crate) fn build_app(
         socket_path,
         static_dir: static_dir.to_string(),
         pty_sessions: crate::web_terminal::PtySessionManager::new(),
+        launches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
     // Build the API router with authentication
@@ -2005,6 +2132,11 @@ pub(crate) fn build_app(
         .route("/devaipod/pods/{name}/git/diff", get(git_diff))
         .route("/devaipod/pods/{name}/git/commits", get(git_commits))
         .route("/devaipod/run", post(run_workspace))
+        .route("/devaipod/launches", get(list_launches))
+        .route(
+            "/devaipod/launches/{pod_name}",
+            axum::routing::delete(dismiss_launch),
+        )
         .route("/devaipod/advisor/launch", post(launch_advisor))
         .route("/devaipod/advisor/status", get(advisor_status))
         .route("/devaipod/proposals", get(list_proposals_api))

@@ -159,7 +159,7 @@ fn resolve_source<'a>(source: Option<&'a str>, config: &'a config::Config) -> Re
 ///
 /// Also strips leading hyphens to avoid generating names that look like
 /// command-line options (e.g., `-foo` would break `devaipod attach -foo`).
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' {
@@ -174,7 +174,7 @@ fn sanitize_name(name: &str) -> String {
 }
 
 /// Generate a short unique suffix for pod names
-fn unique_suffix() -> String {
+pub(crate) fn unique_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -188,7 +188,7 @@ fn unique_suffix() -> String {
 /// Create a pod name from a project name
 ///
 /// Always generates a unique name to avoid conflicts with existing pods.
-fn make_pod_name(project_name: &str) -> String {
+pub(crate) fn make_pod_name(project_name: &str) -> String {
     format!(
         "{}{}-{}",
         POD_NAME_PREFIX,
