@@ -573,15 +573,22 @@ impl DevaipodPod {
                     )
                 }
                 WorkspaceSource::PullRequest(pr_info) => {
-                    // Create a GitRepoInfo from the PR info for clone_agent_workspace_script
+                    // Origin should always point to the upstream repo (where PRs merge to).
+                    // If the PR is from a fork, add the fork as a separate remote.
+                    let upstream_url = pr_info.pr_ref.upstream_url();
+                    let fork_url = if pr_info.head_clone_url != upstream_url {
+                        Some(pr_info.head_clone_url.clone())
+                    } else {
+                        None
+                    };
                     let git_info = crate::git::GitRepoInfo {
                         local_path: std::path::PathBuf::from(&reference_repo_path),
-                        remote_url: Some(pr_info.head_clone_url.clone()),
+                        remote_url: Some(upstream_url),
                         commit_sha: pr_info.head_sha.clone(),
                         branch: Some(pr_info.head_ref.clone()),
                         is_dirty: false,
                         dirty_files: vec![],
-                        fork_url: None, // Fork remote is handled by clone_pr_script
+                        fork_url,
                     };
                     crate::git::clone_agent_workspace_script(
                         &workspace_folder,
@@ -752,14 +759,20 @@ impl DevaipodPod {
                         )
                     }
                     WorkspaceSource::PullRequest(pr_info) => {
+                        let upstream_url = pr_info.pr_ref.upstream_url();
+                        let fork_url = if pr_info.head_clone_url != upstream_url {
+                            Some(pr_info.head_clone_url.clone())
+                        } else {
+                            None
+                        };
                         let git_info = crate::git::GitRepoInfo {
                             local_path: std::path::PathBuf::from(&reference_repo_path),
-                            remote_url: Some(pr_info.head_clone_url.clone()),
+                            remote_url: Some(upstream_url),
                             commit_sha: pr_info.head_sha.clone(),
                             branch: Some(pr_info.head_ref.clone()),
                             is_dirty: false,
                             dirty_files: vec![],
-                            fork_url: None,
+                            fork_url,
                         };
                         crate::git::clone_worker_workspace_script(
                             &workspace_folder,
