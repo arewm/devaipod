@@ -28,6 +28,7 @@ mod secrets;
 mod service_gator;
 mod ssh_server;
 mod tui;
+mod pod_api;
 mod web;
 mod web_terminal;
 
@@ -773,6 +774,18 @@ enum HostCommand {
         #[arg(long)]
         open: bool,
     },
+
+    /// Run the per-pod API server (sidecar container mode)
+    ///
+    /// Starts an HTTP server that provides git and PTY endpoints by operating
+    /// directly on the mounted workspace volume. Designed to run as a sidecar
+    /// container within a devaipod pod, replacing exec-based git operations.
+    ///
+    /// Examples:
+    ///   devaipod pod-api                              # Default port 8090, workspace /workspaces
+    ///   devaipod pod-api --port 9000                  # Custom port
+    ///   devaipod pod-api --workspace /home/user/repo  # Custom workspace path
+    PodApi(pod_api::PodApiArgs),
     /// Manage service-gator scopes for a workspace
     ///
     /// Service-gator provides scope-restricted access to external services
@@ -1040,7 +1053,7 @@ fn init_tracing(verbose: bool, quiet: bool) {
 fn command_requires_config(cmd: &HostCommand) -> bool {
     !matches!(
         cmd,
-        HostCommand::Init { .. } | HostCommand::Completions { .. }
+        HostCommand::Init { .. } | HostCommand::Completions { .. } | HostCommand::PodApi(_)
     )
 }
 
@@ -1048,7 +1061,7 @@ fn command_requires_config(cmd: &HostCommand) -> bool {
 fn command_allowed_on_host(cmd: &HostCommand) -> bool {
     matches!(
         cmd,
-        HostCommand::Init { .. } | HostCommand::Completions { .. }
+        HostCommand::Init { .. } | HostCommand::Completions { .. } | HostCommand::PodApi(_)
     )
 }
 
@@ -1299,6 +1312,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
 
             crate::web::run_web_server(port, token).await
         }
+        HostCommand::PodApi(args) => crate::pod_api::run(args).await,
         HostCommand::Advisor {
             task,
             status,
