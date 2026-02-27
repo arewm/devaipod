@@ -824,6 +824,9 @@ enum HostCommand {
         /// List current draft proposals
         #[arg(long)]
         proposals: bool,
+        /// Override the advisor pod name (default: advisor → devaipod-advisor)
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// Internal helper commands (not for direct user use)
@@ -1317,7 +1320,8 @@ async fn run_host(cli: HostCli) -> Result<()> {
             task,
             status,
             proposals,
-        } => cmd_advisor(&config, task.as_deref(), status, proposals).await,
+            name,
+        } => cmd_advisor(&config, task.as_deref(), status, proposals, name.as_deref()).await,
         HostCommand::Helper { action } => run_helper_async(action).await,
     }
 }
@@ -2820,17 +2824,21 @@ async fn cmd_advisor(
     task: Option<&str>,
     show_status: bool,
     show_proposals: bool,
+    name_override: Option<&str>,
 ) -> Result<()> {
-    const ADVISOR_POD: &str = "devaipod-advisor";
+    let advisor_pod = match name_override {
+        Some(n) => normalize_pod_name(n),
+        None => "devaipod-advisor".to_string(),
+    };
 
-    let existing = check_advisor_pod_state(ADVISOR_POD);
+    let existing = check_advisor_pod_state(&advisor_pod);
 
     if show_status {
-        return cmd_advisor_status(ADVISOR_POD, &existing);
+        return cmd_advisor_status(&advisor_pod, &existing);
     }
 
     if show_proposals {
-        return cmd_advisor_proposals(ADVISOR_POD);
+        return cmd_advisor_proposals(&advisor_pod);
     }
 
     // When called from the web handler, DEVAIPOD_NO_ATTACH is set to
@@ -2841,25 +2849,25 @@ async fn cmd_advisor(
         AdvisorPodState::Running => {
             if let Some(task) = task {
                 eprintln!("Advisor is running. Sending task...");
-                start_agent_task(ADVISOR_POD, task, false)?;
+                start_agent_task(&advisor_pod, task, false)?;
             } else {
                 eprintln!("Advisor is running.");
             }
             if no_attach {
                 return Ok(());
             }
-            cmd_attach(ADVISOR_POD, None, AttachTarget::Agent).await
+            cmd_attach(&advisor_pod, None, AttachTarget::Agent).await
         }
         AdvisorPodState::Stopped => {
             eprintln!("Starting stopped advisor pod...");
-            cmd_start(ADVISOR_POD)?;
+            cmd_start(&advisor_pod)?;
             if let Some(task) = task {
-                start_agent_task(ADVISOR_POD, task, false)?;
+                start_agent_task(&advisor_pod, task, false)?;
             }
             if no_attach {
                 return Ok(());
             }
-            cmd_attach(ADVISOR_POD, None, AttachTarget::Agent).await
+            cmd_attach(&advisor_pod, None, AttachTarget::Agent).await
         }
         AdvisorPodState::NotFound => {
             eprintln!("No advisor pod found. Creating one...");
@@ -2867,7 +2875,7 @@ async fn cmd_advisor(
             if no_attach {
                 return Ok(());
             }
-            cmd_attach(ADVISOR_POD, None, AttachTarget::Agent).await
+            cmd_attach(&advisor_pod, None, AttachTarget::Agent).await
         }
     }
 }
