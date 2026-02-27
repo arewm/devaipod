@@ -136,10 +136,7 @@ use crate::podman::{ContainerConfig, PodmanService};
 fn collect_config_devices(config: &DevcontainerConfig, devices: &mut Vec<String>) {
     for device_spec in config.device_args() {
         let path = device_spec.split(':').next().unwrap_or(&device_spec);
-        if !path.is_empty()
-            && Path::new(path).exists()
-            && !devices.contains(&path.to_string())
-        {
+        if !path.is_empty() && Path::new(path).exists() && !devices.contains(&path.to_string()) {
             devices.push(path.to_string());
         }
     }
@@ -1144,9 +1141,7 @@ echo "Dotfiles installed successfully"
                 )
                 .await
             {
-                Ok((_exit, stdout, _stderr)) => {
-                    String::from_utf8_lossy(&stdout).trim().to_string()
-                }
+                Ok((_exit, stdout, _stderr)) => String::from_utf8_lossy(&stdout).trim().to_string(),
                 Err(_) => String::new(),
             };
             let sha_json = if sha.is_empty() {
@@ -3640,9 +3635,7 @@ mod tests {
 
         // Device should be in the devices list
         assert!(
-            container_config
-                .devices
-                .contains(&"/dev/null".to_string()),
+            container_config.devices.contains(&"/dev/null".to_string()),
             "devices should include /dev/null from runArgs"
         );
     }

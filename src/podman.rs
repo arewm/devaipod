@@ -46,7 +46,11 @@ pub fn get_container_socket() -> Result<PathBuf> {
     if let Ok(path) = std::env::var(PODMAN_SOCKET_ENV) {
         let path = PathBuf::from(path);
         if path.exists() {
-            tracing::debug!("Using {} for podman connection (from {})", path.display(), PODMAN_SOCKET_ENV);
+            tracing::debug!(
+                "Using {} for podman connection (from {})",
+                path.display(),
+                PODMAN_SOCKET_ENV
+            );
             return Ok(path);
         }
     }

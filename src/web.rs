@@ -62,10 +62,15 @@ fn pod_name_from_cookie(headers: &HeaderMap) -> Option<String> {
             s.split(';').find_map(|pair| {
                 let pair = pair.trim();
                 let prefix = format!("{}=", DEVAIPOD_AGENT_POD_COOKIE);
-                pair.starts_with(&prefix).then(|| pair[prefix.len()..].to_string())
+                pair.starts_with(&prefix)
+                    .then(|| pair[prefix.len()..].to_string())
             })
         })
-        .map(|s| urlencoding::decode(&s).unwrap_or(std::borrow::Cow::Borrowed(s.as_str())).into_owned())
+        .map(|s| {
+            urlencoding::decode(&s)
+                .unwrap_or(std::borrow::Cow::Borrowed(s.as_str()))
+                .into_owned()
+        })
 }
 
 /// Normalize pod name: ensure it has the "devaipod-" prefix.
@@ -571,7 +576,12 @@ async fn proxy_to_upstream(
     let stream = tokio::net::TcpStream::connect(format!("{}:{}", host, port))
         .await
         .map_err(|e| {
-            tracing::error!("Failed to connect to opencode server at {}:{}: {}", host, port, e);
+            tracing::error!(
+                "Failed to connect to opencode server at {}:{}: {}",
+                host,
+                port,
+                e
+            );
             StatusCode::BAD_GATEWAY
         })?;
 
@@ -686,12 +696,10 @@ async fn proxy_to_upstream(
             }
         });
 
-        return response_builder
-            .body(Body::empty())
-            .map_err(|e| {
-                tracing::error!("Failed to build upgrade response: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            });
+        return response_builder.body(Body::empty()).map_err(|e| {
+            tracing::error!("Failed to build upgrade response: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        });
     }
 
     // Normal (non-upgrade) response: normalize HTTP version for SSE/chunked support
@@ -726,10 +734,7 @@ fn sse_keepalive_stream(comment: &str) -> Body {
 
 /// Whether a path is an SSE event-stream endpoint (global-sdk, event listener).
 fn is_event_stream_path(path: &str) -> bool {
-    path == "event"
-        || path.starts_with("event/")
-        || path == "global"
-        || path.starts_with("global/")
+    path == "event" || path.starts_with("event/") || path == "global" || path.starts_with("global/")
 }
 
 /// Build a 200 OK SSE keepalive response with the given comment.
@@ -781,9 +786,7 @@ struct FrontendErrorReport {
 /// Receives frontend error reports POSTed by the injected console.error interceptor.
 /// Logs them server-side so they appear in `RUST_LOG=devaipod=debug` output alongside
 /// request traces, making it possible to correlate client and server events.
-async fn frontend_error_report(
-    Json(report): Json<FrontendErrorReport>,
-) -> StatusCode {
+async fn frontend_error_report(Json(report): Json<FrontendErrorReport>) -> StatusCode {
     tracing::warn!(
         url = %report.url,
         context = %report.context,
@@ -801,11 +804,7 @@ async fn frontend_error_report(
 /// For event-stream paths (SSE), errors are returned as keepalive streams instead of HTTP
 /// error codes, because the opencode global-sdk reconnects aggressively on non-200 responses.
 async fn opencode_root_proxy(request: Request) -> Result<Response, StatusCode> {
-    let path = request
-        .uri()
-        .path()
-        .trim_start_matches('/')
-        .to_string();
+    let path = request.uri().path().trim_start_matches('/').to_string();
     if path.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -815,7 +814,10 @@ async fn opencode_root_proxy(request: Request) -> Result<Response, StatusCode> {
             if is_event_stream_path(&path) {
                 return sse_keepalive_response("no agent context");
             }
-            tracing::debug!("Root opencode API request without {} cookie", DEVAIPOD_AGENT_POD_COOKIE);
+            tracing::debug!(
+                "Root opencode API request without {} cookie",
+                DEVAIPOD_AGENT_POD_COOKIE
+            );
             return Err(StatusCode::BAD_REQUEST);
         }
     };
@@ -849,13 +851,12 @@ async fn opencode_or_static_fallback(
 
     // SSE paths without a cookie: return a keepalive stream so the SDK doesn't error-loop
     if !has_cookie && is_event_stream_path(trimmed_path) {
-        return sse_keepalive_response("no agent context")
-            .unwrap_or_else(|status| {
-                Response::builder()
-                    .status(status)
-                    .body(Body::empty())
-                    .unwrap()
-            });
+        return sse_keepalive_response("no agent context").unwrap_or_else(|status| {
+            Response::builder()
+                .status(status)
+                .body(Body::empty())
+                .unwrap()
+        });
     }
 
     // The root path is always the control plane, even with the agent cookie.
@@ -879,7 +880,11 @@ async fn opencode_or_static_fallback(
             .uri(request.uri().clone())
             .body(Body::empty())
             .unwrap();
-        let resp = ServeDir::new(OPENCODE_UI_PATH).oneshot(opencode_req).await.unwrap().into_response();
+        let resp = ServeDir::new(OPENCODE_UI_PATH)
+            .oneshot(opencode_req)
+            .await
+            .unwrap()
+            .into_response();
         if resp.status() != StatusCode::NOT_FOUND {
             return resp;
         }
@@ -888,7 +893,11 @@ async fn opencode_or_static_fallback(
             .uri(request.uri().clone())
             .body(Body::empty())
             .unwrap();
-        let resp = ServeDir::new(&state.static_dir).oneshot(static_req).await.unwrap().into_response();
+        let resp = ServeDir::new(&state.static_dir)
+            .oneshot(static_req)
+            .await
+            .unwrap()
+            .into_response();
         if resp.status() != StatusCode::NOT_FOUND {
             return resp;
         }
@@ -917,9 +926,10 @@ async fn opencode_or_static_fallback(
 
 /// Check if a path has a file extension (e.g. "foo.js", "bar.css").
 fn has_file_extension(path: &str) -> bool {
-    path.rsplit_once('/').map_or(path, |(_dir, file)| file).contains('.')
+    path.rsplit_once('/')
+        .map_or(path, |(_dir, file)| file)
+        .contains('.')
 }
-
 
 /// Script injected right after <head> in the opencode index.html.
 ///
@@ -961,7 +971,11 @@ window.addEventListener('unhandledrejection',function(e){
 /// unmodified inside the iframe at the same origin, so its API calls (/session, /rpc,
 /// /global/event, etc.) are handled by the cookie-based fallback proxy.
 fn agent_iframe_wrapper(name: &str) -> String {
-    let escaped_name = name.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let escaped_name = name
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
     format!(
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -1001,9 +1015,7 @@ f.contentWindow.dispatchEvent(new PopStateEvent('popstate'));
 }
 
 /// Redirect /_devaipod/agent/{name} to /_devaipod/agent/{name}/ and set the agent cookie.
-async fn agent_wrapper(
-    Path(name): Path<String>,
-) -> Result<Response, StatusCode> {
+async fn agent_wrapper(Path(name): Path<String>) -> Result<Response, StatusCode> {
     let location = format!("/_devaipod/agent/{}/", urlencoding::encode(&name));
     let cookie_value = format!(
         "{}={}; Path=/; SameSite=Lax; Max-Age=86400",
@@ -1072,9 +1084,7 @@ async fn serve_opencode_raw_ui() -> Result<Response, StatusCode> {
 /// serve from `OPENCODE_UI_PATH`. The cookie is only needed to distinguish which
 /// pod's opencode *backend* to proxy API calls to (handled by the fallback handler),
 /// not for static asset serving.
-async fn serve_root_assets(
-    Path(path): Path<String>,
-) -> Result<Response, StatusCode> {
+async fn serve_root_assets(Path(path): Path<String>) -> Result<Response, StatusCode> {
     let opencode_path = if path.is_empty() {
         "assets".to_string()
     } else {
@@ -1089,8 +1099,7 @@ async fn serve_root_assets(
 /// protection, and SPA fallback (index.html for paths without file extensions).
 async fn serve_opencode_static(path: &str) -> Result<Response, StatusCode> {
     let index_html = format!("{}/index.html", OPENCODE_UI_PATH);
-    let serve_dir = ServeDir::new(OPENCODE_UI_PATH)
-        .fallback(ServeFile::new(&index_html));
+    let serve_dir = ServeDir::new(OPENCODE_UI_PATH).fallback(ServeFile::new(&index_html));
 
     // Build a GET request for the path
     let uri = format!("/{}", path.trim_start_matches('/'));
@@ -1100,11 +1109,7 @@ async fn serve_opencode_static(path: &str) -> Result<Response, StatusCode> {
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // ServeDir with a fallback has error type Infallible, so unwrap is safe.
-    Ok(serve_dir
-        .oneshot(request)
-        .await
-        .unwrap()
-        .into_response())
+    Ok(serve_dir.oneshot(request).await.unwrap().into_response())
 }
 
 /// Request body for run endpoint
@@ -1261,11 +1266,7 @@ async fn run_workspace(
                 );
             }
             Err(e) => {
-                tracing::error!(
-                    "Failed to execute devaipod run for {}: {}",
-                    pod_name_bg,
-                    e
-                );
+                tracing::error!("Failed to execute devaipod run for {}: {}", pod_name_bg, e);
                 map.insert(
                     pod_name_bg.clone(),
                     LaunchState::Failed {
@@ -1291,9 +1292,7 @@ async fn run_workspace(
 /// before the pod appears in podman). Completed entries are removed eagerly
 /// in the spawn callback above; failed entries are kept until the UI
 /// acknowledges them via DELETE.
-async fn list_launches(
-    State(state): State<Arc<AppState>>,
-) -> Json<HashMap<String, LaunchState>> {
+async fn list_launches(State(state): State<Arc<AppState>>) -> Json<HashMap<String, LaunchState>> {
     let map = state.launches.lock().await;
     Json(map.clone())
 }
@@ -1519,13 +1518,14 @@ async fn recreate_workspace(
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::error!("devaipod rebuild failed: {}", stderr);
         let msg = stderr.trim();
-        let status = if msg.contains("no repository label") || msg.contains("Cannot determine source") {
-            StatusCode::BAD_REQUEST
-        } else if msg.contains("not found") {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
+        let status =
+            if msg.contains("no repository label") || msg.contains("Cannot determine source") {
+                StatusCode::BAD_REQUEST
+            } else if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
         return Err((
             status,
             Json(ApiErrorBody {
@@ -2090,11 +2090,7 @@ async fn exec_in_container(container: &str, cmd: &[&str]) -> Result<(i64, Vec<u8
 ///
 /// Exposed for tests so we can hit the router with in-process requests (fast)
 /// without starting a server or container.
-pub(crate) fn build_app(
-    token: String,
-    socket_path: Option<PathBuf>,
-    static_dir: &str,
-) -> Router {
+pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir: &str) -> Router {
     let state = Arc::new(AppState {
         token: token.clone(),
         socket_path,
@@ -2140,10 +2136,7 @@ pub(crate) fn build_app(
         .route("/devaipod/advisor/launch", post(launch_advisor))
         .route("/devaipod/advisor/status", get(advisor_status))
         .route("/devaipod/proposals", get(list_proposals_api))
-        .route(
-            "/devaipod/proposals/{id}/dismiss",
-            post(dismiss_proposal),
-        )
+        .route("/devaipod/proposals/{id}/dismiss", post(dismiss_proposal))
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
         .nest(
             "/devaipod/pods/{name}/pty",
@@ -2276,7 +2269,10 @@ mod tests {
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
             .expect("Location header must be set");
-        assert_eq!(location, "/_devaipod/agent/test-pod/", "Location must redirect to trailing-slash path");
+        assert_eq!(
+            location, "/_devaipod/agent/test-pod/",
+            "Location must redirect to trailing-slash path"
+        );
 
         let set_cookie = headers
             .get(header::SET_COOKIE)
@@ -2299,14 +2295,26 @@ mod tests {
     fn test_agent_iframe_wrapper() {
         let html = agent_iframe_wrapper("test-pod");
         assert!(html.contains("test-pod"), "wrapper must include pod name");
-        assert!(html.contains("/_devaipod/opencode-ui"), "wrapper must contain iframe src to opencode-ui");
+        assert!(
+            html.contains("/_devaipod/opencode-ui"),
+            "wrapper must contain iframe src to opencode-ui"
+        );
         assert!(html.contains("Pods"), "wrapper must have back-to-pods link");
-        assert!(html.contains("devaipod_token"), "wrapper must read token from sessionStorage");
+        assert!(
+            html.contains("devaipod_token"),
+            "wrapper must read token from sessionStorage"
+        );
 
         // HTML-escaping
         let html = agent_iframe_wrapper("<script>alert(1)</script>");
-        assert!(!html.contains("<script>alert"), "pod name must be HTML-escaped");
-        assert!(html.contains("&lt;script&gt;"), "angle brackets must be escaped");
+        assert!(
+            !html.contains("<script>alert"),
+            "pod name must be HTML-escaped"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "angle brackets must be escaped"
+        );
     }
 
     #[test]
@@ -2555,8 +2563,14 @@ mod tests {
         let rewritten_html = html
             .replace(" src=\"/", &format!(" src=\"{base}"))
             .replace(" href=\"/", &format!(" href=\"{base}"));
-        assert!(rewritten_html.contains(base), "HTML src/href must be rewritten");
-        assert!(!rewritten_html.contains("src=\"/assets/"), "HTML must not leave bare src=\"/");
+        assert!(
+            rewritten_html.contains(base),
+            "HTML src/href must be rewritten"
+        );
+        assert!(
+            !rewritten_html.contains("src=\"/assets/"),
+            "HTML must not leave bare src=\"/"
+        );
 
         // CSS patterns (fonts and assets)
         let css = r#"url("/assets/font.woff2") url('/x.woff2') url(/unquoted.woff2) url( "/spaced.woff2")"#;
@@ -2567,6 +2581,9 @@ mod tests {
             .replace("url( '/", &format!("url( '{base}"))
             .replace("url(/", &format!("url({base}"));
         assert!(rewritten_css.contains(base), "CSS url() must be rewritten");
-        assert!(!rewritten_css.contains("url(\"/assets/"), "CSS must not leave bare url(\"/");
+        assert!(
+            !rewritten_css.contains("url(\"/assets/"),
+            "CSS must not leave bare url(\"/"
+        );
     }
 }

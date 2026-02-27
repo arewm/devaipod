@@ -2546,7 +2546,9 @@ async fn cmd_controlplane(serve: bool, _port: u16, list: bool, json: bool) -> Re
         eprintln!("This feature is planned for a future release. See:");
         eprintln!("  https://github.com/cgwalters/devaipod/blob/main/docs/todo/opencode-web-enhancements.md");
         eprintln!();
-        eprintln!("For now, use 'devaipod web' or 'devaipod list' and 'devaipod attach' to manage pods.");
+        eprintln!(
+            "For now, use 'devaipod web' or 'devaipod list' and 'devaipod attach' to manage pods."
+        );
         std::process::exit(1);
     }
 
@@ -2554,7 +2556,9 @@ async fn cmd_controlplane(serve: bool, _port: u16, list: bool, json: bool) -> Re
     eprintln!("Control plane TUI mode is not yet implemented.");
     eprintln!();
     eprintln!("This feature is planned for a future release. See:");
-    eprintln!("  https://github.com/cgwalters/devaipod/blob/main/docs/todo/opencode-web-enhancements.md");
+    eprintln!(
+        "  https://github.com/cgwalters/devaipod/blob/main/docs/todo/opencode-web-enhancements.md"
+    );
     eprintln!();
     eprintln!("For now, use these commands to manage pods:");
     eprintln!("  devaipod list              # List all workspaces");
@@ -4066,7 +4070,13 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
     tracing::info!("Pod '{}' deleted", pod_name);
 
     // Clean up all devaipod volumes
-    for suffix in ["-workspace", "-agent-home", "-agent-workspace", "-worker-home", "-worker-workspace"] {
+    for suffix in [
+        "-workspace",
+        "-agent-home",
+        "-agent-workspace",
+        "-worker-home",
+        "-worker-workspace",
+    ] {
         let volume = format!("{pod_name}{suffix}");
         let output = podman_command()
             .args(["volume", "rm", "--force", "--", &volume])

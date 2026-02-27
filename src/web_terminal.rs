@@ -347,7 +347,10 @@ async fn pty_create(
 
     // Spawn background task to read exec output and bridge stdin.
     match start_result {
-        StartExecResults::Attached { mut output, mut input } => {
+        StartExecResults::Attached {
+            mut output,
+            mut input,
+        } => {
             let tx = output_tx.clone();
             let so = session_output.clone();
 
@@ -404,7 +407,12 @@ async fn pty_create(
             });
         }
         StartExecResults::Detached => {
-            state.pty_sessions.sessions.write().await.remove(&session_id);
+            state
+                .pty_sessions
+                .sessions
+                .write()
+                .await
+                .remove(&session_id);
             tracing::error!("Exec {} started in detached mode", exec_id);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -558,7 +566,11 @@ async fn handle_ws(
     let meta = serde_json::json!({"cursor": cursor});
     let mut meta_bytes = vec![0x00u8];
     meta_bytes.extend_from_slice(meta.to_string().as_bytes());
-    if ws_tx.send(Message::Binary(meta_bytes.into())).await.is_err() {
+    if ws_tx
+        .send(Message::Binary(meta_bytes.into()))
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -662,5 +674,3 @@ pub fn pty_router() -> Router<Arc<AppState>> {
         .route("/{pty_id}", get(pty_get).put(pty_update).delete(pty_delete))
         .route("/{pty_id}/connect", get(pty_connect))
 }
-
-
