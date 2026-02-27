@@ -1,11 +1,11 @@
-import { createEffect, createResource, on, Show, type JSX } from "solid-js"
+import { createEffect, createResource, on, onCleanup, onMount, Show, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { FileDiff } from "@opencode-ai/sdk/v2"
 import { SessionReview } from "@opencode-ai/ui/session-review"
 import { Select } from "@opencode-ai/ui/select"
 import type { SelectedLineRange } from "@/context/file"
 import type { LineComment } from "@/context/comments"
-import { getPodName, apiFetch } from "@/utils/devaipod-api"
+import { getPodName, getAuthToken, apiFetch } from "@/utils/devaipod-api"
 
 export type DiffStyle = "unified" | "split"
 
@@ -57,7 +57,7 @@ export function GitReviewTab(props: GitReviewTabProps) {
     baseCommit: undefined as string | undefined,
   })
 
-  const [log] = createResource(
+  const [log, { refetch: refetchLog }] = createResource(
     () => podName,
     async (pod) => {
       const data = await apiFetch<{ commits: GitLogEntry[] }>(
@@ -79,6 +79,32 @@ export function GitReviewTab(props: GitReviewTabProps) {
       },
     ),
   )
+
+  // Subscribe to git SSE events and auto-refresh when new commits arrive
+  if (podName) {
+    onMount(() => {
+      const token = getAuthToken()
+      let url = `/api/devaipod/pods/${encodeURIComponent(podName)}/pod-api/git/events`
+      if (token) url += `?token=${encodeURIComponent(token)}`
+
+      const es = new EventSource(url)
+      es.addEventListener("git.updated", (event) => {
+        try {
+          const payload = JSON.parse(event.data) as { head?: string }
+          const currentHead = log()?.[0]?.sha
+          if (payload.head && payload.head !== currentHead) {
+            refetchLog()
+          }
+        } catch (err) {
+          console.warn("Failed to parse git.updated event:", err)
+        }
+      })
+      es.onerror = (err) => {
+        console.warn("Git events SSE error (will auto-reconnect):", err)
+      }
+      onCleanup(() => es.close())
+    })
+  }
 
   const diffParams = () => {
     if (!podName) return undefined
