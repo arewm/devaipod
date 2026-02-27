@@ -21,6 +21,8 @@ import { extractPromptFromParts } from "@/utils/prompt"
 import { UserMessage } from "@opencode-ai/sdk/v2"
 import { combineCommandSections } from "@/pages/session/helpers"
 import { canAddSelectionContext } from "@/pages/session/session-command-helpers"
+import { type WorkspaceTerminals } from "@/context/workspace-terminal"
+import { isDevaipod } from "@/utils/devaipod-api"
 
 export type SessionCommandContext = {
   command: ReturnType<typeof useCommand>
@@ -49,6 +51,7 @@ export type SessionCommandContext = {
   setActiveMessage: (message: UserMessage | undefined) => void
   addSelectionToContext: (path: string, selection: FileSelection) => void
   focusInput: () => void
+  wsTerminal?: WorkspaceTerminals
 }
 
 const withCategory = (category: string) => {
@@ -160,7 +163,7 @@ export const useSessionCommands = (input: SessionCommandContext) => {
     }),
     terminalCommand({
       id: "terminal.new",
-      title: input.language.t("command.terminal.new"),
+      title: isDevaipod() ? "New Agent Terminal" : input.language.t("command.terminal.new"),
       description: input.language.t("command.terminal.new.description"),
       keybind: "ctrl+alt+t",
       onSelect: () => {
@@ -464,6 +467,21 @@ export const useSessionCommands = (input: SessionCommandContext) => {
     ]
   })
 
+  const workspaceTerminalCommands = createMemo(() => {
+    if (!isDevaipod() || !input.wsTerminal) return []
+    return [
+      terminalCommand({
+        id: "terminal.workspace.new",
+        title: "Open Workspace Terminal",
+        description: "Open a terminal in the workspace container",
+        onSelect: () => {
+          input.wsTerminal!.new()
+          input.view().terminal.open()
+        },
+      }),
+    ]
+  })
+
   input.command.register("session", () =>
     combineCommandSections([
       sessionCommands(),
@@ -475,6 +493,7 @@ export const useSessionCommands = (input: SessionCommandContext) => {
       permissionCommands(),
       sessionActionCommands(),
       shareCommands(),
+      workspaceTerminalCommands(),
     ]),
   )
 }

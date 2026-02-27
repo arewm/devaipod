@@ -942,6 +942,7 @@ export default function Page() {
     setActiveMessage,
     addSelectionToContext,
     focusInput,
+    wsTerminal,
   })
 
   const openReviewFile = createOpenReviewFile({
