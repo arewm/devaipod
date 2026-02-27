@@ -6,16 +6,21 @@
 //! against the local filesystem, eliminating the ~200-500ms per-exec overhead.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Context, Result};
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -26,6 +31,8 @@ use tokio::process::Command;
 struct AppState {
     /// Path to the workspace root (default `/workspaces`).
     workspace: Arc<PathBuf>,
+    /// Broadcast sender for git filesystem change events.
+    git_events_tx: broadcast::Sender<GitEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +128,175 @@ struct GitPushRequest {
 struct GitPushResponse {
     success: bool,
     message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Git filesystem watcher (SSE event source)
+// ---------------------------------------------------------------------------
+
+/// Event emitted when the git state changes on disk.
+#[derive(Clone, Debug, Serialize)]
+struct GitEvent {
+    head: String,
+    timestamp: String,
+}
+
+/// Reads the current HEAD sha from the workspace. Returns an empty string on
+/// failure (e.g. bare init with no commits yet).
+async fn read_head_sha(workspace: &PathBuf) -> String {
+    match run_git(workspace, &["rev-parse", "HEAD"]).await {
+        Ok((0, stdout, _)) => String::from_utf8_lossy(&stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Background watcher that monitors `.git/` for ref changes and broadcasts
+/// `GitEvent`s to all SSE subscribers.
+///
+/// The `RecommendedWatcher` is kept alive inside the spawned task — dropping it
+/// would stop inotify watches.
+struct GitWatcher;
+
+impl GitWatcher {
+    /// Spawn the background watcher task. Returns the broadcast sender that SSE
+    /// handlers subscribe to.
+    fn spawn(workspace: Arc<PathBuf>) -> broadcast::Sender<GitEvent> {
+        let (tx, _) = broadcast::channel::<GitEvent>(64);
+        let tx_clone = tx.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = Self::run(workspace, tx_clone).await {
+                tracing::error!("GitWatcher exited with error: {e}");
+            }
+        });
+
+        tx
+    }
+
+    async fn run(workspace: Arc<PathBuf>, tx: broadcast::Sender<GitEvent>) -> Result<()> {
+        use notify::{RecursiveMode, Watcher};
+
+        let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<()>(128);
+
+        // The watcher must live as long as we want events, so we bind it here
+        // and keep it alive for the lifetime of this task.
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            match res {
+                Ok(_) => {
+                    // Non-blocking send; if the channel is full we just skip
+                    // (the debounce will catch the next one).
+                    let _ = fs_tx.try_send(());
+                }
+                Err(e) => tracing::warn!("filesystem watch error: {e}"),
+            }
+        })
+        .context("Failed to create filesystem watcher")?;
+
+        let git_dir = workspace.join(".git");
+
+        // Watch .git/refs/ recursively (branch updates, remote refs, tags).
+        let refs_dir = git_dir.join("refs");
+        if refs_dir.is_dir() {
+            watcher
+                .watch(&refs_dir, RecursiveMode::Recursive)
+                .with_context(|| format!("Failed to watch {}", refs_dir.display()))?;
+        }
+
+        // Watch .git/HEAD (branch switches).
+        let head_file = git_dir.join("HEAD");
+        if head_file.exists() {
+            watcher
+                .watch(&head_file, RecursiveMode::NonRecursive)
+                .with_context(|| format!("Failed to watch {}", head_file.display()))?;
+        }
+
+        // Watch .git/FETCH_HEAD if it exists (created on first fetch).
+        let fetch_head = git_dir.join("FETCH_HEAD");
+        if fetch_head.exists() {
+            if let Err(e) = watcher.watch(&fetch_head, RecursiveMode::NonRecursive) {
+                tracing::debug!("FETCH_HEAD watch skipped (will retry): {e}");
+            }
+        }
+
+        tracing::info!("GitWatcher started for {}", workspace.display());
+
+        // Debounced event loop: collect events for 200ms, then emit one
+        // GitEvent with the current HEAD.
+        loop {
+            // Wait for at least one filesystem notification.
+            if fs_rx.recv().await.is_none() {
+                // Channel closed — watcher was dropped.
+                break;
+            }
+
+            // Debounce: drain any further events that arrive within 200ms.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            while fs_rx.try_recv().is_ok() {}
+
+            let head = read_head_sha(&workspace).await;
+            let event = GitEvent {
+                head,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            };
+
+            // Ignore send errors (no active receivers is fine).
+            let _ = tx.send(event);
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE handler
+// ---------------------------------------------------------------------------
+
+/// `GET /git/events` — Server-Sent Events stream of git state changes.
+///
+/// Sends an initial event with the current HEAD sha, then pushes `git.updated`
+/// events whenever the filesystem watcher detects ref changes. A keepalive
+/// comment is sent every 30 seconds to prevent proxy timeouts.
+async fn git_events_sse(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let workspace = state.workspace.clone();
+    let mut rx = state.git_events_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        // Send initial HEAD so the client has a baseline.
+        let head = read_head_sha(&workspace).await;
+        let initial = GitEvent {
+            head,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Ok(data) = serde_json::to_string(&initial) {
+            yield Ok(Event::default().event("git.updated").data(data));
+        }
+
+        // Stream subsequent events from the broadcast channel.
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Ok(data) = serde_json::to_string(&event) {
+                        yield Ok(Event::default().event("git.updated").data(data));
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!("SSE client lagged, skipped {n} events");
+                    // Continue — the next event will have the latest HEAD anyway.
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(30))
+            .text("keepalive"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +842,7 @@ fn build_router(state: AppState) -> Router {
         .route("/git/commits", get(git_commits))
         .route("/git/log", get(git_log))
         .route("/git/diff-range", get(git_diff_range))
+        .route("/git/events", get(git_events_sse))
         .route("/git/fetch-agent", post(git_fetch_agent))
         .route("/git/push", post(git_push))
         // PTY stubs
@@ -677,8 +854,12 @@ fn build_router(state: AppState) -> Router {
 
 /// Run the pod-api HTTP server.
 pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
+    let workspace = Arc::new(args.workspace.clone());
+    let git_events_tx = GitWatcher::spawn(Arc::clone(&workspace));
+
     let state = AppState {
-        workspace: Arc::new(args.workspace.clone()),
+        workspace,
+        git_events_tx,
     };
 
     let app = build_router(state);
