@@ -280,17 +280,80 @@ core (or is easily proposed upstream) while review/sync lives in
 - [ ] Write an `update-opencode-ui.sh` script for pulling new upstream releases
 
 ### Phase 1: Pod management in SPA (replaces dist/index.html)
-- [ ] Implement pod-prefixed API proxy in `web.rs`
-      (`/pods/{name}/api/{*path}` → pod's opencode backend) — needed before
-      the SPA can talk to pod backends without the cookie hack
-- [ ] Spike: create `src/devaipod/pods.tsx` with a basic pod list page,
-      patch `app.tsx` to add the route, verify it builds and renders
-- [ ] Wire pod list to devaipod REST API (`/api/podman/...`, `/api/devaipod/run`)
-- [ ] Add sidebar pod icon with navigation to `/pods`
-- [ ] Create `DevaipodProvider` context for pod state and auth
-- [ ] Wire pod selection to `ServerProvider` base URL
 
-### Phase 2: Git browser and commit-range review — partially done
+The current `dist/index.html` is a 1759-line vanilla HTML/JS app that
+handles pod listing, creation, terminal access, advisor proposals, and
+agent navigation. All of this moves into the opencode SPA as a `/pods`
+route, eliminating the iframe/cookie architecture entirely.
+
+#### Architecture
+
+The SPA gets a new `DevaipodProvider` context that manages pod state,
+auth, and active pod selection. When the user opens a pod's agent,
+the provider sets the `ServerProvider` base URL to the pod's proxied
+API path (`/pods/{name}/api/...`) and navigates to the session view.
+This replaces the cookie-based routing and iframe wrapper.
+
+Key design decisions:
+- Each pod is effectively a separate opencode "server"; switching pods
+  remounts the SDK/sync providers (clean reconnect, no stale state)
+- The `/pods` route lives before `/:dir` in the router so it doesn't
+  get caught by the directory catch-all
+- Auth token flows through `DevaipodProvider` instead of cookies;
+  `getPodName()` reads from context rather than `DEVAIPOD_AGENT_POD`
+- The Home page (`/`) redirects to `/pods` in devaipod mode
+
+#### API surface the pods page needs
+
+From the control plane:
+- `GET /api/podman/v5.0.0/libpod/pods/json` — pod list
+- `POST /api/podman/.../pods/{name}/{start|stop}` — lifecycle
+- `DELETE /api/podman/.../pods/{name}?force=true` — delete
+- `POST /api/devaipod/run` — launch workspace
+- `GET /api/devaipod/launches` — poll launch state
+- `DELETE /api/devaipod/launches/{name}` — dismiss failed launch
+- `GET /api/devaipod/pods/{name}/opencode-info` — session info
+- `GET /api/devaipod/pods/{name}/agent-status` — agent activity
+- `POST /api/devaipod/pods/{name}/recreate` — recreate workspace
+- `POST /api/devaipod/advisor/launch` — advisor pod
+- `GET /api/devaipod/proposals` — advisor proposals
+
+#### Dependency order
+
+1. Pod-prefixed API proxy in web.rs (server prerequisite)
+2. DevaipodProvider context (state management)
+3. Pods page component (UI)
+4. Pod selection → ServerProvider wiring (the critical glue)
+5. Sidebar integration (nice-to-have)
+6. Cleanup (remove dist/, iframe, cookie routing)
+
+#### Tasks
+
+- [ ] Add `/pods/{name}/api/{*path}` proxy route in `web.rs` — forwards
+      to the pod's opencode backend, same as the existing per-pod proxy
+      but with a stable URL path instead of cookie-based routing
+- [ ] Create `DevaipodProvider` context (`context/devaipod.tsx`, ~200 lines)
+      managing pod list, launch state, agent status polling, active pod,
+      and auth token propagation
+- [ ] Create pods page (`pages/pods.tsx`, ~500 lines) with pod list,
+      launch form, advisor section. Reuse `@opencode-ai/ui` components
+      (Button, Dialog, DropdownMenu, Icon, Tooltip)
+- [ ] Add `/pods` route in `app.tsx` before `/:dir` catch-all
+- [ ] Wire pod selection: clicking "Open Agent" sets `ServerProvider`
+      base URL to `/pods/{name}/api` and navigates to session view
+- [ ] Redirect `/` to `/pods` when `isDevaipod()` (or always in
+      devaipod mode via the provider)
+- [ ] Update `getPodName()` / `isDevaipod()` to read from
+      `DevaipodProvider` context instead of cookies
+- [ ] Add sidebar pod icon with navigation to `/pods`
+
+### Phase 2: Git browser and commit-range review — mostly done
+
+Backend git endpoints now run in the pod-api sidecar container
+(`devaipod pod-api`) instead of exec'ing into workspace containers.
+The sidecar mounts the agent's workspace volume directly and watches
+`.git/refs/` via inotify, pushing `git.updated` SSE events to the
+frontend for live diff updates.
 
 - [x] Add `GET /git/log` endpoint with structured commit objects
 - [x] Add `GET /git/diff-range` endpoint with per-file before/after content
@@ -298,9 +361,15 @@ core (or is easily proposed upstream) while review/sync lives in
 - [x] Create `GitReviewTab` component reusing `SessionReview` diff renderer
 - [x] Wire into session.tsx (conditional on devaipod cookie)
 - [x] Extract shared API utils to `utils/devaipod-api.ts`
-- [ ] Add fetch button to GitReviewTab (currently never calls fetch-agent)
+- [x] Move git endpoints to pod-api sidecar (direct git, no exec overhead)
+- [x] Add inotify-based git watcher + SSE endpoint (`GET /git/events`)
+- [x] Subscribe GitReviewTab to SSE for automatic refresh on new commits
+- [x] Proxy pod-api requests through control plane (`/pod-api/*`)
+- [x] Integration tests for api container, endpoints, and SSE
 - [ ] Add push/sync button to GitReviewTab
 - [ ] Wire inline comments from commit-range view back to agent prompt context
+- [ ] Debug "expand" button in diff view (likely DiffComponentProvider
+      context or shadow DOM event propagation issue)
 
 ### Phase 2.5: Workspace and agent terminals — partially done
 
@@ -330,9 +399,19 @@ same `Terminal` component with custom WebSocket URL and resize handler.
       workspace when commits are in "approved" state. No service-gator
       callback needed — the workspace pushes directly after human approval.
 
-### Phase 4: Cleanup
-- [ ] Remove iframe wrapper, cookie routing, SSE keepalive, and related code
-- [ ] Drop `dist/index.html` once the pods page is functional
+### Phase 4: Cleanup (~450 lines removed from web.rs)
+
+Once the SPA pods page handles pod management and session navigation
+natively (via DevaipodProvider + ServerProvider, no iframe/cookie):
+
+- [ ] Remove `DEVAIPOD_AGENT_POD` cookie infrastructure
+- [ ] Remove `agent_iframe_wrapper()` and HTML generation
+- [ ] Remove `serve_opencode_raw_ui()` with injected JavaScript
+- [ ] Remove SSE keepalive hack and `DEVAIPOD_HEAD_SCRIPT`
+- [ ] Remove cookie-aware fallback router
+- [ ] Remove root-level opencode proxy and `/assets/*` hijacking
+- [ ] Drop `dist/index.html` and vendored xterm.js
+- [ ] Remove `patches/opencode-devaipod.patch` (no longer referenced)
 
 ## Testing
 
