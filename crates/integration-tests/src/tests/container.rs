@@ -6,7 +6,7 @@
 //! - Readonly tests: Use the shared fixture, only query pod state
 //! - Mutating tests: Create/delete their own pods
 
-use color_eyre::eyre::bail;
+use color_eyre::eyre::{bail, Context};
 use color_eyre::Result;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -219,10 +219,51 @@ fn test_readonly_containers_exist(fixture: &SharedFixture) -> Result<()> {
         "Pod should have agent container: {}",
         ps_output
     );
+    assert!(
+        ps_output.contains("api"),
+        "Pod should have api container: {}",
+        ps_output
+    );
 
     Ok(())
 }
 readonly_test!(test_readonly_containers_exist);
+
+/// Verify the pod-api server responds with valid JSON on /git/status
+fn test_readonly_api_git_status(fixture: &SharedFixture) -> Result<()> {
+    let sh = shell()?;
+    let agent = fixture.agent_container();
+    // The api container shares the pod network namespace, so we can reach it
+    // from any container in the pod. Use the agent container which has curl.
+    let output = cmd!(
+        sh,
+        "podman exec {agent} curl -sf http://localhost:8090/git/status"
+    )
+    .read()?;
+    let _parsed: serde_json::Value =
+        serde_json::from_str(&output).context("pod-api /git/status should return valid JSON")?;
+    Ok(())
+}
+readonly_test!(test_readonly_api_git_status);
+
+/// Verify the pod-api /git/log endpoint returns valid JSON with a commits array
+fn test_readonly_api_git_log(fixture: &SharedFixture) -> Result<()> {
+    let sh = shell()?;
+    let agent = fixture.agent_container();
+    let output = cmd!(
+        sh,
+        "podman exec {agent} curl -sf http://localhost:8090/git/log"
+    )
+    .read()?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&output).context("pod-api /git/log should return valid JSON")?;
+    assert!(
+        parsed.get("commits").and_then(|c| c.as_array()).is_some(),
+        "/git/log response should have a 'commits' array"
+    );
+    Ok(())
+}
+readonly_test!(test_readonly_api_git_log);
 
 /// Verify we can query pod status via devaipod
 fn test_readonly_status_command(fixture: &SharedFixture) -> Result<()> {

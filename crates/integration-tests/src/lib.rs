@@ -395,6 +395,11 @@ impl SharedFixture {
         format!("{}-agent", self.pod_name)
     }
 
+    /// Get the api container name
+    pub fn api_container(&self) -> String {
+        format!("{}-api", self.pod_name)
+    }
+
     /// Get the SSH config directory path (used for isolated testing)
     pub fn ssh_config_dir(&self) -> &std::path::Path {
         self._ssh_config_dir.path()
