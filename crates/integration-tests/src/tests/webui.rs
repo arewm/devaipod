@@ -1390,16 +1390,11 @@ fn test_web_container_opencode_info_endpoint() -> Result<()> {
                             "opencode-info should have 'accessible' field"
                         );
 
-                        // URL should have token query param format
+                        // URL should be a direct localhost URL (token is not included)
                         let url = info.get("url").unwrap().as_str().unwrap_or("");
                         assert!(
                             url.starts_with("http://127.0.0.1:"),
                             "URL should start with 'http://127.0.0.1:', got: {}",
-                            url
-                        );
-                        assert!(
-                            url.contains("?token="),
-                            "URL should contain '?token=', got: {}",
                             url
                         );
 
@@ -1498,18 +1493,9 @@ fn test_web_container_opencode_connectivity() -> Result<()> {
             }
         };
 
-        // Extract token/password from the URL
-        let url = info.get("url").and_then(|u| u.as_str()).unwrap_or("");
-        let password = url
-            .split("token=")
-            .nth(1)
-            .map(|t| t.split('&').next().unwrap_or(t))
-            .unwrap_or("");
-
-        if password.is_empty() {
-            tracing::warn!("Could not extract token from URL: {}", url);
-            continue;
-        }
+        // The URL no longer includes a token; the opencode server inside
+        // the pod does not require authentication for localhost access.
+        let _url = info.get("url").and_then(|u| u.as_str()).unwrap_or("");
 
         tracing::info!(
             "Testing opencode proxy connectivity on port {} for pod {}",
@@ -1519,16 +1505,13 @@ fn test_web_container_opencode_connectivity() -> Result<()> {
 
         found_running_pod = true;
 
-        // Test 1: Initial page load with token in query param
+        // Test 1: Initial page load (no token needed for localhost access)
         // curl from inside the web container to the host's published port
         // Note: 127.0.0.1 in the container refers to the container's localhost,
         // but the opencode proxy port is published on the host.
         // We need to use the host's IP or the podman network gateway.
         // For rootless podman, we can try host.containers.internal or the host IP.
-        let curl_url = format!(
-            "http://host.containers.internal:{}/?token={}",
-            port, password
-        );
+        let curl_url = format!("http://host.containers.internal:{}/", port);
         let curl_output = Command::new("podman")
             .args([
                 "exec",
@@ -1584,9 +1567,7 @@ fn test_web_container_opencode_connectivity() -> Result<()> {
             tracing::info!("Got redirect (302), which is also acceptable");
         }
 
-        // Test 2: Request with cookie-based auth (simulating browser after initial load)
-        // The auth proxy sets a session cookie after ?token= auth
-        let cookie_header = format!("Cookie: devaipod_session={}", password);
+        // Test 2: Request to /health (no auth needed for localhost access)
         let health_url = format!("http://host.containers.internal:{}/health", port);
         let curl_health_output = Command::new("podman")
             .args([
@@ -1598,8 +1579,6 @@ fn test_web_container_opencode_connectivity() -> Result<()> {
                 "10",
                 "-w",
                 "\n%{http_code}",
-                "-H",
-                &cookie_header,
                 &health_url,
             ])
             .output()?;
@@ -1615,7 +1594,7 @@ fn test_web_container_opencode_connectivity() -> Result<()> {
         // The important thing is we got a response (not connection refused)
         if health_status > 0 {
             tracing::info!(
-                "Cookie-based request to /health returned status {}",
+                "Request to /health returned status {}",
                 health_status
             );
         }

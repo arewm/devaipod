@@ -422,7 +422,6 @@ const OPENCODE_API_SEGMENTS: &[&str] = &[
 /// Get opencode connection info for a pod
 ///
 /// Returns the direct URL to access the opencode web UI.
-/// The URL includes a token query parameter for authentication.
 /// On 404 returns JSON body so the frontend can show "Pod or agent not found".
 async fn opencode_info(
     Path(name): Path<String>,
