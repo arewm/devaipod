@@ -244,6 +244,8 @@ pub struct InstanceInfo {
     pub last_activity_ts: Option<i64>,
     /// Whether worker container exists and is running
     pub worker_healthy: Option<bool>,
+    /// Names of containers that are not running (for degraded status display)
+    pub degraded_containers: Vec<String>,
 }
 
 /// Mode of the TUI (normal browsing vs delete selection)
@@ -625,6 +627,28 @@ impl App {
                     && c.state.as_deref() == Some("running")
             });
 
+            // Collect names of non-running containers (for degraded status display)
+            let degraded_containers: Vec<String> = containers
+                .iter()
+                .filter(|c| {
+                    c.state.as_deref() != Some("running")
+                        && !c
+                            .names
+                            .as_ref()
+                            .is_some_and(|n| n.iter().any(|name| name.ends_with("-infra")))
+                })
+                .filter_map(|c| {
+                    c.names.as_ref().and_then(|n| {
+                        n.first().map(|name| {
+                            let name = name.trim_start_matches('/');
+                            name.strip_prefix(&format!("{}-", full_name))
+                                .unwrap_or(name)
+                                .to_string()
+                        })
+                    })
+                })
+                .collect();
+
             // Initialize last_activity_ts from agent state if available, otherwise from created_ts
             let last_activity_ts = agent_state
                 .last_message_ts
@@ -651,6 +675,7 @@ impl App {
                 gator_scopes,
                 last_activity_ts,
                 worker_healthy: Some(worker_healthy),
+                degraded_containers,
             });
         }
 
@@ -2700,11 +2725,18 @@ fn render_instance_card(
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // Line 1: Name and metadata bar
-    let status_style = match instance.status.as_str() {
-        "Running" => Style::default().fg(Color::Green),
-        "Exited" => Style::default().fg(Color::Red),
-        "Degraded" => Style::default().fg(Color::Yellow),
-        _ => Style::default(),
+    let (health_label, status_style) = match instance.status.as_str() {
+        "Running" => ("Healthy".to_string(), Style::default().fg(Color::Green)),
+        "Exited" => ("Stopped".to_string(), Style::default().fg(Color::Red)),
+        "Degraded" => {
+            let reason = if instance.degraded_containers.is_empty() {
+                "Degraded".to_string()
+            } else {
+                format!("Degraded: {} down", instance.degraded_containers.join(", "))
+            };
+            (reason, Style::default().fg(Color::Yellow))
+        }
+        _ => (instance.status.clone(), Style::default()),
     };
 
     let mode = instance.mode.clone().unwrap_or_else(|| "-".to_string());
@@ -2776,7 +2808,7 @@ fn render_instance_card(
             }),
         ),
         Span::raw(" │ ".to_string()),
-        Span::styled(instance.status.clone(), status_style),
+        Span::styled(health_label, status_style),
         Span::raw(" │ ".to_string()),
         Span::styled(mode, mode_style),
         Span::raw(" │ ".to_string()),
@@ -3189,6 +3221,7 @@ mod tests {
                 gator_scopes: Some("--gh-repo user/myproject:read".to_string()),
                 last_activity_ts: Some(1705315800000), // 2024-01-15 10:30 in millis
                 worker_healthy: Some(true),
+                degraded_containers: vec![],
             },
             InstanceInfo {
                 name: "otherrepo-def456".to_string(),
@@ -3214,6 +3247,7 @@ mod tests {
                 gator_scopes: None,
                 last_activity_ts: Some(1705240800000), // 2024-01-14 14:00 in millis
                 worker_healthy: Some(false),
+                degraded_containers: vec![],
             },
             InstanceInfo {
                 name: "degraded-pod".to_string(),
@@ -3245,6 +3279,7 @@ mod tests {
                 gator_scopes: Some("--gh-repo org/repo:read,write".to_string()),
                 last_activity_ts: None,
                 worker_healthy: None,
+                degraded_containers: vec!["agent".to_string()],
             },
         ]
     }

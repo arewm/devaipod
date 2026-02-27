@@ -158,7 +158,7 @@
             border-top: 1px solid var(--border);
         }
         
-        .container-row {
+        .pod-health {
             display: flex;
             align-items: center;
             gap: 0.5rem;
@@ -166,22 +166,16 @@
             font-size: 0.85rem;
         }
         
-        .container-status {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
+        .pod-health.healthy {
+            color: var(--success);
         }
         
-        .container-status.running {
-            background: var(--success);
+        .pod-health.degraded {
+            color: var(--warning);
         }
         
-        .container-status.stopped {
-            background: var(--error);
-        }
-        
-        .container-name {
-            color: var(--text-secondary);
+        .pod-health.stopped {
+            color: var(--error);
         }
         
         .loading {
@@ -960,19 +954,18 @@
             const repo = labels['io.devaipod.repo'] || '';
             const mode = labels['io.devaipod.mode'] || '';
             
-            // Render containers
-            const containers = (pod.Containers || [])
-                .filter(c => !c.Names.includes('-infra'))
-                .map(c => {
-                    const containerStatus = c.Status === 'running' ? 'running' : 'stopped';
-                    const shortName = c.Names.replace(pod.Name + '-', '');
-                    return `
-                        <div class="container-row">
-                            <span class="container-status ${containerStatus}"></span>
-                            <span class="container-name">${shortName}</span>
-                        </div>
-                    `;
-                }).join('');
+            // Compute pod health status
+            const nonInfraContainers = (pod.Containers || []).filter(c => !c.Names.includes('-infra'));
+            const stoppedContainers = nonInfraContainers.filter(c => c.Status !== 'running');
+            let podHealthHtml = '';
+            if (status.toLowerCase() !== 'running') {
+                podHealthHtml = '<div class="pod-health stopped">Stopped</div>';
+            } else if (stoppedContainers.length === 0) {
+                podHealthHtml = '<div class="pod-health healthy">Healthy</div>';
+            } else {
+                const stoppedNames = stoppedContainers.map(c => c.Names.replace(pod.Name + '-', '')).join(', ');
+                podHealthHtml = '<div class="pod-health degraded">Degraded: ' + escapeHtml(stoppedNames) + ' stopped</div>';
+            }
             
             const shortName = pod.Name.replace('devaipod-', '');
             const isAdvisor = shortName === 'advisor';
@@ -1014,7 +1007,7 @@
                         <div class="pod-meta-item"><span class="pod-meta-label">Created:</span> <span class="pod-meta-value">${formatDate(pod.Created)}</span></div>
                     </div>
                     ${agentStatusHtml}
-                    ${containers ? `<div class="pod-containers">${containers}</div>` : ''}
+                    ${podHealthHtml ? `<div class="pod-containers">${podHealthHtml}</div>` : ''}
                     <div class="pod-actions">
                         ${actionsHtml}
                     </div>
