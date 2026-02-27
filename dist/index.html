@@ -119,9 +119,14 @@
             text-transform: uppercase;
         }
         
-        .pod-status.running {
+        .pod-status.healthy {
             background: rgba(0, 189, 0, 0.2);
             color: var(--success);
+        }
+        
+        .pod-status.degraded {
+            background: rgba(255, 220, 23, 0.15);
+            color: var(--warning);
         }
         
         .pod-status.stopped {
@@ -152,31 +157,7 @@
             font-size: 0.9em;
         }
         
-        .pod-containers {
-            margin-top: 0.75rem;
-            padding-top: 0.75rem;
-            border-top: 1px solid var(--border);
-        }
         
-        .pod-health {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.25rem 0;
-            font-size: 0.85rem;
-        }
-        
-        .pod-health.healthy {
-            color: var(--success);
-        }
-        
-        .pod-health.degraded {
-            color: var(--warning);
-        }
-        
-        .pod-health.stopped {
-            color: var(--error);
-        }
         
         .loading {
             text-align: center;
@@ -595,7 +576,6 @@
 
         .pod-card.collapsed .pod-meta,
         .pod-card.collapsed .agent-status,
-        .pod-card.collapsed .pod-containers,
         .pod-card.collapsed .pod-actions,
         .pod-card.collapsed .advisor-proposals-inline {
             display: none;
@@ -946,7 +926,6 @@
         // Render a pod card
         function renderPod(pod) {
             const status = pod.Status || 'unknown';
-            const statusClass = status.toLowerCase() === 'running' ? 'running' : 'stopped';
             
             // Extract devaipod labels
             const labels = pod.Labels || {};
@@ -954,17 +933,20 @@
             const repo = labels['io.devaipod.repo'] || '';
             const mode = labels['io.devaipod.mode'] || '';
             
-            // Compute pod health status
+            // Compute pod health status for the header badge
             const nonInfraContainers = (pod.Containers || []).filter(c => !c.Names.includes('-infra'));
             const stoppedContainers = nonInfraContainers.filter(c => c.Status !== 'running');
-            let podHealthHtml = '';
+            let healthClass, healthLabel;
             if (status.toLowerCase() !== 'running') {
-                podHealthHtml = '<div class="pod-health stopped">Stopped</div>';
+                healthClass = 'stopped';
+                healthLabel = 'Stopped';
             } else if (stoppedContainers.length === 0) {
-                podHealthHtml = '<div class="pod-health healthy">Healthy</div>';
+                healthClass = 'healthy';
+                healthLabel = 'Healthy';
             } else {
+                healthClass = 'degraded';
                 const stoppedNames = stoppedContainers.map(c => c.Names.replace(pod.Name + '-', '')).join(', ');
-                podHealthHtml = '<div class="pod-health degraded">Degraded: ' + escapeHtml(stoppedNames) + ' stopped</div>';
+                healthLabel = stoppedNames + ' down';
             }
             
             const shortName = pod.Name.replace('devaipod-', '');
@@ -998,7 +980,7 @@
                     <div class="pod-header" onclick="togglePodCard(this)">
                         <span class="pod-name">${shortName}</span>
                         <span class="expand-toggle">&#9660;</span>
-                        <span class="pod-status ${statusClass}">${status}</span>
+                        <span class="pod-status ${healthClass}">${healthLabel}</span>
                     </div>
                     <div class="pod-meta">
                         ${repo ? `<div class="pod-meta-item"><span class="pod-meta-label">Repo:</span> <span class="pod-meta-value">${repo}</span></div>` : ''}
@@ -1007,7 +989,6 @@
                         <div class="pod-meta-item"><span class="pod-meta-label">Created:</span> <span class="pod-meta-value">${formatDate(pod.Created)}</span></div>
                     </div>
                     ${agentStatusHtml}
-                    ${podHealthHtml ? `<div class="pod-containers">${podHealthHtml}</div>` : ''}
                     <div class="pod-actions">
                         ${actionsHtml}
                     </div>
