@@ -145,6 +145,9 @@ fn collect_config_devices(config: &DevcontainerConfig, devices: &mut Vec<String>
 /// Port for the opencode server in the agent container
 pub const OPENCODE_PORT: u16 = 4096;
 
+/// Port for the per-pod devaipod API sidecar.
+pub const POD_API_PORT: u16 = 8090;
+
 /// Port for the worker's opencode server (internal, no auth)
 pub const WORKER_OPENCODE_PORT: u16 = 4098;
 
@@ -218,6 +221,38 @@ pub const GATOR_PORT: u16 = 8765;
 /// Image for the service-gator container
 const GATOR_IMAGE: &str = "ghcr.io/cgwalters/service-gator:latest";
 
+/// Fallback image for the devaipod API sidecar container.
+// TODO: Derive this from the running control-plane container at runtime
+// (see detect_own_container_image() in main.rs for the pattern).
+const DEVAIPOD_IMAGE_FALLBACK: &str = "ghcr.io/cgwalters/devaipod:latest";
+
+/// Detect the image of the running devaipod control-plane container.
+///
+/// Returns the image name if we can detect it, otherwise falls back to
+/// `DEVAIPOD_IMAGE_FALLBACK`.
+fn detect_self_image() -> String {
+    // Only attempt detection when running inside the devaipod container
+    if std::env::var("DEVAIPOD_CONTAINER").as_deref() == Ok("1") {
+        if let Ok(output) = std::process::Command::new("podman")
+            .args(["inspect", "devaipod", "--format", "{{.ImageName}}"])
+            .output()
+        {
+            if output.status.success() {
+                let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !image.is_empty() {
+                    tracing::debug!("Detected devaipod self-image: {}", image);
+                    return image;
+                }
+            }
+        }
+        tracing::debug!(
+            "Could not detect own container image, falling back to {}",
+            DEVAIPOD_IMAGE_FALLBACK
+        );
+    }
+    DEVAIPOD_IMAGE_FALLBACK.to_string()
+}
+
 /// Label name for storing the current service-gator scopes as JSON
 /// Used for backwards compatibility with pre-inotify pods
 pub const GATOR_SCOPES_LABEL: &str = "io.devaipod.gator-scopes";
@@ -249,6 +284,9 @@ pub struct DevaipodPod {
     /// Name of the gator container (if enabled)
     #[allow(dead_code)] // Stored for future container management
     pub gator_container: Option<String>,
+    /// Name of the API sidecar container
+    #[allow(dead_code)] // Stored for future container management
+    pub api_container: Option<String>,
     /// Name of the worker container (if orchestration enabled)
     #[allow(dead_code)] // Stored for future container management
     pub worker_container: Option<String>,
@@ -490,7 +528,10 @@ impl DevaipodPod {
 
         // Publish the opencode port to a random host port.  We use 0.0.0.0 so the
         // devaipod control-plane container can reach agent pods via host.containers.internal.
-        let publish_ports = vec![format!("0.0.0.0::{}", OPENCODE_PORT)];
+        let publish_ports = vec![
+            format!("0.0.0.0::{}", OPENCODE_PORT),
+            format!("0.0.0.0::{}", POD_API_PORT),
+        ];
 
         podman
             .create_pod(pod_name, &labels, &publish_ports)
@@ -880,6 +921,19 @@ impl DevaipodPod {
             None
         };
 
+        // Create API sidecar container (devaipod pod-api)
+        let api_container_name = format!("{}-api", pod_name);
+        let self_image = detect_self_image();
+        let api_config =
+            Self::api_container_config(&agent_workspace_volume, &volume_name);
+        podman
+            .create_container(&api_container_name, &self_image, pod_name, api_config)
+            .await
+            .with_context(|| {
+                format!("Failed to create API sidecar container: {}", api_container_name)
+            })?;
+        let api_container = Some(api_container_name);
+
         // Create worker container if orchestration is enabled
         // Note: Worker volumes were already created and cloned above (before agent container creation)
         // to avoid Podman auto-creating empty volumes when the agent container is created.
@@ -922,6 +976,7 @@ impl DevaipodPod {
 
         let container_count = 2
             + if gator_container.is_some() { 1 } else { 0 }
+            + if api_container.is_some() { 1 } else { 0 }
             + if worker_container.is_some() { 1 } else { 0 };
         tracing::debug!(
             "Created pod '{}' with {} containers",
@@ -934,6 +989,7 @@ impl DevaipodPod {
             workspace_container,
             agent_container,
             gator_container,
+            api_container,
             worker_container,
             image,
             workspace_folder,
@@ -2457,6 +2513,52 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
         }
     }
 
+    /// Create container config for the devaipod API sidecar container.
+    ///
+    /// This container runs `devaipod pod-api` and provides git/PTY REST APIs
+    /// for the pod, accessible only within the pod via localhost.
+    fn api_container_config(
+        agent_workspace_volume: &str,
+        main_workspace_volume: &str,
+    ) -> ContainerConfig {
+        let mut env = std::collections::HashMap::new();
+        env.insert("HOME".to_string(), "/tmp".to_string());
+
+        let command = vec![
+            "devaipod".to_string(),
+            "pod-api".to_string(),
+            "--port".to_string(),
+            POD_API_PORT.to_string(),
+            "--workspace".to_string(),
+            "/workspaces".to_string(),
+        ];
+
+        ContainerConfig {
+            // Mount volumes:
+            // 1. Agent workspace at /workspaces — read-write because git fetch/push
+            //    need to update refs and objects.
+            // 2. Main workspace at /mnt/main-workspace — read-only for git alternates.
+            volume_mounts: vec![
+                (
+                    agent_workspace_volume.to_string(),
+                    "/workspaces".to_string(),
+                ),
+                (
+                    main_workspace_volume.to_string(),
+                    "/mnt/main-workspace:ro".to_string(),
+                ),
+            ],
+            env,
+            workdir: None,
+            user: None,
+            command: Some(command),
+            // Minimal privileges - no need for network binding since it's pod-internal
+            drop_all_caps: true,
+            no_new_privileges: true,
+            ..Default::default()
+        }
+    }
+
     /// Create container config for the worker container
     ///
     /// The worker runs `opencode serve` in a similar configuration to the agent (task owner),
@@ -3067,6 +3169,37 @@ mod tests {
             container_config.cap_add,
             vec!["NET_BIND_SERVICE".to_string()]
         );
+    }
+
+    #[test]
+    fn test_api_container_config() {
+        let agent_workspace_volume = "test-agent-workspace";
+        let main_workspace_volume = "test-main-workspace";
+        let container_config =
+            DevaipodPod::api_container_config(agent_workspace_volume, main_workspace_volume);
+
+        // Verify two volumes are mounted
+        assert_eq!(container_config.volume_mounts.len(), 2);
+        // Agent workspace at /workspaces — read-write for git fetch/push
+        assert_eq!(container_config.volume_mounts[0].0, "test-agent-workspace");
+        assert_eq!(container_config.volume_mounts[0].1, "/workspaces");
+        // Main workspace at /mnt/main-workspace (read-only for git alternates)
+        assert_eq!(container_config.volume_mounts[1].0, "test-main-workspace");
+        assert_eq!(
+            container_config.volume_mounts[1].1,
+            "/mnt/main-workspace:ro"
+        );
+
+        // Verify command runs pod-api
+        let cmd = container_config.command.as_ref().unwrap();
+        assert_eq!(cmd[0], "devaipod");
+        assert_eq!(cmd[1], "pod-api");
+        assert!(cmd.contains(&"--port".to_string()));
+        assert!(cmd.contains(&POD_API_PORT.to_string()));
+
+        // Verify security restrictions
+        assert!(container_config.drop_all_caps);
+        assert!(container_config.no_new_privileges);
     }
 
     #[test]
