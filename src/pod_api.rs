@@ -214,7 +214,7 @@ impl GitWatcher {
         let fetch_head = git_dir.join("FETCH_HEAD");
         if fetch_head.exists() {
             if let Err(e) = watcher.watch(&fetch_head, RecursiveMode::NonRecursive) {
-                tracing::debug!("FETCH_HEAD watch skipped (will retry): {e}");
+                tracing::debug!("FETCH_HEAD watch skipped (non-critical): {e}");
             }
         }
 

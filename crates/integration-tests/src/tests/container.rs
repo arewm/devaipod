@@ -265,6 +265,31 @@ fn test_readonly_api_git_log(fixture: &SharedFixture) -> Result<()> {
 }
 readonly_test!(test_readonly_api_git_log);
 
+/// Verify the pod-api /git/events SSE endpoint returns an initial git.updated event
+fn test_readonly_api_git_events(fixture: &SharedFixture) -> Result<()> {
+    let sh = shell()?;
+    let agent = fixture.agent_container();
+    // Use curl with --max-time to avoid hanging forever.
+    // The SSE endpoint should send an initial event immediately on connect.
+    // -N disables buffering so we get the event without waiting for the buffer to fill.
+    let output = cmd!(sh, "podman exec {agent} curl -sf -N --max-time 3 http://localhost:8090/git/events")
+        .ignore_status()  // curl returns exit code 28 on timeout, which is expected
+        .read()?;
+    // Should contain the initial git.updated event
+    assert!(
+        output.contains("git.updated"),
+        "SSE stream should contain initial git.updated event: {}",
+        output
+    );
+    assert!(
+        output.contains("head"),
+        "SSE event should contain head sha: {}",
+        output
+    );
+    Ok(())
+}
+readonly_test!(test_readonly_api_git_events);
+
 /// Verify we can query pod status via devaipod
 fn test_readonly_status_command(fixture: &SharedFixture) -> Result<()> {
     // Use short_name() for devaipod CLI commands
