@@ -710,6 +710,102 @@ async fn proxy_to_upstream(
     Ok(Response::from_parts(parts, body))
 }
 
+/// Get the published host port for the pod-api sidecar container.
+///
+/// The pod-api container listens on `POD_API_PORT` (8090) inside the pod.
+/// Since we publish that port when creating the pod, we can discover the
+/// host-mapped port by inspecting the infra container's port bindings —
+/// the same way we discover the opencode port.
+async fn get_pod_api_port(pod_name: &str) -> Result<u16, StatusCode> {
+    use bollard::Docker;
+
+    let socket_path = get_container_socket().map_err(|e| {
+        tracing::error!("Failed to get container socket: {}", e);
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let docker = Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to connect to container socket: {}", e);
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    // Inspect the agent container to find the published port mapping.
+    // All containers in the pod share the same network namespace, so port
+    // bindings appear on any container — we use the agent container since
+    // get_pod_opencode_info already does so.
+    let info = docker
+        .inspect_container(&format!("{pod_name}-agent"), None)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to inspect agent container for {pod_name}: {e}");
+            StatusCode::NOT_FOUND
+        })?;
+
+    let ports = info
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.ports.as_ref())
+        .ok_or_else(|| {
+            tracing::error!("No port mappings found for {pod_name}");
+            StatusCode::NOT_FOUND
+        })?;
+
+    let api_port = crate::pod::POD_API_PORT;
+    let port_key = format!("{api_port}/tcp");
+    let bindings = ports
+        .get(&port_key)
+        .and_then(|b| b.as_ref())
+        .ok_or_else(|| {
+            tracing::error!("Port {api_port} not published for {pod_name}");
+            StatusCode::NOT_FOUND
+        })?;
+
+    bindings
+        .first()
+        .and_then(|b| b.host_port.as_ref())
+        .and_then(|p| p.parse::<u16>().ok())
+        .ok_or_else(|| {
+            tracing::error!("Could not parse host port for pod-api of {pod_name}");
+            StatusCode::NOT_FOUND
+        })
+}
+
+/// Catch-all proxy handler for the per-pod API sidecar.
+///
+/// Routes `/api/devaipod/pods/{name}/pod-api/{*path}` to the pod-api container
+/// at `http://{host}:{published_port}/{path}`.
+async fn pod_api_proxy(
+    Path((name, path)): Path<(String, String)>,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    let pod_name = normalize_pod_name(&name);
+
+    let port = get_pod_api_port(&pod_name).await.map_err(|code| {
+        if code == StatusCode::NOT_FOUND {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            code
+        }
+    })?;
+
+    let host = host_for_pod_services();
+
+    tracing::debug!(
+        "Proxying to pod-api for pod {} on {}:{}, path: {}",
+        pod_name,
+        host,
+        port,
+        path
+    );
+
+    proxy_to_upstream(&host, port, path, request).await
+}
+
 /// Return a long-lived SSE stream that sends periodic keepalive comments.
 /// The opencode SDK (global-sdk) calls GET /global/event as a streaming SSE connection;
 /// if we close the response immediately the SDK reconnects in a tight loop, flooding the
@@ -2688,6 +2784,13 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         .route("/devaipod/pods/{name}/git/diff-range", get(git_diff_range))
         .route("/devaipod/pods/{name}/git/fetch-agent", post(git_fetch_agent))
         .route("/devaipod/pods/{name}/git/push", post(git_push))
+        .route(
+            "/devaipod/pods/{name}/pod-api/{*path}",
+            get(pod_api_proxy)
+                .post(pod_api_proxy)
+                .put(pod_api_proxy)
+                .delete(pod_api_proxy),
+        )
         .route("/devaipod/run", post(run_workspace))
         .route("/devaipod/launches", get(list_launches))
         .route(
