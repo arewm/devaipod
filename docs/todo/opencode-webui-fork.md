@@ -371,18 +371,31 @@ frontend for live diff updates.
 - [ ] Debug "expand" button in diff view (likely DiffComponentProvider
       context or shadow DOM event propagation issue)
 
-### Phase 2.5: Workspace and agent terminals — partially done
+### Phase 2.5: Workspace and agent terminals — mostly done
 
 The opencode SPA's terminal connects to the agent container's opencode
 PTY. We added a parallel workspace terminal that connects to the devaipod
-control plane's PTY API (`/api/devaipod/pods/{name}/pty/*`), reusing the
-same `Terminal` component with custom WebSocket URL and resize handler.
+PTY API (`/api/devaipod/pods/{name}/pty/*`), reusing the same `Terminal`
+component with custom WebSocket URL and resize handler.
+
+The PTY backend was originally in `web_terminal.rs` using bollard's Docker
+exec API (~200-500ms overhead per call). This has been replaced with direct
+PTY spawning in the pod-api sidecar (`pod_api.rs`): the sidecar allocates
+a real PTY via `rustix::pty`, spawns the child process directly, and
+streams I/O over WebSocket. The control plane proxies PTY requests to the
+pod-api sidecar, same as git endpoints. `web_terminal.rs` has been deleted.
 
 - [x] Add optional `wsUrl` and `onPtyResize` props to `Terminal` component
 - [x] Create `context/workspace-terminal.tsx` (devaipod PTY API client)
 - [x] Add Agent/Workspace type selector toggle to terminal panel
 - [x] Wire into session.tsx (conditional on `isDevaipod()`)
 - [x] Disable opencode's built-in git snapshotting (`"snapshot": false`)
+- [x] Implement direct PTY in pod-api sidecar (replaces exec-based
+      `web_terminal.rs`): `rustix::pty` allocation, `AsyncFd` I/O,
+      session management with ring buffer, WebSocket handler
+- [x] Proxy PTY requests from control plane to pod-api sidecar
+- [x] Delete `web_terminal.rs` and remove `PtySessionManager` from
+      control plane `AppState`
 - [ ] Verify workspace terminal works end-to-end in deployed container
 - [ ] Rename existing terminal label to "Agent Terminal" in devaipod mode
       (currently only the tab label supports `kind` prefix but it's not

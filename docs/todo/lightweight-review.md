@@ -177,21 +177,28 @@ inline comment system from `@opencode-ai/ui`.
 
 ### What's done
 
-**Backend (all in `src/web.rs`):**
+**Backend (pod-api sidecar in `src/pod_api.rs`, proxied via `src/web.rs`):**
 
-- `GET /git/log` — structured commit log with `base`/`head` range params,
-  defaults to `agent/HEAD`. Uses NUL/RS-delimited `git log` format. (line ~2054)
+All git and PTY endpoints now run in the pod-api sidecar container, which
+mounts the agent's workspace volume directly. Commands run as local
+`tokio::process::Command` calls — no exec-into-container overhead. The
+control plane proxies requests to the sidecar. Legacy exec-based git
+endpoints remain in `web.rs` but are no longer the primary path.
+
+- `GET /git/log` — structured commit log with `base`/`head` range params.
+  Uses NUL/RS-delimited `git log` format.
 - `GET /git/diff-range` — per-file diffs with before/after content via
-  `git show`, concurrent file fetching, max 100 files. (line ~2216)
-- `POST /git/fetch-agent` — runs `git fetch agent` in the workspace
-  container. (line ~2431)
-- `POST /git/push` — runs `git push origin <branch>` in the workspace
-  container. (line ~2476)
-- `exec_in_container()` helper for running commands in workspace via
-  bollard. (line ~2517)
-- Input validation (`is_valid_git_ref`) to block shell injection. (line ~2040)
+  `git show`, concurrent file fetching, max 100 files.
+- `POST /git/fetch-agent` — runs `git fetch agent` directly.
+- `POST /git/push` — runs `git push origin <branch>` directly.
+- `GET /git/events` — inotify-based SSE stream of git ref changes
+  (debounced, pushes `git.updated` events to frontend).
+- Input validation (`is_valid_git_ref`) to block shell injection.
 - Older/simpler endpoints: `GET /git/status`, `GET /git/diff`,
-  `GET /git/commits` (lines ~1957-2037).
+  `GET /git/commits`.
+- PTY endpoints (`GET/POST /pty`, `GET/PUT/DELETE /pty/{id}`,
+  `GET /pty/{id}/connect`) — direct PTY spawning via `rustix::pty`
+  with `AsyncFd` I/O. Replaces the exec-based `web_terminal.rs`.
 - Git remote setup during pod creation (`src/pod.rs` `setup_git_remotes()`)
   configures bidirectional `agent`/`workspace` remotes between containers,
   using read-only volume mounts — no network needed for fetch.
@@ -230,7 +237,8 @@ inline comment system from `@opencode-ai/ui`.
 
 ### Implementation path forward
 
-The backend endpoints are complete for the core read path. The immediate
+The backend endpoints are complete for the core read path (git + PTY),
+all running in the pod-api sidecar with no exec overhead. The immediate
 next steps are frontend: add a fetch button and a push button to the
 `GitReviewTab`, then decide whether review state tracking is needed
 before we can ship a usable flow.

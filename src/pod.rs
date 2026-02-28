@@ -924,8 +924,14 @@ impl DevaipodPod {
         // Create API sidecar container (devaipod pod-api)
         let api_container_name = format!("{}-api", pod_name);
         let self_image = detect_self_image();
-        let api_config =
-            Self::api_container_config(&agent_workspace_volume, &volume_name);
+        let socket_path = crate::podman::get_container_socket()
+            .context("Cannot create API sidecar without podman socket")?;
+        let api_config = Self::api_container_config(
+            &agent_workspace_volume,
+            &volume_name,
+            &workspace_container,
+            &socket_path,
+        );
         podman
             .create_container(&api_container_name, &self_image, pod_name, api_config)
             .await
@@ -2517,10 +2523,18 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
     ///
     /// This container runs `devaipod pod-api` and provides git/PTY REST APIs
     /// for the pod, accessible only within the pod via localhost.
+    ///
+    /// The podman socket is bind-mounted so the sidecar can exec into the
+    /// workspace container for PTY sessions (giving users a shell with the
+    /// devcontainer's full tool set, not just the minimal devaipod image).
     fn api_container_config(
         agent_workspace_volume: &str,
         main_workspace_volume: &str,
+        workspace_container_name: &str,
+        socket_path: &std::path::Path,
     ) -> ContainerConfig {
+        use crate::podman::MountConfig;
+
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), "/tmp".to_string());
 
@@ -2531,10 +2545,23 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             POD_API_PORT.to_string(),
             "--workspace".to_string(),
             "/workspaces".to_string(),
+            "--workspace-container".to_string(),
+            workspace_container_name.to_string(),
         ];
 
+        // Bind-mount the podman socket so we can exec into the workspace
+        // container for PTY sessions.
+        let socket_str = socket_path.to_string_lossy();
+        let socket_mount = MountConfig {
+            source: socket_str.to_string(),
+            target: "/run/podman/podman.sock".to_string(),
+            readonly: false,
+        };
+
         ContainerConfig {
-            // Mount volumes:
+            // Bind mount: podman socket for exec-into-workspace PTY.
+            mounts: vec![socket_mount],
+            // Named volumes:
             // 1. Agent workspace at /workspaces — read-write because git fetch/push
             //    need to update refs and objects.
             // 2. Main workspace at /mnt/main-workspace — read-only for git alternates.
@@ -2552,9 +2579,14 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             workdir: None,
             user: None,
             command: Some(command),
-            // Minimal privileges - no need for network binding since it's pod-internal
+            // Minimal privileges — drop all capabilities since the only
+            // privileged operation is connecting to the podman socket
+            // (file-permission-based, not capability-based).
             drop_all_caps: true,
             no_new_privileges: true,
+            // Disable SELinux labeling so we can access the bind-mounted
+            // podman socket (which has the host's SELinux context).
+            security_opts: vec!["label=disable".to_string()],
             ..Default::default()
         }
     }
@@ -3175,10 +3207,16 @@ mod tests {
     fn test_api_container_config() {
         let agent_workspace_volume = "test-agent-workspace";
         let main_workspace_volume = "test-main-workspace";
-        let container_config =
-            DevaipodPod::api_container_config(agent_workspace_volume, main_workspace_volume);
+        let workspace_container = "devaipod-test-workspace";
+        let socket_path = std::path::Path::new("/run/podman/podman.sock");
+        let container_config = DevaipodPod::api_container_config(
+            agent_workspace_volume,
+            main_workspace_volume,
+            workspace_container,
+            socket_path,
+        );
 
-        // Verify two volumes are mounted
+        // Verify two named volumes are mounted
         assert_eq!(container_config.volume_mounts.len(), 2);
         // Agent workspace at /workspaces — read-write for git fetch/push
         assert_eq!(container_config.volume_mounts[0].0, "test-agent-workspace");
@@ -3190,12 +3228,18 @@ mod tests {
             "/mnt/main-workspace:ro"
         );
 
-        // Verify command runs pod-api
+        // Verify podman socket bind mount
+        assert_eq!(container_config.mounts.len(), 1);
+        assert_eq!(container_config.mounts[0].target, "/run/podman/podman.sock");
+
+        // Verify command runs pod-api with workspace container name
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "devaipod");
         assert_eq!(cmd[1], "pod-api");
         assert!(cmd.contains(&"--port".to_string()));
         assert!(cmd.contains(&POD_API_PORT.to_string()));
+        assert!(cmd.contains(&"--workspace-container".to_string()));
+        assert!(cmd.contains(&workspace_container.to_string()));
 
         // Verify security restrictions
         assert!(container_config.drop_all_caps);

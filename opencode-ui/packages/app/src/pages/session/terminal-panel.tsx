@@ -164,6 +164,11 @@ export function TerminalPanel(props: {
     const wt = props.workspaceTerminal!
     const wsAll = createMemo(() => wt.all())
 
+    // Auto-create the first workspace terminal when none exist.
+    if (wsAll().length === 0) {
+      wt.new()
+    }
+
     return (
       <div class="flex flex-col h-full">
         <div class="h-10 flex items-center gap-1 border-b border-border-weak-base bg-background-stronger overflow-x-auto">

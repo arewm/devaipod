@@ -5,22 +5,27 @@
 //! operations. All git commands run as direct `tokio::process::Command` calls
 //! against the local filesystem, eliminating the ~200-500ms per-exec overhead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Query, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
+use bollard::Docker;
 use color_eyre::eyre::{Context, Result};
-use futures_util::Stream;
+use futures_util::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -33,6 +38,10 @@ struct AppState {
     workspace: Arc<PathBuf>,
     /// Broadcast sender for git filesystem change events.
     git_events_tx: broadcast::Sender<GitEvent>,
+    /// PTY session manager.
+    pty_sessions: PtySessionManager,
+    /// Name of the workspace container to exec into for PTY sessions.
+    workspace_container: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -803,19 +812,550 @@ async fn git_push(
 }
 
 // ---------------------------------------------------------------------------
-// PTY stubs (to be implemented in a follow-up)
+// PTY data structures and session management
 // ---------------------------------------------------------------------------
 
-async fn pty_create() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+/// Maximum size of the output ring buffer per session (2 MB).
+const MAX_RING_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+
+/// Capacity of the broadcast channel per session.
+const BROADCAST_CAPACITY: usize = 256;
+
+/// How long to keep exited sessions before cleanup (5 minutes).
+const EXITED_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// PTY session info returned by most endpoints.
+#[derive(Debug, Serialize, Clone)]
+struct PtyInfo {
+    id: String,
+    title: String,
+    command: String,
+    args: Vec<String>,
+    cwd: String,
+    status: String,
+    pid: Option<u64>,
 }
 
-async fn pty_resize() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+/// Request body for `POST /pty`.
+#[derive(Debug, Deserialize)]
+struct PtyCreateInput {
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    cwd: Option<String>,
+    title: Option<String>,
+    env: Option<HashMap<String, String>>,
 }
 
-async fn pty_websocket() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+/// Request body for `PUT /pty/{pty_id}`.
+#[derive(Debug, Deserialize)]
+struct PtyUpdateInput {
+    title: Option<String>,
+    size: Option<PtySize>,
+}
+
+/// Terminal dimensions.
+#[derive(Debug, Deserialize)]
+struct PtySize {
+    rows: u16,
+    cols: u16,
+}
+
+/// Query parameters for the WebSocket connect endpoint.
+#[derive(Debug, Deserialize)]
+struct ConnectQuery {
+    cursor: Option<u64>,
+}
+
+/// Mutable output state for a single PTY session, behind its own lock so that
+/// the output reader task does not require a write lock on the global sessions map.
+struct SessionOutput {
+    /// Ring buffer of output bytes (VecDeque for O(1) front drain).
+    ring_buffer: VecDeque<u8>,
+    /// Total bytes written since session start (monotonically increasing cursor).
+    cursor: u64,
+    /// Session status: "running" or "exited".
+    status: String,
+    /// When the session exited (for cleanup TTL). `None` while running.
+    exited_at: Option<std::time::Instant>,
+}
+
+/// Internal state for a single PTY session.
+struct PtySession {
+    /// Metadata returned via the REST API.
+    info: PtyInfo,
+    /// The bollard exec ID for resize operations.
+    exec_id: String,
+    /// Per-session mutable output state (ring buffer, cursor, status).
+    output: Arc<tokio::sync::Mutex<SessionOutput>>,
+    /// Broadcast channel sender for streaming output to WebSocket clients.
+    output_tx: broadcast::Sender<(Vec<u8>, u64)>,
+    /// Sender half of the channel used to forward WebSocket input to PTY stdin.
+    /// `None` once the child process has exited or stdin is closed.
+    stdin_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+}
+
+impl PtySession {
+    /// Return a snapshot of the session info with the current status.
+    async fn info(&self) -> PtyInfo {
+        let output = self.output.lock().await;
+        let mut info = self.info.clone();
+        info.status = output.status.clone();
+        info
+    }
+}
+
+/// Manages PTY sessions. Internally wraps an `Arc` so it is cheap to clone.
+#[derive(Clone)]
+struct PtySessionManager {
+    sessions: Arc<RwLock<HashMap<String, PtySession>>>,
+}
+
+impl PtySessionManager {
+    fn new() -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+/// Generate a short random session ID like `pty_a1b2c3d4e5f6`.
+fn generate_pty_id() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let suffix: u64 = rng.random::<u64>() & 0xFFFF_FFFF_FFFF;
+    format!("pty_{suffix:x}")
+}
+
+/// Remove sessions that have been in "exited" state for longer than `EXITED_SESSION_TTL`.
+async fn cleanup_stale_pty_sessions(sessions: &mut HashMap<String, PtySession>) {
+    let now = std::time::Instant::now();
+    let mut to_remove = Vec::new();
+    for (id, session) in sessions.iter() {
+        let output = session.output.lock().await;
+        if let Some(exited_at) = output.exited_at {
+            if now.duration_since(exited_at) > EXITED_SESSION_TTL {
+                to_remove.push(id.clone());
+            }
+        }
+    }
+    for id in &to_remove {
+        sessions.remove(id);
+    }
+    if !to_remove.is_empty() {
+        tracing::info!("Cleaned up {} stale exited PTY sessions", to_remove.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Docker/Podman connection helper
+// ---------------------------------------------------------------------------
+
+/// Connect to the container runtime socket (podman or docker).
+fn connect_docker() -> std::result::Result<Docker, StatusCode> {
+    let socket_path = crate::podman::get_container_socket().map_err(|e| {
+        tracing::error!("No container socket: {}", e);
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to connect to container socket: {}", e);
+        StatusCode::SERVICE_UNAVAILABLE
+    })
+}
+
+// ---------------------------------------------------------------------------
+// PTY handlers
+// ---------------------------------------------------------------------------
+
+/// `GET /pty` — list all sessions.
+async fn pty_list(State(state): State<AppState>) -> Json<Vec<PtyInfo>> {
+    let sessions = state.pty_sessions.sessions.read().await;
+    let mut infos = Vec::with_capacity(sessions.len());
+    for s in sessions.values() {
+        infos.push(s.info().await);
+    }
+    Json(infos)
+}
+
+/// `POST /pty` — create a new PTY session via bollard exec into the workspace container.
+async fn pty_create(
+    State(state): State<AppState>,
+    Json(input): Json<PtyCreateInput>,
+) -> Result<(StatusCode, Json<PtyInfo>), (StatusCode, String)> {
+    let command = input.command.unwrap_or_else(|| "/bin/bash".to_string());
+    let args = input.args.unwrap_or_default();
+    let cwd = input.cwd.unwrap_or_else(|| state.workspace.to_string_lossy().into_owned());
+    let title = input.title.unwrap_or_else(|| {
+        let full = format!("{} {}", command, args.join(" "));
+        full.trim().to_string()
+    });
+    let env = input.env.unwrap_or_default();
+
+    if state.workspace_container.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No workspace container configured (--workspace-container)".to_string(),
+        ));
+    }
+
+    let docker = connect_docker().map_err(|sc| (sc, "Failed to connect to container runtime".to_string()))?;
+
+    // Build the command vector for exec.
+    let mut cmd: Vec<String> = vec![command.clone()];
+    cmd.extend(args.clone());
+
+    // Build environment variables list.
+    let mut env_vec: Vec<String> = vec![
+        "TERM=xterm-256color".to_string(),
+        "COLORTERM=truecolor".to_string(),
+    ];
+    for (k, v) in &env {
+        env_vec.push(format!("{k}={v}"));
+    }
+
+    let exec = docker
+        .create_exec(
+            &state.workspace_container,
+            CreateExecOptions {
+                cmd: Some(cmd),
+                attach_stdin: Some(true),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                tty: Some(true),
+                working_dir: Some(cwd.clone()),
+                env: Some(env_vec),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to create exec: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create exec: {e}"))
+        })?;
+
+    let exec_id = exec.id.clone();
+
+    let start_result = docker
+        .start_exec(
+            &exec.id,
+            Some(bollard::exec::StartExecOptions {
+                detach: false,
+                tty: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to start exec: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start exec: {e}"))
+        })?;
+
+    let session_id = generate_pty_id();
+    let (output_tx, _) = broadcast::channel::<(Vec<u8>, u64)>(BROADCAST_CAPACITY);
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    let info = PtyInfo {
+        id: session_id.clone(),
+        title,
+        command,
+        args,
+        cwd,
+        status: "running".to_string(),
+        pid: None,
+    };
+
+    let session_output = Arc::new(tokio::sync::Mutex::new(SessionOutput {
+        ring_buffer: VecDeque::new(),
+        cursor: 0,
+        status: "running".to_string(),
+        exited_at: None,
+    }));
+
+    let session = PtySession {
+        info: info.clone(),
+        exec_id: exec_id.clone(),
+        output: session_output.clone(),
+        output_tx: output_tx.clone(),
+        stdin_tx: Some(stdin_tx),
+    };
+
+    {
+        let mut sessions = state.pty_sessions.sessions.write().await;
+        cleanup_stale_pty_sessions(&mut sessions).await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    match start_result {
+        StartExecResults::Attached { mut output, mut input } => {
+            // Spawn stdin writer: forward bytes from the mpsc channel to exec stdin.
+            tokio::spawn(async move {
+                while let Some(data) = stdin_rx.recv().await {
+                    if input.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // Spawn output reader: read from exec output and distribute to ring buffer + broadcast.
+            let sid = session_id.clone();
+            let tx = output_tx;
+            let so = session_output;
+            tokio::spawn(async move {
+                while let Some(chunk) = output.next().await {
+                    let bytes = match &chunk {
+                        Ok(bollard::container::LogOutput::StdOut { message }) => message.to_vec(),
+                        Ok(bollard::container::LogOutput::StdErr { message }) => message.to_vec(),
+                        Ok(bollard::container::LogOutput::Console { message }) => message.to_vec(),
+                        Ok(_) => continue,
+                        Err(e) => {
+                            tracing::debug!("Exec output stream ended for {sid}: {e}");
+                            break;
+                        }
+                    };
+                    if bytes.is_empty() {
+                        continue;
+                    }
+
+                    let mut out = so.lock().await;
+                    out.ring_buffer.extend(bytes.iter());
+                    out.cursor += bytes.len() as u64;
+
+                    if out.ring_buffer.len() > MAX_RING_BUFFER_BYTES {
+                        let overflow = out.ring_buffer.len() - MAX_RING_BUFFER_BYTES;
+                        out.ring_buffer.drain(..overflow);
+                    }
+
+                    let _ = tx.send((bytes, out.cursor));
+                }
+
+                let mut out = so.lock().await;
+                out.status = "exited".to_string();
+                out.exited_at = Some(std::time::Instant::now());
+                tracing::info!("PTY session {sid} exited");
+            });
+        }
+        StartExecResults::Detached => {
+            // Remove the session we just inserted — detached exec is unusable for PTY.
+            let mut sessions = state.pty_sessions.sessions.write().await;
+            sessions.remove(&session_id);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Exec started in detached mode unexpectedly".to_string(),
+            ));
+        }
+    }
+
+    Ok((StatusCode::CREATED, Json(info)))
+}
+
+/// `GET /pty/{pty_id}` — get session info.
+async fn pty_get(
+    Path(pty_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<PtyInfo>, StatusCode> {
+    let sessions = state.pty_sessions.sessions.read().await;
+    let session = sessions.get(&pty_id).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(session.info().await))
+}
+
+/// `PUT /pty/{pty_id}` — update session (resize and/or rename).
+async fn pty_update(
+    Path(pty_id): Path<String>,
+    State(state): State<AppState>,
+    Json(input): Json<PtyUpdateInput>,
+) -> Result<Json<PtyInfo>, (StatusCode, String)> {
+    // Read the exec_id under a read lock (no need to hold a write lock for resize).
+    let exec_id = {
+        let sessions = state.pty_sessions.sessions.read().await;
+        let session = sessions.get(&pty_id).ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
+        session.exec_id.clone()
+    };
+
+    // Perform the resize outside the lock — it's an async network call.
+    if let Some(size) = &input.size {
+        let docker = connect_docker().map_err(|sc| (sc, "Failed to connect to container runtime".to_string()))?;
+        docker
+            .resize_exec(
+                &exec_id,
+                ResizeExecOptions {
+                    height: size.rows,
+                    width: size.cols,
+                },
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to resize exec {pty_id}: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resize: {e}"))
+            })?;
+    }
+
+    // Update title under write lock.
+    if let Some(title) = input.title {
+        let mut sessions = state.pty_sessions.sessions.write().await;
+        if let Some(session) = sessions.get_mut(&pty_id) {
+            session.info.title = title;
+        }
+    }
+
+    // Return current info.
+    let sessions = state.pty_sessions.sessions.read().await;
+    let session = sessions.get(&pty_id).ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
+    Ok(Json(session.info().await))
+}
+
+/// `DELETE /pty/{pty_id}` — remove session and clean up.
+///
+/// Dropping the session closes the broadcast channel and stdin sender, which
+/// shuts down the background tasks. The exec process will be cleaned up by
+/// the container runtime.
+async fn pty_delete(
+    Path(pty_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, StatusCode> {
+    let mut sessions = state.pty_sessions.sessions.write().await;
+    let _session = sessions.remove(&pty_id).ok_or(StatusCode::NOT_FOUND)?;
+    tracing::info!("Deleted PTY session {pty_id}");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /pty/{pty_id}/connect` — WebSocket upgrade.
+async fn pty_connect(
+    Path(pty_id): Path<String>,
+    Query(query): Query<ConnectQuery>,
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, StatusCode> {
+    let sessions = state.pty_sessions.sessions.read().await;
+    let session = sessions.get(&pty_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    let replay_cursor = query.cursor.unwrap_or(0);
+    let output_rx = session.output_tx.subscribe();
+    let stdin_tx = session.stdin_tx.clone();
+
+    // Compute replay bytes under the per-session output lock.
+    let out = session.output.lock().await;
+    let current_cursor = out.cursor;
+    let replay_bytes = if replay_cursor < current_cursor {
+        let buffer_start_cursor = current_cursor - out.ring_buffer.len() as u64;
+        let effective_start = replay_cursor.max(buffer_start_cursor);
+        let offset = (effective_start - buffer_start_cursor) as usize;
+        let (front, back) = out.ring_buffer.as_slices();
+        let mut replay = Vec::with_capacity(out.ring_buffer.len() - offset);
+        if offset < front.len() {
+            replay.extend_from_slice(&front[offset..]);
+            replay.extend_from_slice(back);
+        } else {
+            replay.extend_from_slice(&back[offset - front.len()..]);
+        }
+        Some(replay)
+    } else {
+        None
+    };
+    drop(out);
+    drop(sessions);
+
+    let pty_id_owned = pty_id.clone();
+    Ok(ws.on_upgrade(move |socket| {
+        handle_ws(
+            socket,
+            pty_id_owned,
+            replay_bytes,
+            current_cursor,
+            output_rx,
+            stdin_tx,
+        )
+    }))
+}
+
+/// Handle an upgraded WebSocket connection for a PTY session.
+async fn handle_ws(
+    socket: WebSocket,
+    pty_id: String,
+    replay_bytes: Option<Vec<u8>>,
+    mut cursor: u64,
+    mut output_rx: broadcast::Receiver<(Vec<u8>, u64)>,
+    stdin_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Send initial meta frame: [0x00] + JSON {"cursor": <u64>}
+    let meta = serde_json::json!({"cursor": cursor});
+    let mut meta_bytes = vec![0x00u8];
+    meta_bytes.extend_from_slice(meta.to_string().as_bytes());
+    if ws_tx.send(Message::Binary(meta_bytes.into())).await.is_err() {
+        return;
+    }
+
+    // Replay buffered output from the requested cursor.
+    if let Some(replay) = replay_bytes {
+        if !replay.is_empty()
+            && ws_tx
+                .send(Message::Text(
+                    String::from_utf8_lossy(&replay).into_owned().into(),
+                ))
+                .await
+                .is_err()
+        {
+            return;
+        }
+    }
+
+    // Bridge: PTY output → WebSocket, WebSocket input → PTY stdin.
+    loop {
+        tokio::select! {
+            result = output_rx.recv() => {
+                match result {
+                    Ok((data, new_cursor)) => {
+                        cursor = new_cursor;
+                        if ws_tx.send(Message::Text(
+                            String::from_utf8_lossy(&data).into_owned().into()
+                        )).await.is_err() {
+                            break;
+                        }
+                        // Send updated meta frame.
+                        let meta = serde_json::json!({"cursor": cursor});
+                        let mut meta_bytes = vec![0x00u8];
+                        meta_bytes.extend_from_slice(meta.to_string().as_bytes());
+                        if ws_tx.send(Message::Binary(meta_bytes.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("WebSocket client for {pty_id} lagged {n} messages");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(ref tx) = stdin_tx {
+                            let _ = tx.send(text.as_bytes().to_vec()).await;
+                        }
+                    }
+                    Some(Ok(Message::Binary(data))) => {
+                        if let Some(ref tx) = stdin_tx {
+                            let _ = tx.send(data.to_vec()).await;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        tracing::debug!("WebSocket error for {pty_id}: {e}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    tracing::debug!("WebSocket client disconnected from {pty_id}");
 }
 
 // ---------------------------------------------------------------------------
@@ -831,6 +1371,9 @@ pub(crate) struct PodApiArgs {
     /// Path to the workspace directory
     #[arg(long, default_value = "/workspaces")]
     workspace: PathBuf,
+    /// Name of the workspace container to exec into for PTY sessions.
+    #[arg(long)]
+    workspace_container: Option<String>,
 }
 
 /// Build the axum router (public for testing).
@@ -845,10 +1388,10 @@ fn build_router(state: AppState) -> Router {
         .route("/git/events", get(git_events_sse))
         .route("/git/fetch-agent", post(git_fetch_agent))
         .route("/git/push", post(git_push))
-        // PTY stubs
-        .route("/pty/create", post(pty_create))
-        .route("/pty/resize", post(pty_resize))
-        .route("/pty/ws", get(pty_websocket))
+        // PTY endpoints
+        .route("/pty", get(pty_list).post(pty_create))
+        .route("/pty/{pty_id}", get(pty_get).put(pty_update).delete(pty_delete))
+        .route("/pty/{pty_id}/connect", get(pty_connect))
         .with_state(state)
 }
 
@@ -860,6 +1403,8 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
     let state = AppState {
         workspace,
         git_events_tx,
+        pty_sessions: PtySessionManager::new(),
+        workspace_container: args.workspace_container.unwrap_or_default(),
     };
 
     let app = build_router(state);

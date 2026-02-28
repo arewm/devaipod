@@ -162,8 +162,6 @@ pub(crate) struct AppState {
     socket_path: Option<PathBuf>,
     /// Path to control-plane static files (e.g. dist/index.html)
     static_dir: String,
-    /// PTY session manager for web terminal access
-    pub(crate) pty_sessions: crate::web_terminal::PtySessionManager,
     /// Background launch states so the UI can track in-flight launches.
     launches: LaunchMap,
 }
@@ -803,6 +801,41 @@ async fn pod_api_proxy(
     );
 
     proxy_to_upstream(&host, port, path, request).await
+}
+
+/// Helper: proxy a request to a pod's pod-api sidecar at the given path.
+async fn proxy_to_pod_api(
+    name: &str,
+    upstream_path: String,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    let pod_name = normalize_pod_name(name);
+    let port = get_pod_api_port(&pod_name).await.map_err(|code| {
+        if code == StatusCode::NOT_FOUND {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            code
+        }
+    })?;
+    let host = host_for_pod_services();
+    proxy_to_upstream(&host, port, upstream_path, request).await
+}
+
+/// Proxy PTY root requests (`GET /pty`, `POST /pty`) to the pod-api sidecar.
+async fn pty_pod_api_proxy_root(
+    Path(name): Path<String>,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    proxy_to_pod_api(&name, "pty".to_string(), request).await
+}
+
+/// Proxy PTY sub-path requests (`GET/PUT/DELETE /pty/{id}`, `GET /pty/{id}/connect`)
+/// to the pod-api sidecar.
+async fn pty_pod_api_proxy(
+    Path((name, rest)): Path<(String, String)>,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    proxy_to_pod_api(&name, format!("pty/{rest}"), request).await
 }
 
 /// Return a long-lived SSE stream that sends periodic keepalive comments.
@@ -2747,7 +2780,6 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         token: token.clone(),
         socket_path,
         static_dir: static_dir.to_string(),
-        pty_sessions: crate::web_terminal::PtySessionManager::new(),
         launches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
@@ -2801,9 +2833,16 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         .route("/devaipod/proposals", get(list_proposals_api))
         .route("/devaipod/proposals/{id}/dismiss", post(dismiss_proposal))
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
-        .nest(
+        // PTY: proxy to the pod-api sidecar (direct PTY, no exec overhead)
+        .route(
             "/devaipod/pods/{name}/pty",
-            crate::web_terminal::pty_router(),
+            get(pty_pod_api_proxy_root).post(pty_pod_api_proxy_root),
+        )
+        .route(
+            "/devaipod/pods/{name}/pty/{*rest}",
+            get(pty_pod_api_proxy)
+                .put(pty_pod_api_proxy)
+                .delete(pty_pod_api_proxy),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

@@ -917,7 +917,6 @@
                     throw new Error(msg);
                 }
                 await refreshPods({force: true});
-                alert('Workspace recreated successfully.');
             } catch (err) {
                 alert(`Recreate failed: ${err.message}`);
             }
