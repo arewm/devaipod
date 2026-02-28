@@ -193,8 +193,13 @@ test-integration image=default_test_image: container-build build-integration
         VOL_MOUNT="-v /run/podman/podman.sock:/run/podman/podman.sock"
     fi
     echo "Running integration tests (image: {{ CONTAINER_IMAGE }}-integration:latest)..."
+    # Share /tmp so test-created repos are visible to podman for bind-mounts.
+    # devaipod's init container bind-mounts <repo>/.git into workspace pods;
+    # tests create repos under /tmp, so the paths must resolve identically
+    # from both the runner and the podman service.
     podman run --rm --privileged \
         $VOL_MOUNT \
+        -v /tmp:/tmp \
         -v "$CONFIG":/root/.config/devaipod.toml:ro \
         -e DEVAIPOD_TEST_IMAGE={{image}} \
         -e DEVAIPOD_CONTAINER_IMAGE={{ CONTAINER_IMAGE }}:latest \

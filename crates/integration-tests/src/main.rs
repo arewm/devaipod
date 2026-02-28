@@ -411,56 +411,6 @@ fn main() {
             .collect()
     };
 
-    // Tests that spawn pods or start inner containers. These fail in the
-    // containerized runner because temp paths inside the runner are not
-    // visible to sibling containers via the shared podman socket.
-    // TODO: Fix by using a shared volume or running on Linux where paths align.
-    const CONTAINER_IGNORED_TESTS: &[&str] = &[
-        // container.rs - all spawn pods from local temp repos
-        "test_pod_creation_and_deletion",
-        "test_workspace_container_has_repo",
-        "test_stop_and_start_pod",
-        "test_image_override_creates_pod",
-        "test_logs_command",
-        "test_exec_runs_command",
-        "test_pod_has_api_credentials",
-        "test_api_authentication_works",
-        "test_lifecycle_commands_run_in_both_containers",
-        "test_init_script_configures_both_containers",
-        "test_agent_has_separate_workspace",
-        "test_agent_cannot_write_to_main_workspace",
-        "test_agent_workspace_shares_git_objects",
-        "test_gator_can_access_agent_workspace",
-        "test_gator_can_resolve_git_alternates",
-        "test_gator_scopes_configuration",
-        "test_gator_mcp_api_accessible",
-        // orchestration.rs
-        "test_pod_no_worker_by_default",
-        // advisor.rs - spawn pods from local temp repos
-        "test_advisor_launch_with_image",
-        "test_advisor_launch_remote_with_image",
-        // ssh.rs - all need running pods
-        "test_ssh_config_created_on_pod_up",
-        "test_ssh_config_removed_on_pod_delete",
-        "test_ssh_server_starts_on_exec_stdio",
-        "test_ssh_client_connectivity",
-        "test_ssh_config_command",
-        "test_exec_stdio_multiple_commands",
-        "test_exec_stdio_agent_container",
-        // webui.rs - start inner devaipod container with temp config mounts
-        "test_web_container_starts",
-        "test_web_agent_ui_index_rewrites_asset_urls",
-        "test_web_ui_root_with_token",
-        "test_web_ui_run_endpoint",
-        "test_web_container_auth",
-        "test_web_container_pod_list",
-        "test_web_container_opencode_info_endpoint",
-        "test_web_container_opencode_connectivity",
-        "test_auth_proxy_cookie_persistence",
-        "test_auth_proxy_wrong_password_returns_401_with_www_authenticate",
-        "test_auth_proxy_api_request_without_auth",
-    ];
-
     // Collect mutating tests from the distributed slice
     let mutating_tests: Vec<Trial> = INTEGRATION_TESTS
         .iter()
@@ -473,11 +423,6 @@ fn main() {
 
             // Mark podman tests as ignored if podman is not available
             if requires_podman && !has_podman {
-                trial = trial.with_ignored_flag(true);
-            }
-
-            // Mark tests that need host path visibility as ignored in container
-            if CONTAINER_IGNORED_TESTS.contains(&name) {
                 trial = trial.with_ignored_flag(true);
             }
 
