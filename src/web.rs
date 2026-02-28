@@ -439,7 +439,7 @@ async fn opencode_info(
 ) -> Result<Json<OpencodeInfoResponse>, (StatusCode, Json<ApiErrorBody>)> {
     let pod_name = normalize_pod_name(&name);
 
-    let (port, _password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
+    let (port, password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
         let msg = if code == StatusCode::NOT_FOUND {
             "Pod or agent not found (agent container may not be running or port not published)"
                 .to_string()
@@ -453,7 +453,7 @@ async fn opencode_info(
     let url = format!("http://127.0.0.1:{}/", port);
 
     // Fetch the most recent session so the control plane can navigate directly to it
-    let latest_session = fetch_latest_session(port).await;
+    let latest_session = fetch_latest_session(port, &password).await;
 
     Ok(Json(OpencodeInfoResponse {
         url,
@@ -468,7 +468,7 @@ async fn opencode_info(
 /// Calls GET /session on the pod's opencode server and returns the session with
 /// the most recent `time.updated` timestamp.  Returns None on any error
 /// (non-fatal: the control plane just won't deep-link into a session).
-async fn fetch_latest_session(port: u16) -> Option<LatestSessionInfo> {
+async fn fetch_latest_session(port: u16, password: &str) -> Option<LatestSessionInfo> {
     let host = host_for_pod_services();
 
     let client = reqwest::Client::builder()
@@ -478,6 +478,7 @@ async fn fetch_latest_session(port: u16) -> Option<LatestSessionInfo> {
 
     let resp = client
         .get(format!("http://{}:{}/session", host, port))
+        .basic_auth("opencode", Some(password))
         .send()
         .await
         .ok()?;
@@ -537,14 +538,14 @@ async fn opencode_proxy(
 async fn opencode_proxy_impl(
     name: String,
     path: String,
-    request: Request,
+    mut request: Request,
 ) -> Result<Response, StatusCode> {
     let pod_name = normalize_pod_name(&name);
 
     // Get the pod's opencode connection info.
     // Map NOT_FOUND (pod/agent not running or port not published) to SERVICE_UNAVAILABLE
     // so 404 is reserved for "route not found"; integration tests assert root proxy route exists (not 404).
-    let (port, _password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
+    let (port, password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
         if code == StatusCode::NOT_FOUND {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
@@ -562,6 +563,16 @@ async fn opencode_proxy_impl(
         host,
         port,
         path
+    );
+
+    // Add basic auth for the opencode server (same scheme the TUI uses).
+    // The opencode server may require auth; without it requests can return 404.
+    let credentials = BASE64_STANDARD.encode(format!("opencode:{}", password));
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Basic {}", credentials)
+            .parse()
+            .expect("valid header value"),
     );
 
     proxy_to_upstream(&host, port, path, request).await
