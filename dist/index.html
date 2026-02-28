@@ -7,10 +7,6 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <!-- xterm.js: vendored at container build time (see Containerfile) -->
-    <link rel="stylesheet" href="vendor/xterm/xterm.css">
-    <script src="vendor/xterm/xterm.js"></script>
-    <script src="vendor/xterm/addon-fit.js"></script>
     <style>
         :root {
             --bg-primary: #131010;
@@ -608,50 +604,6 @@
             transform: rotate(-90deg);
         }
 
-        /* Terminal overlay */
-        .terminal-overlay {
-            display: none;
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0, 0, 0, 0.85);
-            z-index: 1000;
-            flex-direction: column;
-        }
-        .terminal-overlay.active {
-            display: flex;
-        }
-        .terminal-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 0.5rem 1rem;
-            background: var(--bg-secondary);
-            border-bottom: 1px solid var(--border);
-            color: var(--text-primary);
-            font-size: 0.85rem;
-        }
-        .terminal-header .terminal-title {
-            font-weight: 600;
-        }
-        .terminal-close-btn {
-            background: none;
-            border: 1px solid var(--border);
-            color: var(--text-secondary);
-            padding: 0.25rem 0.75rem;
-            border-radius: 4px;
-            cursor: pointer;
-            font-family: inherit;
-            font-size: 0.8rem;
-        }
-        .terminal-close-btn:hover {
-            border-color: var(--error);
-            color: var(--error);
-        }
-        .terminal-body {
-            flex: 1;
-            padding: 4px;
-            overflow: hidden;
-        }
     </style>
 </head>
 <body>
@@ -737,14 +689,6 @@
         <div id="error-container"></div>
         <div id="pods-container" class="loading">Loading pods...</div>
     </main>
-
-    <div id="terminal-overlay" class="terminal-overlay">
-        <div class="terminal-header">
-            <span class="terminal-title" id="terminal-title">Terminal</span>
-            <button class="terminal-close-btn" onclick="closeTerminal()">Close (Esc)</button>
-        </div>
-        <div class="terminal-body" id="terminal-container"></div>
-    </div>
 
     <script>
         // Extract token from URL
@@ -848,10 +792,6 @@
                 openAgent(shortName);
                 return;
             }
-            if (action === 'terminal' && shortName) {
-                openTerminal(shortName);
-                return;
-            }
             if (action === 'recreate' && shortName) {
                 recreatePod(shortName);
                 return;
@@ -895,7 +835,7 @@
                 }
                 window.location.href = `/_devaipod/agent/${encodeURIComponent(shortName)}/${hash}`;
             } catch (err) {
-                alert(`Open Agent failed: ${err.message}`);
+                alert(`Failed to open workspace: ${err.message}`);
             }
         }
         
@@ -955,8 +895,7 @@
             const safeShort = shortName.replace(/"/g, '&quot;');
             let actionsHtml;
             if (isRunning) {
-                actionsHtml = '<button type="button" class="open-btn" data-action="open-agent" data-pod-short="' + safeShort + '">Open Agent</button>' +
-                    '<button type="button" class="action-btn" data-action="terminal" data-pod-short="' + safeShort + '" title="Open workspace terminal">Terminal</button>' +
+                actionsHtml = '<button type="button" class="open-btn" data-action="open-agent" data-pod-short="' + safeShort + '">Open</button>' +
                     '<button type="button" class="action-btn" data-action="stop" data-pod-full="' + safeFull + '" title="Stop pod">Stop</button>';
             } else {
                 actionsHtml = '<button type="button" class="action-btn" data-action="start" data-pod-full="' + safeFull + '" title="Start pod">Start</button>';
@@ -1447,16 +1386,6 @@
                 }
             }
             
-            // Escape key closes terminal overlay first
-            if (e.key === 'Escape') {
-                const termOverlay = document.getElementById('terminal-overlay');
-                if (termOverlay.classList.contains('active')) {
-                    e.preventDefault();
-                    closeTerminal();
-                    return;
-                }
-            }
-
             // Escape key closes the launch form
             if (e.key === 'Escape') {
                 const form = document.getElementById('launch-form');
@@ -1494,175 +1423,6 @@
             }
         });
         
-        // Terminal state
-        let activeTerminal = null;  // { term, ws, sessionId, podName, fitAddon }
-
-        async function openTerminal(podName) {
-            // Create a PTY session
-            try {
-                const response = await fetch(`/api/devaipod/pods/${encodeURIComponent(podName)}/pty`, {
-                    method: 'POST',
-                    headers: {
-                        ...authHeader,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({})
-                });
-                if (!response.ok) {
-                    const text = await response.text();
-                    throw new Error(text || `HTTP ${response.status}`);
-                }
-                const ptyInfo = await response.json();
-                connectTerminal(podName, ptyInfo);
-            } catch (err) {
-                alert(`Failed to open terminal: ${err.message}`);
-            }
-        }
-
-        function connectTerminal(podName, ptyInfo) {
-            // Close any existing terminal
-            if (activeTerminal) {
-                cleanupTerminal();
-            }
-
-            // Create xterm.js instance
-            const term = new Terminal({
-                cursorBlink: true,
-                fontSize: 14,
-                fontFamily: "'IBM Plex Mono', 'Cascadia Code', Menlo, Monaco, monospace",
-                theme: {
-                    background: '#131010',
-                    foreground: '#f1ecec',
-                    cursor: '#89b5ff',
-                    selectionBackground: 'rgba(137, 181, 255, 0.3)',
-                    black: '#131010',
-                    red: '#ef442a',
-                    green: '#00bd00',
-                    yellow: '#ffdc17',
-                    blue: '#89b5ff',
-                    magenta: '#c678dd',
-                    cyan: '#56b6c2',
-                    white: '#f1ecec',
-                }
-            });
-
-            const fitAddon = new FitAddon.FitAddon();
-            term.loadAddon(fitAddon);
-
-            const container = document.getElementById('terminal-container');
-            container.innerHTML = '';
-            term.open(container);
-
-            // Show overlay
-            document.getElementById('terminal-overlay').classList.add('active');
-            document.getElementById('terminal-title').textContent = `Terminal — ${podName} workspace`;
-
-            // Fit terminal to container
-            setTimeout(() => fitAddon.fit(), 50);
-
-            // Connect WebSocket
-            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${wsProtocol}//${window.location.host}/api/devaipod/pods/${encodeURIComponent(podName)}/pty/${encodeURIComponent(ptyInfo.id)}/connect?token=${encodeURIComponent(token)}&cursor=0`;
-            const ws = new WebSocket(wsUrl);
-
-            ws.binaryType = 'arraybuffer';
-
-            ws.onopen = () => {
-                // Send initial resize
-                const dims = fitAddon.proposeDimensions();
-                if (dims) {
-                    fetch(`/api/devaipod/pods/${encodeURIComponent(podName)}/pty/${encodeURIComponent(ptyInfo.id)}`, {
-                        method: 'PUT',
-                        headers: {
-                            ...authHeader,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({ size: { rows: dims.rows, cols: dims.cols } })
-                    }).catch(() => {});
-                }
-            };
-
-            ws.onmessage = (event) => {
-                if (event.data instanceof ArrayBuffer) {
-                    const bytes = new Uint8Array(event.data);
-                    // Check for meta frame (starts with 0x00)
-                    if (bytes.length > 0 && bytes[0] === 0x00) {
-                        // Meta frame — contains cursor info, ignore for now
-                        return;
-                    }
-                    // Binary terminal data
-                    term.write(bytes);
-                } else {
-                    // Text terminal data
-                    term.write(event.data);
-                }
-            };
-
-            ws.onclose = () => {
-                term.write('\r\n\x1b[90m[Connection closed]\x1b[0m\r\n');
-            };
-
-            ws.onerror = () => {
-                term.write('\r\n\x1b[31m[Connection error]\x1b[0m\r\n');
-            };
-
-            // Forward terminal input to WebSocket
-            term.onData((data) => {
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(data);
-                }
-            });
-
-            // Handle window resize
-            const resizeHandler = () => {
-                fitAddon.fit();
-                const dims = fitAddon.proposeDimensions();
-                if (dims && ws.readyState === WebSocket.OPEN) {
-                    fetch(`/api/devaipod/pods/${encodeURIComponent(podName)}/pty/${encodeURIComponent(ptyInfo.id)}`, {
-                        method: 'PUT',
-                        headers: {
-                            ...authHeader,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({ size: { rows: dims.rows, cols: dims.cols } })
-                    }).catch(() => {});
-                }
-            };
-            window.addEventListener('resize', resizeHandler);
-
-            activeTerminal = {
-                term, ws, sessionId: ptyInfo.id, podName, fitAddon,
-                resizeHandler
-            };
-        }
-
-        function cleanupTerminal() {
-            if (!activeTerminal) return;
-            const { term, ws, sessionId, podName, resizeHandler } = activeTerminal;
-
-            window.removeEventListener('resize', resizeHandler);
-
-            if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-                ws.close();
-            }
-
-            term.dispose();
-
-            // Delete the PTY session
-            fetch(`/api/devaipod/pods/${encodeURIComponent(podName)}/pty/${encodeURIComponent(sessionId)}`, {
-                method: 'DELETE',
-                headers: authHeader
-            }).catch(() => {});
-
-            activeTerminal = null;
-        }
-
-        function closeTerminal() {
-            cleanupTerminal();
-            document.getElementById('terminal-overlay').classList.remove('active');
-            document.getElementById('terminal-container').innerHTML = '';
-        }
-
         // Refresh agent status for all running pods (parallel fetch, setTimeout chaining)
         var iconMap = {
             'Working': { icon: '\u25CF', cls: 'working' },
