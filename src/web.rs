@@ -3,9 +3,9 @@
 //! This module provides:
 //! - Token-based authentication for API access
 //! - Podman socket proxy at `/api/podman/*`
-//! - Agent view at `/_devaipod/agent/{name}/` (vendored opencode UI with injected back button)
+//! - Agent view at `/_devaipod/agent/{name}/` (iframe wrapper pointing at pod-api sidecar)
 //! - Workspace recreate at `POST /api/devaipod/pods/{name}/recreate`
-//! - Git and opencode-info endpoints for workspace containers
+//! - Opencode-info and agent-status endpoints for the pods page
 //! - Static file serving for web UI
 
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 use crate::advisor;
 use crate::podman::{get_container_socket, host_for_pod_services};
@@ -48,10 +48,6 @@ fn state_token_path() -> std::path::PathBuf {
     std::path::PathBuf::from(dir).join(STATE_TOKEN_FILENAME)
 }
 
-/// Cookie name for attributing root-level opencode API requests and /assets/* to a pod.
-/// The opencode app uses window.location.origin, so it requests /session, /rpc, /assets/* at root;
-/// we set this cookie when loading the agent page; with it we serve opencode assets at /assets/*.
-const DEVAIPOD_AGENT_POD_COOKIE: &str = "DEVAIPOD_AGENT_POD";
 const DEVAIPOD_AUTH_COOKIE: &str = "DEVAIPOD_AUTH";
 
 /// Extract a raw cookie value by name from the request headers.
@@ -67,15 +63,6 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
                     .then(|| pair[prefix.len()..].to_string())
             })
         })
-}
-
-/// Get pod name from DEVAIPOD_AGENT_POD cookie if present (URL-decoded).
-fn pod_name_from_cookie(headers: &HeaderMap) -> Option<String> {
-    cookie_value(headers, DEVAIPOD_AGENT_POD_COOKIE).map(|s| {
-        urlencoding::decode(&s)
-            .unwrap_or(std::borrow::Cow::Borrowed(s.as_str()))
-            .into_owned()
-    })
 }
 
 /// Normalize pod name: ensure it has the "devaipod-" prefix.
@@ -423,13 +410,6 @@ struct ApiErrorBody {
 /// Path to vendored opencode web UI
 const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
 
-/// Opencode API path segments; used in tests and documentation.
-/// Root-level requests with the agent cookie are proxied via the catch-all fallback.
-#[cfg(test)]
-const OPENCODE_API_SEGMENTS: &[&str] = &[
-    "rpc", "event", "session", "global", "path", "project", "provider", "auth",
-];
-
 /// Get opencode connection info for a pod
 ///
 /// Returns the direct URL to access the opencode web UI.
@@ -505,232 +485,6 @@ async fn fetch_latest_session(port: u16, password: &str) -> Option<LatestSession
         })
 }
 
-/// Proxy handler for opencode server root path
-///
-/// Handles `/api/devaipod/pods/{name}/opencode` (no trailing path)
-///
-/// NOTE: This proxy has limited usefulness because the opencode web UI
-/// fetches assets from absolute paths (e.g., `/assets/index.js`). When
-/// accessed through this proxy path, those asset requests go to devaipod's
-/// root, not back through the proxy. For now, use the `/opencode-info`
-/// endpoint to get a direct URL to the pod's opencode server instead.
-async fn opencode_proxy_root(
-    Path(name): Path<String>,
-    request: Request,
-) -> Result<Response, StatusCode> {
-    opencode_proxy_impl(name, String::new(), request).await
-}
-
-/// Proxy handler for opencode server with path
-///
-/// Forwards requests to a pod's opencode server.
-/// The opencode server itself proxies non-API paths to app.opencode.ai for the web UI.
-///
-/// Path: `/api/devaipod/pods/{name}/opencode/{*path}`
-async fn opencode_proxy(
-    Path((name, path)): Path<(String, String)>,
-    request: Request,
-) -> Result<Response, StatusCode> {
-    opencode_proxy_impl(name, path, request).await
-}
-
-/// Implementation of opencode proxy
-async fn opencode_proxy_impl(
-    name: String,
-    path: String,
-    mut request: Request,
-) -> Result<Response, StatusCode> {
-    let pod_name = normalize_pod_name(&name);
-
-    // Get the pod's opencode connection info.
-    // Map NOT_FOUND (pod/agent not running or port not published) to SERVICE_UNAVAILABLE
-    // so 404 is reserved for "route not found"; integration tests assert root proxy route exists (not 404).
-    let (port, password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
-        if code == StatusCode::NOT_FOUND {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            code
-        }
-    })?;
-
-    // When in container mode we use host gateway (e.g. host.containers.internal) so we
-    // reach ports published on the host; avoids --network host and works on macOS.
-    let host = host_for_pod_services();
-
-    tracing::debug!(
-        "Proxying to opencode for pod {} on {}:{}, path: {}",
-        pod_name,
-        host,
-        port,
-        path
-    );
-
-    // Add basic auth for the opencode server (same scheme the TUI uses).
-    // The opencode server may require auth; without it requests can return 404.
-    let credentials = BASE64_STANDARD.encode(format!("opencode:{}", password));
-    request.headers_mut().insert(
-        header::AUTHORIZATION,
-        format!("Basic {}", credentials)
-            .parse()
-            .expect("valid header value"),
-    );
-
-    proxy_to_upstream(&host, port, path, request).await
-}
-
-/// Low-level HTTP proxy: connect to `host:port`, forward `request`,
-/// and return the response with the HTTP version normalized to 1.1.
-///
-/// Supports HTTP Upgrade (WebSocket): when the request contains an `Upgrade` header,
-/// the proxy negotiates the upgrade with upstream and then bidirectionally copies
-/// raw bytes between the client and upstream connections.
-///
-/// Separated from `opencode_proxy_impl` so it can be tested with a mock server
-/// (the caller handles pod discovery; this function handles the TCP connection).
-async fn proxy_to_upstream(
-    host: &str,
-    port: u16,
-    path: String,
-    request: Request,
-) -> Result<Response, StatusCode> {
-    // Connect to the published opencode port (host:port)
-    let stream = tokio::net::TcpStream::connect(format!("{}:{}", host, port))
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                "Failed to connect to opencode server at {}:{}: {}",
-                host,
-                port,
-                e
-            );
-            StatusCode::BAD_GATEWAY
-        })?;
-
-    let io = TokioIo::new(stream);
-
-    // Check if this is an HTTP Upgrade request (e.g. WebSocket for /pty/*)
-    let is_upgrade = request.headers().get(header::UPGRADE).is_some();
-
-    // Create HTTP client
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| {
-            tracing::error!("Handshake with opencode server failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
-
-    // Spawn connection handler. For upgrade requests, use with_upgrades()
-    // so hyper keeps the connection alive after the 101 response.
-    if is_upgrade {
-        tokio::spawn(async move {
-            if let Err(e) = conn.with_upgrades().await {
-                // Upgrade connections normally close cleanly
-                tracing::debug!("Upgrade connection closed: {}", e);
-            }
-        });
-    } else {
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::error!("Connection to opencode server failed: {}", e);
-            }
-        });
-    }
-
-    // Build the upstream URI
-    let mut uri = if path.is_empty() || path == "/" {
-        "/".to_string()
-    } else if path.starts_with('/') {
-        path
-    } else {
-        format!("/{}", path)
-    };
-
-    // Preserve query string (e.g. /file?path=src/main.rs, /pty/.../connect?directory=...)
-    if let Some(query) = request.uri().query() {
-        uri.push('?');
-        uri.push_str(query);
-    }
-
-    // Decompose the request. For upgrade requests, we reconstruct a Request
-    // from the parts so hyper::upgrade::on() can extract the upgrade future.
-    let (parts, body) = request.into_parts();
-
-    let mut builder = hyper::Request::builder()
-        .method(parts.method.clone())
-        .uri(&uri)
-        .header(header::HOST, format!("{}:{}", host, port));
-
-    // Copy headers (except Host which we set)
-    for (key, value) in parts.headers.iter() {
-        if key != header::HOST {
-            builder = builder.header(key, value);
-        }
-    }
-
-    let proxy_request = builder.body(body).map_err(|e| {
-        tracing::error!("Failed to build opencode proxy request: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Send request and get response
-    let upstream_response = sender.send_request(proxy_request).await.map_err(|e| {
-        tracing::error!("Failed to send request to opencode: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
-
-    // Handle HTTP Upgrade (WebSocket) responses
-    if is_upgrade && upstream_response.status() == StatusCode::SWITCHING_PROTOCOLS {
-        // Build the 101 response to send back to the client.
-        // Reconstruct a Request from the decomposed parts so hyper can
-        // extract the upgrade future (it's stored in the extensions).
-        let mut response_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
-        for (key, value) in upstream_response.headers() {
-            response_builder = response_builder.header(key, value);
-        }
-
-        // Reconstruct the inbound request from parts — the upgrade future
-        // lives in `parts.extensions` and survives the round-trip.
-        let inbound_request = Request::from_parts(parts, Body::empty());
-
-        // Spawn a task to bridge the upgraded connections once both sides
-        // have completed the upgrade handshake
-        tokio::spawn(async move {
-            let client_upgraded = hyper::upgrade::on(inbound_request).await;
-            let upstream_upgraded = hyper::upgrade::on(upstream_response).await;
-
-            match (client_upgraded, upstream_upgraded) {
-                (Ok(client), Ok(upstream)) => {
-                    let mut client_io = TokioIo::new(client);
-                    let mut upstream_io = TokioIo::new(upstream);
-                    if let Err(e) =
-                        tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
-                    {
-                        tracing::debug!("WebSocket proxy connection closed: {}", e);
-                    }
-                }
-                (Err(e), _) => {
-                    tracing::error!("Client upgrade failed: {}", e);
-                }
-                (_, Err(e)) => {
-                    tracing::error!("Upstream upgrade failed: {}", e);
-                }
-            }
-        });
-
-        return response_builder.body(Body::empty()).map_err(|e| {
-            tracing::error!("Failed to build upgrade response: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        });
-    }
-
-    // Normal (non-upgrade) response: normalize HTTP version for SSE/chunked support
-    let (mut parts, body) = upstream_response.into_parts();
-    parts.version = hyper::Version::HTTP_11;
-    let body = Body::new(body);
-
-    Ok(Response::from_parts(parts, body))
-}
-
 /// Get the published host port for the pod-api sidecar container.
 ///
 /// The pod-api container listens on `POD_API_PORT` (8090) inside the pod.
@@ -794,6 +548,126 @@ async fn get_pod_api_port(pod_name: &str) -> Result<u16, StatusCode> {
             tracing::error!("Could not parse host port for pod-api of {pod_name}");
             StatusCode::NOT_FOUND
         })
+}
+
+/// Low-level HTTP proxy: connect to `host:port`, forward `request`,
+/// and return the response with the HTTP version normalized to 1.1.
+///
+/// Supports HTTP Upgrade (WebSocket): when the request contains an `Upgrade` header,
+/// the proxy negotiates the upgrade with upstream and then bidirectionally copies
+/// raw bytes between the client and upstream connections.
+async fn proxy_to_upstream(
+    host: &str,
+    port: u16,
+    path: String,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    let stream = tokio::net::TcpStream::connect(format!("{}:{}", host, port))
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to connect to upstream at {}:{}: {}", host, port, e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let io = TokioIo::new(stream);
+
+    let is_upgrade = request.headers().get(header::UPGRADE).is_some();
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| {
+            tracing::error!("Handshake with upstream failed: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    if is_upgrade {
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                tracing::debug!("Upgrade connection closed: {}", e);
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::error!("Connection to upstream failed: {}", e);
+            }
+        });
+    }
+
+    let mut uri = if path.is_empty() || path == "/" {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path
+    } else {
+        format!("/{}", path)
+    };
+
+    if let Some(query) = request.uri().query() {
+        uri.push('?');
+        uri.push_str(query);
+    }
+
+    let (parts, body) = request.into_parts();
+
+    let mut builder = hyper::Request::builder()
+        .method(parts.method.clone())
+        .uri(&uri)
+        .header(header::HOST, format!("{}:{}", host, port));
+
+    for (key, value) in parts.headers.iter() {
+        if key != header::HOST {
+            builder = builder.header(key, value);
+        }
+    }
+
+    let proxy_request = builder.body(body).map_err(|e| {
+        tracing::error!("Failed to build proxy request: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let upstream_response = sender.send_request(proxy_request).await.map_err(|e| {
+        tracing::error!("Failed to send request to upstream: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if is_upgrade && upstream_response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let mut response_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+        for (key, value) in upstream_response.headers() {
+            response_builder = response_builder.header(key, value);
+        }
+
+        let inbound_request = Request::from_parts(parts, Body::empty());
+
+        tokio::spawn(async move {
+            let client_upgraded = hyper::upgrade::on(inbound_request).await;
+            let upstream_upgraded = hyper::upgrade::on(upstream_response).await;
+
+            match (client_upgraded, upstream_upgraded) {
+                (Ok(client), Ok(upstream)) => {
+                    let mut client_io = TokioIo::new(client);
+                    let mut upstream_io = TokioIo::new(upstream);
+                    if let Err(e) =
+                        tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
+                    {
+                        tracing::debug!("WebSocket proxy connection closed: {}", e);
+                    }
+                }
+                (Err(e), _) => tracing::error!("Client upgrade failed: {}", e),
+                (_, Err(e)) => tracing::error!("Upstream upgrade failed: {}", e),
+            }
+        });
+
+        return response_builder.body(Body::empty()).map_err(|e| {
+            tracing::error!("Failed to build upgrade response: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        });
+    }
+
+    let (mut parts, body) = upstream_response.into_parts();
+    parts.version = hyper::Version::HTTP_11;
+    let body = Body::new(body);
+
+    Ok(Response::from_parts(parts, body))
 }
 
 /// Catch-all proxy handler for the per-pod API sidecar.
@@ -862,43 +736,6 @@ async fn pty_pod_api_proxy(
     proxy_to_pod_api(&name, format!("pty/{rest}"), request).await
 }
 
-/// Return a long-lived SSE stream that sends periodic keepalive comments.
-/// The opencode SDK (global-sdk) calls GET /global/event as a streaming SSE connection;
-/// if we close the response immediately the SDK reconnects in a tight loop, flooding the
-/// console with "event stream error". A keepalive stream keeps the connection open.
-fn sse_keepalive_stream(comment: &str) -> Body {
-    let initial = format!(": {comment}\n\n");
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(2);
-    tokio::spawn(async move {
-        if tx.send(Ok(initial)).await.is_err() {
-            return;
-        }
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            if tx.send(Ok(": keepalive\n\n".to_string())).await.is_err() {
-                return;
-            }
-        }
-    });
-    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
-}
-
-/// Whether a path is an SSE event-stream endpoint (global-sdk, event listener).
-fn is_event_stream_path(path: &str) -> bool {
-    path == "event" || path.starts_with("event/") || path == "global" || path.starts_with("global/")
-}
-
-/// Build a 200 OK SSE keepalive response with the given comment.
-fn sse_keepalive_response(comment: &str) -> Result<Response, StatusCode> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(sse_keepalive_stream(comment))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
 /// Middleware that logs every HTTP request and response (method, URI, status, duration, content-type).
 /// Query parameters are stripped to avoid leaking tokens into logs.
 async fn request_trace(request: Request, next: Next) -> Response {
@@ -949,71 +786,24 @@ async fn frontend_error_report(Json(report): Json<FrontendErrorReport>) -> Statu
     StatusCode::NO_CONTENT
 }
 
-/// Proxy opencode API requests that hit the root (e.g. /session, /rpc, /global/event).
-/// The opencode app uses window.location.origin, so it requests these at root; we attribute
-/// the request to a pod via the DEVAIPOD_AGENT_POD cookie set when loading the agent page.
+/// Fallback handler: serve static files from the vendored opencode UI directory
+/// (for /assets/*, favicon.ico, etc.) or the SPA index.html for client-side
+/// routing (e.g. /pods, /some-dir/session/123).
 ///
-/// For event-stream paths (SSE), errors are returned as keepalive streams instead of HTTP
-/// error codes, because the opencode global-sdk reconnects aggressively on non-200 responses.
-async fn opencode_root_proxy(request: Request) -> Result<Response, StatusCode> {
-    let path = request.uri().path().trim_start_matches('/').to_string();
-    if path.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    let pod_name = match pod_name_from_cookie(request.headers()) {
-        Some(n) => n,
-        None => {
-            if is_event_stream_path(&path) {
-                return sse_keepalive_response("no agent context");
-            }
-            tracing::debug!(
-                "Root opencode API request without {} cookie",
-                DEVAIPOD_AGENT_POD_COOKIE
-            );
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
-    match opencode_proxy_impl(pod_name, path.clone(), request).await {
-        Ok(resp) => Ok(resp),
-        Err(status) => {
-            if is_event_stream_path(&path) {
-                tracing::debug!("SSE proxy failed ({status}), returning keepalive stream");
-                sse_keepalive_response("agent not ready")
-            } else {
-                Err(status)
-            }
-        }
-    }
-}
-
-/// Fallback handler: if the DEVAIPOD_AGENT_POD cookie is set, proxy the request to the
-/// opencode backend for that pod. Otherwise, serve from the control-plane static directory
-/// or the vendored opencode UI directory (for root-level files like oc-theme-preload.js,
-/// favicons, etc. that the opencode index.html references with absolute paths).
-///
-/// SSE event-stream paths (e.g. /event, /global/event) without a cookie get an SSE
-/// keepalive response instead of 404, so the opencode global-sdk doesn't error loop.
-async fn opencode_or_static_fallback(
-    State(state): State<Arc<AppState>>,
-    request: Request,
-) -> Response {
-    let has_cookie = pod_name_from_cookie(request.headers()).is_some();
+/// The pod-api sidecar now handles the opencode UI and API proxy directly,
+/// so this fallback no longer does cookie-based routing or opencode proxying.
+async fn static_or_spa_fallback(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let path = request.uri().path();
     let trimmed_path = path.trim_start_matches('/');
 
-    // SSE paths without a cookie: return a keepalive stream so the SDK doesn't error-loop
-    if !has_cookie && is_event_stream_path(trimmed_path) {
-        return sse_keepalive_response("no agent context").unwrap_or_else(|status| {
-            Response::builder()
-                .status(status)
-                .body(Body::empty())
-                .unwrap()
-        });
-    }
+    // Check if path looks like a static file (has a file extension).
+    // Try vendored opencode UI dir first, then control-plane static dir.
+    let has_ext = trimmed_path
+        .rsplit_once('/')
+        .map_or(trimmed_path, |(_dir, file)| file)
+        .contains('.');
 
-    // If the path looks like a static file (has a file extension), check the vendored
-    // opencode UI directory first, then the old control-plane static directory.
-    if has_file_extension(trimmed_path) {
+    if has_ext {
         let opencode_req = Request::builder()
             .uri(request.uri().clone())
             .body(Body::empty())
@@ -1026,7 +816,6 @@ async fn opencode_or_static_fallback(
         if resp.status() != StatusCode::NOT_FOUND {
             return resp;
         }
-        // Also check the old control-plane static directory.
         let static_req = Request::builder()
             .uri(request.uri().clone())
             .body(Body::empty())
@@ -1041,44 +830,15 @@ async fn opencode_or_static_fallback(
         }
     }
 
-    // The root path "/" is handled by an explicit route (serve_spa_page), so
-    // it won't reach here.  The cookie persists across navigation so the
-    // browser still sends it when the user navigates away from an agent session.
-    // The opencode API never uses "/" — its endpoints are /session, /rpc, etc.
-    let is_root = trimmed_path.is_empty();
-
-    if has_cookie && !is_root {
-        match opencode_root_proxy(request).await {
-            Ok(resp) => resp,
-            Err(status) => Response::builder()
-                .status(status)
-                .body(Body::empty())
-                .unwrap(),
-        }
-    } else {
-        // For any non-file, non-API path (e.g. /pods, /some-dir/session/123),
-        // serve the opencode SPA so client-side routing can handle it.
-        match serve_opencode_index().await {
-            Ok(resp) => resp,
-            Err(status) => Response::builder()
-                .status(status)
-                .body(Body::empty())
-                .unwrap(),
-        }
+    // For any non-file path, serve the SPA index.html for client-side routing.
+    match serve_opencode_index().await {
+        Ok(resp) => resp,
+        Err(status) => Response::builder()
+            .status(status)
+            .body(Body::empty())
+            .unwrap(),
     }
 }
-
-/// Check if a path has a file extension (e.g. "foo.js", "bar.css").
-fn has_file_extension(path: &str) -> bool {
-    path.rsplit_once('/')
-        .map_or(path, |(_dir, file)| file)
-        .contains('.')
-}
-
-// Note: localStorage scoping, error reporting, and SSE suppression are handled
-// in the opencode SPA source (entry.tsx / devaipod-api.ts), not via server-side
-// script injection. The SPA is built with VITE_DEVAIPOD=true and reads the
-// DEVAIPOD_AGENT_POD cookie at runtime to scope per-pod state.
 
 /// Wrapper HTML page that embeds the pod-api sidecar's opencode UI in a full-screen
 /// iframe with a thin navigation bar. The `base_url` points at the pod-api sidecar's
@@ -1188,16 +948,6 @@ async fn agent_ui_root(
         .unwrap())
 }
 
-/// Handler for agent UI sub-paths (static assets under /_devaipod/agent/{name}/).
-/// With the iframe approach, the opencode SPA's API calls go to the root origin
-/// (handled by the cookie-based fallback proxy), so this only serves static files.
-async fn agent_ui_handler(
-    Path((_name, path)): Path<(String, String)>,
-    _request: Request,
-) -> Result<Response, StatusCode> {
-    serve_opencode_static(&path).await
-}
-
 /// Serve the opencode SPA's index.html.
 /// The SPA handles devaipod-specific behavior (localStorage scoping, error
 /// reporting, SSE suppression) internally via VITE_DEVAIPOD and cookie detection.
@@ -1270,37 +1020,24 @@ async fn serve_old_ui(State(state): State<Arc<AppState>>) -> Result<Response, St
 
 /// Serve /assets/* from the vendored opencode UI directory.
 ///
-/// The control-plane UI (`dist/index.html`) uses inline styles and has no `/assets/`
-/// subdirectory. All `/assets/*` requests come from the opencode SPA, so we always
-/// serve from `OPENCODE_UI_PATH`. The cookie is only needed to distinguish which
-/// pod's opencode *backend* to proxy API calls to (handled by the fallback handler),
-/// not for static asset serving.
+/// All `/assets/*` requests come from the opencode SPA, so we always
+/// serve from `OPENCODE_UI_PATH`.
 async fn serve_root_assets(Path(path): Path<String>) -> Result<Response, StatusCode> {
-    let opencode_path = if path.is_empty() {
+    let file_path = if path.is_empty() {
         "assets".to_string()
     } else {
         format!("assets/{}", path)
     };
-    serve_opencode_static(&opencode_path).await
-}
-
-/// Serve a static file from the vendored opencode UI directory.
-///
-/// Uses `tower_http::services::ServeDir` for mime type detection, path traversal
-/// protection, and SPA fallback (index.html for paths without file extensions).
-async fn serve_opencode_static(path: &str) -> Result<Response, StatusCode> {
-    let index_html = format!("{}/index.html", OPENCODE_UI_PATH);
-    let serve_dir = ServeDir::new(OPENCODE_UI_PATH).fallback(ServeFile::new(&index_html));
-
-    // Build a GET request for the path
-    let uri = format!("/{}", path.trim_start_matches('/'));
+    let uri = format!("/{}", file_path.trim_start_matches('/'));
     let request = Request::builder()
         .uri(&uri)
         .body(Body::empty())
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    // ServeDir with a fallback has error type Infallible, so unwrap is safe.
-    Ok(serve_dir.oneshot(request).await.unwrap().into_response())
+    Ok(ServeDir::new(OPENCODE_UI_PATH)
+        .oneshot(request)
+        .await
+        .unwrap()
+        .into_response())
 }
 
 /// Request body for run endpoint
@@ -2060,762 +1797,17 @@ fn derive_agent_status_from_messages(
     )
 }
 
-/// Response for git status endpoint
-#[derive(Debug, Serialize)]
-struct GitStatusResponse {
-    /// Exit code from git command
-    exit_code: i64,
-    /// Raw output from git status --porcelain
-    output: String,
-    /// Parsed list of changed files
-    files: Vec<GitStatusFile>,
-}
-
-/// A single file from git status output
-#[derive(Debug, Serialize)]
-struct GitStatusFile {
-    /// Status code (e.g., "M", "A", "??")
-    status: String,
-    /// File path
-    path: String,
-}
-
-/// Response for git diff endpoint
-#[derive(Debug, Serialize)]
-struct GitDiffResponse {
-    /// Exit code from git command
-    exit_code: i64,
-    /// Raw diff output
-    diff: String,
-}
-
-/// Response for git commits endpoint
-#[derive(Debug, Serialize)]
-struct GitCommitsResponse {
-    /// Exit code from git command
-    exit_code: i64,
-    /// List of recent commits
-    commits: Vec<GitCommit>,
-}
-
-/// A single commit from git log output
-#[derive(Debug, Serialize)]
-struct GitCommit {
-    /// Short commit hash
-    hash: String,
-    /// Commit message (first line)
-    message: String,
-}
-
-/// Query parameters for the git log endpoint
-#[derive(Debug, Deserialize)]
-struct GitLogQuery {
-    /// Base ref for range (optional)
-    base: Option<String>,
-    /// Head ref for range (optional)
-    head: Option<String>,
-}
-
-/// A detailed commit entry from git log
-#[derive(Debug, Serialize, Deserialize)]
-struct GitLogEntry {
-    /// Full commit SHA
-    sha: String,
-    /// Short commit SHA
-    short_sha: String,
-    /// Commit message (full, not just first line)
-    message: String,
-    /// Author name
-    author: String,
-    /// Author email
-    author_email: String,
-    /// Commit timestamp (ISO 8601)
-    timestamp: String,
-    /// Parent commit SHAs
-    parents: Vec<String>,
-}
-
-/// Response for the git log endpoint
-#[derive(Debug, Serialize)]
-struct GitLogResponse {
-    commits: Vec<GitLogEntry>,
-}
-
-/// Get git status for a workspace pod
-///
-/// Runs `git status --porcelain` in the workspace container and returns
-/// parsed results as JSON.
-async fn git_status(Path(name): Path<String>) -> Result<Json<GitStatusResponse>, StatusCode> {
-    let container_name = format!("devaipod-{}-workspace", name);
-
-    let (exit_code, stdout, _stderr) =
-        exec_in_container(&container_name, &["git", "status", "--porcelain"])
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to run git status in {}: {}", container_name, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-    let output = String::from_utf8_lossy(&stdout).to_string();
-
-    // Parse the porcelain output
-    let files: Vec<GitStatusFile> = output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            // Format is: XY PATH or XY ORIG -> PATH for renames
-            let status = line.chars().take(2).collect::<String>().trim().to_string();
-            let path = line.chars().skip(3).collect::<String>();
-            GitStatusFile { status, path }
-        })
-        .collect();
-
-    Ok(Json(GitStatusResponse {
-        exit_code,
-        output,
-        files,
-    }))
-}
-
-/// Get git diff for a workspace pod
-///
-/// Runs `git diff HEAD` in the workspace container.
-async fn git_diff(Path(name): Path<String>) -> Result<Json<GitDiffResponse>, StatusCode> {
-    let container_name = format!("devaipod-{}-workspace", name);
-
-    let (exit_code, stdout, _stderr) = exec_in_container(&container_name, &["git", "diff", "HEAD"])
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to run git diff in {}: {}", container_name, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let diff = String::from_utf8_lossy(&stdout).to_string();
-
-    Ok(Json(GitDiffResponse { exit_code, diff }))
-}
-
-/// Get recent git commits for a workspace pod
-///
-/// Runs `git log --oneline -20` in the workspace container.
-async fn git_commits(Path(name): Path<String>) -> Result<Json<GitCommitsResponse>, StatusCode> {
-    let container_name = format!("devaipod-{}-workspace", name);
-
-    let (exit_code, stdout, _stderr) =
-        exec_in_container(&container_name, &["git", "log", "--oneline", "-20"])
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to run git log in {}: {}", container_name, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-    let output = String::from_utf8_lossy(&stdout);
-
-    // Parse the oneline output
-    let commits: Vec<GitCommit> = output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| {
-            // Format is: HASH MESSAGE
-            let mut parts = line.splitn(2, ' ');
-            let hash = parts.next()?.to_string();
-            let message = parts.next().unwrap_or("").to_string();
-            Some(GitCommit { hash, message })
-        })
-        .collect();
-
-    Ok(Json(GitCommitsResponse { exit_code, commits }))
-}
-
-/// Validate that a string looks like a safe git ref (no shell metacharacters).
-fn is_valid_git_ref(s: &str) -> bool {
-    !s.is_empty()
-        && !s.contains("..")
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | '.' | '_' | '~' | '^'))
-}
-
-/// Get structured git log for an agent pod
-///
-/// Runs `git log` in the workspace container with a structured format string,
-/// supporting optional `base` and `head` query parameters for range filtering.
-///
-/// Use workspace container — it has the agent remote and is trusted.
-/// Agent commits are available after `git fetch agent`.
-async fn git_log(
-    Path(name): Path<String>,
-    Query(params): Query<GitLogQuery>,
-) -> Result<Json<GitLogResponse>, (StatusCode, String)> {
-    // Validate ref parameters if provided
-    if let Some(ref base) = params.base {
-        if !is_valid_git_ref(base) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Invalid git ref for 'base': {base}"),
-            ));
-        }
-    }
-    if let Some(ref head) = params.head {
-        if !is_valid_git_ref(head) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Invalid git ref for 'head': {head}"),
-            ));
-        }
-    }
-
-    // Use workspace container — it has the agent remote and is trusted.
-    // Agent commits are available after `git fetch agent`.
-    let container_name = format!("devaipod-{name}-workspace");
-
-    // Use %x00 (NUL) as field separator, %x1e (record separator) between commits.
-    // Fields: full SHA, short SHA, subject+body, author name, author email,
-    //         author date ISO, parent hashes (space-separated).
-    let format_arg = "--format=%H%x00%h%x00%s%n%b%x00%an%x00%ae%x00%aI%x00%P%x1e".to_string();
-    let range_arg: String;
-
-    let mut cmd: Vec<&str> = vec!["git", "log", &format_arg];
-
-    match (&params.base, &params.head) {
-        (Some(base), Some(head)) => {
-            range_arg = format!("{base}..{head}");
-            cmd.push(&range_arg);
-            cmd.push("-500");
-        }
-        (None, Some(head)) => {
-            cmd.push(head.as_str());
-            cmd.push("-50");
-        }
-        (Some(_base), None) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "'base' requires 'head' to also be specified".to_string(),
-            ));
-        }
-        // Default: fetch latest agent commits then show them.
-        // The fetch is fast (local volume mount, no network) and ensures
-        // the user always sees the agent's current state.
-        (None, None) => {
-            if let Err(e) = exec_in_container(&container_name, &["git", "fetch", "agent"]).await {
-                tracing::warn!("git fetch agent in {container_name} failed: {e}");
-                // Non-fatal: agent remote may not exist yet for fresh pods.
-            }
-            cmd.push("agent/HEAD");
-            cmd.push("-50");
-        }
-    }
-
-    let (exit_code, stdout, stderr) =
-        exec_in_container(&container_name, &cmd)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to run git log in {container_name}: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to exec in container: {e}"),
-                )
-            })?;
-
-    if exit_code != 0 {
-        let stderr_text = String::from_utf8_lossy(&stderr);
-        // If the ref doesn't exist yet (e.g. agent remote has no commits),
-        // return an empty commit list rather than a 500.
-        if stderr_text.contains("unknown revision") || stderr_text.contains("bad default revision")
-        {
-            return Ok(Json(GitLogResponse {
-                commits: Vec::new(),
-            }));
-        }
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("git log failed: {}", stderr_text),
-        ));
-    }
-
-    let output = String::from_utf8_lossy(&stdout);
-
-    // If git produced no output, return empty list (e.g. empty repo or empty range)
-    if output.trim().is_empty() {
-        return Ok(Json(GitLogResponse {
-            commits: Vec::new(),
-        }));
-    }
-
-    let commits: Vec<GitLogEntry> = output
-        .split('\x1e')
-        .filter(|record| !record.trim().is_empty())
-        .filter_map(|record| {
-            let fields: Vec<&str> = record.trim().splitn(7, '\0').collect();
-            if fields.len() < 7 {
-                tracing::warn!(
-                    "Skipping malformed git log record ({} fields): {:?}",
-                    fields.len(),
-                    record
-                );
-                return None;
-            }
-            Some(GitLogEntry {
-                sha: fields[0].to_string(),
-                short_sha: fields[1].to_string(),
-                message: fields[2].trim().to_string(),
-                author: fields[3].to_string(),
-                author_email: fields[4].to_string(),
-                timestamp: fields[5].to_string(),
-                parents: fields[6]
-                    .split_whitespace()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect(),
-            })
-        })
-        .collect();
-
-    Ok(Json(GitLogResponse { commits }))
-}
-
-/// Query parameters for the git diff-range endpoint
-#[derive(Debug, Deserialize)]
-struct GitDiffRangeQuery {
-    /// Base commit SHA (required)
-    base: String,
-    /// Head commit SHA (required)
-    head: String,
-}
-
-/// A single file's diff in structured form, compatible with opencode's FileDiff type
-#[derive(Debug, Serialize)]
-struct FileDiff {
-    /// File path
-    file: String,
-    /// File content before (at base commit). Empty string for added files.
-    before: String,
-    /// File content after (at head commit). Empty string for deleted files.
-    after: String,
-    /// Number of lines added
-    additions: u32,
-    /// Number of lines deleted
-    deletions: u32,
-    /// Change status: "added", "deleted", or "modified"
-    status: &'static str,
-}
-
-/// Response for the git diff-range endpoint
-#[derive(Debug, Serialize)]
-struct GitDiffRangeResponse {
-    files: Vec<FileDiff>,
-}
-
-/// Maximum number of files allowed in a diff-range response.
-/// Large changesets would require too many per-file exec calls.
-const DIFF_RANGE_MAX_FILES: usize = 100;
-
-/// Get structured per-file diffs for a commit range in a workspace pod.
-///
-/// Returns before/after file content, addition/deletion counts, and change
-/// status for each file changed between `base` and `head`. Compatible with
-/// the opencode SDK's `FileDiff` type.
-///
-/// Use workspace container — it has the agent remote and is trusted.
-/// Agent commits are available after `git fetch agent`.
-async fn git_diff_range(
-    Path(name): Path<String>,
-    Query(params): Query<GitDiffRangeQuery>,
-) -> Result<Json<GitDiffRangeResponse>, (StatusCode, String)> {
-    // Validate refs
-    if !is_valid_git_ref(&params.base) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Invalid git ref for 'base': {}", params.base),
-        ));
-    }
-    if !is_valid_git_ref(&params.head) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Invalid git ref for 'head': {}", params.head),
-        ));
-    }
-
-    // Use workspace container — it has the agent remote and is trusted.
-    // Agent commits are available after `git fetch agent`.
-    let container_name = format!("devaipod-{name}-workspace");
-
-    // Step 1+2: Get changed files with statuses and numstat in one pass each.
-    // --no-renames treats renames as delete+add which simplifies handling.
-    let name_status_cmd = [
-        "git",
-        "diff",
-        "--name-status",
-        "--no-renames",
-        &params.base,
-        &params.head,
-    ];
-    let numstat_cmd = [
-        "git",
-        "diff",
-        "--numstat",
-        "--no-renames",
-        &params.base,
-        &params.head,
-    ];
-
-    let (ns_result, num_result) = tokio::join!(
-        exec_in_container(&container_name, &name_status_cmd),
-        exec_in_container(&container_name, &numstat_cmd),
-    );
-
-    let (ns_exit, ns_stdout, ns_stderr) = ns_result.map_err(|e| {
-        tracing::error!("Failed to run git diff --name-status in {container_name}: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to exec in container: {e}"),
-        )
-    })?;
-
-    if ns_exit != 0 {
-        let stderr_text = String::from_utf8_lossy(&ns_stderr);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("git diff --name-status failed: {}", stderr_text),
-        ));
-    }
-
-    let (num_exit, num_stdout, num_stderr) = num_result.map_err(|e| {
-        tracing::error!("Failed to run git diff --numstat in {container_name}: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to exec in container: {e}"),
-        )
-    })?;
-
-    if num_exit != 0 {
-        let stderr_text = String::from_utf8_lossy(&num_stderr);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("git diff --numstat failed: {}", stderr_text),
-        ));
-    }
-
-    let ns_output = String::from_utf8_lossy(&ns_stdout);
-    let num_output = String::from_utf8_lossy(&num_stdout);
-
-    // If name-status produced nothing, return empty
-    if ns_output.trim().is_empty() {
-        return Ok(Json(GitDiffRangeResponse { files: Vec::new() }));
-    }
-
-    // Parse --name-status: each line is "STATUS\tFILENAME"
-    let mut file_statuses: Vec<(&str, &'static str)> = Vec::new(); // (path, status)
-    for line in ns_output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(2, '\t');
-        let status_char = parts.next().unwrap_or("").trim();
-        let file_path = match parts.next() {
-            Some(p) => p.trim(),
-            None => continue,
-        };
-        let status: &'static str = match status_char {
-            "A" => "added",
-            "D" => "deleted",
-            _ => "modified",
-        };
-        file_statuses.push((file_path, status));
-    }
-
-    if file_statuses.len() > DIFF_RANGE_MAX_FILES {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "Too many changed files ({}, max {})",
-                file_statuses.len(),
-                DIFF_RANGE_MAX_FILES
-            ),
-        ));
-    }
-
-    // Parse --numstat: each line is "ADDS\tDELS\tFILENAME"
-    // Binary files show "-\t-\tFILENAME"
-    let mut numstat_map: std::collections::HashMap<&str, (u32, u32)> =
-        std::collections::HashMap::new();
-    for line in num_output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let fields: Vec<&str> = line.splitn(3, '\t').collect();
-        if fields.len() < 3 {
-            continue;
-        }
-        let adds = fields[0].parse::<u32>().unwrap_or(0);
-        let dels = fields[1].parse::<u32>().unwrap_or(0);
-        numstat_map.insert(fields[2].trim(), (adds, dels));
-    }
-
-    // Step 3: Fetch before/after content for all files in two batched execs
-    // (one for base, one for head) instead of per-file execs.  Each exec
-    // runs a shell loop that outputs file contents separated by a NUL byte
-    // delimiter.  This reduces 2N exec calls to 2, which matters because
-    // each exec has ~200-500ms overhead through the podman VM on macOS.
-    const FILE_SEPARATOR: &str = "\x00DEVAIPOD_FILE_SEP\x00";
-
-    let base_files: Vec<&str> = file_statuses
-        .iter()
-        .filter(|(_, status)| *status != "added")
-        .map(|(path, _)| *path)
-        .collect();
-    let head_files: Vec<&str> = file_statuses
-        .iter()
-        .filter(|(_, status)| *status != "deleted")
-        .map(|(path, _)| *path)
-        .collect();
-
-    // Build a shell script that cats each file at the given ref, separated
-    // by the delimiter.  Using printf to avoid echo interpreting escapes.
-    fn build_batch_script(ref_name: &str, files: &[&str], sep: &str) -> String {
-        let mut script = String::new();
-        for (i, file) in files.iter().enumerate() {
-            if i > 0 {
-                script.push_str(&format!("printf '{sep}';")); // delimiter between files
-            }
-            script.push_str(&format!(
-                "git show '{ref_name}:{file}' 2>/dev/null || true;",
-            ));
-        }
-        script
-    }
-
-    let (base_contents, head_contents) = tokio::join!(
-        async {
-            if base_files.is_empty() {
-                return std::collections::HashMap::new();
-            }
-            let script = build_batch_script(&params.base, &base_files, FILE_SEPARATOR);
-            match exec_in_container(&container_name, &["sh", "-c", &script]).await {
-                Ok((_code, stdout, _stderr)) => {
-                    let output = String::from_utf8(stdout)
-                        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
-                    let parts: Vec<&str> = output.split(FILE_SEPARATOR).collect();
-                    let mut map = std::collections::HashMap::new();
-                    for (i, file) in base_files.iter().enumerate() {
-                        map.insert(file.to_string(), parts.get(i).unwrap_or(&"").to_string());
-                    }
-                    map
-                }
-                Err(e) => {
-                    tracing::error!("Failed to batch-fetch base content: {e}");
-                    std::collections::HashMap::new()
-                }
-            }
-        },
-        async {
-            if head_files.is_empty() {
-                return std::collections::HashMap::new();
-            }
-            let script = build_batch_script(&params.head, &head_files, FILE_SEPARATOR);
-            match exec_in_container(&container_name, &["sh", "-c", &script]).await {
-                Ok((_code, stdout, _stderr)) => {
-                    let output = String::from_utf8(stdout)
-                        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
-                    let parts: Vec<&str> = output.split(FILE_SEPARATOR).collect();
-                    let mut map = std::collections::HashMap::new();
-                    for (i, file) in head_files.iter().enumerate() {
-                        map.insert(file.to_string(), parts.get(i).unwrap_or(&"").to_string());
-                    }
-                    map
-                }
-                Err(e) => {
-                    tracing::error!("Failed to batch-fetch head content: {e}");
-                    std::collections::HashMap::new()
-                }
-            }
-        },
-    );
-
-    let mut files = Vec::with_capacity(file_statuses.len());
-    for &(file_path, status) in &file_statuses {
-        let (adds, dels) = numstat_map.get(file_path).copied().unwrap_or((0, 0));
-        files.push(FileDiff {
-            file: file_path.to_string(),
-            before: base_contents.get(file_path).cloned().unwrap_or_default(),
-            after: head_contents.get(file_path).cloned().unwrap_or_default(),
-            additions: adds,
-            deletions: dels,
-            status,
-        });
-    }
-
-    Ok(Json(GitDiffRangeResponse { files }))
-}
-
-#[derive(Debug, Serialize)]
-struct GitFetchResponse {
-    /// Whether new commits were fetched
-    success: bool,
-    /// Human-readable summary
-    message: String,
-}
-
-/// Fetch latest commits from the agent remote
-///
-/// Runs `git fetch agent` in the workspace container to pull
-/// the agent's latest commits for review.
-async fn git_fetch_agent(
-    Path(name): Path<String>,
-) -> Result<Json<GitFetchResponse>, (StatusCode, String)> {
-    let container_name = format!("devaipod-{name}-workspace");
-
-    let (exit_code, _stdout, stderr) =
-        exec_in_container(&container_name, &["git", "fetch", "agent"])
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to run git fetch agent in {container_name}: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to exec in container: {e}"),
-                )
-            })?;
-
-    if exit_code != 0 {
-        let stderr_text = String::from_utf8_lossy(&stderr);
-        return Ok(Json(GitFetchResponse {
-            success: false,
-            message: format!("git fetch agent failed: {}", stderr_text),
-        }));
-    }
-
-    Ok(Json(GitFetchResponse {
-        success: true,
-        message: "Fetched latest agent commits".to_string(),
-    }))
-}
-
-#[derive(Debug, Deserialize)]
-struct GitPushRequest {
-    branch: String,
-}
-
-#[derive(Debug, Serialize)]
-struct GitPushResponse {
-    success: bool,
-    message: String,
-}
-
-/// Push a branch to origin from the workspace
-///
-/// Used after human approves agent commits — the workspace has GH_TOKEN
-/// and can push directly.
-async fn git_push(
-    Path(name): Path<String>,
-    Json(body): Json<GitPushRequest>,
-) -> Result<Json<GitPushResponse>, (StatusCode, String)> {
-    if !is_valid_git_ref(&body.branch) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Invalid branch name: {}", body.branch),
-        ));
-    }
-
-    let container_name = format!("devaipod-{name}-workspace");
-
-    let (exit_code, _stdout, stderr) =
-        exec_in_container(&container_name, &["git", "push", "origin", &body.branch])
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to run git push in {container_name}: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to exec in container: {e}"),
-                )
-            })?;
-
-    if exit_code != 0 {
-        let stderr_text = String::from_utf8_lossy(&stderr);
-        return Ok(Json(GitPushResponse {
-            success: false,
-            message: format!("git push failed: {}", stderr_text),
-        }));
-    }
-
-    Ok(Json(GitPushResponse {
-        success: true,
-        message: format!("Pushed branch '{}' to origin", body.branch),
-    }))
-}
-
-/// Execute a command in a container and return output
-///
-/// Uses bollard to execute the command and capture stdout/stderr.
-async fn exec_in_container(container: &str, cmd: &[&str]) -> Result<(i64, Vec<u8>, Vec<u8>)> {
-    use bollard::exec::{CreateExecOptions, StartExecResults};
-    use bollard::Docker;
-    use futures_util::StreamExt;
-
-    let socket_path = get_container_socket()?;
-    let docker = Docker::connect_with_unix(
-        &format!("unix://{}", socket_path.display()),
-        120,
-        bollard::API_DEFAULT_VERSION,
-    )
-    .context("Failed to connect to container socket")?;
-
-    let exec = docker
-        .create_exec(
-            container,
-            CreateExecOptions {
-                cmd: Some(cmd.to_vec()),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            },
-        )
-        .await
-        .context("Failed to create exec")?;
-
-    let result = docker
-        .start_exec(&exec.id, None)
-        .await
-        .context("Failed to start exec")?;
-
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-
-    match result {
-        StartExecResults::Attached { mut output, .. } => {
-            while let Some(chunk) = output.next().await {
-                match chunk {
-                    Ok(bollard::container::LogOutput::StdOut { message }) => {
-                        stdout_buf.extend_from_slice(&message);
-                    }
-                    Ok(bollard::container::LogOutput::StdErr { message }) => {
-                        stderr_buf.extend_from_slice(&message);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("Exec output error: {}", e);
-                    }
-                }
-            }
-        }
-        StartExecResults::Detached => {}
-    }
-
-    let inspect = docker
-        .inspect_exec(&exec.id)
-        .await
-        .context("Failed to inspect exec")?;
-
-    let exit_code = inspect.exit_code.unwrap_or(-1);
-    Ok((exit_code, stdout_buf, stderr_buf))
-}
+// Git endpoints (git_status, git_diff, git_commits, git_log, git_diff_range,
+// git_fetch_agent, git_push) and exec_in_container have been removed.
+// The pod-api sidecar now handles all git operations directly, and the frontend
+// routes git requests through the pod-api proxy.
 
 /// Run the web server
 ///
 /// Starts an HTTP server on the specified port with:
 /// - Token-based authentication on `/api/*` routes
 /// - Podman socket proxy at `/api/podman/*`
-/// - Git endpoints at `/api/devaipod/pods/{name}/git/*`
+/// - Pod-api proxy for git and PTY access
 /// - Static file serving from `dist/` directory
 ///
 /// # Arguments
@@ -2849,32 +1841,8 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
                 .put(podman_proxy)
                 .delete(podman_proxy),
         )
-        .route(
-            "/devaipod/pods/{name}/opencode",
-            get(opencode_proxy_root)
-                .post(opencode_proxy_root)
-                .put(opencode_proxy_root)
-                .delete(opencode_proxy_root),
-        )
-        .route(
-            "/devaipod/pods/{name}/opencode/{*path}",
-            get(opencode_proxy)
-                .post(opencode_proxy)
-                .put(opencode_proxy)
-                .delete(opencode_proxy),
-        )
         .route("/devaipod/pods/{name}/opencode-info", get(opencode_info))
         .route("/devaipod/pods/{name}/agent-status", get(agent_status))
-        .route("/devaipod/pods/{name}/git/status", get(git_status))
-        .route("/devaipod/pods/{name}/git/diff", get(git_diff))
-        .route("/devaipod/pods/{name}/git/commits", get(git_commits))
-        .route("/devaipod/pods/{name}/git/log", get(git_log))
-        .route("/devaipod/pods/{name}/git/diff-range", get(git_diff_range))
-        .route(
-            "/devaipod/pods/{name}/git/fetch-agent",
-            post(git_fetch_agent),
-        )
-        .route("/devaipod/pods/{name}/git/push", post(git_push))
         .route(
             "/devaipod/pods/{name}/pod-api/{*path}",
             get(pod_api_proxy)
@@ -2931,22 +1899,11 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         .route("/_devaipod/oldui", get(serve_old_ui))
         .route("/_devaipod/agent/{name}", get(agent_wrapper))
         .route("/_devaipod/agent/{name}/", get(agent_ui_root))
-        .route(
-            "/_devaipod/agent/{name}/{*path}",
-            get(agent_ui_handler)
-                .post(agent_ui_handler)
-                .put(agent_ui_handler)
-                .delete(agent_ui_handler)
-                .patch(agent_ui_handler),
-        )
         // /assets/*: always serve from vendored opencode UI (control-plane UI uses inline styles)
         .route("/assets", get(serve_root_assets))
         .route("/assets/{*path}", get(serve_root_assets))
-        // Catch-all fallback: if the agent cookie is set, proxy to the opencode backend;
-        // otherwise serve the SPA for client-side routing. This avoids maintaining a
-        // hardcoded list of opencode API routes (the SPA uses window.location.origin
-        // for all its API calls: /session, /global/event, /agent, /config, etc.).
-        .fallback(opencode_or_static_fallback)
+        // Catch-all fallback: serve static files or the SPA index.html for client-side routing.
+        .fallback(static_or_spa_fallback)
         .layer(middleware::from_fn(request_trace))
         .layer(cors)
         .with_state(state)
@@ -3117,60 +2074,6 @@ mod tests {
         assert_eq!(token.len(), 43);
     }
 
-    #[test]
-    fn test_parse_git_status_line() {
-        // Test parsing a modified file
-        let line = " M src/main.rs";
-        let status = line.chars().take(2).collect::<String>().trim().to_string();
-        let path = line.chars().skip(3).collect::<String>();
-        assert_eq!(status, "M");
-        assert_eq!(path, "src/main.rs");
-
-        // Test parsing an untracked file
-        let line = "?? new_file.txt";
-        let status = line.chars().take(2).collect::<String>().trim().to_string();
-        let path = line.chars().skip(3).collect::<String>();
-        assert_eq!(status, "??");
-        assert_eq!(path, "new_file.txt");
-    }
-
-    #[test]
-    fn test_parse_git_log_line() {
-        let line = "abc1234 Fix the bug in parser";
-        let mut parts = line.splitn(2, ' ');
-        let hash = parts.next().unwrap().to_string();
-        let message = parts.next().unwrap_or("").to_string();
-        assert_eq!(hash, "abc1234");
-        assert_eq!(message, "Fix the bug in parser");
-    }
-
-    #[test]
-    fn test_agent_ui_api_path_detection() {
-        // Test the logic used in agent_ui_handler to determine API vs static paths (OPENCODE_API_SEGMENTS)
-        let is_api = |path: &str| {
-            OPENCODE_API_SEGMENTS
-                .iter()
-                .any(|p| path == *p || path.starts_with(&format!("{}/", p)))
-        };
-
-        assert!(is_api("rpc"));
-        assert!(is_api("event"));
-        assert!(is_api("session"));
-        assert!(is_api("global"));
-        assert!(is_api("path"));
-        assert!(is_api("project"));
-        assert!(is_api("provider"));
-        assert!(is_api("auth"));
-        assert!(is_api("rpc/some/path"));
-
-        // Static paths should not be detected as API
-        assert!(!is_api(""));
-        assert!(!is_api("index.html"));
-        assert!(!is_api("assets/main.js"));
-        assert!(!is_api("favicon.ico"));
-        assert!(!is_api("some/other/path"));
-    }
-
     /// Verify proxy_to_upstream upgrades HTTP/1.0 responses to HTTP/1.1.
     ///
     /// Browsers require HTTP/1.1 for SSE (chunked transfer encoding). This test
@@ -3325,41 +2228,6 @@ mod tests {
             request_line.contains("src"),
             "proxy must preserve path param value; request line: {}",
             request_line
-        );
-    }
-
-    /// Document and assert the URL rewrite patterns used for agent UI (HTML and CSS).
-    /// If you add or change patterns, update docs/audit-agent-ui-rewriting.md and this test.
-    #[test]
-    fn test_agent_ui_rewrite_patterns() {
-        let base = "/agent/example-pod/";
-
-        // HTML patterns (index.html)
-        let html = r#"<script src="/assets/x.js"></script><link href="/assets/y.css">"#;
-        let rewritten_html = html
-            .replace(" src=\"/", &format!(" src=\"{base}"))
-            .replace(" href=\"/", &format!(" href=\"{base}"));
-        assert!(
-            rewritten_html.contains(base),
-            "HTML src/href must be rewritten"
-        );
-        assert!(
-            !rewritten_html.contains("src=\"/assets/"),
-            "HTML must not leave bare src=\"/"
-        );
-
-        // CSS patterns (fonts and assets)
-        let css = r#"url("/assets/font.woff2") url('/x.woff2') url(/unquoted.woff2) url( "/spaced.woff2")"#;
-        let rewritten_css = css
-            .replace("url(\"/", &format!("url(\"{base}"))
-            .replace("url('/", &format!("url('{base}"))
-            .replace("url( \"/", &format!("url( \"{base}"))
-            .replace("url( '/", &format!("url( '{base}"))
-            .replace("url(/", &format!("url({base}"));
-        assert!(rewritten_css.contains(base), "CSS url() must be rewritten");
-        assert!(
-            !rewritten_css.contains("url(\"/assets/"),
-            "CSS must not leave bare url(\"/"
         );
     }
 }

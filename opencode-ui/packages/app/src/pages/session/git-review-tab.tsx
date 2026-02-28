@@ -61,7 +61,7 @@ export function GitReviewTab(props: GitReviewTabProps) {
     () => podName,
     async (pod) => {
       const data = await apiFetch<{ commits: GitLogEntry[] }>(
-        `/api/devaipod/pods/${encodeURIComponent(pod)}/git/log`,
+        `/api/devaipod/pods/${encodeURIComponent(pod)}/pod-api/git/log`,
       )
       return data.commits
     },
@@ -119,7 +119,7 @@ export function GitReviewTab(props: GitReviewTabProps) {
 
   const [diffData] = createResource(diffParams, async (params) => {
     const data = await apiFetch<{ files: ApiFileDiff[] }>(
-      `/api/devaipod/pods/${encodeURIComponent(params.pod)}/git/diff-range?base=${encodeURIComponent(params.base)}&head=${encodeURIComponent(params.head)}`,
+      `/api/devaipod/pods/${encodeURIComponent(params.pod)}/pod-api/git/diff-range?base=${encodeURIComponent(params.base)}&head=${encodeURIComponent(params.head)}`,
     )
     return data.files
   })

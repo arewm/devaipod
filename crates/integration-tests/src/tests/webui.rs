@@ -11,18 +11,20 @@
 //!
 //! ## UI surface (keep covered by tests)
 //!
-//! The frontend (static `dist/index.html` or Leptos/WASM build) relies on:
+//! The frontend relies on:
 //!
 //! - **GET /** — Control plane HTML (optional `?token=...`). Must return 200 and
 //!   contain "devaipod" and control-plane markers (e.g. "Refresh", "Launch", or token prompt).
-//! - **GET /_devaipod/agent/{name}** — 307 redirect to /_devaipod/agent/{name}/ with Set-Cookie DEVAIPOD_AGENT_POD.
-//! - **GET /_devaipod/agent/{name}/** — Iframe wrapper page (back button bar + full-screen iframe loading /_devaipod/opencode-ui).
-//! - **GET /_devaipod/opencode-ui** — Raw opencode SPA index.html (with error interceptor, no URL rewriting).
+//! - **GET /_devaipod/agent/{name}** — 307 redirect to /_devaipod/agent/{name}/.
+//! - **GET /_devaipod/agent/{name}/** — Iframe wrapper page (back button bar + full-screen
+//!   iframe pointing at the pod-api sidecar).
 //! - **GET /api/podman/v5.0.0/libpod/pods/json** — Pod list (Bearer token required).
 //! - **POST /api/podman/.../pods/{name}/start**, **.../stop**, **DELETE .../pods/{name}?force=true**
 //! - **GET /api/devaipod/pods/{name}/opencode-info** — Agent info for "Open Agent".
 //! - **POST /api/devaipod/pods/{name}/recreate** — Recreate workspace (same repo).
 //! - **POST /api/devaipod/run** — Create workspace (JSON: `{ "source", "task" }`).
+//! - **GET /api/devaipod/pods/{name}/pod-api/{*path}** — Proxy to the per-pod API sidecar
+//!   (git operations, PTY, etc.).
 //!
 //! ## How to run
 //!
@@ -30,31 +32,6 @@
 //!   is built and tests run against it. Direct `cargo test -p integration-tests` will error unless
 //!   `DEVAIPOD_INTEGRATION_ALLOW_DIRECT=1` is set.
 //! - **Fast route tests (no container)**: `cargo test -p devaipod web::tests::` — sub-second.
-//!
-//! ## Testing approach (why these tests exist)
-//!
-//! We test the **critical path a browser takes** so regressions (e.g. "Could not connect to server",
-//! asset 404s, missing API routes) are caught:
-//!
-//! - **Agent page load**: GET /_devaipod/agent/{name}/ returns the iframe wrapper page (back button
-//!   bar + full-screen iframe pointing to /_devaipod/opencode-ui). The opencode SPA runs unmodified
-//!   inside the iframe.
-//! - **Static assets**: JS and CSS from the opencode-ui index are served via /assets/* with the
-//!   DEVAIPOD_AGENT_POD cookie (the cookie tells serve_root_assets to serve from opencode dir).
-//! - **Root-level API with cookie**: The opencode app uses `window.location.origin`, so it requests
-//!   /session, /rpc, /path, etc. at **root**. We proxy those using the DEVAIPOD_AGENT_POD cookie.
-//!   Tests send that cookie and assert root /session (and other API segments) return not 400/404.
-//! - **Full critical path**: `test_web_opencode_ui_full_critical_path` runs the complete flow (index →
-//!   JS + CSS assets → root API with cookie) so "opencode web UI works" is covered in one test.
-//! - **Event stream (no cookie)**: `test_web_event_stream_no_cookie_returns_http11_sse` asserts GET /event,
-//!   /global, and /global/event without agent cookie return HTTP/1.1 200 with `text/event-stream`
-//!   so webviews (e.g. global-sdk) do not see "Load failed".
-//! - **Event stream (unreachable pod)**: `test_web_event_stream_with_cookie_unreachable_pod_returns_http11_sse`
-//!   asserts that SSE endpoints with a cookie pointing to a nonexistent pod still return HTTP/1.1 200
-//!   keepalive (not 502/503), preventing the global-sdk reconnection storm.
-//! - **Control plane**: Root with token, auth, run endpoint are covered.
-//!
-//! Adding a new route or rewrite that affects the agent UI should be covered by one of these tests.
 //!
 //! ## Test tiers
 //!
@@ -439,7 +416,7 @@ impl WebContainerGuard {
         Ok((http_version, status, content_type, body))
     }
 
-    /// Run curl with a Cookie header (e.g. for root-level opencode API requests that require DEVAIPOD_AGENT_POD).
+    /// Run curl with a Cookie header.
     fn curl_in_container_with_cookie(&self, path: &str, cookie: &str) -> Result<(i32, String)> {
         let url = format!("http://127.0.0.1:8080{}", path);
         let cookie_header = format!("Cookie: {}", cookie);
@@ -593,7 +570,7 @@ impl WebFixture {
         self.guard.curl_in_container(path, auth_token)
     }
 
-    /// Run curl with a Cookie header (for root-level opencode API: DEVAIPOD_AGENT_POD=name).
+    /// Run curl with a Cookie header.
     pub fn curl_in_container_with_cookie(&self, path: &str, cookie: &str) -> Result<(i32, String)> {
         self.guard.curl_in_container_with_cookie(path, cookie)
     }
@@ -722,401 +699,6 @@ fn test_web_agent_ui_index_rewrites_asset_urls() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_web_agent_ui_index_rewrites_asset_urls);
-
-/// Verify an asset referenced by the agent UI index is served at /_devaipod/agent/{name}/{path}
-///
-/// With the iframe approach, assets are loaded from /assets/* with the cookie set.
-/// Verify GET /_devaipod/opencode-ui serves the opencode SPA HTML and assets load via /assets/*
-///
-/// The iframe loads the opencode SPA from /_devaipod/opencode-ui. The SPA's scripts and
-/// stylesheets reference /assets/... which are served by serve_root_assets when the
-/// DEVAIPOD_AGENT_POD cookie is set. This test verifies the opencode-ui endpoint returns
-/// valid HTML and that an asset extracted from it is served at /assets/*.
-///
-/// Tier 1: Parallel safe, no pod needed
-fn test_web_agent_ui_serves_asset() -> Result<()> {
-    let fixture = WebFixture::get()?;
-    // Fetch the raw opencode UI
-    let (status, body) = fixture.curl_in_container("/_devaipod/opencode-ui", None)?;
-    assert_eq!(status, 200, "/_devaipod/opencode-ui must return 200");
-    assert!(
-        body.contains("<script") || body.contains("<link"),
-        "opencode-ui must contain script or link tags; got: {}",
-        &body[..body.len().min(500)]
-    );
-
-    // Extract an asset path: src="/assets/..." or href="/assets/..."
-    let asset_path = ["src=\"/assets/", "href=\"/assets/"]
-        .iter()
-        .find_map(|prefix| {
-            body.find(prefix).map(|start| {
-                let value_start = start + prefix.len() - "/assets/".len();
-                let rest = &body[value_start..];
-                let end = rest.find('"').unwrap_or(rest.len());
-                rest[..end].to_string()
-            })
-        });
-    let asset_path = match asset_path {
-        Some(p) => p,
-        None => bail!(
-            "Could not find /assets/ path in opencode-ui HTML. Body sample: {}",
-            &body[..body.len().min(800)]
-        ),
-    };
-
-    // Assets need the DEVAIPOD_AGENT_POD cookie to be served from the opencode dir
-    let cookie = format!("{}=example-pod", DEVAIPOD_AGENT_POD_COOKIE_NAME);
-    let (asset_status, _) = fixture.curl_in_container_with_cookie(&asset_path, &cookie)?;
-    assert_eq!(
-        asset_status, 200,
-        "GET {} (asset from opencode-ui index) with cookie should return 200",
-        asset_path
-    );
-
-    Ok(())
-}
-podman_integration_test!(test_web_agent_ui_serves_asset);
-
-/// Cookie name used to attribute root-level opencode API requests to a pod (must match web server).
-const DEVAIPOD_AGENT_POD_COOKIE_NAME: &str = "DEVAIPOD_AGENT_POD";
-
-/// Verify root-level opencode API is proxied when cookie is set (session, rpc, etc.)
-///
-/// The opencode app uses window.location.origin, so it requests /session, /rpc at root.
-/// We proxy those using the DEVAIPOD_AGENT_POD cookie. This test ensures the route exists and
-/// accepts the cookie (we expect 502/503 if no pod is running, but not 400 or 404).
-///
-/// Requires a container image built with root proxy routes (see web.rs). Use
-/// `just test-integration-container` to build and run against the current code.
-///
-/// Tier 1: Parallel safe, no pod needed
-fn test_web_agent_ui_root_api_with_cookie() -> Result<()> {
-    let fixture = WebFixture::get()?;
-    let cookie = format!(
-        "{}={}",
-        DEVAIPOD_AGENT_POD_COOKIE_NAME,
-        urlencoding::encode("example-pod")
-    );
-    let (status, _body) = fixture.curl_in_container_with_cookie("/session", &cookie)?;
-    assert_ne!(
-        status, 400,
-        "GET /session with cookie must not return 400 (missing cookie) — root proxy must be wired"
-    );
-    assert_ne!(
-        status, 404,
-        "GET /session with cookie must not return 404 — root opencode API route must exist"
-    );
-    Ok(())
-}
-podman_integration_test!(test_web_agent_ui_root_api_with_cookie);
-
-/// Verify root-level API path segments (path, project, provider, auth) are proxied, not 404.
-///
-/// Same image requirement as test_web_agent_ui_root_api_with_cookie.
-///
-/// Tier 1: Parallel safe, no pod needed
-fn test_web_agent_ui_root_api_paths_proxied() -> Result<()> {
-    let fixture = WebFixture::get()?;
-    let cookie = format!(
-        "{}={}",
-        DEVAIPOD_AGENT_POD_COOKIE_NAME,
-        urlencoding::encode("example-pod")
-    );
-    for path in ["/path", "/project", "/provider", "/auth"] {
-        let (status, _body) = fixture.curl_in_container_with_cookie(path, &cookie)?;
-        assert_ne!(
-            status, 404,
-            "GET {} with cookie must not return 404 — route must exist for opencode API",
-            path
-        );
-    }
-    Ok(())
-}
-podman_integration_test!(test_web_agent_ui_root_api_paths_proxied);
-
-/// Event-stream endpoints (/event, /global, /global/event) without agent cookie must return
-/// HTTP/1.1 200 with text/event-stream so webviews (e.g. global-sdk) do not see "Load failed".
-/// The global-sdk calls GET /global/event; /event and /global are also covered.
-///
-/// Critically, the response MUST be HTTP/1.1 (not HTTP/1.0) because SSE requires chunked
-/// transfer encoding; an HTTP/1.0 response causes browsers to close the connection and retry
-/// in a tight loop.
-///
-/// Tier 1: Parallel safe, no pod needed
-fn test_web_event_stream_no_cookie_returns_http11_sse() -> Result<()> {
-    let fixture = WebFixture::get()?;
-    for path in ["/event", "/global", "/global/event"] {
-        let (http_ver, status, content_type, body) = fixture.curl_full_headers(path, 2, None)?;
-        assert_eq!(
-            status, 200,
-            "GET {} without cookie must return 200 (not 400) so event stream does not Load failed",
-            path
-        );
-        assert_eq!(
-            http_ver, "HTTP/1.1",
-            "GET {} must respond with HTTP/1.1 for SSE streaming; got {http_ver}",
-            path
-        );
-        assert!(
-            content_type
-                .trim()
-                .to_lowercase()
-                .contains("text/event-stream"),
-            "GET {} must return Content-Type: text/event-stream, got {:?}",
-            path,
-            content_type
-        );
-        assert!(
-            body.contains("no agent context") || body.is_empty() || body.starts_with(':'),
-            "GET {} body must be valid SSE (comment or empty), got: {:?}",
-            path,
-            body.chars().take(80).collect::<String>()
-        );
-    }
-    Ok(())
-}
-podman_integration_test!(test_web_event_stream_no_cookie_returns_http11_sse);
-
-/// Event-stream endpoints WITH agent cookie but unreachable pod must still return HTTP/1.1 200
-/// SSE keepalive (not an HTTP error like 502/503). This covers the scenario where a user is on
-/// an agent page (/_devaipod/agent/{name}/) and the pod's opencode server is not (yet) reachable — the
-/// global-sdk opens /global/event and must get a long-lived SSE stream, not an error that
-/// triggers aggressive reconnection.
-///
-/// Tier 1: Parallel safe, pod name is fictitious (proxy will fail to connect)
-fn test_web_event_stream_with_cookie_unreachable_pod_returns_http11_sse() -> Result<()> {
-    let fixture = WebFixture::get()?;
-    let cookie = format!(
-        "{}={}",
-        DEVAIPOD_AGENT_POD_COOKIE_NAME,
-        urlencoding::encode("nonexistent-pod-12345")
-    );
-    for path in ["/event", "/global", "/global/event"] {
-        let (http_ver, status, content_type, _body) =
-            fixture.curl_full_headers(path, 2, Some(&cookie))?;
-        assert_eq!(
-            status, 200,
-            "GET {} with cookie for unreachable pod must return 200 SSE keepalive, got {status}",
-            path
-        );
-        assert_eq!(
-            http_ver, "HTTP/1.1",
-            "GET {} with cookie must respond HTTP/1.1 for SSE streaming; got {http_ver}",
-            path
-        );
-        assert!(
-            content_type
-                .trim()
-                .to_lowercase()
-                .contains("text/event-stream"),
-            "GET {} with cookie must return text/event-stream, got {:?}",
-            path,
-            content_type
-        );
-    }
-    Ok(())
-}
-podman_integration_test!(test_web_event_stream_with_cookie_unreachable_pod_returns_http11_sse);
-
-/// Verify CSS assets from the opencode UI are served correctly via /assets/* with cookie.
-///
-/// Tier 1: Parallel safe, no pod needed
-/// Verify CSS assets from the opencode UI are served correctly via /assets/* with cookie
-///
-/// With the iframe approach, CSS assets are loaded from /assets/... (root-level) when the
-/// DEVAIPOD_AGENT_POD cookie is set. No CSS rewriting is needed.
-fn test_web_agent_ui_css_rewrites_urls() -> Result<()> {
-    let fixture = WebFixture::get()?;
-    // Fetch the opencode-ui index to find a CSS asset
-    let (status, body) = fixture.curl_in_container("/_devaipod/opencode-ui", None)?;
-    assert_eq!(status, 200, "opencode-ui must return 200");
-
-    // Find a .css href
-    let css_path = body.split("href=\"").skip(1).find_map(|after| {
-        let end = after.find('"')?;
-        let value = &after[..end];
-        value.contains(".css").then(|| {
-            let p = value.to_string();
-            if p.starts_with('/') {
-                p
-            } else {
-                format!("/{}", p)
-            }
-        })
-    });
-    let css_path = match css_path {
-        Some(p) => p,
-        None => bail!(
-            "Could not find .css href in opencode-ui HTML. Body sample: {}",
-            &body[..body.len().min(600)]
-        ),
-    };
-    // CSS needs the cookie to be served from the opencode dir
-    let cookie = format!("{}=example-pod", DEVAIPOD_AGENT_POD_COOKIE_NAME);
-    let (css_status, _css_body) = fixture.curl_in_container_with_cookie(&css_path, &cookie)?;
-    assert_eq!(
-        css_status, 200,
-        "GET {} (CSS from opencode) with cookie should return 200",
-        css_path
-    );
-    Ok(())
-}
-podman_integration_test!(test_web_agent_ui_css_rewrites_urls);
-
-/// Full critical path: iframe wrapper → opencode-ui → assets → API
-///
-/// Simulates the browser flow: load agent wrapper (iframe), load opencode-ui (raw SPA),
-/// load JS and CSS assets via /assets/* with cookie, then call root API (/session, /path).
-/// Catches regressions like empty pages, 404s, or broken asset serving.
-///
-/// Tier 1: Parallel safe, no pod needed
-fn test_web_opencode_ui_full_critical_path() -> Result<()> {
-    let fixture = WebFixture::get()?;
-    let pod_name = "example-pod";
-    let cookie = format!(
-        "{}={}",
-        DEVAIPOD_AGENT_POD_COOKIE_NAME,
-        urlencoding::encode(pod_name)
-    );
-    // 1. Agent wrapper must be the iframe page
-    let wrapper_path = format!("/_devaipod/agent/{}/", urlencoding::encode(pod_name));
-    let (status, body) = fixture.curl_in_container(&wrapper_path, None)?;
-    assert_eq!(status, 200, "Agent wrapper must return 200, got {}", status);
-    assert!(
-        body.contains("/_devaipod/opencode-ui"),
-        "Wrapper must contain iframe src"
-    );
-    assert!(body.contains("Pods"), "Wrapper must have back link");
-
-    // 2. Opencode-ui must serve valid HTML with script/link tags
-    let (status, body) = fixture.curl_in_container("/_devaipod/opencode-ui", None)?;
-    assert_eq!(status, 200, "opencode-ui must return 200");
-
-    // 3. Extract and fetch one JS and one CSS from the opencode index via /assets/*
-    let mut js_path: Option<String> = None;
-    let mut css_path: Option<String> = None;
-    for prefix in ["href=\"", "src=\""] {
-        let mut search_start = 0;
-        while let Some(rel) = body[search_start..].find(prefix) {
-            let start = search_start + rel + prefix.len();
-            let rest = &body[start..];
-            let end = rest.find('"').unwrap_or(rest.len());
-            let p = rest[..end].to_string();
-            if p.starts_with("/assets/") {
-                if p.ends_with(".js") {
-                    js_path.get_or_insert(p.clone());
-                } else if p.ends_with(".css") {
-                    css_path.get_or_insert(p.clone());
-                }
-            }
-            search_start = start + end + 1;
-        }
-    }
-    if let Some(ref p) = js_path {
-        let (s, _) = fixture.curl_in_container_with_cookie(p, &cookie)?;
-        assert_eq!(s, 200, "JS asset {} with cookie must return 200", p);
-    }
-    if let Some(ref p) = css_path {
-        let (s, _) = fixture.curl_in_container_with_cookie(p, &cookie)?;
-        assert_eq!(s, 200, "CSS asset {} with cookie must return 200", p);
-    }
-    assert!(
-        js_path.is_some(),
-        "opencode-ui must reference at least one JS asset"
-    );
-    assert!(
-        css_path.is_some(),
-        "opencode-ui must reference at least one CSS asset"
-    );
-
-    // 4. Root API with cookie — must not 400 or 404
-    for api_path in ["/session", "/path"] {
-        let (status, _) = fixture.curl_in_container_with_cookie(api_path, &cookie)?;
-        assert_ne!(status, 400, "{} with cookie must not return 400", api_path);
-        assert_ne!(status, 404, "{} with cookie must not return 404", api_path);
-    }
-
-    Ok(())
-}
-podman_integration_test!(test_web_opencode_ui_full_critical_path);
-
-/// Verify GET /_devaipod/agent/{name} (no trailing slash) returns 307 redirect with Location and Set-Cookie.
-///
-/// The control plane navigates to /_devaipod/agent/{name}; the server redirects to /_devaipod/agent/{name}/ and sets
-/// DEVAIPOD_AGENT_POD cookie so root-level opencode API requests are attributed to the pod.
-///
-/// Tier 1: Parallel safe, no pod needed
-fn test_web_agent_redirect_sets_cookie() -> Result<()> {
-    let fixture = WebFixture::get()?;
-    let pod_name = "example-pod";
-    let path = format!("/_devaipod/agent/{}", urlencoding::encode(pod_name));
-    let url = format!("http://127.0.0.1:8080{}", path);
-
-    // curl without -L: do not follow redirects so we can assert 307 and headers
-    let output = Command::new("podman")
-        .args([
-            "exec",
-            fixture.container_name(),
-            "curl",
-            "-s",
-            "-D",
-            "-",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "30",
-            &url,
-        ])
-        .output()?;
-
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let (headers_str, _body) = if let Some(pos) = raw.find("\r\n\r\n") {
-        (raw[..pos].to_string(), raw[pos + 4..].to_string())
-    } else if let Some(pos) = raw.find("\n\n") {
-        (raw[..pos].to_string(), raw[pos + 2..].to_string())
-    } else {
-        (raw.to_string(), String::new())
-    };
-
-    let status: i32 = headers_str
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1).and_then(|s| s.parse().ok()))
-        .unwrap_or(-1);
-    assert_eq!(
-        status, 307,
-        "GET /_devaipod/agent/{{name}} must return 307 redirect, got {}",
-        status
-    );
-
-    let location = headers_str
-        .lines()
-        .find(|l| l.trim_start().to_lowercase().starts_with("location:"))
-        .and_then(|l| l.split(':').nth(1).map(|v| v.trim().to_string()))
-        .expect("Location header must be present");
-    let expected_location = format!("/_devaipod/agent/{}/", urlencoding::encode(pod_name));
-    assert_eq!(
-        location, expected_location,
-        "Location header must point to /_devaipod/agent/{{name}}/"
-    );
-
-    let set_cookie = headers_str
-        .lines()
-        .find(|l| l.trim_start().to_lowercase().starts_with("set-cookie:"));
-    assert!(set_cookie.is_some(), "Set-Cookie header must be present");
-    let set_cookie_val = set_cookie.unwrap();
-    assert!(
-        set_cookie_val
-            .to_lowercase()
-            .contains(&DEVAIPOD_AGENT_POD_COOKIE_NAME.to_lowercase()),
-        "Set-Cookie must contain {}, got: {}",
-        DEVAIPOD_AGENT_POD_COOKIE_NAME,
-        set_cookie_val
-    );
-
-    Ok(())
-}
-podman_integration_test!(test_web_agent_redirect_sets_cookie);
 
 /// Verify control-plane UI is served at root with token (UI surface: GET /)
 ///
