@@ -1,26 +1,60 @@
-# Agent UI: native integration vs iframe
+# Agent UI: vendored opencode SPA in devaipod
 
 ## Current state (Feb 2026)
 
-The vendored opencode web UI (pinned at v1.1.65, built from source in the
-Containerfile) runs inside an iframe at `/_devaipod/opencode-ui`. The control
-plane is a separate vanilla HTML/JS page (`dist/index.html`). Cookie-based
-routing (`DEVAIPOD_AGENT_POD`) directs root-level opencode API calls to the
-correct pod's backend.
+The vendored opencode web UI (built from source in the Containerfile with
+`VITE_DEVAIPOD=true`) is served by the **pod-api sidecar** container. Each
+pod has a sidecar that serves the SPA, proxies opencode API calls to
+`localhost:4096` (within the pod's network namespace), and handles git and
+PTY endpoints directly.
 
-This works but requires ~450 lines of workaround code in `web.rs`:
+The control plane's role is limited to:
+- Pod lifecycle management (create, start, stop, rebuild)
+- Auth (cookie-based login, token validation)
+- Discovering the pod-api sidecar's published port
+- Serving the iframe wrapper page with a "Back to Pods" navigation bar
+- The `/pods` management page (SPA route, outside the opencode SDK stack)
 
-- Cookie parsing and setting across two handlers
-- SSE keepalive streams to prevent the opencode SDK from error-looping
-  when there's no pod context
-- Console error interception injected into the vendored index.html
-- A complex fallback router that discriminates static files from API calls
-  from SSE streams, all arriving at the same root origin
-- Manual `/assets/*` routing since the opencode SPA uses absolute paths
+### Architecture
 
-Static file serving was recently simplified to use `tower_http::ServeDir`
-instead of hand-rolled mime detection and path traversal checks, but the
-fundamental complexity comes from running two apps at one origin.
+```
+Browser → control plane:8080
+  ├─ /pods                    Pod management page (SPA route)
+  ├─ /_devaipod/agent/{name}/ Iframe wrapper (discovers pod-api port)
+  └─ /api/devaipod/...        Pod lifecycle, agent status, proposals
+
+Browser → pod-api:{port}      (via iframe, each pod has its own port/origin)
+  ├─ /                        Vendored opencode SPA (index.html)
+  ├─ /assets/*                SPA static files (JS, CSS, fonts)
+  ├─ /git/*                   Git endpoints (direct process, no exec overhead)
+  ├─ /pty/*                   Workspace PTY (WebSocket, bollard exec)
+  ├─ /git/events              SSE stream (inotify-based git watcher)
+  └─ /*                       Fallback: proxy to opencode at localhost:4096
+                              (session, rpc, event, config, etc.)
+                              with Basic auth, SSE keepalive for readiness
+```
+
+Each pod exposes only one published port (the pod-api sidecar at 8090
+internal, random host port). The opencode server port (4096) is NOT
+published — the sidecar proxies to it internally.
+
+Since each pod runs on its own origin (different host port), localStorage
+is naturally isolated per pod — no monkey-patching or cookie-based scoping
+needed.
+
+### Key files
+
+| File | Purpose |
+|------|---------|
+| `src/pod_api.rs` | Pod-api sidecar: git, PTY, opencode proxy, static UI |
+| `src/web.rs` | Control plane: auth, pod management, iframe wrapper |
+| `src/pod.rs` | Pod/container creation, sidecar config |
+| `opencode-ui/packages/app/src/context/devaipod.tsx` | Pod management context |
+| `opencode-ui/packages/app/src/pages/pods.tsx` | Pod management page |
+| `opencode-ui/packages/app/src/context/workspace-terminal.tsx` | Workspace PTY client |
+| `opencode-ui/packages/app/src/pages/session/git-review-tab.tsx` | Git diff review |
+| `opencode-ui/packages/app/src/pages/session/terminal-panel.tsx` | Agent/Workspace terminal tabs |
+| `opencode-ui/packages/app/src/utils/devaipod-api.ts` | `isDevaipod()`, `apiFetch`, error reporting |
 
 ## Why we vendor the opencode UI
 
@@ -34,235 +68,8 @@ to `https://app.opencode.ai`. This is unsuitable for devaipod because:
 
 Vendoring the built SPA eliminates all three problems. The opencode SPA
 detects it's not on `opencode.ai` and uses `window.location.origin` for
-API calls.
-
-## Recommended path: extend the vendored UI natively
-
-Since we already build the opencode UI from source at a pinned tag, we can
-add devaipod-specific pages and components directly — no iframe needed. The
-opencode web app is SolidJS + TypeScript + Vite + Tailwind, and its layout
-already provides sidebar, routing, and theming infrastructure we can reuse.
-
-### What this eliminates
-
-The entire iframe/cookie/proxy workaround layer (~450 lines, ~25% of web.rs):
-
-- `DEVAIPOD_AGENT_POD` cookie infrastructure
-- `agent_iframe_wrapper()` and related HTML generation
-- `serve_opencode_raw_ui()` with injected JavaScript
-- SSE keepalive hack (`sse_keepalive_stream`, `is_event_stream_path`)
-- Console error interception (`DEVAIPOD_HEAD_SCRIPT`)
-- Frontend error report endpoint
-- Cookie-aware fallback router (`opencode_or_static_fallback` complexity)
-- Root-level opencode proxy (`opencode_root_proxy`)
-- `/assets/*` route hijacking
-- ~130 lines of related tests
-
-### Architecture
-
-The opencode SPA connects to its server via `window.location.origin`. For
-multi-pod support, the devaipod server would proxy pod-specific API paths:
-
-```
-/pods/{name}/api/session    → pod's opencode backend (port 4097)
-/pods/{name}/api/rpc        → pod's opencode backend
-/pods/{name}/api/global/... → pod's opencode backend
-```
-
-The SPA would be configured with a per-pod `baseUrl` through the opencode
-`ServerProvider` context instead of relying on cookie-based dispatch at root.
-This eliminates the entire cookie routing layer.
-
-### Minimal file changes
-
-Files to modify in the opencode source (at build time):
-
-| File | Change |
-|------|--------|
-| `packages/app/src/app.tsx` | Add `/pods` route before the `/:dir` catch-all |
-| `packages/app/src/pages/layout.tsx` | Add pods icon to sidebar bottom (near settings/help) |
-| `packages/app/src/pages/layout/sidebar-shell.tsx` | Add `onOpenPods` callback |
-
-New files:
-
-| File | Purpose |
-|------|---------|
-| `packages/app/src/pages/pods.tsx` | Pod list/management (replaces `dist/index.html`) |
-| `packages/app/src/context/devaipod.tsx` | Devaipod state: pod list, auth token, active pod |
-
-### Vendored frontend, not a separate repo
-
-Rather than maintaining a separate fork repo or carrying patch files, vendor
-the opencode frontend source directly into the devaipod repo under
-`opencode-ui/`. This keeps everything in one repo and makes changes normal
-commits.
-
-The opencode web frontend is part of a bun workspace monorepo. The minimal
-set of packages needed to build it:
-
-| Directory | Purpose |
-|---|---|
-| `packages/app/` | The SPA itself (SolidJS + Vite + Tailwind) |
-| `packages/ui/` | Shared component library (`@opencode-ai/ui`) |
-| `packages/sdk/js/` | API client/types (`@opencode-ai/sdk`) — no runtime deps |
-| `packages/util/` | Small utility library (`@opencode-ai/util`) — just zod |
-
-Plus the root `package.json` (for workspace config and bun's `catalog:`
-version resolution) and `bun.lock`.
-
-The remaining ~13 packages in the opencode monorepo (CLI, desktop, docs,
-extensions, etc.) are not needed and are not vendored.
-
-**Initial import**: Extract the 4 packages + root config from the opencode
-repo at the pinned tag, commit as a single "vendor opencode frontend
-v1.1.65" commit. Inline any `catalog:` version references that would break
-without the full monorepo, or keep the root `package.json` catalog section
-intact (bun should tolerate missing workspace members).
-
-**Devaipod changes**: Normal commits on top, isolated in
-`packages/app/src/devaipod/` where possible. Modifications to upstream
-files (`app.tsx`, `layout.tsx`) kept minimal.
-
-**Upstream sync**: A script (or manual process) to pull updates from a new
-opencode release:
-1. Fetch the new tag
-2. Extract the same 4 packages + root config
-3. Apply as a commit, resolve conflicts with our changes
-4. Verify the build
-
-This is slightly more work than a `git subtree pull` but avoids the subtree
-limitation of requiring a single prefix path. It also avoids maintaining a
-second git repository.
-
-**Containerfile change**: Instead of cloning opencode at build time, build
-from the vendored source:
-
-```dockerfile
-# -- opencode web UI build stage --
-FROM ghcr.io/bootc-dev/devenv-debian:latest AS opencode-web
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL https://bun.sh/install | bash && \
-    ln -sf /root/.bun/bin/bun /usr/local/bin/bun
-COPY opencode-ui/ /build/opencode/
-WORKDIR /build/opencode
-RUN bun install --frozen-lockfile
-WORKDIR /build/opencode/packages/app
-RUN bun run build
-```
-
-This eliminates the network clone, the patch application step, and the
-pinned `OPENCODE_VERSION` ARG. The vendored source is the single source of
-truth.
-
-### Reusable opencode components
-
-The opencode UI library (`@opencode-ai/ui`) provides Button, Dialog,
-DropdownMenu, Tooltip, Icon, and other accessible primitives. The pods page
-would use these directly, getting theme consistency for free.
-
-### Server-side changes
-
-The Rust web server simplifies significantly:
-
-- The fallback handler becomes a plain `ServeDir` for the opencode SPA
-- Pod-prefixed API proxy replaces the cookie-based root proxy
-- No SSE keepalive needed (the SPA only connects to a pod when one is active)
-- No HTML injection needed (devaipod controls are native SPA components)
-- Auth can use a single mechanism (bearer token in header or query param)
-
-### Key considerations
-
-**Pod switching**: The opencode `ServerProvider` holds the API base URL. When
-switching pods, the devaipod context would update the base URL and the
-`GlobalSDKProvider`/`GlobalSyncProvider` need to remount (reconnect SSE, reload
-session state). This can be done by keying the providers on the active pod name.
-
-**API version coupling**: The opencode API has no versioning (`/session`,
-`/rpc`, not `/v1/session`). Between v1.1.65 and v1.2.x, changes have been
-additive (new event types, optional fields). Unknown events are dropped by
-the SDK. Risk is low for minor version skew but increases if the fork falls
-behind by many releases. Pinning the opencode backend version in pods to match
-the UI build tag mitigates this.
-
-**Upstream sync burden**: The opencode project releases frequently.
-Keeping devaipod code in isolated files (`packages/app/src/devaipod/`)
-and only touching `app.tsx` and `layout.tsx` minimally keeps merge conflicts
-rare when pulling new upstream releases into the vendored directory.
-Contributing multi-server/multi-pod support upstream would further reduce
-the diff we carry.
-
-## Git browser and commit-range review
-
-> See also: [lightweight-review.md](./lightweight-review.md) for the full
-> rationale on why we're building this in the opencode UI rather than
-> running a local Forgejo.
-
-OpenCode today has a "changes" view (`SessionReview` / `review-tab.tsx`)
-that shows session-level file diffs and supports inline line comments that
-feed back into the agent's prompt context. This is genuinely useful but
-operates at the wrong abstraction level for reviewing agent work: it shows
-uncommitted changes relative to session start, not commits.
-
-What we need for a proper review workflow:
-
-### Git commit browser
-
-A new tab/panel (sibling to the existing "Changes" and "Files" tabs) that
-shows the commit log for the workspace branch. For each commit: hash, author,
-message, timestamp. Clicking a commit shows its diff using the existing
-`@pierre/diffs` renderer and `SessionReview` accordion.
-
-Data source: the control plane runs `git fetch agent` in the workspace
-container to pull agent commits, then serves them via
-`GET /api/devaipod/pods/{name}/git/log` returning structured commit objects.
-The workspace already has the agent's git set up as a remote called `agent`
-(see `REMOTE_AGENT` in `src/git.rs`), and git's content-addressed hashing
-ensures fetched data is trustworthy. The existing `/git/commits` endpoint
-returns recent commits but may need richer output — parent SHAs, full diff
-per commit.
-
-### Commit-range diff view
-
-Select two commits (or a base ref + HEAD) and see the combined diff, exactly
-like a GitHub PR "Files changed" view. This is the core review primitive.
-
-The opencode `Diff` component already supports rendering arbitrary before/after
-content pairs. The new piece is a control plane endpoint that returns the
-diff for a commit range:
-
-```
-GET /api/devaipod/pods/{name}/git/diff?base={sha}&head={sha}
-```
-
-returning an array of `FileDiff` objects compatible with the existing
-`sync.data.session_diff` format.
-
-### Review actions
-
-Approve/reject/request-changes controls attached to a commit range. The
-inline comment system already works — what's missing is:
-
-- A per-range review state (pending → approved/rejected → synced)
-- An "approve" action that marks the range and enables the sync button
-- A "request changes" action that sends the review comments to the agent
-  (the inline comment → prompt context flow already exists; we just need
-  to also inject a top-level "changes requested" message)
-
-### Upstream sync
-
-A "Push" / "Create PR" button visible only for approved commit ranges.
-Calls the control plane which runs `git push origin {branch}` in the
-workspace container (which has GH_TOKEN). The agent container never sees
-this flow.
-
-### Upstream-ability
-
-The git browser and commit-range diff are genuinely useful features for any
-opencode user, not just devaipod. The review state and sync controls are
-devaipod-specific. Structuring the code so the git browser lives in opencode
-core (or is easily proposed upstream) while review/sync lives in
-`src/devaipod/` keeps the fork surface minimal.
+API calls — which on the pod-api sidecar routes to the correct opencode
+server automatically.
 
 ## Tasks
 
@@ -273,203 +80,129 @@ core (or is easily proposed upstream) while review/sync lives in
 - [x] Verify the vendored source builds
 - [x] Apply existing `opencode-devaipod.patch` changes as a normal commit
 - [x] Update Containerfile to build from `opencode-ui/` instead of cloning
-      from GitHub (uses `oven/bun` image, sparse-checkouts fonts from
-      upstream since they're gitignored at ~60MB)
-- [ ] Remove `patches/opencode-devaipod.patch` (still present but no longer
-      used by the Containerfile; keep until we're sure nothing references it)
+      from GitHub
+- [x] Remove `patches/opencode-devaipod.patch` (deleted, was dead code)
 - [ ] Write an `update-opencode-ui.sh` script for pulling new upstream releases
 
-### Phase 1: Pod management in SPA — mostly done
+### Phase 1: Pod management in SPA — DONE
 
-The opencode SPA now has a `/pods` route with a full pod management
-page, ported from the ~1700-line vanilla `dist/index.html`.
-
-#### Architecture
-
-The SPA has a `DevaipodProvider` context (`context/devaipod.tsx`)
-that manages pod list, launch state, agent status polling, and
-proposals via polling. The `/pods` route renders `PodsPage` which
-uses `@opencode-ai/ui` components (Button, Card, TextField,
-Collapsible, Icon, Tag, Spinner, Checkbox).
-
-Key design decisions:
-- `/pods` is outside the opencode SDK provider stack (no
-  `ServerProvider`, `GlobalSDKProvider`, or `GlobalSyncProvider`) —
-  it only talks to the devaipod control plane API via `apiFetch`
-- The Home page (`/`) redirects to `/pods` when `isDevaipod()` is
-  true and no pod cookie is set
-- `isDevaipod()` checks `import.meta.env.VITE_DEVAIPOD` (build-time
-  flag set in the Containerfile) as well as the cookie fallback
-- Opening a pod navigates to `/_devaipod/agent/{name}/` (sets
-  cookie, existing iframe flow) — switching to pod-prefixed URL
-  routing is deferred to Phase 4
-
-#### Server-side changes
-
-- `/pods` route serves the opencode SPA's index.html with the
-  devaipod head script injection (shared helper
-  `opencode_index_with_script`)
-- `DEVAIPOD_HEAD_SCRIPT` now also sets `window.__DEVAIPOD__ = true`
-- `VITE_DEVAIPOD=true` set in the Containerfile opencode-web build
-  stage
-
-#### Terminal cleanup
-
-The control plane terminal button and all xterm.js code were removed
-from `dist/index.html` (terminal is now in the opencode SPA's
-workspace terminal panel). The xterm.js vendor step was removed from
-the Containerfile. The "Open Agent" button was renamed to "Open".
-
-#### Tasks
-
-- [x] Create `DevaipodProvider` context (`context/devaipod.tsx`,
-      ~370 lines) managing pod list, launch state, agent status,
-      proposals, and pod lifecycle actions
-- [x] Create pods page (`pages/pods.tsx`, ~760 lines) with pod list,
-      launch form, advisor section, proposals, keyboard navigation
-- [x] Add `/pods` route in `app.tsx` before `/:dir` catch-all,
-      outside the opencode SDK provider stack
-- [x] Redirect `/` to `/pods` when `isDevaipod()` and no active pod
-- [x] Update `isDevaipod()` to check `VITE_DEVAIPOD` build-time flag
-- [x] Add `VITE_DEVAIPOD=true` to Containerfile, `__DEVAIPOD__` to
-      head script
-- [x] Serve SPA index.html at `/pods` (Rust route handler)
-- [x] Remove terminal button and xterm.js from control plane
-- [ ] Wire pod selection via pod-prefixed URL routing instead of
-      cookie + iframe (currently uses existing `/_devaipod/agent/`
-      flow — deferred to Phase 4)
+- [x] Create `DevaipodProvider` context with pod list, launch state, agent
+      status, proposals, and pod lifecycle actions
+- [x] Create pods page with pod list, launch form, advisor section, proposals
+- [x] Add `/pods` route in `app.tsx` outside the opencode SDK provider stack
+- [x] Redirect `/` to `/pods`
+- [x] Add `VITE_DEVAIPOD=true` to Containerfile
+- [x] Serve SPA index.html at `/pods`
+- [x] Remove terminal button and xterm.js from old control plane UI
+- [x] Cookie-based auth (`/_devaipod/login` sets HttpOnly cookie)
 - [ ] Add sidebar pod icon with navigation to `/pods`
-- [ ] Add "Back to Pods" navigation from session view
+- [ ] Add "Back to Pods" navigation from session view (currently via
+      iframe wrapper bar)
 
 ### Phase 2: Git browser and commit-range review — mostly done
-
-Backend git endpoints now run in the pod-api sidecar container
-(`devaipod pod-api`) instead of exec'ing into workspace containers.
-The sidecar mounts the agent's workspace volume directly and watches
-`.git/refs/` via inotify, pushing `git.updated` SSE events to the
-frontend for live diff updates.
 
 - [x] Add `GET /git/log` endpoint with structured commit objects
 - [x] Add `GET /git/diff-range` endpoint with per-file before/after content
 - [x] Add `POST /git/fetch-agent` and `POST /git/push` endpoints
 - [x] Create `GitReviewTab` component reusing `SessionReview` diff renderer
-- [x] Wire into session.tsx (conditional on devaipod cookie)
-- [x] Extract shared API utils to `utils/devaipod-api.ts`
+- [x] Wire into session.tsx (conditional on `isDevaipod()`)
 - [x] Move git endpoints to pod-api sidecar (direct git, no exec overhead)
 - [x] Add inotify-based git watcher + SSE endpoint (`GET /git/events`)
 - [x] Subscribe GitReviewTab to SSE for automatic refresh on new commits
-- [x] Proxy pod-api requests through control plane (`/pod-api/*`)
 - [x] Integration tests for api container, endpoints, and SSE
 - [ ] Add push/sync button to GitReviewTab
 - [ ] Wire inline comments from commit-range view back to agent prompt context
-- [ ] Debug "expand" button in diff view (likely DiffComponentProvider
-      context or shadow DOM event propagation issue)
+- [ ] Debug "expand" button in diff view
 
-### Phase 2.5: Workspace and agent terminals — mostly done
-
-The opencode SPA's terminal connects to the agent container's opencode
-PTY. We added a parallel workspace terminal that connects to the devaipod
-PTY API (`/api/devaipod/pods/{name}/pty/*`), reusing the same `Terminal`
-component with custom WebSocket URL and resize handler.
-
-The PTY backend was originally in `web_terminal.rs` using bollard's Docker
-exec API in the control plane. This has been moved to the pod-api sidecar
-(`pod_api.rs`): the sidecar uses bollard to exec into the workspace
-container (giving users the full devcontainer tool set), manages sessions
-with ring buffers and broadcast channels, and streams I/O over WebSocket.
-The control plane proxies PTY requests to the pod-api sidecar (same as
-git endpoints). `web_terminal.rs` has been deleted; `forbid(unsafe_code)`
-is now enforced crate-wide.
-
-The pod-api sidecar container has the podman socket bind-mounted (with
-`label=disable` for SELinux) so it can exec into the workspace container.
+### Phase 2.5: Workspace and agent terminals — DONE
 
 - [x] Add optional `wsUrl` and `onPtyResize` props to `Terminal` component
-- [x] Create `context/workspace-terminal.tsx` (devaipod PTY API client)
+- [x] Create `context/workspace-terminal.tsx` (pod-api PTY client at `/pty/*`)
 - [x] Add Agent/Workspace type selector toggle to terminal panel
 - [x] Wire into session.tsx (conditional on `isDevaipod()`)
-- [x] Disable opencode's built-in git snapshotting (`"snapshot": false`)
 - [x] Implement PTY in pod-api sidecar via bollard exec into workspace
       container; session management with ring buffer, WebSocket handler
-- [x] Proxy PTY requests from control plane to pod-api sidecar
-- [x] Delete `web_terminal.rs` and remove `PtySessionManager` from
-      control plane `AppState`; `forbid(unsafe_code)` crate-wide
-- [x] Mount podman socket into api container (`label=disable` for
-      SELinux), pass `--workspace-container` name
-- [x] Verify workspace terminal works end-to-end in deployed container
-- [x] Auto-create first workspace terminal when switching to Workspace tab
+- [x] Delete `web_terminal.rs`; `forbid(unsafe_code)` crate-wide
+- [x] Mount podman socket into api container (`label=disable` for SELinux)
 - [ ] Rename existing terminal label to "Agent Terminal" in devaipod mode
-      (currently only the tab label supports `kind` prefix but it's not
-      passed through `SortableTerminalTab`)
+      (the `kind` parameter exists in `terminalTabLabel()` but is never passed)
 
 ### Phase 3: Review state and sync
-- [ ] Add review state endpoints (`GET/POST /api/devaipod/pods/{name}/review`)
-- [ ] Add sync endpoint (`POST /api/devaipod/pods/{name}/sync`) — control
-      plane runs `git push origin {branch}` in workspace container (which
-      has GH_TOKEN) after verifying commits are in "approved" state
-- [ ] Create `src/devaipod/review-controls.tsx` — approve/reject/sync buttons
-- [ ] Review state persistence in control plane (SQLite or JSON per pod)
-- [ ] Push gate enforcement: control plane only triggers `git push` in the
-      workspace when commits are in "approved" state. No service-gator
-      callback needed — the workspace pushes directly after human approval.
 
-### Phase 4: Cleanup (~450 lines removed from web.rs)
+- [ ] Add review state endpoints
+- [ ] Add sync endpoint — control plane runs `git push origin {branch}` in
+      workspace container after verifying commits are in "approved" state
+- [ ] Create review controls — approve/reject/sync buttons
+- [ ] Review state persistence
 
-Once the SPA pods page handles pod management and session navigation
-natively (via DevaipodProvider + ServerProvider, no iframe/cookie):
+### Phase 4: Cleanup — DONE
 
-- [ ] Remove `DEVAIPOD_AGENT_POD` cookie infrastructure
-- [ ] Remove `agent_iframe_wrapper()` and HTML generation
-- [ ] Remove `serve_opencode_raw_ui()` with injected JavaScript
-- [ ] Remove SSE keepalive hack and `DEVAIPOD_HEAD_SCRIPT`
-- [ ] Remove cookie-aware fallback router
-- [ ] Remove root-level opencode proxy and `/assets/*` hijacking
-- [ ] Drop `dist/index.html` and vendored xterm.js
-- [ ] Remove `patches/opencode-devaipod.patch` (no longer referenced)
+The pod-api sidecar architecture eliminated the entire iframe/cookie/proxy
+workaround layer. The following have been removed:
+
+- [x] `DEVAIPOD_AGENT_POD` cookie infrastructure
+- [x] `DEVAIPOD_HEAD_SCRIPT` (server-side script injection)
+- [x] `serve_opencode_raw_ui()` and `opencode_index_with_script()`
+- [x] SSE keepalive hack in web.rs (moved to pod_api.rs where it belongs)
+- [x] Cookie-aware fallback router (`opencode_or_static_fallback`)
+- [x] Root-level opencode proxy (`opencode_root_proxy`, `opencode_proxy_impl`)
+- [x] All git endpoint handlers in web.rs (replaced by pod_api.rs)
+- [x] `exec_in_container` helper (~200-500ms overhead per call)
+- [x] `get_pod_opencode_info` (port discovery + password lookup)
+- [x] Stop publishing opencode port (4096) to host
+- [x] `getPodName`, `getControlPlaneUrl`, `scopeLocalStorageToPod` in SPA
+- [x] `patches/opencode-devaipod.patch` (deleted earlier)
+- [ ] Drop `dist/index.html` (old control plane UI, still served at
+      `/_devaipod/oldui` as fallback)
+
+### Phase 5: Iframe removal
+
+Currently the agent view is embedded in an iframe (wrapper page with "Back
+to Pods" bar). Removing the iframe requires:
+
+- [ ] Navigate between `/pods` and agent sessions within the SPA router
+      (no full page reload)
+- [ ] The `ServerProvider` / `GlobalSDKProvider` must remount when switching
+      pods (they read `server.url` once at init)
+- [ ] Auth token must reach the pod-api sidecar (currently the SPA runs at
+      the sidecar's origin, so no cross-origin issues — but navigating away
+      from `/pods` to a different origin requires solving this)
+
+This is a larger refactor. The iframe approach works well enough for now.
 
 ## Testing
 
 ### Strategy
 
-Follow opencode upstream's testing approach. The vendored `opencode-ui/`
-ships with three test layers and we should use all of them:
+**Rust unit tests** (`cargo test`): 274 tests covering web.rs routing,
+proxy behavior, pod configuration, git operations. Run via `just test-container`
+(278 → 274 after removing tests for deleted cookie/git code).
 
 **Bun unit tests** (`bun test` with happy-dom): 46 existing test files.
-Fast, no infra needed. Good for testing our new modules in isolation:
-- `utils/devaipod-api.ts` — token/cookie parsing, `apiFetch` behavior
-- `context/workspace-terminal.tsx` — session lifecycle, ID generation
+Good for testing devaipod-specific modules:
+- `utils/devaipod-api.ts` — `apiFetch`, error reporting
+- `context/workspace-terminal.tsx` — session lifecycle
 - `pages/session/terminal-label.ts` — `kind` prefix formatting
-- `pages/session/terminal-panel.test.ts` — extend existing tab label tests
 
-**Playwright E2E tests** (`bun test:e2e`): 33 existing specs using
-Chromium. Require a running opencode backend. For devaipod-specific
-features (workspace terminal, git review tab, Agent/Workspace toggle),
-we need:
-- A fixture that sets the `DEVAIPOD_AGENT_POD` cookie so devaipod
-  code paths activate
-- Either a mock devaipod PTY/git API (simpler, test UI logic only)
-  or a real devaipod container (slower, full integration)
-- New specs: `e2e/devaipod/workspace-terminal.spec.ts`,
-  `e2e/devaipod/git-review.spec.ts`
+**Rust integration tests** (`cargo test -p integration-tests`): verify HTTP
+endpoints, auth, static files, and proxying using curl inside a running
+devaipod container.
 
-**Rust integration tests** (`cargo test -p integration-tests`): existing
-`webui.rs` tests verify HTTP endpoints, auth, static files, and proxying
-using curl inside a running devaipod container. Add:
-- Workspace PTY REST API smoke tests (create, resize, delete sessions)
-- Git API endpoint tests (log, diff-range, fetch-agent)
-- Verify opencode-ui assets contain expected devaipod markers (e.g.
-  built JS includes workspace terminal code)
+**Playwright E2E tests** (`bun test:e2e`): 33 existing specs. For devaipod
+features, the SPA can be served directly from the pod-api sidecar — no
+cookie injection needed since `VITE_DEVAIPOD=true` enables all devaipod
+code paths at build time.
 
-### What to add first
+## Discoveries
 
-1. **Bun unit tests** for `devaipod-api.ts` and `terminal-label.ts` with
-   `kind` — these are trivial to write and catch regressions in shared code.
-
-2. **Rust integration tests** for the workspace PTY API — the test infra
-   already runs a container and can make HTTP requests. No browser needed.
-   Test the create → resize → delete flow via curl.
-
-3. **Playwright specs** for the workspace terminal — requires the most
-   setup (cookie injection, devaipod API mocking or real container) but
-   gives the most confidence. Can start with a smoke test that verifies
-   the Agent/Workspace toggle renders when the cookie is set.
+- **`exec_in_container` has ~200-500ms overhead per call** through the podman
+  VM on macOS — this motivated creating the pod-api sidecar
+- **SELinux is enforcing** on the podman machine VM; api container needs
+  `label=disable` for the podman socket
+- **GlobalSDKProvider does NOT react to URL changes** — it reads `server.url`
+  once at init time. This is why iframe removal (Phase 5) is deferred
+- **SolidJS `createEffect` reactive tracking** — async functions reading
+  store properties inside `createEffect` cause accidental tracking loops;
+  must wrap in `untrack()`
+- **Each pod on its own origin** naturally isolates localStorage, eliminating
+  the need for the `scopeLocalStorageToPod` monkey-patching approach
