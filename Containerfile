@@ -92,6 +92,7 @@ RUN dnf install -y \
         rust cargo \
         openssl-devel \
         gcc \
+        git \
     && dnf clean all
 
 COPY --from=src /src /src
@@ -110,6 +111,20 @@ RUN --network=none \
     --mount=type=cache,target=/root/.cargo/git \
     cargo build --release -p devaipod && \
     cp /src/target/release/devaipod /usr/bin/devaipod
+
+# -- unit tests (built from the build stage, run via `just test-container`) --
+FROM build AS units
+RUN --network=none \
+    --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    mkdir -p /usr/lib/devaipod/units && \
+    cargo test --no-run -p devaipod --message-format=json 2>/dev/null \
+      | python3 -c 'import sys,json;[print(m["executable"])for line in sys.stdin for m in[json.loads(line)]if m.get("profile",{}).get("test")and m.get("executable")]' \
+      | while read bin; do install -m 0755 "$bin" "/usr/lib/devaipod/units/$(basename $bin)"; done && \
+    test -n "$(ls /usr/lib/devaipod/units/)" && \
+    printf '#!/bin/bash\nset -xeuo pipefail\nfor f in /usr/lib/devaipod/units/*; do echo "$f" && "$f"; done\n' \
+      > /usr/bin/devaipod-units && chmod a+x /usr/bin/devaipod-units
 
 # -- final minimal image --
 FROM quay.io/centos/centos:stream10

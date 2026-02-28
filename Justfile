@@ -249,7 +249,17 @@ container-build no_cache="":
 container-build-for-integration:
     podman build --no-cache -t {{ CONTAINER_IMAGE }}:latest -f Containerfile .
 
-# Test the container image
+# Build unit test binaries in a container image (no host toolchain required)
+[group('container')]
+build-units:
+    podman build --target units -t {{ CONTAINER_IMAGE }}-units:latest -f Containerfile .
+
+# Run unit tests in a container (no host toolchain required)
+[group('container')]
+test-container: build-units
+    podman run --rm {{ CONTAINER_IMAGE }}-units:latest /usr/bin/devaipod-units
+
+# Smoke-test the container image
 [group('container')]
 container-test: container-build
     #!/usr/bin/env bash
