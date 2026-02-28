@@ -1,27 +1,4 @@
-/** Shared helpers for calling devaipod control plane APIs from the opencode SPA. */
-
-export function getPodName(): string | undefined {
-  const match = document.cookie.match(/(?:^|;\s*)DEVAIPOD_AGENT_POD=([^;]*)/)
-  return match?.[1] ? decodeURIComponent(match[1]) : undefined
-}
-
-/**
- * Scope localStorage keys per pod when running inside an agent iframe.
- * All agent iframes share the same origin, so without scoping one pod's
- * settings/session data would collide with another's.
- * Must be called before any localStorage access in the app.
- */
-export function scopeLocalStorageToPod(): void {
-  const pod = getPodName()
-  if (!pod) return
-  const prefix = `dpod:${pod}:`
-  const origGet = localStorage.getItem.bind(localStorage)
-  const origSet = localStorage.setItem.bind(localStorage)
-  const origRemove = localStorage.removeItem.bind(localStorage)
-  localStorage.getItem = (key: string) => origGet(prefix + key)
-  localStorage.setItem = (key: string, value: string) => origSet(prefix + key, value)
-  localStorage.removeItem = (key: string) => origRemove(prefix + key)
-}
+/** Shared helpers for calling devaipod APIs from the opencode SPA. */
 
 /**
  * Set up frontend error reporting for devaipod.
@@ -111,21 +88,8 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 }
 
 /**
- * True when the SPA is running inside devaipod — either because it was
- * built with VITE_DEVAIPOD=true or because the DEVAIPOD_AGENT_POD cookie
- * is present (dev-mode fallback).
+ * True when the SPA is running inside devaipod (built with VITE_DEVAIPOD=true).
  */
 export function isDevaipod(): boolean {
-  if (import.meta.env.VITE_DEVAIPOD === "true") return true
-  return document.cookie.includes("DEVAIPOD_AGENT_POD=")
-}
-
-/**
- * Base URL for the devaipod control plane API.
- * When running inside devaipod the SPA is served by the control plane,
- * so the origin is the API host. Returns empty string outside devaipod.
- */
-export function getControlPlaneUrl(): string {
-  if (!isDevaipod()) return ""
-  return window.location.origin
+  return import.meta.env.VITE_DEVAIPOD === "true"
 }

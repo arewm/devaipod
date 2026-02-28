@@ -9,7 +9,6 @@
 import { batch, createMemo, createSignal } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import type { LocalPTY } from "@/context/terminal"
-import { apiFetch, getAuthToken, getPodName } from "@/utils/devaipod-api"
 
 // ---------------------------------------------------------------------------
 // API types (match web_terminal.rs PtyInfo / PtyCreateInput)
@@ -29,28 +28,26 @@ interface PtyInfo {
 // REST helpers
 // ---------------------------------------------------------------------------
 
-function apiBase(): string | undefined {
-  const pod = getPodName()
-  if (!pod) return undefined
-  return `/api/devaipod/pods/${encodeURIComponent(pod)}/pty`
+// The SPA runs on the pod-api sidecar which serves PTY endpoints at /pty/*.
+// No pod name or control plane routing needed — it's the local origin.
+function apiBase(): string {
+  return "/pty"
 }
 
 async function createPty(title: string): Promise<PtyInfo> {
   const base = apiBase()
-  if (!base) throw new Error("Not in devaipod context")
-  return apiFetch<PtyInfo>(base, {
+  const res = await fetch(base, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title }),
   })
+  if (!res.ok) throw new Error(`Create PTY failed: ${res.status}`)
+  return res.json()
 }
 
 async function deletePty(id: string): Promise<void> {
   const base = apiBase()
-  if (!base) throw new Error("Not in devaipod context")
-  const token = getAuthToken()
-  const headers: Record<string, string> = {}
-  if (token) headers["Authorization"] = `Bearer ${token}`
-  const res = await fetch(`${base}/${id}`, { method: "DELETE", headers })
+  const res = await fetch(`${base}/${id}`, { method: "DELETE" })
   if (!res.ok && res.status !== 404) {
     throw new Error(`Delete PTY failed: ${res.status}`)
   }
@@ -58,20 +55,17 @@ async function deletePty(id: string): Promise<void> {
 
 export async function resizeWorkspacePty(id: string, cols: number, rows: number): Promise<void> {
   const base = apiBase()
-  if (!base) throw new Error("Not in devaipod context")
-  await apiFetch(`${base}/${id}`, {
+  const res = await fetch(`${base}/${id}`, {
     method: "PUT",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ size: { rows, cols } }),
   })
+  if (!res.ok) throw new Error(`Resize PTY failed: ${res.status}`)
 }
 
 export function buildWorkspaceWsUrl(ptyId: string): URL {
   const base = apiBase()
-  if (!base) throw new Error("Not in devaipod context")
-  const url = new URL(`${base}/${ptyId}/connect`, window.location.origin)
-  const token = getAuthToken()
-  if (token) url.searchParams.set("token", token)
-  return url
+  return new URL(`${base}/${ptyId}/connect`, window.location.origin)
 }
 
 // ---------------------------------------------------------------------------

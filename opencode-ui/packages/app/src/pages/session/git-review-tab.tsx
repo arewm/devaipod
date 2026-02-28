@@ -5,7 +5,7 @@ import { SessionReview } from "@opencode-ai/ui/session-review"
 import { Select } from "@opencode-ai/ui/select"
 import type { SelectedLineRange } from "@/context/file"
 import type { LineComment } from "@/context/comments"
-import { getPodName, getAuthToken, apiFetch } from "@/utils/devaipod-api"
+import { apiFetch } from "@/utils/devaipod-api"
 
 export type DiffStyle = "unified" | "split"
 
@@ -51,18 +51,15 @@ function commitLabel(entry: GitLogEntry): string {
 }
 
 export function GitReviewTab(props: GitReviewTabProps) {
-  const podName = getPodName()
-
   const [state, setState] = createStore({
     baseCommit: undefined as string | undefined,
   })
 
+  // The SPA runs on the pod-api sidecar which serves git endpoints at /git/*.
   const [log, { refetch: refetchLog }] = createResource(
-    () => podName,
-    async (pod) => {
-      const data = await apiFetch<{ commits: GitLogEntry[] }>(
-        `/api/devaipod/pods/${encodeURIComponent(pod)}/pod-api/git/log`,
-      )
+    () => true,
+    async () => {
+      const data = await apiFetch<{ commits: GitLogEntry[] }>("/git/log")
       return data.commits
     },
   )
@@ -81,13 +78,9 @@ export function GitReviewTab(props: GitReviewTabProps) {
   )
 
   // Subscribe to git SSE events and auto-refresh when new commits arrive
-  if (podName) {
+  {
     onMount(() => {
-      const token = getAuthToken()
-      let url = `/api/devaipod/pods/${encodeURIComponent(podName)}/pod-api/git/events`
-      if (token) url += `?token=${encodeURIComponent(token)}`
-
-      const es = new EventSource(url)
+      const es = new EventSource("/git/events")
       es.addEventListener("git.updated", (event) => {
         try {
           const payload = JSON.parse(event.data) as { head?: string }
@@ -107,19 +100,18 @@ export function GitReviewTab(props: GitReviewTabProps) {
   }
 
   const diffParams = () => {
-    if (!podName) return undefined
     const entries = log()
     if (!entries || entries.length === 0) return undefined
     const base = state.baseCommit
     if (!base) return undefined
     const head = entries[0]!.sha
     if (base === head) return undefined
-    return { base, head, pod: podName }
+    return { base, head }
   }
 
   const [diffData] = createResource(diffParams, async (params) => {
     const data = await apiFetch<{ files: ApiFileDiff[] }>(
-      `/api/devaipod/pods/${encodeURIComponent(params.pod)}/pod-api/git/diff-range?base=${encodeURIComponent(params.base)}&head=${encodeURIComponent(params.head)}`,
+      `/git/diff-range?base=${encodeURIComponent(params.base)}&head=${encodeURIComponent(params.head)}`,
     )
     return data.files
   })
