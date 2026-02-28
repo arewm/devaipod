@@ -5,7 +5,12 @@ import { Platform, PlatformProvider } from "@/context/platform"
 import { dict as en } from "@/i18n/en"
 import { dict as zh } from "@/i18n/zh"
 import { handleNotificationClick } from "@/utils/notification-click"
+import { scopeLocalStorageToPod, initDevaipodErrorReporting } from "@/utils/devaipod-api"
 import pkg from "../package.json"
+
+// Must run before any localStorage access (e.g. theme, server URL, session state)
+scopeLocalStorageToPod()
+initDevaipodErrorReporting()
 
 const DEFAULT_SERVER_URL_KEY = "opencode.settings.dat:defaultServerUrl"
 

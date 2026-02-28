@@ -1047,7 +1047,7 @@ async fn opencode_or_static_fallback(
     } else {
         // For any non-file, non-API path (e.g. /pods, /some-dir/session/123),
         // serve the opencode SPA so client-side routing can handle it.
-        match opencode_index_with_script().await {
+        match serve_opencode_index().await {
             Ok(resp) => resp,
             Err(status) => Response::builder()
                 .status(status)
@@ -1064,40 +1064,10 @@ fn has_file_extension(path: &str) -> bool {
         .contains('.')
 }
 
-/// Script injected right after <head> in the opencode index.html.
-///
-/// Intercepts console.error/warn and POSTs them to the server for correlation
-/// with request traces.  Suppresses the harmless "[global-sdk] event stream
-/// error" emitted when an SSE fetch() is aborted during page navigation.
-///
-/// Note: localStorage scoping per pod is handled at build time by patching
-/// the opencode SPA's persist system (see `patches/opencode-scope-localstorage.patch`).
-const DEVAIPOD_HEAD_SCRIPT: &str = r#"<script>(function(){
-var _err=console.error;var _warn=console.warn;
-function report(level,args){
-  try{
-    var msg=Array.prototype.map.call(args,function(a){
-      return typeof a==='object'?JSON.stringify(a):String(a);
-    }).join(' ');
-    var stack='';try{throw new Error();}catch(e){stack=e.stack||'';}
-    fetch('/_devaipod/frontend-error',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:'['+level+'] '+msg,url:location.href,stack:stack,
-        context:navigator.userAgent})
-    }).catch(function(){});
-  }catch(e){}
-}
-console.error=function(){
-  var first=arguments[0];
-  if(typeof first==='string'&&first.indexOf('[global-sdk] event stream error')===0)return;
-  _err.apply(console,arguments);report('error',arguments);
-};
-console.warn=function(){_warn.apply(console,arguments);report('warn',arguments);};
-window.addEventListener('unhandledrejection',function(e){
-  report('unhandledrejection',[e.reason]);
-});
-window.__DEVAIPOD__=true;
-})()</script>"#;
+// Note: localStorage scoping, error reporting, and SSE suppression are handled
+// in the opencode SPA source (entry.tsx / devaipod-api.ts), not via server-side
+// script injection. The SPA is built with VITE_DEVAIPOD=true and reads the
+// DEVAIPOD_AGENT_POD cookie at runtime to scope per-pod state.
 
 /// Wrapper HTML page that embeds the opencode SPA in a full-screen iframe with a
 /// thin navigation bar. This avoids the fragile HTML/CSS rewriting that was previously
@@ -1133,16 +1103,18 @@ iframe{{width:100%;height:calc(100% - 44px);border:none}}
 <script>(function(){{
 var t=sessionStorage.getItem('devaipod_token');
 if(t)document.getElementById('db').href='/?token='+encodeURIComponent(t);
-// Deep-link the iframe to the most recent session.
+// Deep-link the iframe to the most recent session or root.
 // The control plane passes session route as a hash: #/<base64dir>/session/<id>.
 // After the SPA loads, we navigate it by dispatching the opencode deep-link
 // custom event with a direct URL.  Same-origin iframe access.
-var route=window.location.hash.slice(1);
-if(route){{var f=document.getElementById('oc');
+// When no hash is present (e.g. advisor with no sessions), navigate to '/'
+// so the SPA's home route renders instead of the unmatched /_devaipod/opencode-ui path.
+var route=window.location.hash.slice(1)||'/';
+var f=document.getElementById('oc');
 f.addEventListener('load',function(){{try{{
 f.contentWindow.history.pushState(null,'',route);
 f.contentWindow.dispatchEvent(new PopStateEvent('popstate'));
-}}catch(e){{}}}},{{once:true}})}}
+}}catch(e){{}}}},{{once:true}})
 }})()
 </script></body></html>"#
     )
@@ -1193,28 +1165,26 @@ async fn agent_ui_handler(
     serve_opencode_static(&path).await
 }
 
-/// Read the opencode SPA's index.html and inject the `DEVAIPOD_HEAD_SCRIPT`.
-/// Shared by `serve_opencode_raw_ui` (iframe) and `serve_pods_page` (top-level /pods).
-async fn opencode_index_with_script() -> Result<Response, StatusCode> {
+/// Serve the opencode SPA's index.html.
+/// The SPA handles devaipod-specific behavior (localStorage scoping, error
+/// reporting, SSE suppression) internally via VITE_DEVAIPOD and cookie detection.
+async fn serve_opencode_index() -> Result<Response, StatusCode> {
     let ui_path = std::path::Path::new(OPENCODE_UI_PATH).join("index.html");
     let content = tokio::fs::read(&ui_path).await.map_err(|e| {
         tracing::error!("Failed to read opencode index.html: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let html = String::from_utf8_lossy(&content);
-    let html = html.replacen("<head>", &format!("<head>\n{DEVAIPOD_HEAD_SCRIPT}"), 1);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from(html))
+        .body(Body::from(content))
         .unwrap())
 }
 
-/// Serve the raw opencode UI (index.html) for loading inside the agent iframe.
-/// Only the error interceptor script is injected; no URL rewriting or back button.
+/// Serve the opencode UI (index.html) for loading inside the agent iframe.
 async fn serve_opencode_raw_ui() -> Result<Response, StatusCode> {
-    opencode_index_with_script().await
+    serve_opencode_index().await
 }
 
 /// Redirect `/` to `/pods`.
@@ -1253,10 +1223,10 @@ async fn login(
         .unwrap()
 }
 
-/// Serve the opencode SPA with the devaipod head script injected.
+/// Serve the opencode SPA for top-level pages (e.g. /pods).
 /// The SPA handles client-side routing internally.
 async fn serve_spa_page() -> Result<Response, StatusCode> {
-    opencode_index_with_script().await
+    serve_opencode_index().await
 }
 
 /// Serve the old control-plane UI at /_devaipod/oldui.

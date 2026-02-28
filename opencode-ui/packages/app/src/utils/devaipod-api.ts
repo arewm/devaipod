@@ -5,6 +5,79 @@ export function getPodName(): string | undefined {
   return match?.[1] ? decodeURIComponent(match[1]) : undefined
 }
 
+/**
+ * Scope localStorage keys per pod when running inside an agent iframe.
+ * All agent iframes share the same origin, so without scoping one pod's
+ * settings/session data would collide with another's.
+ * Must be called before any localStorage access in the app.
+ */
+export function scopeLocalStorageToPod(): void {
+  const pod = getPodName()
+  if (!pod) return
+  const prefix = `dpod:${pod}:`
+  const origGet = localStorage.getItem.bind(localStorage)
+  const origSet = localStorage.setItem.bind(localStorage)
+  const origRemove = localStorage.removeItem.bind(localStorage)
+  localStorage.getItem = (key: string) => origGet(prefix + key)
+  localStorage.setItem = (key: string, value: string) => origSet(prefix + key, value)
+  localStorage.removeItem = (key: string) => origRemove(prefix + key)
+}
+
+/**
+ * Set up frontend error reporting for devaipod.
+ * Intercepts console.error/warn and POSTs them to /_devaipod/frontend-error
+ * for correlation with server-side request traces.
+ * Suppresses the harmless "[global-sdk] event stream error" from SSE aborts.
+ */
+export function initDevaipodErrorReporting(): void {
+  if (!isDevaipod()) return
+
+  const origError = console.error
+  const origWarn = console.warn
+
+  function report(level: string, args: unknown[]) {
+    try {
+      const msg = args
+        .map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a)))
+        .join(" ")
+      let stack = ""
+      try {
+        throw new Error()
+      } catch (e) {
+        stack = (e as Error).stack ?? ""
+      }
+      fetch("/_devaipod/frontend-error", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: `[${level}] ${msg}`,
+          url: location.href,
+          stack,
+          context: navigator.userAgent,
+        }),
+      }).catch(() => {})
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  console.error = (...args: unknown[]) => {
+    const first = args[0]
+    if (typeof first === "string" && first.startsWith("[global-sdk] event stream error")) return
+    origError.apply(console, args)
+    report("error", args)
+  }
+
+  console.warn = (...args: unknown[]) => {
+    origWarn.apply(console, args)
+    report("warn", args)
+  }
+
+  window.addEventListener("unhandledrejection", (e) => {
+    report("unhandledrejection", [e.reason])
+  })
+}
+
 export function getAuthToken(): string | undefined {
   const stored = typeof sessionStorage !== "undefined" ? sessionStorage.getItem("devaipod_token") : null
   if (stored) return stored
