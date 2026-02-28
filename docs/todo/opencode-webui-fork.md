@@ -279,73 +279,67 @@ core (or is easily proposed upstream) while review/sync lives in
       used by the Containerfile; keep until we're sure nothing references it)
 - [ ] Write an `update-opencode-ui.sh` script for pulling new upstream releases
 
-### Phase 1: Pod management in SPA (replaces dist/index.html)
+### Phase 1: Pod management in SPA — mostly done
 
-The current `dist/index.html` is a 1759-line vanilla HTML/JS app that
-handles pod listing, creation, terminal access, advisor proposals, and
-agent navigation. All of this moves into the opencode SPA as a `/pods`
-route, eliminating the iframe/cookie architecture entirely.
+The opencode SPA now has a `/pods` route with a full pod management
+page, ported from the ~1700-line vanilla `dist/index.html`.
 
 #### Architecture
 
-The SPA gets a new `DevaipodProvider` context that manages pod state,
-auth, and active pod selection. When the user opens a pod's agent,
-the provider sets the `ServerProvider` base URL to the pod's proxied
-API path (`/pods/{name}/api/...`) and navigates to the session view.
-This replaces the cookie-based routing and iframe wrapper.
+The SPA has a `DevaipodProvider` context (`context/devaipod.tsx`)
+that manages pod list, launch state, agent status polling, and
+proposals via polling. The `/pods` route renders `PodsPage` which
+uses `@opencode-ai/ui` components (Button, Card, TextField,
+Collapsible, Icon, Tag, Spinner, Checkbox).
 
 Key design decisions:
-- Each pod is effectively a separate opencode "server"; switching pods
-  remounts the SDK/sync providers (clean reconnect, no stale state)
-- The `/pods` route lives before `/:dir` in the router so it doesn't
-  get caught by the directory catch-all
-- Auth token flows through `DevaipodProvider` instead of cookies;
-  `getPodName()` reads from context rather than `DEVAIPOD_AGENT_POD`
-- The Home page (`/`) redirects to `/pods` in devaipod mode
+- `/pods` is outside the opencode SDK provider stack (no
+  `ServerProvider`, `GlobalSDKProvider`, or `GlobalSyncProvider`) —
+  it only talks to the devaipod control plane API via `apiFetch`
+- The Home page (`/`) redirects to `/pods` when `isDevaipod()` is
+  true and no pod cookie is set
+- `isDevaipod()` checks `import.meta.env.VITE_DEVAIPOD` (build-time
+  flag set in the Containerfile) as well as the cookie fallback
+- Opening a pod navigates to `/_devaipod/agent/{name}/` (sets
+  cookie, existing iframe flow) — switching to pod-prefixed URL
+  routing is deferred to Phase 4
 
-#### API surface the pods page needs
+#### Server-side changes
 
-From the control plane:
-- `GET /api/podman/v5.0.0/libpod/pods/json` — pod list
-- `POST /api/podman/.../pods/{name}/{start|stop}` — lifecycle
-- `DELETE /api/podman/.../pods/{name}?force=true` — delete
-- `POST /api/devaipod/run` — launch workspace
-- `GET /api/devaipod/launches` — poll launch state
-- `DELETE /api/devaipod/launches/{name}` — dismiss failed launch
-- `GET /api/devaipod/pods/{name}/opencode-info` — session info
-- `GET /api/devaipod/pods/{name}/agent-status` — agent activity
-- `POST /api/devaipod/pods/{name}/recreate` — recreate workspace
-- `POST /api/devaipod/advisor/launch` — advisor pod
-- `GET /api/devaipod/proposals` — advisor proposals
+- `/pods` route serves the opencode SPA's index.html with the
+  devaipod head script injection (shared helper
+  `opencode_index_with_script`)
+- `DEVAIPOD_HEAD_SCRIPT` now also sets `window.__DEVAIPOD__ = true`
+- `VITE_DEVAIPOD=true` set in the Containerfile opencode-web build
+  stage
 
-#### Dependency order
+#### Terminal cleanup
 
-1. Pod-prefixed API proxy in web.rs (server prerequisite)
-2. DevaipodProvider context (state management)
-3. Pods page component (UI)
-4. Pod selection → ServerProvider wiring (the critical glue)
-5. Sidebar integration (nice-to-have)
-6. Cleanup (remove dist/, iframe, cookie routing)
+The control plane terminal button and all xterm.js code were removed
+from `dist/index.html` (terminal is now in the opencode SPA's
+workspace terminal panel). The xterm.js vendor step was removed from
+the Containerfile. The "Open Agent" button was renamed to "Open".
 
 #### Tasks
 
-- [ ] Add `/pods/{name}/api/{*path}` proxy route in `web.rs` — forwards
-      to the pod's opencode backend, same as the existing per-pod proxy
-      but with a stable URL path instead of cookie-based routing
-- [ ] Create `DevaipodProvider` context (`context/devaipod.tsx`, ~200 lines)
-      managing pod list, launch state, agent status polling, active pod,
-      and auth token propagation
-- [ ] Create pods page (`pages/pods.tsx`, ~500 lines) with pod list,
-      launch form, advisor section. Reuse `@opencode-ai/ui` components
-      (Button, Dialog, DropdownMenu, Icon, Tooltip)
-- [ ] Add `/pods` route in `app.tsx` before `/:dir` catch-all
-- [ ] Wire pod selection: clicking "Open Agent" sets `ServerProvider`
-      base URL to `/pods/{name}/api` and navigates to session view
-- [ ] Redirect `/` to `/pods` when `isDevaipod()` (or always in
-      devaipod mode via the provider)
-- [ ] Update `getPodName()` / `isDevaipod()` to read from
-      `DevaipodProvider` context instead of cookies
+- [x] Create `DevaipodProvider` context (`context/devaipod.tsx`,
+      ~370 lines) managing pod list, launch state, agent status,
+      proposals, and pod lifecycle actions
+- [x] Create pods page (`pages/pods.tsx`, ~760 lines) with pod list,
+      launch form, advisor section, proposals, keyboard navigation
+- [x] Add `/pods` route in `app.tsx` before `/:dir` catch-all,
+      outside the opencode SDK provider stack
+- [x] Redirect `/` to `/pods` when `isDevaipod()` and no active pod
+- [x] Update `isDevaipod()` to check `VITE_DEVAIPOD` build-time flag
+- [x] Add `VITE_DEVAIPOD=true` to Containerfile, `__DEVAIPOD__` to
+      head script
+- [x] Serve SPA index.html at `/pods` (Rust route handler)
+- [x] Remove terminal button and xterm.js from control plane
+- [ ] Wire pod selection via pod-prefixed URL routing instead of
+      cookie + iframe (currently uses existing `/_devaipod/agent/`
+      flow — deferred to Phase 4)
 - [ ] Add sidebar pod icon with navigation to `/pods`
+- [ ] Add "Back to Pods" navigation from session view
 
 ### Phase 2: Git browser and commit-range review — mostly done
 
@@ -379,24 +373,31 @@ PTY API (`/api/devaipod/pods/{name}/pty/*`), reusing the same `Terminal`
 component with custom WebSocket URL and resize handler.
 
 The PTY backend was originally in `web_terminal.rs` using bollard's Docker
-exec API (~200-500ms overhead per call). This has been replaced with direct
-PTY spawning in the pod-api sidecar (`pod_api.rs`): the sidecar allocates
-a real PTY via `rustix::pty`, spawns the child process directly, and
-streams I/O over WebSocket. The control plane proxies PTY requests to the
-pod-api sidecar, same as git endpoints. `web_terminal.rs` has been deleted.
+exec API in the control plane. This has been moved to the pod-api sidecar
+(`pod_api.rs`): the sidecar uses bollard to exec into the workspace
+container (giving users the full devcontainer tool set), manages sessions
+with ring buffers and broadcast channels, and streams I/O over WebSocket.
+The control plane proxies PTY requests to the pod-api sidecar (same as
+git endpoints). `web_terminal.rs` has been deleted; `forbid(unsafe_code)`
+is now enforced crate-wide.
+
+The pod-api sidecar container has the podman socket bind-mounted (with
+`label=disable` for SELinux) so it can exec into the workspace container.
 
 - [x] Add optional `wsUrl` and `onPtyResize` props to `Terminal` component
 - [x] Create `context/workspace-terminal.tsx` (devaipod PTY API client)
 - [x] Add Agent/Workspace type selector toggle to terminal panel
 - [x] Wire into session.tsx (conditional on `isDevaipod()`)
 - [x] Disable opencode's built-in git snapshotting (`"snapshot": false`)
-- [x] Implement direct PTY in pod-api sidecar (replaces exec-based
-      `web_terminal.rs`): `rustix::pty` allocation, `AsyncFd` I/O,
-      session management with ring buffer, WebSocket handler
+- [x] Implement PTY in pod-api sidecar via bollard exec into workspace
+      container; session management with ring buffer, WebSocket handler
 - [x] Proxy PTY requests from control plane to pod-api sidecar
 - [x] Delete `web_terminal.rs` and remove `PtySessionManager` from
-      control plane `AppState`
-- [ ] Verify workspace terminal works end-to-end in deployed container
+      control plane `AppState`; `forbid(unsafe_code)` crate-wide
+- [x] Mount podman socket into api container (`label=disable` for
+      SELinux), pass `--workspace-container` name
+- [x] Verify workspace terminal works end-to-end in deployed container
+- [x] Auto-create first workspace terminal when switching to Workspace tab
 - [ ] Rename existing terminal label to "Agent Terminal" in devaipod mode
       (currently only the tab label supports `kind` prefix but it's not
       passed through `SortableTerminalTab`)
