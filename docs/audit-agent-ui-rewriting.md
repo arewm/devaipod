@@ -59,7 +59,7 @@ Served with correct Content-Type: html, js, css, json, png, svg, ico, woff, woff
 ## 4. Verification
 
 - Unit tests: `cargo test -p devaipod web::` — `test_agent_ui_api_path_detection` (OPENCODE_API_SEGMENTS), `test_agent_ui_rewrite_patterns` (HTML/CSS rewrite patterns), `test_agent_redirect` (307 + cookie), `test_agent_back_button_injection`.
-- Integration tests: `just test-integration-container` (full critical path, assets, root API with cookie, CSS rewrite when applicable). See `crates/integration-tests/src/tests/webui.rs` module doc and `test_web_opencode_ui_full_critical_path`.
+- Integration tests: `just test-integration` (full critical path, assets, root API with cookie, CSS rewrite when applicable). See `crates/integration-tests/src/tests/webui.rs` module doc and `test_web_opencode_ui_full_critical_path`.
 
 ## 5. Static file fallback for bare filenames (fonts)
 

@@ -10,7 +10,7 @@
 
 ## Done
 
-- [x] Added `just test-integration-container-quick` with cached build
+- [x] Added containerized integration test runner (`just test-integration`)
 - [x] Made `RUST_TEST_THREADS` overridable from environment
 
 ## Future Improvements

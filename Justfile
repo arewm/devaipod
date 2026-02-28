@@ -26,105 +26,11 @@ test:
 # Default test image (must have git installed)
 default_test_image := "ghcr.io/bootc-dev/devenv-debian:latest"
 
-# Go template for podman machine socket path (used in test-integration-container; literal braces)
+# Go template for podman machine socket path (literal braces)
 _podman_socket_format := "{" + "{" + ".ConnectionInfo.PodmanSocket.Path" + "}" + "}"
 
-# Run integration tests (requires podman)
-# On macOS set DEVAIPOD_PODMAN_SOCKET so the binary finds the podman machine socket.
-test-integration image=default_test_image:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build
-    if [ -z "${XDG_RUNTIME_DIR:-}" ] && command -v podman &>/dev/null; then
-        SOCKET=$(podman machine inspect --format '{{_podman_socket_format}}' 2>/dev/null || true)
-        if [ -n "$SOCKET" ] && [ -S "$SOCKET" ]; then
-            export DEVAIPOD_PODMAN_SOCKET="$SOCKET"
-        fi
-    fi
-    DEVAIPOD_PATH=./target/debug/devaipod DEVAIPOD_TEST_IMAGE={{image}} cargo test -p integration-tests
-
-# Shared implementation for container integration tests.
-# Starts the devaipod container, then runs integration tests inside it.
-# On macOS the container runs in the VM; use VM socket path /run/podman/podman.sock.
-[private]
-_run-integration-container image threads:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    SOCKET=""
-    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "${XDG_RUNTIME_DIR}/podman/podman.sock" ]; then
-        SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"
-    elif command -v podman &>/dev/null; then
-        SOCKET=$(podman machine inspect --format '{{_podman_socket_format}}' 2>/dev/null || true)
-    fi
-    if [ -z "$SOCKET" ] || [ ! -S "$SOCKET" ]; then
-        echo "Could not find podman socket. Set XDG_RUNTIME_DIR (Linux) or start podman machine (macOS)."
-        exit 1
-    fi
-    CONFIG=".ci/devaipod-test.toml"
-    if [ ! -f "$CONFIG" ]; then
-        echo "Missing $CONFIG (minimal config for container tests)"
-        exit 1
-    fi
-    PWD_ABS=$(cd . && pwd)
-    TMPDIR_ABS="${PWD_ABS}/tmp"
-    mkdir -p "$TMPDIR_ABS"
-    # Use a dedicated container name so integration tests don't clash with a running devaipod instance.
-    CONTAINER_NAME="devaipod-integration"
-    cleanup() { podman rm -f "$CONTAINER_NAME" 2>/dev/null || true; }
-    trap cleanup EXIT
-    mkdir -p ~/.ssh/config.d/devaipod
-    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-        VOL_MOUNT="-v $SOCKET:/run/podman/podman.sock"
-    else
-        VOL_MOUNT="-v /run/podman/podman.sock:/run/podman/podman.sock"
-    fi
-    echo "Starting devaipod integration container ($CONTAINER_NAME)..."
-    if ! podman volume exists devaipod-state 2>/dev/null; then
-        podman volume create devaipod-state
-    fi
-    ADD_HOST=""
-    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-        ADD_HOST="--add-host=host.containers.internal:host-gateway"
-    fi
-    podman run -d --name "$CONTAINER_NAME" --privileged --replace \
-        $ADD_HOST \
-        $VOL_MOUNT \
-        -v devaipod-state:/var/lib/devaipod \
-        -v "$PWD_ABS:$PWD_ABS" \
-        -v "$(pwd)/$CONFIG:/root/.config/devaipod.toml:ro" \
-        -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
-        -w "$PWD_ABS" \
-        {{ CONTAINER_IMAGE }}:latest
-    echo "Waiting for $CONTAINER_NAME to be running..."
-    for i in $(seq 1 30); do
-        if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' "$CONTAINER_NAME" 2>/dev/null)" = "true" ]; then
-            break
-        fi
-        sleep 1
-    done
-    if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' "$CONTAINER_NAME" 2>/dev/null)" != "true" ]; then
-        echo "$CONTAINER_NAME failed to reach running state"
-        podman logs "$CONTAINER_NAME" 2>&1 | tail -50
-        exit 1
-    fi
-    echo "Running integration tests against built container ({{ CONTAINER_IMAGE }}:latest)..."
-    cargo build -p integration-tests
-    export DEVAIPOD_CONTAINER_IMAGE="{{ CONTAINER_IMAGE }}:latest"
-    export DEVAIPOD_PODMAN_SOCKET="$SOCKET"
-    RUST_TEST_THREADS="${RUST_TEST_THREADS:-{{threads}}}" TMPDIR="$TMPDIR_ABS" DEVAIPOD_TEST_IMAGE={{image}} cargo test -p integration-tests
-
-# Run integration tests with a full --no-cache container rebuild.
-# Use for CI or when web routes / Containerfile have changed.
-# Override parallelism with RUST_TEST_THREADS env var (default: serial).
-test-integration-container image=default_test_image: container-build-for-integration (_run-integration-container image "1")
-
-# Fast variant for local iteration: uses cached container build.
-# Defaults to 4 test threads (web tests are parallel-safe).
-# Override with RUST_TEST_THREADS env var.
-test-integration-container-quick image=default_test_image: container-build (_run-integration-container image "4")
-
-# Run all tests (unit + integration)
-test-all: test test-integration
+# Run all tests (unit tests + containerized integration tests)
+test-all: test-container test-integration
 
 # Format code
 fmt:
@@ -238,16 +144,10 @@ build-web:
 CONTAINER_IMAGE := "localhost/devaipod"
 
 # Build the container image.
-# no_cache: set to "--no-cache" to force full rebuild (used by test-integration-container so image has latest routes).
+# no_cache: set to "--no-cache" to force full rebuild.
 [group('container')]
 container-build no_cache="":
     podman build {{ no_cache }} -t {{ CONTAINER_IMAGE }}:latest -f Containerfile .
-
-# Force full rebuild (no cache); ensures latest code changes are in the image, but slow.
-# Used by test-integration-container so the image has current web routes; use for CI or when web routes change.
-[group('container')]
-container-build-for-integration:
-    podman build --no-cache -t {{ CONTAINER_IMAGE }}:latest -f Containerfile .
 
 # Build unit test binaries in a container image (no host toolchain required)
 [group('container')]
@@ -258,6 +158,47 @@ build-units:
 [group('container')]
 test-container: build-units
     podman run --rm {{ CONTAINER_IMAGE }}-units:latest /usr/bin/devaipod-units
+
+# Build integration test runner in a container image (no host toolchain required)
+[group('container')]
+build-integration no_cache="":
+    podman build {{ no_cache }} --target integration-runner -t {{ CONTAINER_IMAGE }}-integration:latest -f Containerfile .
+
+# Run integration tests in a container (requires podman socket)
+# Builds both the main devaipod image (for webui tests) and the integration-runner.
+# Mounts the user's devaipod config so tests use real settings.
+[group('container')]
+test-integration image=default_test_image: container-build build-integration
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CONFIG="${DEVAIPOD_CONFIG:-$HOME/.config/devaipod.toml}"
+    if [ ! -f "$CONFIG" ]; then
+        echo "No config file found at $CONFIG. Run 'devaipod init' first."
+        exit 1
+    fi
+    SOCKET=""
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "${XDG_RUNTIME_DIR}/podman/podman.sock" ]; then
+        SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"
+    elif command -v podman &>/dev/null; then
+        SOCKET=$(podman machine inspect --format '{{_podman_socket_format}}' 2>/dev/null || true)
+    fi
+    if [ -z "$SOCKET" ] || [ ! -S "$SOCKET" ]; then
+        echo "Could not find podman socket. Linux: set XDG_RUNTIME_DIR. macOS: run 'podman machine start'."
+        exit 1
+    fi
+    # Linux: mount host socket directly. macOS: container runs in VM, mount VM socket path.
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        VOL_MOUNT="-v $SOCKET:/run/podman/podman.sock"
+    else
+        VOL_MOUNT="-v /run/podman/podman.sock:/run/podman/podman.sock"
+    fi
+    echo "Running integration tests (image: {{ CONTAINER_IMAGE }}-integration:latest)..."
+    podman run --rm --privileged \
+        $VOL_MOUNT \
+        -v "$CONFIG":/root/.config/devaipod.toml:ro \
+        -e DEVAIPOD_TEST_IMAGE={{image}} \
+        -e DEVAIPOD_CONTAINER_IMAGE={{ CONTAINER_IMAGE }}:latest \
+        {{ CONTAINER_IMAGE }}-integration:latest
 
 # Smoke-test the container image
 [group('container')]

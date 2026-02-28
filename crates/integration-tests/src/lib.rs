@@ -327,38 +327,14 @@ impl SharedFixture {
         })
     }
 
-    /// Get the path to the devaipod binary (duplicated from main.rs for independence)
+    /// Get the path to the devaipod binary.
+    ///
+    /// In the containerized test runner, devaipod is at /usr/bin/devaipod.
+    /// Override with DEVAIPOD_PATH for local development.
     fn get_devaipod_command() -> color_eyre::Result<String> {
-        use color_eyre::eyre::eyre;
-
         if let Ok(path) = std::env::var("DEVAIPOD_PATH") {
-            let path = std::path::PathBuf::from(&path);
-            if path.is_relative() {
-                // Find workspace root
-                let mut dir = std::env::current_dir()?;
-                loop {
-                    if dir.join("Cargo.lock").exists() {
-                        let abs_path = dir.join(&path);
-                        if abs_path.exists() {
-                            return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
-                        }
-                        break;
-                    }
-                    if !dir.pop() {
-                        break;
-                    }
-                }
-                let cwd = std::env::current_dir()?;
-                let abs_path = cwd.join(&path);
-                if abs_path.exists() {
-                    return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
-                }
-                return Err(eyre!("Cannot find devaipod binary at {}", path.display()));
-            }
-            return Ok(path.to_string_lossy().to_string());
+            return Ok(path);
         }
-
-        // Fall back to hoping it's in PATH
         Ok("devaipod".to_string())
     }
 

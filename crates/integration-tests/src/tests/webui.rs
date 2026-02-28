@@ -6,8 +6,8 @@
 //! - Pod list API access
 //! - **UI surface**: control-plane HTML and all APIs used by the frontend
 //!
-//! The tests build and run the devaipod container image, mounting the
-//! podman socket to allow the web UI to manage sibling containers.
+//! The tests start a devaipod container image (passed via `DEVAIPOD_CONTAINER_IMAGE`),
+//! mount the podman socket, and test the web server via `podman exec` + curl.
 //!
 //! ## UI surface (keep covered by tests)
 //!
@@ -28,9 +28,8 @@
 //!
 //! ## How to run
 //!
-//! - **Integration tests (this module)**: Run **`just test-integration-container`** so the container
-//!   is built and tests run against it. Direct `cargo test -p integration-tests` will error unless
-//!   `DEVAIPOD_INTEGRATION_ALLOW_DIRECT=1` is set.
+//! - **Integration tests (this module)**: Run **`just test-integration`** which builds both the
+//!   main devaipod image and the integration-runner image, then runs tests in a container.
 //! - **Fast route tests (no container)**: `cargo test -p devaipod web::tests::` — sub-second.
 //!
 //! ## Test tiers
@@ -53,88 +52,20 @@ use xshell::{cmd, Shell};
 use crate::podman_integration_test;
 use crate::shell;
 
-/// Default image tag when tests build the image themselves
-const TEST_IMAGE_TAG: &str = "localhost/devaipod:test";
-
-/// Env var: when set, use this image and do not build (e.g. `just container-build` then run tests).
+/// Env var: the pre-built devaipod container image to test against.
+/// Set by `just test-integration` (which builds both the main image and the
+/// integration-runner image before running tests).
 const DEVAIPOD_CONTAINER_IMAGE_ENV: &str = "DEVAIPOD_CONTAINER_IMAGE";
 
-/// When set (e.g. 1), allow running tests without DEVAIPOD_CONTAINER_IMAGE. By default, direct runs error out.
-const DEVAIPOD_INTEGRATION_ALLOW_DIRECT_ENV: &str = "DEVAIPOD_INTEGRATION_ALLOW_DIRECT";
-
-/// Image tag for the web container: DEVAIPOD_CONTAINER_IMAGE if set, else TEST_IMAGE_TAG.
-fn web_container_image() -> String {
-    std::env::var(DEVAIPOD_CONTAINER_IMAGE_ENV).unwrap_or_else(|_| TEST_IMAGE_TAG.to_string())
-}
-
-/// Build result cached across tests (only used when not using DEVAIPOD_CONTAINER_IMAGE).
-static BUILD_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
-
-/// Build the devaipod container image for testing (unless DEVAIPOD_CONTAINER_IMAGE is set).
-/// When DEVAIPOD_CONTAINER_IMAGE is set, the caller is expected to have built the image
-/// (e.g. via `just container-build`); we skip building and use that image.
-fn ensure_container_built() -> Result<()> {
-    if std::env::var(DEVAIPOD_CONTAINER_IMAGE_ENV).is_ok() {
-        tracing::info!(
-            "Using pre-built image from {}",
-            DEVAIPOD_CONTAINER_IMAGE_ENV
-        );
-        return Ok(());
-    }
-    if std::env::var(DEVAIPOD_INTEGRATION_ALLOW_DIRECT_ENV).is_err() {
-        bail!("Integration tests must be run against a built container. Run: just test-integration-container. Set DEVAIPOD_INTEGRATION_ALLOW_DIRECT=1 to allow direct runs.");
-    }
-    let result = BUILD_RESULT.get_or_init(|| {
-        let sh = match Shell::new() {
-            Ok(sh) => sh,
-            Err(e) => return Err(format!("Failed to create shell: {}", e)),
-        };
-
-        // Find workspace root (where Containerfile lives)
-        let mut dir = match std::env::current_dir() {
-            Ok(d) => d,
-            Err(e) => return Err(format!("Failed to get current dir: {}", e)),
-        };
-        loop {
-            if dir.join("Containerfile").exists() {
-                break;
-            }
-            if !dir.pop() {
-                return Err("Could not find Containerfile in parent directories".to_string());
-            }
-        }
-
-        let containerfile = dir.join("Containerfile");
-        let context = dir.to_string_lossy().to_string();
-        let containerfile_str = containerfile.to_string_lossy().to_string();
-
-        tracing::info!("Building devaipod container image: {}", TEST_IMAGE_TAG);
-
-        let build_output = cmd!(
-            sh,
-            "podman build --tag {TEST_IMAGE_TAG} -f {containerfile_str} {context}"
+/// Get the container image to use for web UI tests.
+///
+/// Requires `DEVAIPOD_CONTAINER_IMAGE` to be set (done by `just test-integration`).
+fn web_container_image() -> Result<String> {
+    std::env::var(DEVAIPOD_CONTAINER_IMAGE_ENV).map_err(|_| {
+        color_eyre::eyre::eyre!(
+            "DEVAIPOD_CONTAINER_IMAGE not set. Run: just test-integration"
         )
-        .ignore_status()
-        .output();
-
-        match build_output {
-            Ok(output) => {
-                if output.status.success() {
-                    tracing::info!("Container image built successfully");
-                    Ok(())
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    Err(format!("Container build failed: {}", stderr))
-                }
-            }
-            Err(e) => Err(format!("Failed to run podman build: {}", e)),
-        }
-    });
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(msg) => bail!("{}", msg),
-    }
+    })
 }
 
 /// Helper struct to manage a running web container.
@@ -159,8 +90,6 @@ impl WebContainerGuard {
 
     /// Start the web container and extract the token from logs
     fn start() -> Result<Self> {
-        ensure_container_built()?;
-
         let sh = shell()?;
 
         // Generate unique container name
@@ -202,7 +131,7 @@ impl WebContainerGuard {
             config_path.to_string_lossy()
         );
 
-        let image = web_container_image();
+        let image = web_container_image()?;
         tracing::info!(
             "Starting web container {} from image {}",
             container_name,

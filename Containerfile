@@ -66,7 +66,6 @@ RUN mkdir -p packages/ui/src/assets/fonts && \
 
 RUN bun install --frozen-lockfile
 WORKDIR /build/packages/app
-ENV VITE_DEVAIPOD=true
 RUN bun run build
 
 # Output is in /build/packages/app/dist
@@ -125,6 +124,50 @@ RUN --network=none \
     test -n "$(ls /usr/lib/devaipod/units/)" && \
     printf '#!/bin/bash\nset -xeuo pipefail\nfor f in /usr/lib/devaipod/units/*; do echo "$f" && "$f"; done\n' \
       > /usr/bin/devaipod-units && chmod a+x /usr/bin/devaipod-units
+
+# -- integration tests (built from the build stage) --
+# Builds integration test binaries into a separate directory. These tests
+# require the devaipod binary and runtime dependencies (podman, git, etc.)
+# to exercise the full workflow including container orchestration.
+FROM build AS integration
+# Build integration test binaries in release mode. The devaipod release binary
+# is already at /usr/bin/devaipod from the build stage.
+# First compile with normal output so errors are visible and fail the build,
+# then re-run with --message-format=json to extract the binary paths.
+RUN --network=none \
+    --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    cargo test --release --no-run -p integration-tests 2>&1 && \
+    mkdir -p /usr/lib/devaipod/integration && \
+    cargo test --release --no-run -p integration-tests --message-format=json 2>/dev/null \
+      | python3 -c 'import sys,json;[print(m["executable"])for line in sys.stdin for m in[json.loads(line)]if m.get("profile",{}).get("test")and m.get("executable")]' \
+      | while read bin; do install -m 0755 "$bin" "/usr/lib/devaipod/integration/$(basename $bin)"; done && \
+    test -n "$(ls /usr/lib/devaipod/integration/)" && \
+    printf '#!/bin/bash\nset -xeuo pipefail\nfor f in /usr/lib/devaipod/integration/*; do echo "$f" && "$f"; done\n' \
+      > /usr/bin/devaipod-integration && chmod a+x /usr/bin/devaipod-integration
+
+# -- integration test runner (minimal runtime image) --
+# Contains integration test binaries plus runtime deps needed to run tests.
+# Build: podman build --target integration-runner -t localhost/devaipod-integration .
+# Run:   podman run --rm --privileged -v /run/podman/podman.sock:/run/podman/podman.sock localhost/devaipod-integration
+FROM quay.io/centos/centos:stream10 AS integration-runner
+
+RUN dnf install -y \
+        podman-remote \
+        git \
+        openssh-clients \
+        tmux \
+    && dnf clean all \
+    && ln -sf /usr/bin/podman-remote /usr/bin/podman
+
+COPY --from=integration /usr/lib/devaipod/integration /usr/lib/devaipod/integration
+COPY --from=integration /usr/bin/devaipod-integration /usr/bin/devaipod-integration
+COPY --from=integration /usr/bin/devaipod /usr/bin/devaipod
+
+ENV DEVAIPOD_CONTAINER=1
+
+CMD ["/usr/bin/devaipod-integration"]
 
 # -- final minimal image --
 FROM quay.io/centos/centos:stream10

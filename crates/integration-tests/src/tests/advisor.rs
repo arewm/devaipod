@@ -81,7 +81,7 @@ integration_test!(test_mcp_flag_dry_run);
 ///
 /// NOTE: This test uses a local path as the source, which requires the
 /// podman VM to have access to the host temp directory. It works when run
-/// inside the devaipod container (just test-integration-container) but may
+/// inside the devaipod container (just test-integration) but may
 /// fail on macOS with a podman machine due to path visibility. The remote
 /// variant (test_advisor_launch_remote_with_image) tests the actual advisor
 /// flow and works everywhere.
