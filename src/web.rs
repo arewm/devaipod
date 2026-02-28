@@ -291,94 +291,6 @@ async fn podman_proxy(
     Ok(Response::from_parts(parts, body))
 }
 
-/// Get opencode connection info for a pod
-///
-/// Returns (published_port, api_password) for the pod's opencode server.
-async fn get_pod_opencode_info(pod_name: &str) -> Result<(u16, String), StatusCode> {
-    use bollard::Docker;
-
-    let socket_path = get_container_socket().map_err(|e| {
-        tracing::error!("Failed to get container socket: {}", e);
-        StatusCode::SERVICE_UNAVAILABLE
-    })?;
-
-    let docker = Docker::connect_with_unix(
-        &format!("unix://{}", socket_path.display()),
-        120,
-        bollard::API_DEFAULT_VERSION,
-    )
-    .map_err(|e| {
-        tracing::error!("Failed to connect to container socket: {}", e);
-        StatusCode::SERVICE_UNAVAILABLE
-    })?;
-
-    // Get pod info to find the API password from labels
-    // The password is stored in the pod's label: io.devaipod.api-password
-    let pod_info = docker
-        .inspect_container(&format!("{}-agent", pod_name), None)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to inspect agent container for {}: {}", pod_name, e);
-            StatusCode::NOT_FOUND
-        })?;
-
-    // Get the published port for opencode
-    let ports = pod_info
-        .network_settings
-        .as_ref()
-        .and_then(|ns| ns.ports.as_ref())
-        .ok_or_else(|| {
-            tracing::error!("No port mappings found for {}", pod_name);
-            StatusCode::NOT_FOUND
-        })?;
-
-    let opencode_port = crate::pod::OPENCODE_PORT;
-    let port_key = format!("{}/tcp", opencode_port);
-    let bindings = ports
-        .get(&port_key)
-        .and_then(|b| b.as_ref())
-        .ok_or_else(|| {
-            tracing::error!("Port {} not published for {}", opencode_port, pod_name);
-            StatusCode::NOT_FOUND
-        })?;
-
-    let host_port = bindings
-        .first()
-        .and_then(|b| b.host_port.as_ref())
-        .and_then(|p| p.parse::<u16>().ok())
-        .ok_or_else(|| {
-            tracing::error!("Could not parse host port for {}", pod_name);
-            StatusCode::NOT_FOUND
-        })?;
-
-    // Get the API password from pod labels
-    // We need to inspect the pod itself, not the container
-    let pod_inspect_output = std::process::Command::new("podman")
-        .args([
-            "pod",
-            "inspect",
-            pod_name,
-            "--format",
-            "{{index .Labels \"io.devaipod.api-password\"}}",
-        ])
-        .output()
-        .map_err(|e| {
-            tracing::error!("Failed to run podman pod inspect: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let api_password = String::from_utf8_lossy(&pod_inspect_output.stdout)
-        .trim()
-        .to_string();
-
-    if api_password.is_empty() {
-        tracing::error!("No API password found in pod labels for {}", pod_name);
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    Ok((host_port, api_password))
-}
-
 /// Response for opencode info endpoint
 #[derive(Debug, Serialize)]
 struct OpencodeInfoResponse {
@@ -419,9 +331,9 @@ async fn opencode_info(
 ) -> Result<Json<OpencodeInfoResponse>, (StatusCode, Json<ApiErrorBody>)> {
     let pod_name = normalize_pod_name(&name);
 
-    let (port, password) = get_pod_opencode_info(&pod_name).await.map_err(|code| {
+    let port = get_pod_api_port(&pod_name).await.map_err(|code| {
         let msg = if code == StatusCode::NOT_FOUND {
-            "Pod or agent not found (agent container may not be running or port not published)"
+            "Pod or agent not found (pod-api sidecar may not be running or port not published)"
                 .to_string()
         } else {
             code.to_string()
@@ -429,11 +341,12 @@ async fn opencode_info(
         (code, Json(ApiErrorBody { error: msg }))
     })?;
 
-    // Build URL for the opencode web UI
-    let url = format!("http://127.0.0.1:{}/", port);
+    // Build URL for the opencode web UI (via pod-api sidecar)
+    let url = format!("http://localhost:{}/", port);
 
-    // Fetch the most recent session so the control plane can navigate directly to it
-    let latest_session = fetch_latest_session(port, &password).await;
+    // Fetch the most recent session via the pod-api sidecar (which proxies to
+    // the opencode server internally and handles auth).
+    let latest_session = fetch_latest_session(port).await;
 
     Ok(Json(OpencodeInfoResponse {
         url,
@@ -443,12 +356,13 @@ async fn opencode_info(
     }))
 }
 
-/// Fetch the most recent session from a pod's opencode backend.
+/// Fetch the most recent session via the pod-api sidecar.
 ///
-/// Calls GET /session on the pod's opencode server and returns the session with
-/// the most recent `time.updated` timestamp.  Returns None on any error
-/// (non-fatal: the control plane just won't deep-link into a session).
-async fn fetch_latest_session(port: u16, password: &str) -> Option<LatestSessionInfo> {
+/// Calls GET /session on the pod-api sidecar, which proxies to the opencode
+/// server internally (with auth). Returns the session with the most recent
+/// `time.updated` timestamp. Returns None on any error (non-fatal: the
+/// control plane just won't deep-link into a session).
+async fn fetch_latest_session(pod_api_port: u16) -> Option<LatestSessionInfo> {
     let host = host_for_pod_services();
 
     let client = reqwest::Client::builder()
@@ -457,8 +371,7 @@ async fn fetch_latest_session(port: u16, password: &str) -> Option<LatestSession
         .ok()?;
 
     let resp = client
-        .get(format!("http://{}:{}/session", host, port))
-        .basic_auth("opencode", Some(password))
+        .get(format!("http://{}:{}/session", host, pod_api_port))
         .send()
         .await
         .ok()?;
@@ -511,8 +424,7 @@ async fn get_pod_api_port(pod_name: &str) -> Result<u16, StatusCode> {
 
     // Inspect the agent container to find the published port mapping.
     // All containers in the pod share the same network namespace, so port
-    // bindings appear on any container — we use the agent container since
-    // get_pod_opencode_info already does so.
+    // bindings appear on any container.
     let info = docker
         .inspect_container(&format!("{pod_name}-agent"), None)
         .await
@@ -1541,8 +1453,8 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
         session_count: 0,
     };
 
-    let (port, password) = match get_pod_opencode_info(&pod_name).await {
-        Ok(info) => info,
+    let port = match get_pod_api_port(&pod_name).await {
+        Ok(p) => p,
         Err(_) => return Json(stopped),
     };
 
@@ -1556,10 +1468,9 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
         Err(_) => return Json(unknown),
     };
 
-    // Fetch sessions
+    // Fetch sessions via the pod-api sidecar (handles opencode auth internally)
     let sessions_resp = match client
         .get(format!("http://{}:{}/session", host, port))
-        .basic_auth("opencode", Some(&password))
         .send()
         .await
     {
@@ -1598,13 +1509,12 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
         None => return Json(unknown),
     };
 
-    // Fetch recent messages
+    // Fetch recent messages via pod-api sidecar
     let messages_resp = match client
         .get(format!(
             "http://{}:{}/session/{}/message?limit=5",
             host, port, session_id
         ))
-        .basic_auth("opencode", Some(&password))
         .send()
         .await
     {

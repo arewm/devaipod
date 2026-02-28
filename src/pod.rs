@@ -526,12 +526,11 @@ impl DevaipodPod {
         let api_password = generate_api_password();
         labels.push(("io.devaipod.api-password".to_string(), api_password.clone()));
 
-        // Publish the opencode port to a random host port.  We use 0.0.0.0 so the
-        // devaipod control-plane container can reach agent pods via host.containers.internal.
-        let publish_ports = vec![
-            format!("0.0.0.0::{}", OPENCODE_PORT),
-            format!("0.0.0.0::{}", POD_API_PORT),
-        ];
+        // Publish the pod-api port to a random host port.  We use 0.0.0.0 so the
+        // devaipod control-plane container can reach it via host.containers.internal.
+        // The opencode server port (4096) is NOT published — the pod-api sidecar
+        // proxies to it internally via localhost within the pod network namespace.
+        let publish_ports = vec![format!("0.0.0.0::{}", POD_API_PORT)];
 
         podman
             .create_pod(pod_name, &labels, &publish_ports)
