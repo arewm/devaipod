@@ -987,23 +987,9 @@ async fn opencode_or_static_fallback(
         });
     }
 
-    // The root path is always the control plane, even with the agent cookie.
-    // The cookie persists across navigation (Path=/; Max-Age=86400) so the
-    // browser still sends it when the user clicks "back to pods".  The opencode
-    // API never uses "/" — its endpoints are /session, /rpc, /global, etc.
-    let is_root = trimmed_path.is_empty();
-
     // If the path looks like a static file (has a file extension), check the vendored
-    // opencode UI directory first, then the control-plane static directory.
-    // The opencode index.html references root-level files like /oc-theme-preload.js
-    // and /favicon-v3.svg with absolute paths; the control-plane index.html references
-    // vendor/xterm/*.js for the web terminal.
-    //
-    // We must resolve static files before the opencode proxy fallback below,
-    // otherwise the agent cookie causes requests like /vendor/xterm/xterm.js to be
-    // proxied to the opencode backend which returns its SPA index.html (HTML, not JS),
-    // breaking the terminal.
-    if !is_root && has_file_extension(trimmed_path) {
+    // opencode UI directory first, then the old control-plane static directory.
+    if has_file_extension(trimmed_path) {
         let opencode_req = Request::builder()
             .uri(request.uri().clone())
             .body(Body::empty())
@@ -1016,7 +1002,7 @@ async fn opencode_or_static_fallback(
         if resp.status() != StatusCode::NOT_FOUND {
             return resp;
         }
-        // Also check the control-plane static directory (e.g. dist/vendor/xterm/).
+        // Also check the old control-plane static directory.
         let static_req = Request::builder()
             .uri(request.uri().clone())
             .body(Body::empty())
@@ -1031,6 +1017,12 @@ async fn opencode_or_static_fallback(
         }
     }
 
+    // The root path "/" is handled by an explicit route (serve_spa_page), so
+    // it won't reach here.  The cookie persists across navigation so the
+    // browser still sends it when the user navigates away from an agent session.
+    // The opencode API never uses "/" — its endpoints are /session, /rpc, etc.
+    let is_root = trimmed_path.is_empty();
+
     if has_cookie && !is_root {
         match opencode_root_proxy(request).await {
             Ok(resp) => resp,
@@ -1040,12 +1032,12 @@ async fn opencode_or_static_fallback(
                 .unwrap(),
         }
     } else {
-        // Serve from control-plane static directory
-        let serve_dir = ServeDir::new(&state.static_dir);
-        match serve_dir.oneshot(request).await {
-            Ok(resp) => resp.into_response(),
-            Err(_) => Response::builder()
-                .status(StatusCode::NOT_FOUND)
+        // For any non-file, non-API path (e.g. /pods, /some-dir/session/123),
+        // serve the opencode SPA so client-side routing can handle it.
+        match opencode_index_with_script().await {
+            Ok(resp) => resp,
+            Err(status) => Response::builder()
+                .status(status)
                 .body(Body::empty())
                 .unwrap(),
         }
@@ -1091,6 +1083,7 @@ console.warn=function(){_warn.apply(console,arguments);report('warn',arguments);
 window.addEventListener('unhandledrejection',function(e){
   report('unhandledrejection',[e.reason]);
 });
+window.__DEVAIPOD__=true;
 })()</script>"#;
 
 /// Wrapper HTML page that embeds the opencode SPA in a full-screen iframe with a
@@ -1187,9 +1180,9 @@ async fn agent_ui_handler(
     serve_opencode_static(&path).await
 }
 
-/// Serve the raw opencode UI (index.html) for loading inside the agent iframe.
-/// Only the error interceptor script is injected; no URL rewriting or back button.
-async fn serve_opencode_raw_ui() -> Result<Response, StatusCode> {
+/// Read the opencode SPA's index.html and inject the `DEVAIPOD_HEAD_SCRIPT`.
+/// Shared by `serve_opencode_raw_ui` (iframe) and `serve_pods_page` (top-level /pods).
+async fn opencode_index_with_script() -> Result<Response, StatusCode> {
     let ui_path = std::path::Path::new(OPENCODE_UI_PATH).join("index.html");
     let content = tokio::fs::read(&ui_path).await.map_err(|e| {
         tracing::error!("Failed to read opencode index.html: {}", e);
@@ -1202,6 +1195,42 @@ async fn serve_opencode_raw_ui() -> Result<Response, StatusCode> {
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(html))
+        .unwrap())
+}
+
+/// Serve the raw opencode UI (index.html) for loading inside the agent iframe.
+/// Only the error interceptor script is injected; no URL rewriting or back button.
+async fn serve_opencode_raw_ui() -> Result<Response, StatusCode> {
+    opencode_index_with_script().await
+}
+
+/// Redirect `/` to `/pods` — the SPA pods page is the primary entry point.
+async fn redirect_to_pods() -> Response {
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, "/pods")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Serve the opencode SPA with the devaipod head script injected.
+/// The SPA handles client-side routing internally.
+async fn serve_spa_page() -> Result<Response, StatusCode> {
+    opencode_index_with_script().await
+}
+
+/// Serve the old control-plane UI at /_devaipod/oldui.
+async fn serve_old_ui(State(state): State<Arc<AppState>>) -> Result<Response, StatusCode> {
+    let index_path = std::path::Path::new(&state.static_dir).join("index.html");
+    let content = tokio::fs::read(&index_path).await.map_err(|e| {
+        tracing::error!("Failed to read old UI index.html: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(content))
         .unwrap())
 }
 
@@ -2865,6 +2894,9 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         // TODO: add lightweight auth (e.g. shared secret) for production use
         .route("/api/devaipod/mcp", post(crate::mcp::handle_mcp))
         .nest("/api", api_router)
+        .route("/", get(redirect_to_pods))
+        .route("/pods", get(serve_spa_page))
+        .route("/_devaipod/oldui", get(serve_old_ui))
         .route("/_devaipod/opencode-ui", get(serve_opencode_raw_ui))
         .route("/_devaipod/agent/{name}", get(agent_wrapper))
         .route("/_devaipod/agent/{name}/", get(agent_ui_root))
@@ -2880,9 +2912,9 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         .route("/assets", get(serve_root_assets))
         .route("/assets/{*path}", get(serve_root_assets))
         // Catch-all fallback: if the agent cookie is set, proxy to the opencode backend;
-        // otherwise serve control-plane static files. This avoids maintaining a hardcoded
-        // list of opencode API routes (the SPA uses window.location.origin for all its
-        // API calls: /session, /global/event, /agent, /config, /file, /find/file, etc.).
+        // otherwise serve the SPA for client-side routing. This avoids maintaining a
+        // hardcoded list of opencode API routes (the SPA uses window.location.origin
+        // for all its API calls: /session, /global/event, /agent, /config, etc.).
         .fallback(opencode_or_static_fallback)
         .layer(middleware::from_fn(request_trace))
         .layer(cors)

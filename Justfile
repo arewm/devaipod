@@ -221,6 +221,16 @@ allow-repo-e2e repo=default_test_repo workspace=default_test_workspace:
     echo "Done! The repo {{repo}} is now allowed for PR creation."
 
 # ============================================================================
+# Web UI (opencode SPA fork)
+# ============================================================================
+
+# Build the opencode SPA in a container (no host node/bun required)
+[group('web')]
+build-web:
+    podman run --rm -v {{ justfile_directory() }}/opencode-ui:/build:z \
+        -w /build/packages/app docker.io/oven/bun:latest sh -c "bun run build"
+
+# ============================================================================
 # Container builds
 # ============================================================================
 

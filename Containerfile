@@ -66,6 +66,7 @@ RUN mkdir -p packages/ui/src/assets/fonts && \
 
 RUN bun install --frozen-lockfile
 WORKDIR /build/packages/app
+ENV VITE_DEVAIPOD=true
 RUN bun run build
 
 # Output is in /build/packages/app/dist
@@ -142,17 +143,6 @@ ENV DEVAIPOD_CONTAINER=1
 # Copy devaipod web UI static files directly from build context
 # (not from src stage, as that's a snapshot that may not include untracked files)
 COPY dist /usr/share/devaipod/dist
-
-# Vendor xterm.js for the web terminal (avoids CDN dependency at runtime)
-ARG XTERM_VERSION=5.5.0
-ARG XTERM_FIT_VERSION=0.10.0
-RUN mkdir -p /usr/share/devaipod/dist/vendor/xterm && \
-    curl -fsSL "https://unpkg.com/@xterm/xterm@${XTERM_VERSION}/css/xterm.css" \
-      -o /usr/share/devaipod/dist/vendor/xterm/xterm.css && \
-    curl -fsSL "https://unpkg.com/@xterm/xterm@${XTERM_VERSION}/lib/xterm.js" \
-      -o /usr/share/devaipod/dist/vendor/xterm/xterm.js && \
-    curl -fsSL "https://unpkg.com/@xterm/addon-fit@${XTERM_FIT_VERSION}/lib/addon-fit.js" \
-      -o /usr/share/devaipod/dist/vendor/xterm/addon-fit.js
 
 # Copy vendored opencode web UI fork (built from opencode-ui/ in the repo)
 # This is served at /opencode/ and proxies API calls to the agent's opencode server

@@ -1,6 +1,6 @@
 import "@/index.css"
 import { ErrorBoundary, Suspense, lazy, type JSX, type ParentProps } from "solid-js"
-import { Router, Route, Navigate } from "@solidjs/router"
+import { Router, Route } from "@solidjs/router"
 import { MetaProvider } from "@solidjs/meta"
 import { Font } from "@opencode-ai/ui/font"
 import { MarkedProvider } from "@opencode-ai/ui/context/marked"
@@ -32,6 +32,7 @@ import DirectoryLayout from "@/pages/directory-layout"
 import { ErrorPage } from "./pages/error"
 const Home = lazy(() => import("@/pages/home"))
 const Session = lazy(() => import("@/pages/session"))
+const Pods = lazy(() => import("@/pages/pods"))
 const Loading = () => <div class="size-full" />
 
 const HomeRoute = () => (
@@ -98,7 +99,8 @@ function SessionProviders(props: ParentProps) {
   )
 }
 
-function RouterRoot(props: ParentProps<{ appChildren?: JSX.Element }>) {
+/** Layout route for the opencode session UI — wraps children in the full provider stack. */
+function OpenCodeLayout(props: ParentProps<{ appChildren?: JSX.Element }>) {
   return (
     <AppShellProviders>
       {props.appChildren}
@@ -160,6 +162,12 @@ function ServerKey(props: ParentProps) {
   return props.children
 }
 
+const PodsRoute = () => (
+  <Suspense fallback={<Loading />}>
+    <Pods />
+  </Suspense>
+)
+
 export function AppInterface(props: { defaultUrl?: string; children?: JSX.Element; isSidecar?: boolean }) {
   const platform = usePlatform()
   const storedDefaultServerUrl = getStoredDefaultServerUrl(platform)
@@ -174,22 +182,31 @@ export function AppInterface(props: { defaultUrl?: string; children?: JSX.Elemen
   })
 
   return (
-    <ServerProvider defaultUrl={defaultServerUrl} isSidecar={props.isSidecar}>
-      <ServerKey>
-        <GlobalSDKProvider>
-          <GlobalSyncProvider>
-            <Router
-              root={(routerProps) => <RouterRoot appChildren={props.children}>{routerProps.children}</RouterRoot>}
-            >
-              <Route path="/" component={HomeRoute} />
-              <Route path="/:dir" component={DirectoryLayout}>
-                <Route path="/" component={SessionIndexRoute} />
-                <Route path="/session/:id?" component={SessionRoute} />
-              </Route>
-            </Router>
-          </GlobalSyncProvider>
-        </GlobalSDKProvider>
-      </ServerKey>
-    </ServerProvider>
+    <Router>
+      {/* /pods — standalone page, no opencode server needed */}
+      <Route path="/pods" component={PodsRoute} />
+
+      {/* Everything else goes through the full opencode provider stack */}
+      <Route
+        path=""
+        component={(routerProps) => (
+          <ServerProvider defaultUrl={defaultServerUrl} isSidecar={props.isSidecar}>
+            <ServerKey>
+              <GlobalSDKProvider>
+                <GlobalSyncProvider>
+                  <OpenCodeLayout appChildren={props.children}>{routerProps.children}</OpenCodeLayout>
+                </GlobalSyncProvider>
+              </GlobalSDKProvider>
+            </ServerKey>
+          </ServerProvider>
+        )}
+      >
+        <Route path="/" component={HomeRoute} />
+        <Route path="/:dir" component={DirectoryLayout}>
+          <Route path="/" component={SessionIndexRoute} />
+          <Route path="/session/:id?" component={SessionRoute} />
+        </Route>
+      </Route>
+    </Router>
   )
 }

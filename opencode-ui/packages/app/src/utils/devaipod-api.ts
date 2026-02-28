@@ -24,10 +24,30 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`API ${res.status}: ${text}`)
   }
-  return res.json()
+  const contentType = res.headers.get("content-type") ?? ""
+  if (contentType.includes("application/json")) {
+    return res.json()
+  }
+  // For non-JSON responses (e.g. 204 No Content), return undefined
+  return undefined as T
 }
 
-/** True when the SPA is served through devaipod (cookie present). */
+/**
+ * True when the SPA is running inside devaipod — either because it was
+ * built with VITE_DEVAIPOD=true or because the DEVAIPOD_AGENT_POD cookie
+ * is present (dev-mode fallback).
+ */
 export function isDevaipod(): boolean {
+  if (import.meta.env.VITE_DEVAIPOD === "true") return true
   return document.cookie.includes("DEVAIPOD_AGENT_POD=")
+}
+
+/**
+ * Base URL for the devaipod control plane API.
+ * When running inside devaipod the SPA is served by the control plane,
+ * so the origin is the API host. Returns empty string outside devaipod.
+ */
+export function getControlPlaneUrl(): string {
+  if (!isDevaipod()) return ""
+  return window.location.origin
 }
