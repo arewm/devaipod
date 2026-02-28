@@ -9,7 +9,12 @@ export function getAuthToken(): string | undefined {
   const stored = typeof sessionStorage !== "undefined" ? sessionStorage.getItem("devaipod_token") : null
   if (stored) return stored
   const params = new URLSearchParams(window.location.search)
-  return params.get("token") ?? undefined
+  const token = params.get("token") ?? undefined
+  // Persist to sessionStorage so navigations/redirects don't lose it
+  if (token && typeof sessionStorage !== "undefined") {
+    sessionStorage.setItem("devaipod_token", token)
+  }
+  return token
 }
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {

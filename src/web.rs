@@ -52,25 +52,30 @@ fn state_token_path() -> std::path::PathBuf {
 /// The opencode app uses window.location.origin, so it requests /session, /rpc, /assets/* at root;
 /// we set this cookie when loading the agent page; with it we serve opencode assets at /assets/*.
 const DEVAIPOD_AGENT_POD_COOKIE: &str = "DEVAIPOD_AGENT_POD";
+const DEVAIPOD_AUTH_COOKIE: &str = "DEVAIPOD_AUTH";
 
-/// Get pod name from DEVAIPOD_AGENT_POD cookie if present (URL-decoded).
-fn pod_name_from_cookie(headers: &HeaderMap) -> Option<String> {
+/// Extract a raw cookie value by name from the request headers.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| {
+            let prefix = format!("{name}=");
             s.split(';').find_map(|pair| {
                 let pair = pair.trim();
-                let prefix = format!("{}=", DEVAIPOD_AGENT_POD_COOKIE);
                 pair.starts_with(&prefix)
                     .then(|| pair[prefix.len()..].to_string())
             })
         })
-        .map(|s| {
-            urlencoding::decode(&s)
-                .unwrap_or(std::borrow::Cow::Borrowed(s.as_str()))
-                .into_owned()
-        })
+}
+
+/// Get pod name from DEVAIPOD_AGENT_POD cookie if present (URL-decoded).
+fn pod_name_from_cookie(headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers, DEVAIPOD_AGENT_POD_COOKIE).map(|s| {
+        urlencoding::decode(&s)
+            .unwrap_or(std::borrow::Cow::Borrowed(s.as_str()))
+            .into_owned()
+    })
 }
 
 /// Normalize pod name: ensure it has the "devaipod-" prefix.
@@ -174,11 +179,12 @@ struct TokenQuery {
 
 /// Authentication middleware
 ///
-/// Validates requests by checking:
-/// 1. `?token=...` query parameter
+/// Validates requests by checking (in order):
+/// 1. `DEVAIPOD_AUTH` cookie (set by the login endpoint)
 /// 2. `Authorization: Bearer ...` header
+/// 3. `?token=...` query parameter
 ///
-/// Returns 401 Unauthorized if neither is present or valid.
+/// Returns 401 Unauthorized if none is present or valid.
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     Query(query): Query<TokenQuery>,
@@ -186,9 +192,9 @@ async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Check query parameter first
-    if let Some(ref token) = query.token {
-        if token == &state.token {
+    // Check auth cookie (primary method — set by /_devaipod/login)
+    if let Some(token) = cookie_value(&headers, DEVAIPOD_AUTH_COOKIE) {
+        if token == state.token {
             return Ok(next.run(request).await);
         }
     }
@@ -201,6 +207,13 @@ async fn auth_middleware(
                     return Ok(next.run(request).await);
                 }
             }
+        }
+    }
+
+    // Check query parameter (legacy / one-off use)
+    if let Some(ref token) = query.token {
+        if token == &state.token {
+            return Ok(next.run(request).await);
         }
     }
 
@@ -1204,11 +1217,38 @@ async fn serve_opencode_raw_ui() -> Result<Response, StatusCode> {
     opencode_index_with_script().await
 }
 
-/// Redirect `/` to `/pods` — the SPA pods page is the primary entry point.
+/// Redirect `/` to `/pods`.
 async fn redirect_to_pods() -> Response {
     Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, "/pods")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Login endpoint: validates the token and sets an HttpOnly auth cookie.
+/// This is the initial entry point — the startup URL points here.
+async fn login(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TokenQuery>,
+) -> Response {
+    let valid = query.token.as_ref().is_some_and(|t| t == &state.token);
+    if !valid {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("Invalid or missing token"))
+            .unwrap();
+    }
+    let cookie = format!(
+        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400",
+        DEVAIPOD_AUTH_COOKIE,
+        state.token
+    );
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, "/pods")
+        .header(header::SET_COOKIE, cookie)
         .body(Body::empty())
         .unwrap()
 }
@@ -2887,6 +2927,7 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
 
     Router::new()
         .route("/_devaipod/health", get(|| async { "ok" }))
+        .route("/_devaipod/login", get(login))
         .route("/_devaipod/frontend-error", post(frontend_error_report))
         // MCP endpoint for advisor tools — outside auth since the advisor
         // pod connects without a bearer token. Only exposes pod metadata
@@ -2957,7 +2998,7 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
         .with_context(|| format!("Failed to bind to {}", addr))?;
 
     // Print startup message with URL including token
-    let url = format!("http://127.0.0.1:{}/?token={}", port, token);
+    let url = format!("http://127.0.0.1:{}/_devaipod/login?token={}", port, token);
     tracing::info!("Web server started at {}", url);
     println!("Control plane URL: {}", url);
 
