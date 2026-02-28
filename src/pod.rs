@@ -931,12 +931,16 @@ impl DevaipodPod {
             &volume_name,
             &workspace_container,
             &socket_path,
+            &api_password,
         );
         podman
             .create_container(&api_container_name, &self_image, pod_name, api_config)
             .await
             .with_context(|| {
-                format!("Failed to create API sidecar container: {}", api_container_name)
+                format!(
+                    "Failed to create API sidecar container: {}",
+                    api_container_name
+                )
             })?;
         let api_container = Some(api_container_name);
 
@@ -2532,6 +2536,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
         main_workspace_volume: &str,
         workspace_container_name: &str,
         socket_path: &std::path::Path,
+        opencode_password: &str,
     ) -> ContainerConfig {
         use crate::podman::MountConfig;
 
@@ -2547,6 +2552,8 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             "/workspaces".to_string(),
             "--workspace-container".to_string(),
             workspace_container_name.to_string(),
+            "--opencode-password".to_string(),
+            opencode_password.to_string(),
         ];
 
         // Bind-mount the podman socket so we can exec into the workspace
@@ -3214,6 +3221,7 @@ mod tests {
             main_workspace_volume,
             workspace_container,
             socket_path,
+            "test-password-123",
         );
 
         // Verify two named volumes are mounted

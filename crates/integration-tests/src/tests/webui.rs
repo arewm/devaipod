@@ -1593,10 +1593,7 @@ fn test_web_container_opencode_connectivity() -> Result<()> {
         // Health endpoint may or may not exist on the opencode server
         // The important thing is we got a response (not connection refused)
         if health_status > 0 {
-            tracing::info!(
-                "Request to /health returned status {}",
-                health_status
-            );
+            tracing::info!("Request to /health returned status {}", health_status);
         }
 
         // Successfully tested one pod, we're done

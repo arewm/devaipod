@@ -11,25 +11,36 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::prelude::*;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
 use bollard::Docker;
 use color_eyre::eyre::{Context, Result};
 use futures_util::{SinkExt, Stream, StreamExt};
+use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::{broadcast, RwLock};
+use tower::ServiceExt;
+use tower_http::services::{ServeDir, ServeFile};
 
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
+
+/// Path to the vendored opencode UI files.
+const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
+
+/// The opencode server listens on this port inside the pod.
+const OPENCODE_UPSTREAM_PORT: u16 = 4096;
 
 /// Server state shared across all handlers.
 #[derive(Clone)]
@@ -42,6 +53,8 @@ struct AppState {
     pty_sessions: PtySessionManager,
     /// Name of the workspace container to exec into for PTY sessions.
     workspace_container: String,
+    /// Password for authenticating to the opencode server (Basic auth).
+    opencode_password: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,16 +358,13 @@ async fn run_git(workspace: &PathBuf, args: &[&str]) -> Result<(i32, Vec<u8>, Ve
 // ---------------------------------------------------------------------------
 
 /// `GET /git/status` — `git status --porcelain`
-async fn git_status(
-    State(state): State<AppState>,
-) -> Result<Json<GitStatusResponse>, StatusCode> {
-    let (exit_code, stdout, _stderr) =
-        run_git(&state.workspace, &["status", "--porcelain"])
-            .await
-            .map_err(|e| {
-                tracing::error!("git status failed: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+async fn git_status(State(state): State<AppState>) -> Result<Json<GitStatusResponse>, StatusCode> {
+    let (exit_code, stdout, _stderr) = run_git(&state.workspace, &["status", "--porcelain"])
+        .await
+        .map_err(|e| {
+            tracing::error!("git status failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let output = String::from_utf8_lossy(&stdout).to_string();
 
@@ -377,12 +387,13 @@ async fn git_status(
 
 /// `GET /git/diff` — `git diff HEAD`
 async fn git_diff(State(state): State<AppState>) -> Result<Json<GitDiffResponse>, StatusCode> {
-    let (exit_code, stdout, _stderr) = run_git(&state.workspace, &["diff", "HEAD"])
-        .await
-        .map_err(|e| {
-            tracing::error!("git diff failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let (exit_code, stdout, _stderr) =
+        run_git(&state.workspace, &["diff", "HEAD"])
+            .await
+            .map_err(|e| {
+                tracing::error!("git diff failed: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     let diff = String::from_utf8_lossy(&stdout).to_string();
 
@@ -393,13 +404,12 @@ async fn git_diff(State(state): State<AppState>) -> Result<Json<GitDiffResponse>
 async fn git_commits(
     State(state): State<AppState>,
 ) -> Result<Json<GitCommitsResponse>, StatusCode> {
-    let (exit_code, stdout, _stderr) =
-        run_git(&state.workspace, &["log", "--oneline", "-20"])
-            .await
-            .map_err(|e| {
-                tracing::error!("git log failed: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    let (exit_code, stdout, _stderr) = run_git(&state.workspace, &["log", "--oneline", "-20"])
+        .await
+        .map_err(|e| {
+            tracing::error!("git log failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let output = String::from_utf8_lossy(&stdout);
 
@@ -444,8 +454,7 @@ async fn git_log(
     }
 
     // Build the format arg and range specification.
-    let format_arg =
-        "--format=%H%x00%h%x00%s%n%b%x00%an%x00%ae%x00%aI%x00%P%x1e".to_string();
+    let format_arg = "--format=%H%x00%h%x00%s%n%b%x00%an%x00%ae%x00%aI%x00%P%x1e".to_string();
     let range_arg: String;
 
     let mut args: Vec<&str> = vec!["log", &format_arg];
@@ -576,10 +585,7 @@ async fn git_diff_range(
         &params.base,
         &params.head,
     ];
-    let (ns_result, num_result) = tokio::join!(
-        run_git(ws, &ns_args),
-        run_git(ws, &num_args),
-    );
+    let (ns_result, num_result) = tokio::join!(run_git(ws, &ns_args), run_git(ws, &num_args),);
 
     let (ns_exit, ns_stdout, ns_stderr) = ns_result.map_err(|e| {
         tracing::error!("git diff --name-status failed: {e}");
@@ -688,11 +694,20 @@ async fn git_diff_range(
 
     let mut files = Vec::with_capacity(file_statuses.len());
     for (file_path, status) in &file_statuses {
-        let (adds, dels) = numstat_map.get(file_path.as_str()).copied().unwrap_or((0, 0));
+        let (adds, dels) = numstat_map
+            .get(file_path.as_str())
+            .copied()
+            .unwrap_or((0, 0));
         files.push(FileDiff {
             file: file_path.clone(),
-            before: base_contents.get(file_path.as_str()).cloned().unwrap_or_default(),
-            after: head_contents.get(file_path.as_str()).cloned().unwrap_or_default(),
+            before: base_contents
+                .get(file_path.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            after: head_contents
+                .get(file_path.as_str())
+                .cloned()
+                .unwrap_or_default(),
             additions: adds,
             deletions: dels,
             status,
@@ -726,10 +741,8 @@ async fn fetch_file_contents(
                 .output()
                 .await;
             let content = match output {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8(o.stdout)
-                        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
-                }
+                Ok(o) if o.status.success() => String::from_utf8(o.stdout)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()),
                 _ => String::new(),
             };
             (file_owned, content)
@@ -749,16 +762,15 @@ async fn fetch_file_contents(
 async fn git_fetch_agent(
     State(state): State<AppState>,
 ) -> Result<Json<GitFetchResponse>, (StatusCode, String)> {
-    let (exit_code, _stdout, stderr) =
-        run_git(&state.workspace, &["fetch", "agent"])
-            .await
-            .map_err(|e| {
-                tracing::error!("git fetch agent failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to run git fetch agent: {e}"),
-                )
-            })?;
+    let (exit_code, _stdout, stderr) = run_git(&state.workspace, &["fetch", "agent"])
+        .await
+        .map_err(|e| {
+            tracing::error!("git fetch agent failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to run git fetch agent: {e}"),
+            )
+        })?;
 
     if exit_code != 0 {
         let stderr_text = String::from_utf8_lossy(&stderr);
@@ -786,16 +798,15 @@ async fn git_push(
         ));
     }
 
-    let (exit_code, _stdout, stderr) =
-        run_git(&state.workspace, &["push", "origin", &body.branch])
-            .await
-            .map_err(|e| {
-                tracing::error!("git push failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to run git push: {e}"),
-                )
-            })?;
+    let (exit_code, _stdout, stderr) = run_git(&state.workspace, &["push", "origin", &body.branch])
+        .await
+        .map_err(|e| {
+            tracing::error!("git push failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to run git push: {e}"),
+            )
+        })?;
 
     if exit_code != 0 {
         let stderr_text = String::from_utf8_lossy(&stderr);
@@ -988,7 +999,9 @@ async fn pty_create(
 ) -> Result<(StatusCode, Json<PtyInfo>), (StatusCode, String)> {
     let command = input.command.unwrap_or_else(|| "/bin/bash".to_string());
     let args = input.args.unwrap_or_default();
-    let cwd = input.cwd.unwrap_or_else(|| state.workspace.to_string_lossy().into_owned());
+    let cwd = input
+        .cwd
+        .unwrap_or_else(|| state.workspace.to_string_lossy().into_owned());
     let title = input.title.unwrap_or_else(|| {
         let full = format!("{} {}", command, args.join(" "));
         full.trim().to_string()
@@ -1002,7 +1015,8 @@ async fn pty_create(
         ));
     }
 
-    let docker = connect_docker().map_err(|sc| (sc, "Failed to connect to container runtime".to_string()))?;
+    let docker = connect_docker()
+        .map_err(|sc| (sc, "Failed to connect to container runtime".to_string()))?;
 
     // Build the command vector for exec.
     let mut cmd: Vec<String> = vec![command.clone()];
@@ -1034,7 +1048,10 @@ async fn pty_create(
         .await
         .map_err(|e| {
             tracing::error!("Failed to create exec: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create exec: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create exec: {e}"),
+            )
         })?;
 
     let exec_id = exec.id.clone();
@@ -1051,7 +1068,10 @@ async fn pty_create(
         .await
         .map_err(|e| {
             tracing::error!("Failed to start exec: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start exec: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to start exec: {e}"),
+            )
         })?;
 
     let session_id = generate_pty_id();
@@ -1090,7 +1110,10 @@ async fn pty_create(
     }
 
     match start_result {
-        StartExecResults::Attached { mut output, mut input } => {
+        StartExecResults::Attached {
+            mut output,
+            mut input,
+        } => {
             // Spawn stdin writer: forward bytes from the mpsc channel to exec stdin.
             tokio::spawn(async move {
                 while let Some(data) = stdin_rx.recv().await {
@@ -1171,13 +1194,16 @@ async fn pty_update(
     // Read the exec_id under a read lock (no need to hold a write lock for resize).
     let exec_id = {
         let sessions = state.pty_sessions.sessions.read().await;
-        let session = sessions.get(&pty_id).ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
+        let session = sessions
+            .get(&pty_id)
+            .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
         session.exec_id.clone()
     };
 
     // Perform the resize outside the lock — it's an async network call.
     if let Some(size) = &input.size {
-        let docker = connect_docker().map_err(|sc| (sc, "Failed to connect to container runtime".to_string()))?;
+        let docker = connect_docker()
+            .map_err(|sc| (sc, "Failed to connect to container runtime".to_string()))?;
         docker
             .resize_exec(
                 &exec_id,
@@ -1189,7 +1215,10 @@ async fn pty_update(
             .await
             .map_err(|e| {
                 tracing::error!("Failed to resize exec {pty_id}: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resize: {e}"))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to resize: {e}"),
+                )
             })?;
     }
 
@@ -1203,7 +1232,9 @@ async fn pty_update(
 
     // Return current info.
     let sessions = state.pty_sessions.sessions.read().await;
-    let session = sessions.get(&pty_id).ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
+    let session = sessions
+        .get(&pty_id)
+        .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
     Ok(Json(session.info().await))
 }
 
@@ -1286,7 +1317,11 @@ async fn handle_ws(
     let meta = serde_json::json!({"cursor": cursor});
     let mut meta_bytes = vec![0x00u8];
     meta_bytes.extend_from_slice(meta.to_string().as_bytes());
-    if ws_tx.send(Message::Binary(meta_bytes.into())).await.is_err() {
+    if ws_tx
+        .send(Message::Binary(meta_bytes.into()))
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -1359,6 +1394,236 @@ async fn handle_ws(
 }
 
 // ---------------------------------------------------------------------------
+// Opencode proxy and static file serving
+// ---------------------------------------------------------------------------
+
+/// Whether a path is an SSE event-stream endpoint.
+fn is_event_stream_path(path: &str) -> bool {
+    path == "event" || path.starts_with("event/") || path == "global" || path.starts_with("global/")
+}
+
+/// Return a long-lived SSE stream that sends periodic keepalive comments.
+/// Prevents the opencode SDK from error-looping when the upstream isn't ready.
+fn sse_keepalive_stream(comment: &str) -> Body {
+    let initial = format!(": {comment}\n\n");
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(2);
+    tokio::spawn(async move {
+        if tx.send(Ok(initial)).await.is_err() {
+            return;
+        }
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if tx.send(Ok(": keepalive\n\n".to_string())).await.is_err() {
+                return;
+            }
+        }
+    });
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// Build a 200 OK SSE keepalive response.
+fn sse_keepalive_response(comment: &str) -> std::result::Result<Response, StatusCode> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(sse_keepalive_stream(comment))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Whether a path's last segment contains a dot (i.e. looks like a static file).
+fn has_file_extension(path: &str) -> bool {
+    path.rsplit_once('/')
+        .map_or(path, |(_dir, file)| file)
+        .contains('.')
+}
+
+/// Proxy an HTTP request to the opencode server at localhost:4096.
+///
+/// Supports regular requests, SSE streaming, and HTTP Upgrade (WebSocket).
+/// If the upstream is unreachable and the path is an event-stream endpoint,
+/// returns an SSE keepalive stream instead of an error.
+async fn proxy_to_opencode(
+    path: &str,
+    password: &str,
+    request: Request,
+) -> std::result::Result<Response, StatusCode> {
+    let host = "127.0.0.1";
+    let port = OPENCODE_UPSTREAM_PORT;
+
+    // Connect to the opencode server
+    let stream = match tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("Cannot connect to opencode at {}:{}: {}", host, port, e);
+            if is_event_stream_path(path) {
+                return sse_keepalive_response("opencode not ready");
+            }
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+
+    let io = TokioIo::new(stream);
+    let is_upgrade = request.headers().get(header::UPGRADE).is_some();
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| {
+            tracing::error!("Handshake with opencode server failed: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    if is_upgrade {
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                tracing::debug!("Upgrade connection closed: {}", e);
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::error!("Connection to opencode server failed: {}", e);
+            }
+        });
+    }
+
+    // Build the upstream URI, preserving query string
+    let mut uri = if path.is_empty() || path == "/" {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    };
+    if let Some(query) = request.uri().query() {
+        uri.push('?');
+        uri.push_str(query);
+    }
+
+    let (parts, body) = request.into_parts();
+
+    // Add Basic auth header
+    let credentials = BASE64_STANDARD.encode(format!("opencode:{}", password));
+    let mut builder = hyper::Request::builder()
+        .method(parts.method.clone())
+        .uri(&uri)
+        .header(header::HOST, format!("{}:{}", host, port))
+        .header(header::AUTHORIZATION, format!("Basic {}", credentials));
+
+    // Copy headers (except Host and Authorization which we set)
+    for (key, value) in parts.headers.iter() {
+        if key != header::HOST && key != header::AUTHORIZATION {
+            builder = builder.header(key, value);
+        }
+    }
+
+    let proxy_request = builder.body(body).map_err(|e| {
+        tracing::error!("Failed to build opencode proxy request: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let upstream_response = sender.send_request(proxy_request).await.map_err(|e| {
+        tracing::error!("Failed to send request to opencode: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    // Handle HTTP Upgrade (WebSocket) responses
+    if is_upgrade && upstream_response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let mut response_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+        for (key, value) in upstream_response.headers() {
+            response_builder = response_builder.header(key, value);
+        }
+
+        let inbound_request = Request::from_parts(parts, Body::empty());
+
+        tokio::spawn(async move {
+            let client_upgraded = hyper::upgrade::on(inbound_request).await;
+            let upstream_upgraded = hyper::upgrade::on(upstream_response).await;
+
+            match (client_upgraded, upstream_upgraded) {
+                (Ok(client), Ok(upstream)) => {
+                    let mut client_io = TokioIo::new(client);
+                    let mut upstream_io = TokioIo::new(upstream);
+                    if let Err(e) =
+                        tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
+                    {
+                        tracing::debug!("WebSocket proxy connection closed: {}", e);
+                    }
+                }
+                (Err(e), _) => {
+                    tracing::error!("Client upgrade failed: {}", e);
+                }
+                (_, Err(e)) => {
+                    tracing::error!("Upstream upgrade failed: {}", e);
+                }
+            }
+        });
+
+        return response_builder.body(Body::empty()).map_err(|e| {
+            tracing::error!("Failed to build upgrade response: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        });
+    }
+
+    // Normal response: normalize HTTP version for SSE/chunked support
+    let (mut resp_parts, body) = upstream_response.into_parts();
+    resp_parts.version = hyper::Version::HTTP_11;
+    let body = Body::new(body);
+
+    Ok(Response::from_parts(resp_parts, body))
+}
+
+/// Fallback handler: serves static files from the vendored UI or proxies to opencode.
+///
+/// Priority:
+/// 1. If the path has a file extension → try serving from the vendored UI directory
+/// 2. Otherwise → proxy to the opencode server at localhost:4096
+/// 3. If the proxy target is unreachable and path is an event stream → SSE keepalive
+/// 4. For paths without extensions that aren't API calls (404 from opencode) → serve index.html
+async fn fallback_handler(State(state): State<AppState>, request: Request) -> Response {
+    let path = request.uri().path().to_string();
+    let trimmed = path.trim_start_matches('/');
+
+    // Static files: serve from the vendored UI directory
+    if has_file_extension(trimmed) {
+        let file_req = Request::builder()
+            .uri(request.uri().clone())
+            .body(Body::empty())
+            .unwrap();
+        let resp = ServeDir::new(OPENCODE_UI_PATH)
+            .oneshot(file_req)
+            .await
+            .unwrap()
+            .into_response();
+        if resp.status() != StatusCode::NOT_FOUND {
+            return resp;
+        }
+        // File not found in UI dir — fall through to proxy (opencode may serve it)
+    }
+
+    // Everything else: proxy to the opencode server
+    match proxy_to_opencode(trimmed, &state.opencode_password, request).await {
+        Ok(resp) => resp,
+        Err(status) => {
+            // For non-file paths, serve the SPA index.html as fallback
+            if !has_file_extension(trimmed) && !is_event_stream_path(trimmed) {
+                let index_html = format!("{}/index.html", OPENCODE_UI_PATH);
+                let serve_dir =
+                    ServeDir::new(OPENCODE_UI_PATH).fallback(ServeFile::new(&index_html));
+                let fallback_req = Request::builder().uri("/").body(Body::empty()).unwrap();
+                return serve_dir
+                    .oneshot(fallback_req)
+                    .await
+                    .unwrap()
+                    .into_response();
+            }
+            status.into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server entrypoint
 // ---------------------------------------------------------------------------
 
@@ -1374,6 +1639,9 @@ pub(crate) struct PodApiArgs {
     /// Name of the workspace container to exec into for PTY sessions.
     #[arg(long)]
     workspace_container: Option<String>,
+    /// Password for authenticating to the opencode server (Basic auth).
+    #[arg(long, default_value = "")]
+    opencode_password: String,
 }
 
 /// Build the axum router (public for testing).
@@ -1390,8 +1658,13 @@ fn build_router(state: AppState) -> Router {
         .route("/git/push", post(git_push))
         // PTY endpoints
         .route("/pty", get(pty_list).post(pty_create))
-        .route("/pty/{pty_id}", get(pty_get).put(pty_update).delete(pty_delete))
+        .route(
+            "/pty/{pty_id}",
+            get(pty_get).put(pty_update).delete(pty_delete),
+        )
         .route("/pty/{pty_id}/connect", get(pty_connect))
+        // Fallback: static UI files and opencode API proxy
+        .fallback(fallback_handler)
         .with_state(state)
 }
 
@@ -1405,12 +1678,16 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
         git_events_tx,
         pty_sessions: PtySessionManager::new(),
         workspace_container: args.workspace_container.unwrap_or_default(),
+        opencode_password: args.opencode_password,
     };
 
     let app = build_router(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.port));
-    tracing::info!("pod-api listening on {addr} (workspace: {})", args.workspace.display());
+    tracing::info!(
+        "pod-api listening on {addr} (workspace: {})",
+        args.workspace.display()
+    );
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

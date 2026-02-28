@@ -22,13 +22,13 @@ mod gpu;
 mod init;
 mod mcp;
 mod pod;
+mod pod_api;
 mod podman;
 mod prompt;
 mod secrets;
 mod service_gator;
 mod ssh_server;
 mod tui;
-mod pod_api;
 mod web;
 
 /// Prefix for all devaipod pod names

@@ -1080,17 +1080,18 @@ fn has_file_extension(path: &str) -> bool {
 // script injection. The SPA is built with VITE_DEVAIPOD=true and reads the
 // DEVAIPOD_AGENT_POD cookie at runtime to scope per-pod state.
 
-/// Wrapper HTML page that embeds the opencode SPA in a full-screen iframe with a
-/// thin navigation bar. This avoids the fragile HTML/CSS rewriting that was previously
-/// used to inject a back button into the opencode index.html.  The opencode SPA runs
-/// unmodified inside the iframe at the same origin, so its API calls (/session, /rpc,
-/// /global/event, etc.) are handled by the cookie-based fallback proxy.
-fn agent_iframe_wrapper(name: &str) -> String {
+/// Wrapper HTML page that embeds the pod-api sidecar's opencode UI in a full-screen
+/// iframe with a thin navigation bar. The `base_url` points at the pod-api sidecar's
+/// published port (e.g. `http://localhost:54321/` or
+/// `http://localhost:54321/{base64dir}/session/{id}`). The iframe loads the SPA
+/// directly from the sidecar, which also proxies opencode API calls.
+fn agent_iframe_wrapper(name: &str, base_url: &str) -> String {
     let escaped_name = name
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;");
+    let escaped_url = base_url.replace('&', "&amp;").replace('"', "&quot;");
     format!(
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -1109,61 +1110,82 @@ html,body{{height:100%;overflow:hidden;background:#1c1717}}
 #dbar a:hover{{background:rgba(255,255,255,0.14);border-color:rgba(255,255,255,0.25)}}
 iframe{{width:100%;height:calc(100% - 44px);border:none}}
 </style></head><body>
-<div id="dbar"><a id="db" href="/">&#8592; Pods</a></div>
-<iframe id="oc" src="/_devaipod/opencode-ui" allow="clipboard-read; clipboard-write"></iframe>
-<script>(function(){{
-var t=sessionStorage.getItem('devaipod_token');
-if(t)document.getElementById('db').href='/?token='+encodeURIComponent(t);
-// Deep-link the iframe to the most recent session or root.
-// The control plane passes session route as a hash: #/<base64dir>/session/<id>.
-// After the SPA loads, we navigate it by dispatching the opencode deep-link
-// custom event with a direct URL.  Same-origin iframe access.
-// When no hash is present (e.g. advisor with no sessions), navigate to '/'
-// so the SPA's home route renders instead of the unmatched /_devaipod/opencode-ui path.
-var route=window.location.hash.slice(1)||'/';
-var f=document.getElementById('oc');
-f.addEventListener('load',function(){{try{{
-f.contentWindow.history.pushState(null,'',route);
-f.contentWindow.dispatchEvent(new PopStateEvent('popstate'));
-}}catch(e){{}}}},{{once:true}})
-}})()
-</script></body></html>"#
+<div id="dbar"><a href="/pods">&#8592; Pods</a></div>
+<iframe id="oc" src="{escaped_url}" allow="clipboard-read; clipboard-write"></iframe>
+</body></html>"#
     )
 }
 
-/// Redirect /_devaipod/agent/{name} to /_devaipod/agent/{name}/ and set the agent cookie.
-async fn agent_wrapper(Path(name): Path<String>) -> Result<Response, StatusCode> {
-    let location = format!("/_devaipod/agent/{}/", urlencoding::encode(&name));
-    let cookie_value = format!(
-        "{}={}; Path=/; SameSite=Lax; Max-Age=86400",
-        DEVAIPOD_AGENT_POD_COOKIE,
-        urlencoding::encode(&name)
-    );
+/// Redirect /_devaipod/agent/{name} to /_devaipod/agent/{name}/ (URL consistency).
+///
+/// Query parameters (e.g. `?dir=...&session=...`) are preserved across the redirect
+/// so the trailing-slash handler can read them for pod-api URL construction.
+async fn agent_wrapper(Path(name): Path<String>, request: Request) -> Result<Response, StatusCode> {
+    let mut location = format!("/_devaipod/agent/{}/", urlencoding::encode(&name));
+    if let Some(query) = request.uri().query() {
+        location.push('?');
+        location.push_str(query);
+    }
     Ok(Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, location)
-        .header(header::SET_COOKIE, cookie_value)
         .body(Body::empty())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
 }
 
+/// Query parameters for the agent UI page.
+///
+/// The `openPod` frontend function navigates to
+/// `/_devaipod/agent/{name}/?dir=BASE64&session=ID` so the server can construct the
+/// full pod-api URL with the session deep-link path.
+#[derive(Debug, Deserialize)]
+struct AgentQuery {
+    /// Base64-encoded working directory for the session.
+    dir: Option<String>,
+    /// Session ID to deep-link into.
+    session: Option<String>,
+}
+
 /// Serve the iframe wrapper page for a specific agent.
-/// The opencode SPA runs unmodified inside the iframe; the wrapper provides
-/// the "back to pods" navigation bar. Also sets the agent cookie so that
-/// subsequent requests from the iframe (API calls, assets) are routed correctly.
-async fn agent_ui_root(Path(name): Path<String>) -> Response {
-    let cookie_value = format!(
-        "{}={}; Path=/; SameSite=Lax; Max-Age=86400",
-        DEVAIPOD_AGENT_POD_COOKIE,
-        urlencoding::encode(&name)
-    );
-    Response::builder()
+///
+/// Discovers the pod-api sidecar's published port and constructs an iframe src
+/// pointing directly at it (optionally including a session deep-link path).
+/// Returns 503 if the pod-api container is not running or its port cannot be
+/// discovered.
+async fn agent_ui_root(
+    Path(name): Path<String>,
+    Query(query): Query<AgentQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let pod_name = normalize_pod_name(&name);
+
+    let port = get_pod_api_port(&pod_name).await.map_err(|code| {
+        let msg = format!(
+            "Could not discover pod-api port for {pod_name}: \
+             the pod-api sidecar may not be running"
+        );
+        tracing::error!("{msg}");
+        (code, msg)
+    })?;
+
+    // The iframe URL is rendered in the user's browser on the host, so we must
+    // use localhost — not host.containers.internal (which is only resolvable
+    // inside containers).  Published ports are bound to 0.0.0.0 on the host.
+    let host = "localhost";
+
+    // Build the base URL, optionally including the session deep-link path.
+    let base_url = match (query.dir.as_deref(), query.session.as_deref()) {
+        (Some(dir), Some(session)) => {
+            format!("http://{host}:{port}/{dir}/session/{session}")
+        }
+        _ => format!("http://{host}:{port}/"),
+    };
+
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::SET_COOKIE, cookie_value)
-        .body(Body::from(agent_iframe_wrapper(&name)))
-        .unwrap()
+        .body(Body::from(agent_iframe_wrapper(&name, &base_url)))
+        .unwrap())
 }
 
 /// Handler for agent UI sub-paths (static assets under /_devaipod/agent/{name}/).
@@ -1193,11 +1215,6 @@ async fn serve_opencode_index() -> Result<Response, StatusCode> {
         .unwrap())
 }
 
-/// Serve the opencode UI (index.html) for loading inside the agent iframe.
-async fn serve_opencode_raw_ui() -> Result<Response, StatusCode> {
-    serve_opencode_index().await
-}
-
 /// Redirect `/` to `/pods`.
 async fn redirect_to_pods() -> Response {
     Response::builder()
@@ -1209,10 +1226,7 @@ async fn redirect_to_pods() -> Response {
 
 /// Login endpoint: validates the token and sets an HttpOnly auth cookie.
 /// This is the initial entry point — the startup URL points here.
-async fn login(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<TokenQuery>,
-) -> Response {
+async fn login(State(state): State<Arc<AppState>>, Query(query): Query<TokenQuery>) -> Response {
     let valid = query.token.as_ref().is_some_and(|t| t == &state.token);
     if !valid {
         return Response::builder()
@@ -1223,8 +1237,7 @@ async fn login(
     }
     let cookie = format!(
         "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400",
-        DEVAIPOD_AUTH_COOKIE,
-        state.token
+        DEVAIPOD_AUTH_COOKIE, state.token
     );
     Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
@@ -2258,8 +2271,7 @@ async fn git_log(
     // Use %x00 (NUL) as field separator, %x1e (record separator) between commits.
     // Fields: full SHA, short SHA, subject+body, author name, author email,
     //         author date ISO, parent hashes (space-separated).
-    let format_arg =
-        "--format=%H%x00%h%x00%s%n%b%x00%an%x00%ae%x00%aI%x00%P%x1e".to_string();
+    let format_arg = "--format=%H%x00%h%x00%s%n%b%x00%an%x00%ae%x00%aI%x00%P%x1e".to_string();
     let range_arg: String;
 
     let mut cmd: Vec<&str> = vec!["git", "log", &format_arg];
@@ -2308,7 +2320,8 @@ async fn git_log(
         let stderr_text = String::from_utf8_lossy(&stderr);
         // If the ref doesn't exist yet (e.g. agent remote has no commits),
         // return an empty commit list rather than a 500.
-        if stderr_text.contains("unknown revision") || stderr_text.contains("bad default revision") {
+        if stderr_text.contains("unknown revision") || stderr_text.contains("bad default revision")
+        {
             return Ok(Json(GitLogResponse {
                 commits: Vec::new(),
             }));
@@ -2586,10 +2599,7 @@ async fn git_diff_range(
                     let parts: Vec<&str> = output.split(FILE_SEPARATOR).collect();
                     let mut map = std::collections::HashMap::new();
                     for (i, file) in base_files.iter().enumerate() {
-                        map.insert(
-                            file.to_string(),
-                            parts.get(i).unwrap_or(&"").to_string(),
-                        );
+                        map.insert(file.to_string(), parts.get(i).unwrap_or(&"").to_string());
                     }
                     map
                 }
@@ -2611,10 +2621,7 @@ async fn git_diff_range(
                     let parts: Vec<&str> = output.split(FILE_SEPARATOR).collect();
                     let mut map = std::collections::HashMap::new();
                     for (i, file) in head_files.iter().enumerate() {
-                        map.insert(
-                            file.to_string(),
-                            parts.get(i).unwrap_or(&"").to_string(),
-                        );
+                        map.insert(file.to_string(), parts.get(i).unwrap_or(&"").to_string());
                     }
                     map
                 }
@@ -2863,7 +2870,10 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         .route("/devaipod/pods/{name}/git/commits", get(git_commits))
         .route("/devaipod/pods/{name}/git/log", get(git_log))
         .route("/devaipod/pods/{name}/git/diff-range", get(git_diff_range))
-        .route("/devaipod/pods/{name}/git/fetch-agent", post(git_fetch_agent))
+        .route(
+            "/devaipod/pods/{name}/git/fetch-agent",
+            post(git_fetch_agent),
+        )
         .route("/devaipod/pods/{name}/git/push", post(git_push))
         .route(
             "/devaipod/pods/{name}/pod-api/{*path}",
@@ -2919,7 +2929,6 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         .route("/", get(redirect_to_pods))
         .route("/pods", get(serve_spa_page))
         .route("/_devaipod/oldui", get(serve_old_ui))
-        .route("/_devaipod/opencode-ui", get(serve_opencode_raw_ui))
         .route("/_devaipod/agent/{name}", get(agent_wrapper))
         .route("/_devaipod/agent/{name}/", get(agent_ui_root))
         .route(
@@ -2999,13 +3008,14 @@ mod tests {
     use tower::util::ServiceExt;
 
     /// Fast in-process test: GET /_devaipod/agent/{name} must return 307 redirect
-    /// to /_devaipod/agent/{name}/ and set the DEVAIPOD_AGENT_POD cookie.
+    /// to /_devaipod/agent/{name}/ and preserve query parameters.
     #[tokio::test]
     async fn test_agent_redirect() {
         let temp = tempfile::tempdir().expect("temp dir");
         let static_dir = temp.path().to_str().expect("path");
         let app = build_app("test-token".into(), None, static_dir);
 
+        // Without query params
         let req = Request::builder()
             .uri("/_devaipod/agent/test-pod")
             .body(Body::empty())
@@ -3029,40 +3039,50 @@ mod tests {
             location, "/_devaipod/agent/test-pod/",
             "Location must redirect to trailing-slash path"
         );
-
-        let set_cookie = headers
-            .get(header::SET_COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .expect("Set-Cookie header must be set");
         assert!(
-            set_cookie.contains("DEVAIPOD_AGENT_POD="),
-            "Set-Cookie must include DEVAIPOD_AGENT_POD; got: {}",
-            set_cookie
+            headers.get(header::SET_COOKIE).is_none(),
+            "Redirect must not set cookies (cookie routing no longer used)"
         );
-        assert!(
-            set_cookie.contains("test-pod"),
-            "Set-Cookie must include pod name; got: {}",
-            set_cookie
+
+        // With query params
+        let app2 = build_app("test-token".into(), None, static_dir);
+        let req = Request::builder()
+            .uri("/_devaipod/agent/test-pod?dir=abc&session=s1")
+            .body(Body::empty())
+            .expect("request");
+        let res = app2.oneshot(req).await.expect("oneshot");
+        let location = res
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("Location header must be set");
+        assert_eq!(
+            location, "/_devaipod/agent/test-pod/?dir=abc&session=s1",
+            "Redirect must preserve query parameters"
         );
     }
 
     /// Test the iframe wrapper HTML generation.
     #[test]
     fn test_agent_iframe_wrapper() {
-        let html = agent_iframe_wrapper("test-pod");
+        let html = agent_iframe_wrapper("test-pod", "http://localhost:12345/");
         assert!(html.contains("test-pod"), "wrapper must include pod name");
         assert!(
-            html.contains("/_devaipod/opencode-ui"),
-            "wrapper must contain iframe src to opencode-ui"
+            html.contains("http://localhost:12345/"),
+            "wrapper must contain iframe src pointing at pod-api base_url"
         );
         assert!(html.contains("Pods"), "wrapper must have back-to-pods link");
+        assert!(html.contains("/pods"), "back link must point to /pods");
+
+        // With session deep-link
+        let html = agent_iframe_wrapper("test-pod", "http://localhost:12345/abc123/session/s1");
         assert!(
-            html.contains("devaipod_token"),
-            "wrapper must read token from sessionStorage"
+            html.contains("http://localhost:12345/abc123/session/s1"),
+            "wrapper must include session deep-link in iframe src"
         );
 
         // HTML-escaping
-        let html = agent_iframe_wrapper("<script>alert(1)</script>");
+        let html = agent_iframe_wrapper("<script>alert(1)</script>", "http://localhost:1/");
         assert!(
             !html.contains("<script>alert"),
             "pod name must be HTML-escaped"

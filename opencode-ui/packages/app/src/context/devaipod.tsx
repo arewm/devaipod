@@ -223,17 +223,12 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         latest_session?: { id: string; directory: string }
       }>(`/api/devaipod/pods/${encodeURIComponent(shortName)}/opencode-info`)
 
-      const token = getAuthToken()
-      if (token) {
-        sessionStorage.setItem("devaipod_token", token)
-      }
-
-      let hash = ""
+      let qs = ""
       if (info.latest_session) {
         const dir = btoa(info.latest_session.directory)
-        hash = `#/${dir}/session/${info.latest_session.id}`
+        qs = `?dir=${encodeURIComponent(dir)}&session=${encodeURIComponent(info.latest_session.id)}`
       }
-      window.location.href = `/_devaipod/agent/${encodeURIComponent(shortName)}/${hash}`
+      window.location.href = `/_devaipod/agent/${encodeURIComponent(shortName)}/${qs}`
     }
 
     async function startPod(fullName: string) {

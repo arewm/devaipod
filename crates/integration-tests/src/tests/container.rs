@@ -272,9 +272,12 @@ fn test_readonly_api_git_events(fixture: &SharedFixture) -> Result<()> {
     // Use curl with --max-time to avoid hanging forever.
     // The SSE endpoint should send an initial event immediately on connect.
     // -N disables buffering so we get the event without waiting for the buffer to fill.
-    let output = cmd!(sh, "podman exec {agent} curl -sf -N --max-time 3 http://localhost:8090/git/events")
-        .ignore_status()  // curl returns exit code 28 on timeout, which is expected
-        .read()?;
+    let output = cmd!(
+        sh,
+        "podman exec {agent} curl -sf -N --max-time 3 http://localhost:8090/git/events"
+    )
+    .ignore_status() // curl returns exit code 28 on timeout, which is expected
+    .read()?;
     // Should contain the initial git.updated event
     assert!(
         output.contains("git.updated"),
