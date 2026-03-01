@@ -9,6 +9,7 @@
 !scripts/
 !dist/
 !patches/
+!docs/
 !opencode-ui/
 # Re-exclude large generated/fetched dirs within opencode-ui
 opencode-ui/node_modules/

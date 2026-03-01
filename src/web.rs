@@ -325,6 +325,9 @@ struct ApiErrorBody {
 /// Path to vendored opencode web UI
 const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
 
+/// Path to mdbook documentation output
+const DOCS_PATH: &str = "/usr/share/devaipod/docs";
+
 /// Get opencode connection info for a pod
 ///
 /// Returns the direct URL to access the opencode web UI.
@@ -878,6 +881,47 @@ async fn serve_opencode_index() -> Result<Response, StatusCode> {
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(content))
         .unwrap())
+}
+
+/// Redirect `/docs` to `/docs/` for consistency.
+async fn redirect_to_docs() -> Response {
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, "/docs/")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Serve the mdbook index at `/docs/`.
+async fn serve_docs_index() -> Result<Response, StatusCode> {
+    let index_path = std::path::Path::new(DOCS_PATH).join("index.html");
+    let content = tokio::fs::read(&index_path).await.map_err(|e| {
+        tracing::error!("Failed to read docs index.html: {}", e);
+        StatusCode::NOT_FOUND
+    })?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(content))
+        .unwrap())
+}
+
+/// Serve static files from the mdbook output at `/docs/{path}`.
+async fn serve_docs_file(Path(path): Path<String>) -> Result<Response, StatusCode> {
+    let uri = format!("/{}", path.trim_start_matches('/'));
+    let request = Request::builder()
+        .uri(&uri)
+        .body(Body::empty())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let resp = ServeDir::new(DOCS_PATH)
+        .oneshot(request)
+        .await
+        .unwrap()
+        .into_response();
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(resp)
 }
 
 /// Redirect `/` to `/pods`.
@@ -1902,6 +1946,10 @@ pub(crate) fn build_app(
         .route("/_devaipod/oldui", get(serve_old_ui))
         .route("/_devaipod/agent/{name}", get(agent_wrapper))
         .route("/_devaipod/agent/{name}/", get(agent_ui_root))
+        // Serve mdbook documentation at /docs/
+        .route("/docs", get(redirect_to_docs))
+        .route("/docs/", get(serve_docs_index))
+        .route("/docs/{*path}", get(serve_docs_file))
         // /assets/*: always serve from vendored opencode UI (control-plane UI uses inline styles)
         .route("/assets", get(serve_root_assets))
         .route("/assets/{*path}", get(serve_root_assets))

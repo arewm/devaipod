@@ -126,6 +126,14 @@ function PodsPageContent() {
               Refresh
             </Button>
             <a
+              href="/docs/"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="text-11-regular text-text-weak hover:text-text-secondary-base transition-colors"
+            >
+              Docs
+            </a>
+            <a
               href="/_devaipod/oldui"
               class="text-11-regular text-text-weak hover:text-text-secondary-base transition-colors"
             >
