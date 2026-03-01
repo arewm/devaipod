@@ -62,9 +62,7 @@ const DEVAIPOD_CONTAINER_IMAGE_ENV: &str = "DEVAIPOD_CONTAINER_IMAGE";
 /// Requires `DEVAIPOD_CONTAINER_IMAGE` to be set (done by `just test-integration`).
 fn web_container_image() -> Result<String> {
     std::env::var(DEVAIPOD_CONTAINER_IMAGE_ENV).map_err(|_| {
-        color_eyre::eyre::eyre!(
-            "DEVAIPOD_CONTAINER_IMAGE not set. Run: just test-integration"
-        )
+        color_eyre::eyre::eyre!("DEVAIPOD_CONTAINER_IMAGE not set. Run: just test-integration")
     })
 }
 
@@ -582,7 +580,9 @@ fn test_web_container_starts() -> Result<()> {
         &body[..body.len().min(200)]
     );
     assert!(
-        body.contains("<!DOCTYPE html>") || body.contains("<html") || body.contains("<!doctype html>"),
+        body.contains("<!DOCTYPE html>")
+            || body.contains("<html")
+            || body.contains("<!doctype html>"),
         "/pods should return HTML, got: {}",
         &body[..body.len().min(200)]
     );
@@ -616,7 +616,10 @@ fn test_web_agent_ui_index_rewrites_asset_urls() -> Result<()> {
     if status == 404 {
         // Verify the error message is descriptive (not a generic 404)
         assert!(
-            body.contains("pod-api") || body.contains("not found") || body.contains("not running") || body.contains("sidecar"),
+            body.contains("pod-api")
+                || body.contains("not found")
+                || body.contains("not running")
+                || body.contains("sidecar"),
             "404 response should mention pod-api sidecar not being available; got: {}",
             &body[..body.len().min(400)]
         );
@@ -683,24 +686,26 @@ fn test_web_ui_root_with_token() -> Result<()> {
     // /pods serves the SPA directly (no auth required for the page itself)
     let (pods_status, pods_body) = fixture.curl_in_container("/pods", None)?;
     assert_eq!(
-        pods_status, 200,
+        pods_status,
+        200,
         "/pods should return 200, got {}: {}",
         pods_status,
         &pods_body[..pods_body.len().min(300)]
     );
     assert!(
-        pods_body.contains("<!DOCTYPE html>") || pods_body.contains("<html") || pods_body.contains("<!doctype html>"),
+        pods_body.contains("<!DOCTYPE html>")
+            || pods_body.contains("<html")
+            || pods_body.contains("<!doctype html>"),
         "/pods should return HTML, got: {}",
         &pods_body[..pods_body.len().min(500)]
     );
 
     // Bearer token auth should work for API endpoints
-    let (api_status, api_body) = fixture.curl_in_container(
-        "/api/podman/v5.0.0/libpod/pods/json",
-        Some(&token),
-    )?;
+    let (api_status, api_body) =
+        fixture.curl_in_container("/api/podman/v5.0.0/libpod/pods/json", Some(&token))?;
     assert_eq!(
-        api_status, 200,
+        api_status,
+        200,
         "API with Bearer token should return 200, got {}: {}",
         api_status,
         &api_body[..api_body.len().min(300)]

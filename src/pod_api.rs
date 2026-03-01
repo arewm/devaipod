@@ -1804,10 +1804,29 @@ mod tests {
     fn test_is_opencode_api_path_bare_segments() {
         // All known API segments should match when used alone
         for path in [
-            "session", "global", "event", "auth", "project", "config",
-            "experimental", "permission", "question", "provider", "find",
-            "file", "mcp", "tui", "instance", "path", "vcs", "command",
-            "log", "agent", "skill", "lsp", "formatter",
+            "session",
+            "global",
+            "event",
+            "auth",
+            "project",
+            "config",
+            "experimental",
+            "permission",
+            "question",
+            "provider",
+            "find",
+            "file",
+            "mcp",
+            "tui",
+            "instance",
+            "path",
+            "vcs",
+            "command",
+            "log",
+            "agent",
+            "skill",
+            "lsp",
+            "formatter",
         ] {
             assert!(is_opencode_api_path(path), "expected API path: {path}");
         }
@@ -1817,7 +1836,9 @@ mod tests {
     fn test_is_opencode_api_path_with_subpaths() {
         assert!(is_opencode_api_path("session/abc123"));
         assert!(is_opencode_api_path("session/abc123/message"));
-        assert!(is_opencode_api_path("session/abc123/message/msg456/part/p789"));
+        assert!(is_opencode_api_path(
+            "session/abc123/message/msg456/part/p789"
+        ));
         assert!(is_opencode_api_path("global/health"));
         assert!(is_opencode_api_path("global/config"));
         assert!(is_opencode_api_path("global/event"));
