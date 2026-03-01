@@ -145,14 +145,15 @@ CONTAINER_IMAGE := "localhost/devaipod"
 
 # Build the container image.
 # no_cache: set to "--no-cache" to force full rebuild.
+# --jobs=4 lets podman run independent stages (rust, bun, mdbook, opencode-cli) in parallel.
 [group('container')]
 container-build no_cache="":
-    podman build {{ no_cache }} -t {{ CONTAINER_IMAGE }}:latest -f Containerfile .
+    podman build --jobs=4 {{ no_cache }} -t {{ CONTAINER_IMAGE }}:latest -f Containerfile .
 
 # Build unit test binaries in a container image (no host toolchain required)
 [group('container')]
 build-units:
-    podman build --target units -t {{ CONTAINER_IMAGE }}-units:latest -f Containerfile .
+    podman build --jobs=4 --target units -t {{ CONTAINER_IMAGE }}-units:latest -f Containerfile .
 
 # Run unit tests in a container (no host toolchain required)
 [group('container')]
@@ -162,7 +163,7 @@ test-container: build-units
 # Build integration test runner in a container image (no host toolchain required)
 [group('container')]
 build-integration no_cache="":
-    podman build {{ no_cache }} --target integration-runner -t {{ CONTAINER_IMAGE }}-integration:latest -f Containerfile .
+    podman build --jobs=4 {{ no_cache }} --target integration-runner -t {{ CONTAINER_IMAGE }}-integration:latest -f Containerfile .
 
 # Run integration tests in a container (requires podman socket)
 # Builds both the main devaipod image (for webui tests) and the integration-runner.

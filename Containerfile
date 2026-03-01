@@ -44,9 +44,22 @@
 FROM scratch AS src
 COPY . /src
 
+# -- mdbook documentation build stage --
+# Builds the project documentation using mdbook. The output (static HTML) is
+# copied into the final image and served by the control plane web server.
+FROM docker.io/library/rust:slim AS mdbook
+RUN cargo install mdbook@0.4.52 mdbook-mermaid@0.16.0 --locked
+COPY --from=src /src/docs /src/docs
+WORKDIR /src/docs
+RUN mdbook-mermaid install . && mdbook build
+# Output is in /src/docs/book
+
 # -- opencode web UI build stage --
 # Build the vendored opencode UI fork (opencode-ui/) which includes devaipod
 # customizations: workspace terminal, git review tab, per-pod localStorage, etc.
+#
+# Layer ordering is optimised for cache reuse: dependency metadata first, then
+# install, then the full source tree. This mirrors the Rust build stage pattern.
 ARG OPENCODE_VERSION=v1.1.65
 FROM docker.io/oven/bun:latest AS opencode-web
 ARG OPENCODE_VERSION=v1.1.65
@@ -60,11 +73,24 @@ RUN git clone --depth 1 --filter=blob:none --sparse \
     cd /tmp/oc && git sparse-checkout set packages/ui/src/assets/fonts
 
 WORKDIR /build
+
+# 1. Copy only dependency-related files first so that `bun install` is cached
+#    unless package.json, bun.lock, or workspace package.json files change.
+COPY --from=src /src/opencode-ui/package.json /src/opencode-ui/bun.lock /src/opencode-ui/bunfig.toml /build/
+COPY --from=src /src/opencode-ui/packages/app/package.json /build/packages/app/package.json
+COPY --from=src /src/opencode-ui/packages/ui/package.json /build/packages/ui/package.json
+COPY --from=src /src/opencode-ui/packages/sdk/js/package.json /build/packages/sdk/js/package.json
+COPY --from=src /src/opencode-ui/packages/util/package.json /build/packages/util/package.json
+# Patches referenced in patchedDependencies must be present for install.
+COPY --from=src /src/opencode-ui/patches /build/patches
+
+RUN bun install --frozen-lockfile
+
+# 2. Now copy the full source and fonts (changes here skip the install layer).
 COPY --from=src /src/opencode-ui /build
 RUN mkdir -p packages/ui/src/assets/fonts && \
     cp /tmp/oc/packages/ui/src/assets/fonts/*.woff2 packages/ui/src/assets/fonts/
 
-RUN bun install --frozen-lockfile
 WORKDIR /build/packages/app
 RUN bun run build
 
@@ -205,6 +231,9 @@ COPY dist /usr/share/devaipod/dist
 # Copy vendored opencode web UI fork (built from opencode-ui/ in the repo)
 # This is served at /opencode/ and proxies API calls to the agent's opencode server
 COPY --from=opencode-web /build/packages/app/dist /usr/share/devaipod/opencode
+
+# Copy mdbook documentation (served at /docs/ by the control plane)
+COPY --from=mdbook /src/docs/book /usr/share/devaipod/docs
 WORKDIR /usr/share/devaipod
 
 # Default: run web UI server
