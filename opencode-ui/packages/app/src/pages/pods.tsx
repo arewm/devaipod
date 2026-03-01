@@ -728,7 +728,7 @@ function ProposalCard(props: { proposal: Proposal }) {
     // For now, just open a simple confirm + launch
     let repo = p().repo
     if (repo && !repo.startsWith("http")) {
-      repo = `https://github.com/${repo}`
+      repo = `https://${repo}`
     }
     const task = `${p().title}\n\n${p().rationale}`
     ctx.dismissProposal(p().id)
