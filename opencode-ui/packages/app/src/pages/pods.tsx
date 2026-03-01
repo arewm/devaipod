@@ -111,6 +111,7 @@ function PodsPageContent() {
   })
 
   return (
+    <div class="h-full overflow-y-auto">
     <div class="mx-auto mt-8 w-full max-w-3xl px-4 pb-16">
       {/* Header */}
       <header class="flex items-center justify-between border-b border-border-base pb-4 mb-6">
@@ -194,6 +195,7 @@ function PodsPageContent() {
           </For>
         </div>
       </Show>
+    </div>
     </div>
   )
 }
