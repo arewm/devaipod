@@ -133,12 +133,6 @@ function PodsPageContent() {
             >
               Docs
             </a>
-            <a
-              href="/_devaipod/oldui"
-              class="text-11-regular text-text-weak hover:text-text-secondary-base transition-colors"
-            >
-              Old UI
-            </a>
         </div>
       </header>
 

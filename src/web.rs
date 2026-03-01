@@ -22,7 +22,7 @@ use axum::{
     Json, Router,
 };
 use base64::prelude::*;
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{Context, Result};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
@@ -152,8 +152,6 @@ pub(crate) struct AppState {
     token: String,
     /// Path to the podman/docker socket (None if not available at startup)
     socket_path: Option<PathBuf>,
-    /// Path to control-plane static files (e.g. dist/index.html)
-    static_dir: String,
     /// Background launch states so the UI can track in-flight launches.
     launches: LaunchMap,
     /// Image ID (digest) of the running control plane container.
@@ -710,12 +708,11 @@ async fn frontend_error_report(Json(report): Json<FrontendErrorReport>) -> Statu
 ///
 /// The pod-api sidecar now handles the opencode UI and API proxy directly,
 /// so this fallback no longer does cookie-based routing or opencode proxying.
-async fn static_or_spa_fallback(State(state): State<Arc<AppState>>, request: Request) -> Response {
+async fn static_or_spa_fallback(request: Request) -> Response {
     let path = request.uri().path();
     let trimmed_path = path.trim_start_matches('/');
 
     // Check if path looks like a static file (has a file extension).
-    // Try vendored opencode UI dir first, then control-plane static dir.
     let has_ext = trimmed_path
         .rsplit_once('/')
         .map_or(trimmed_path, |(_dir, file)| file)
@@ -728,18 +725,6 @@ async fn static_or_spa_fallback(State(state): State<Arc<AppState>>, request: Req
             .unwrap();
         let resp = ServeDir::new(OPENCODE_UI_PATH)
             .oneshot(opencode_req)
-            .await
-            .unwrap()
-            .into_response();
-        if resp.status() != StatusCode::NOT_FOUND {
-            return resp;
-        }
-        let static_req = Request::builder()
-            .uri(request.uri().clone())
-            .body(Body::empty())
-            .unwrap();
-        let resp = ServeDir::new(&state.static_dir)
-            .oneshot(static_req)
             .await
             .unwrap()
             .into_response();
@@ -960,21 +945,6 @@ async fn login(State(state): State<Arc<AppState>>, Query(query): Query<TokenQuer
 /// The SPA handles client-side routing internally.
 async fn serve_spa_page() -> Result<Response, StatusCode> {
     serve_opencode_index().await
-}
-
-/// Serve the old control-plane UI at /_devaipod/oldui.
-async fn serve_old_ui(State(state): State<Arc<AppState>>) -> Result<Response, StatusCode> {
-    let index_path = std::path::Path::new(&state.static_dir).join("index.html");
-    let content = tokio::fs::read(&index_path).await.map_err(|e| {
-        tracing::error!("Failed to read old UI index.html: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from(content))
-        .unwrap())
 }
 
 /// Serve /assets/* from the vendored opencode UI directory.
@@ -1860,20 +1830,18 @@ fn derive_agent_status_from_messages(
 /// Returns an error if the server fails to bind to the port.
 /// Podman socket availability is checked lazily when proxying requests.
 
-/// Build the web app router for a given token, socket path, and static dir.
+/// Build the web app router for a given token and socket path.
 ///
 /// Exposed for tests so we can hit the router with in-process requests (fast)
 /// without starting a server or container.
 pub(crate) fn build_app(
     token: String,
     socket_path: Option<PathBuf>,
-    static_dir: &str,
     self_image_id: Option<String>,
 ) -> Router {
     let state = Arc::new(AppState {
         token: token.clone(),
         socket_path,
-        static_dir: static_dir.to_string(),
         launches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         self_image_id,
     });
@@ -1943,14 +1911,13 @@ pub(crate) fn build_app(
         .nest("/api", api_router)
         .route("/", get(redirect_to_pods))
         .route("/pods", get(serve_spa_page))
-        .route("/_devaipod/oldui", get(serve_old_ui))
         .route("/_devaipod/agent/{name}", get(agent_wrapper))
         .route("/_devaipod/agent/{name}/", get(agent_ui_root))
         // Serve mdbook documentation at /docs/
         .route("/docs", get(redirect_to_docs))
         .route("/docs/", get(serve_docs_index))
         .route("/docs/{*path}", get(serve_docs_file))
-        // /assets/*: always serve from vendored opencode UI (control-plane UI uses inline styles)
+        // /assets/*: serve from vendored opencode UI
         .route("/assets", get(serve_root_assets))
         .route("/assets/{*path}", get(serve_root_assets))
         // Catch-all fallback: serve static files or the SPA index.html for client-side routing.
@@ -1977,21 +1944,7 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
         tracing::info!("Control plane image ID: {}", id);
     }
 
-    // Find static files directory
-    // Try installed location first, then fall back to development location
-    let static_dir = if std::path::Path::new("/usr/share/devaipod/dist").exists() {
-        "/usr/share/devaipod/dist"
-    } else if std::path::Path::new("dist").exists() {
-        "dist"
-    } else {
-        bail!(
-            "No static files directory found. Expected /usr/share/devaipod/dist (installed) or ./dist (development).\n\
-             The dist/ directory contains the web UI frontend files."
-        );
-    };
-    tracing::info!("Serving static files from: {}", static_dir);
-
-    let app = build_app(token.clone(), socket_path, static_dir, self_image_id);
+    let app = build_app(token.clone(), socket_path, self_image_id);
 
     // Bind to [::] which accepts both IPv4 and IPv6 connections via dual-stack
     // (the Linux default).  Browsers typically try IPv6 first when resolving
@@ -2025,9 +1978,7 @@ mod tests {
     /// to /_devaipod/agent/{name}/ and preserve query parameters.
     #[tokio::test]
     async fn test_agent_redirect() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let static_dir = temp.path().to_str().expect("path");
-        let app = build_app("test-token".into(), None, static_dir, None);
+        let app = build_app("test-token".into(), None, None);
 
         // Without query params
         let req = Request::builder()
@@ -2059,7 +2010,7 @@ mod tests {
         );
 
         // With query params
-        let app2 = build_app("test-token".into(), None, static_dir, None);
+        let app2 = build_app("test-token".into(), None, None);
         let req = Request::builder()
             .uri("/_devaipod/agent/test-pod?dir=abc&session=s1")
             .body(Body::empty())

@@ -33,11 +33,6 @@ Architecture and internals are documented in
 See also [lightweight-review.md](./lightweight-review.md) for the detailed
 review design (API endpoints, review state model, sync flow).
 
-## Cleanup
-
-- [ ] Drop `dist/index.html` (old control plane UI, still served at
-      `/_devaipod/oldui` as fallback)
-
 ## Iframe removal (Phase 5)
 
 Currently the agent view is embedded in an iframe (wrapper page with "Back

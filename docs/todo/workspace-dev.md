@@ -10,18 +10,13 @@ UI components and potentially its terminal infrastructure for workspace access.
 
 ## Current State
 
-**Two independent UIs with an iframe bridge:**
+The old `dist/index.html` control plane UI has been removed. The vendored
+opencode SPA (`/usr/share/devaipod/opencode`) now handles all UI, including
+pod management (`/pods` route) and the agent view (SolidJS + Tailwind).
 
-- `dist/index.html` — the control plane (pod list, launch form, advisor banner).
-  Vanilla HTML/JS/CSS, dark theme via CSS custom properties (`#131010` bg).
-- Vendored opencode SPA (`/usr/share/devaipod/opencode`) — the agent UI (chat,
-  sessions, file viewing). SolidJS + Tailwind, its own theme system. Served
-  inside an iframe wrapped by a 44px "back to pods" nav bar.
-
-The iframe approach requires ~450 lines (~25% of `web.rs`) of workaround code:
-cookie-based pod routing, SSE keepalive injection, console error interception,
-and a complex fallback handler. See
-[opencode-webui-fork.md](./opencode-webui-fork.md) for the full analysis.
+The agent view is still embedded in an iframe (wrapper page with "Back to
+Pods" bar). See [opencode-webui-fork.md](./opencode-webui-fork.md) for the
+remaining iframe-removal plan.
 
 **No web terminal exists.** There are no WebSocket endpoints in `web.rs`. The
 podman proxy is HTTP-only and can't bridge podman's exec/attach streaming.
@@ -49,10 +44,10 @@ Rather than trying to bridge themes across an iframe, extend the vendored
 opencode SPA to include devaipod-specific pages as native SolidJS routes.
 This is already planned in [opencode-webui-fork.md](./opencode-webui-fork.md):
 
-1. Add a `/pods` route inside the opencode SPA for pod management
+1. Add a `/pods` route inside the opencode SPA for pod management (done)
 2. Use per-pod API prefixes (`/pods/{name}/api/...`) instead of cookie routing
 3. Reuse opencode's UI library (`@opencode-ai/ui`) for buttons, dialogs, etc.
-4. Drop `dist/index.html` and the iframe wrapper entirely
+4. Remove the iframe wrapper entirely
 
 Benefits for workspace-dev specifically:
 
@@ -69,8 +64,7 @@ The full fork-and-extend is significant work. An incremental approach:
    switches its default to dark mode and adjusts accent colors. This is a
    small CSS/config change in the vendored build.
 2. **Second**: Add the `/pods` route and pod management page as described in
-   the fork doc. Keep `dist/index.html` as a fallback but start routing
-   through the SPA.
+   the fork doc (done — old `dist/index.html` has been removed).
 3. **Third**: Add the workspace terminal (Part 2 below) as a component within
    the SPA, reachable from both the pod management page and the agent view.
 
@@ -170,9 +164,8 @@ devcontainer config's `remoteUser` and their `$SHELL`), falling back to
 ## Relationship to Other Work
 
 - **[opencode-webui-fork.md](./opencode-webui-fork.md)**: The fork plan is a
-  prerequisite for clean integration. Without it, the terminal would need to
-  be added to `dist/index.html` (adding xterm.js to a vanilla HTML page) or
-  served as a separate page.
+  prerequisite for clean integration. The terminal should be added as a
+  component within the opencode SPA.
 - **[advisor.md](./advisor.md)**: The advisor pod is a workspace like any other.
   Web terminal access would let users interact with the advisor's workspace
   directly from the browser.

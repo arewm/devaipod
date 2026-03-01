@@ -224,10 +224,6 @@ COPY --from=opencode-cli /usr/local/bin/opencode /usr/local/bin/opencode
 # This is checked by `devaipod` to require running in container mode by default
 ENV DEVAIPOD_CONTAINER=1
 
-# Copy devaipod web UI static files directly from build context
-# (not from src stage, as that's a snapshot that may not include untracked files)
-COPY dist /usr/share/devaipod/dist
-
 # Copy vendored opencode web UI fork (built from opencode-ui/ in the repo)
 # This is served at /opencode/ and proxies API calls to the agent's opencode server
 COPY --from=opencode-web /build/packages/app/dist /usr/share/devaipod/opencode
