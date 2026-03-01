@@ -53,14 +53,21 @@ function commitLabel(entry: GitLogEntry): string {
 export function GitReviewTab(props: GitReviewTabProps) {
   const [state, setState] = createStore({
     baseCommit: undefined as string | undefined,
+    gitUnavailable: false,
   })
 
   // The SPA runs on the pod-api sidecar which serves git endpoints at /git/*.
   const [log, { refetch: refetchLog }] = createResource(
     () => true,
     async () => {
-      const data = await apiFetch<{ commits: GitLogEntry[] }>("/git/log")
-      return data.commits
+      try {
+        const data = await apiFetch<{ commits: GitLogEntry[] }>("/git/log")
+        return data.commits
+      } catch (err) {
+        console.warn("Git log unavailable:", err)
+        setState("gitUnavailable", true)
+        return []
+      }
     },
   )
 
@@ -77,10 +84,18 @@ export function GitReviewTab(props: GitReviewTabProps) {
     ),
   )
 
-  // Subscribe to git SSE events and auto-refresh when new commits arrive
+  // Subscribe to git SSE events and auto-refresh when new commits arrive.
+  // If the connection fails (e.g. workspace is not a git repo), just disable
+  // auto-refresh silently instead of crashing.
   {
     onMount(() => {
-      const es = new EventSource("/git/events")
+      let es: EventSource | undefined
+      try {
+        es = new EventSource("/git/events")
+      } catch (err) {
+        console.warn("Git events SSE: failed to connect, auto-refresh disabled:", err)
+        return
+      }
       es.addEventListener("git.updated", (event) => {
         try {
           const payload = JSON.parse(event.data) as { head?: string }
@@ -92,10 +107,11 @@ export function GitReviewTab(props: GitReviewTabProps) {
           console.warn("Failed to parse git.updated event:", err)
         }
       })
-      es.onerror = (err) => {
-        console.warn("Git events SSE error (will auto-reconnect):", err)
+      es.onerror = () => {
+        console.warn("Git events SSE error, closing connection. Auto-refresh disabled.")
+        es!.close()
       }
-      onCleanup(() => es.close())
+      onCleanup(() => es!.close())
     })
   }
 
@@ -110,10 +126,16 @@ export function GitReviewTab(props: GitReviewTabProps) {
   }
 
   const [diffData] = createResource(diffParams, async (params) => {
-    const data = await apiFetch<{ files: ApiFileDiff[] }>(
-      `/git/diff-range?base=${encodeURIComponent(params.base)}&head=${encodeURIComponent(params.head)}`,
-    )
-    return data.files
+    try {
+      const data = await apiFetch<{ files: ApiFileDiff[] }>(
+        `/git/diff-range?base=${encodeURIComponent(params.base)}&head=${encodeURIComponent(params.head)}`,
+      )
+      return data.files
+    } catch (err) {
+      console.warn("Git diff-range unavailable:", err)
+      setState("gitUnavailable", true)
+      return []
+    }
   })
 
   const diffs = (): FileDiff[] => {
@@ -154,14 +176,13 @@ export function GitReviewTab(props: GitReviewTabProps) {
   )
 
   const loading = () => log.loading || diffData.loading
-  const error = () => log.error ?? diffData.error
 
   return (
     <Show
-      when={!error()}
+      when={!state.gitUnavailable}
       fallback={
-        <div class="flex h-full items-center justify-center text-text-danger text-14-regular">
-          Failed to load git data: {String(error())}
+        <div class="flex h-full items-center justify-center text-text-weak text-14-regular">
+          Git review is not available for this workspace.
         </div>
       }
     >
