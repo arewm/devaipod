@@ -85,6 +85,104 @@ pub fn get_container_socket() -> Result<PathBuf> {
     )
 }
 
+/// Get the host-side filesystem path of the container socket.
+///
+/// When running inside a container, the socket at `/run/podman/podman.sock`
+/// is a bind mount from the host. If we need to pass this socket as a bind
+/// mount source to a new container (via `podman --url` which talks to the
+/// host's podman), we must use the **host-side** path, not the container-
+/// internal path.
+///
+/// Resolution strategy:
+/// 1. If not in a container, return `get_container_socket()` directly.
+/// 2. Parse `/proc/self/mountinfo` to find the bind mount source for the
+///    socket. For rootless podman on Linux the socket lives on a per-user
+///    tmpfs (`/run/user/<uid>/`); we extract the uid from the mount's
+///    super-options and reconstruct the host path.
+/// 3. Fall back to the container-internal path (works on macOS podman
+///    machine where paths are consistent between VM and container).
+pub fn get_host_socket_path() -> Result<PathBuf> {
+    let container_path = get_container_socket()?;
+
+    // If not in container mode, the path is already a host path.
+    if !is_container_mode() {
+        return Ok(container_path);
+    }
+
+    // Parse /proc/self/mountinfo to find the host-side source of our socket
+    // bind mount.  Each line looks like:
+    //
+    //   ID PARENT MAJOR:MINOR ROOT MOUNT_POINT OPTS ... - FS_TYPE SOURCE SUPER_OPTS
+    //
+    // For a rootless podman socket bind-mounted into the container the line
+    // looks like:
+    //
+    //   2763 2848 0:110 /podman/podman.sock /run/podman/podman.sock \
+    //       rw,nosuid,nodev,relatime - tmpfs tmpfs \
+    //       rw,seclabel,size=…,uid=1002,gid=1002,…
+    //
+    // ROOT ("/podman/podman.sock") is the path *within* the tmpfs, and the
+    // tmpfs itself is mounted at /run/user/<uid> on the host.  We extract
+    // the uid from the super-options to reconstruct the full host path.
+    if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+        let container_str = container_path.to_string_lossy();
+        for line in mountinfo.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 5 {
+                continue;
+            }
+            let mount_point = fields[4];
+            if mount_point != container_str.as_ref() {
+                continue;
+            }
+
+            let root = fields[3]; // path within the source filesystem
+
+            // Find the " - " separator to access FS_TYPE, SOURCE, SUPER_OPTS.
+            let Some(sep_pos) = fields.iter().position(|f| *f == "-") else {
+                continue;
+            };
+            let fs_type = fields.get(sep_pos + 1).copied().unwrap_or("");
+            let super_opts = fields.get(sep_pos + 3).copied().unwrap_or("");
+
+            // For a tmpfs mount (rootless podman on Linux), reconstruct the
+            // host path from the uid in the super-options.
+            if fs_type == "tmpfs" {
+                if let Some(uid) = super_opts.split(',').find_map(|kv| kv.strip_prefix("uid=")) {
+                    // Host path: /run/user/<uid>/<root>
+                    let host_path = PathBuf::from(format!("/run/user/{}{}", uid, root));
+                    tracing::debug!(
+                        "Resolved host socket path via mountinfo tmpfs uid: {} -> {}",
+                        container_str,
+                        host_path.display()
+                    );
+                    return Ok(host_path);
+                }
+            }
+
+            // For a regular bind mount where root is an absolute host path,
+            // use it directly (e.g. macOS podman machine or root podman).
+            if root != "/" {
+                let host_path = PathBuf::from(root);
+                if host_path.is_absolute() {
+                    tracing::debug!(
+                        "Resolved host socket path via mountinfo root: {} -> {}",
+                        container_str,
+                        host_path.display()
+                    );
+                    return Ok(host_path);
+                }
+            }
+        }
+    }
+
+    tracing::debug!(
+        "Could not resolve host socket path from mountinfo, using container path: {}",
+        container_path.display()
+    );
+    Ok(container_path)
+}
+
 /// Connect to the container socket and return a bollard Docker client
 pub fn connect_to_container_socket() -> Result<Docker> {
     let socket_path = get_container_socket()?;

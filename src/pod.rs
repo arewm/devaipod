@@ -949,7 +949,7 @@ impl DevaipodPod {
         // Create API sidecar container (devaipod pod-api)
         let api_container_name = format!("{}-api", pod_name);
         let self_image = detect_self_image();
-        let socket_path = crate::podman::get_container_socket()
+        let socket_path = crate::podman::get_host_socket_path()
             .context("Cannot create API sidecar without podman socket")?;
         let api_config = Self::api_container_config(
             &agent_workspace_volume,
