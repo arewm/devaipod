@@ -7,8 +7,6 @@
  * Suppresses the harmless "[global-sdk] event stream error" from SSE aborts.
  */
 export function initDevaipodErrorReporting(): void {
-  if (!isDevaipod()) return
-
   const origError = console.error
   const origWarn = console.warn
 
@@ -87,9 +85,4 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   return undefined as T
 }
 
-/**
- * True when the SPA is running inside devaipod (built with VITE_DEVAIPOD=true).
- */
-export function isDevaipod(): boolean {
-  return import.meta.env.VITE_DEVAIPOD === "true"
-}
+

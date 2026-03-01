@@ -861,8 +861,8 @@ async fn agent_ui_root(
 }
 
 /// Serve the opencode SPA's index.html.
-/// The SPA handles devaipod-specific behavior (localStorage scoping, error
-/// reporting, SSE suppression) internally via VITE_DEVAIPOD and cookie detection.
+/// The SPA handles devaipod-specific behavior (error reporting, SSE
+/// suppression) unconditionally since this is a devaipod-specific fork.
 async fn serve_opencode_index() -> Result<Response, StatusCode> {
     let ui_path = std::path::Path::new(OPENCODE_UI_PATH).join("index.html");
     let content = tokio::fs::read(&ui_path).await.map_err(|e| {

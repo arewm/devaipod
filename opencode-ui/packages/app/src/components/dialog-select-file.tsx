@@ -43,6 +43,7 @@ const COMMON_COMMAND_IDS = [
   "session.previous",
   "session.next",
   "terminal.toggle",
+  "terminal.workspace.new",
   "review.toggle",
 ] as const
 

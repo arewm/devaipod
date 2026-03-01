@@ -22,7 +22,6 @@ import { UserMessage } from "@opencode-ai/sdk/v2"
 import { combineCommandSections } from "@/pages/session/helpers"
 import { canAddSelectionContext } from "@/pages/session/session-command-helpers"
 import { type WorkspaceTerminals } from "@/context/workspace-terminal"
-import { isDevaipod } from "@/utils/devaipod-api"
 
 export type SessionCommandContext = {
   command: ReturnType<typeof useCommand>
@@ -163,7 +162,7 @@ export const useSessionCommands = (input: SessionCommandContext) => {
     }),
     terminalCommand({
       id: "terminal.new",
-      title: isDevaipod() ? "New Agent Terminal" : input.language.t("command.terminal.new"),
+      title: "New Agent Terminal",
       description: input.language.t("command.terminal.new.description"),
       keybind: "ctrl+alt+t",
       onSelect: () => {
@@ -468,7 +467,7 @@ export const useSessionCommands = (input: SessionCommandContext) => {
   })
 
   const workspaceTerminalCommands = createMemo(() => {
-    if (!isDevaipod() || !input.wsTerminal) return []
+    if (!input.wsTerminal) return []
     return [
       terminalCommand({
         id: "terminal.workspace.new",
