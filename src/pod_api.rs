@@ -1803,10 +1803,14 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
         .await
         .with_context(|| format!("Failed to bind to {addr}"))?;
 
+    // Handle SIGTERM/SIGINT for graceful shutdown (same PID 1 reasoning
+    // as the control-plane web server — see web.rs).
     axum::serve(listener, app)
+        .with_graceful_shutdown(crate::web::shutdown_signal())
         .await
         .context("pod-api server error")?;
 
+    tracing::info!("pod-api shut down gracefully");
     Ok(())
 }
 

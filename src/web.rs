@@ -1959,12 +1959,37 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
     tracing::info!("Web server started at {}", url);
     println!("Control plane URL: {}", url);
 
-    // Run the server
+    // Run the server with graceful shutdown on SIGTERM/SIGINT.
+    // This is critical because devaipod runs as PID 1 in the container,
+    // and the kernel silently drops signals with SIG_DFL disposition for
+    // PID 1 (the SIGNAL_UNKILLABLE protection).  Without an explicit
+    // handler, `podman stop` would wait the full timeout before SIGKILL.
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .context("Web server error")?;
 
+    tracing::info!("Web server shut down gracefully");
     Ok(())
+}
+
+/// Wait for a SIGTERM or SIGINT signal (whichever arrives first).
+pub async fn shutdown_signal() {
+    let sigterm = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    let sigint = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install SIGINT handler");
+    };
+    tokio::select! {
+        _ = sigterm => tracing::info!("Received SIGTERM, shutting down"),
+        _ = sigint => tracing::info!("Received SIGINT, shutting down"),
+    }
 }
 
 #[cfg(test)]
