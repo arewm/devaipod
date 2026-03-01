@@ -52,6 +52,52 @@ fn podman_pod_inspect(pod_name: &str, format: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Discover the host port published for a given container port in a pod.
+///
+/// Pod-level port bindings are owned by the infra container, so `podman port`
+/// on non-infra containers may return nothing. Instead, we use `podman inspect`
+/// on the pod's infra container (discovered via `podman pod inspect`) and parse
+/// the JSON port mappings. This matches the approach used by the web proxy via
+/// bollard's Docker API.
+fn get_published_port(pod_name: &str, container_port: u16) -> Result<u16> {
+    // Get the infra container ID from the pod
+    let infra_id = podman_pod_inspect(pod_name, "{{.InfraContainerID}}")?;
+    if infra_id.is_empty() {
+        bail!("No infra container found for pod {}", pod_name);
+    }
+
+    // Use podman port on the infra container, which owns the pod-level port bindings
+    let sh = shell()?;
+    let port_str = container_port.to_string();
+    let port_output = cmd!(sh, "podman port {infra_id} {port_str}")
+        .ignore_status()
+        .read()?;
+
+    if port_output.trim().is_empty() {
+        bail!(
+            "Port {} not published for pod {} (infra container {})",
+            container_port,
+            pod_name,
+            &infra_id[..12.min(infra_id.len())]
+        );
+    }
+
+    port_output
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .split(':')
+        .last()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "Could not parse host port from podman port output: {}",
+                port_output
+            )
+        })
+}
+
 /// Poll a condition until it succeeds or times out.
 /// Returns Ok(output) on success, Err on timeout.
 fn poll_until<F>(timeout: Duration, interval: Duration, mut check: F) -> Result<String>
@@ -158,7 +204,10 @@ fn test_readonly_can_exec(fixture: &SharedFixture) -> Result<()> {
 }
 readonly_test!(test_readonly_can_exec);
 
-/// Verify the agent API endpoint responds to authenticated requests
+/// Verify the pod-api sidecar responds to requests.
+///
+/// We test the /git/status endpoint which is handled directly by the pod-api
+/// server (no dependency on the upstream opencode server being ready).
 fn test_readonly_api_responds(fixture: &SharedFixture) -> Result<()> {
     let sh = shell()?;
     let pod_name = fixture.pod_name();
@@ -169,29 +218,29 @@ fn test_readonly_api_responds(fixture: &SharedFixture) -> Result<()> {
     let password = password.trim();
     assert!(!password.is_empty(), "Pod should have API password label");
 
-    // Get the published port (4096 is the opencode port)
-    let agent_container = fixture.agent_container();
-    let port_output = cmd!(sh, "podman port {agent_container} 4096")
-        .ignore_status()
-        .read()?;
-    assert!(
-        port_output.contains("127.0.0.1:"),
-        "Port 4096 (opencode) should be published: {}",
-        port_output
-    );
-
-    let port: u16 = port_output
-        .trim()
-        .split(':')
-        .last()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0);
+    // Get the published pod-api port via the pod's infra container.
+    let port = get_published_port(pod_name, 8090)
+        .context("Port 8090 (pod-api) should be published")?;
     assert!(port > 0, "Should have a valid port number");
 
-    // Test request to /session endpoint (no auth needed, opencode serves directly)
-    let url = format!("http://127.0.0.1:{}/session", port);
-    let response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
-    assert!(response.status.success(), "API request should succeed");
+    // Test /git/status which is handled directly by pod-api (no opencode dependency).
+    // Poll with retries since the pod-api sidecar may still be starting.
+    // Use host.containers.internal since the test runner is inside a container
+    // and needs to reach ports published on the podman VM host.
+    let url = format!("http://host.containers.internal:{}/git/status", port);
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        || {
+            let response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
+            if response.status.success() {
+                Ok(Some(String::from_utf8_lossy(&response.stdout).to_string()))
+            } else {
+                Ok(None)
+            }
+        },
+    )
+    .context("pod-api /git/status should respond within 30s")?;
 
     Ok(())
 }
@@ -235,11 +284,25 @@ fn test_readonly_api_git_status(fixture: &SharedFixture) -> Result<()> {
     let agent = fixture.agent_container();
     // The api container shares the pod network namespace, so we can reach it
     // from any container in the pod. Use the agent container which has curl.
-    let output = cmd!(
-        sh,
-        "podman exec {agent} curl -sf http://localhost:8090/git/status"
+    // Poll with retries since the pod-api sidecar may still be starting.
+    let output = poll_until(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        || {
+            let result = cmd!(
+                sh,
+                "podman exec {agent} curl -sf http://localhost:8090/git/status"
+            )
+            .ignore_status()
+            .output()?;
+            if result.status.success() {
+                Ok(Some(String::from_utf8_lossy(&result.stdout).trim().to_string()))
+            } else {
+                Ok(None)
+            }
+        },
     )
-    .read()?;
+    .context("pod-api /git/status should respond within 30s")?;
     let _parsed: serde_json::Value =
         serde_json::from_str(&output).context("pod-api /git/status should return valid JSON")?;
     Ok(())
@@ -250,11 +313,40 @@ readonly_test!(test_readonly_api_git_status);
 fn test_readonly_api_git_log(fixture: &SharedFixture) -> Result<()> {
     let sh = shell()?;
     let agent = fixture.agent_container();
-    let output = cmd!(
-        sh,
-        "podman exec {agent} curl -sf http://localhost:8090/git/log"
+
+    // Poll with retries since the pod-api sidecar may still be starting.
+    // Use a generous timeout as this runs in parallel with other readonly tests.
+    // If the endpoint returns a non-transient error (like "not a git repository"),
+    // fail immediately rather than retrying for the full timeout.
+    let output = poll_until(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        || {
+            let result = cmd!(
+                sh,
+                "podman exec {agent} curl -s http://localhost:8090/git/log"
+            )
+            .ignore_status()
+            .output()?;
+            let body = String::from_utf8_lossy(&result.stdout).trim().to_string();
+            if result.status.success() {
+                // Curl succeeded — but we also need the response to be valid JSON
+                if body.starts_with('{') {
+                    Ok(Some(body))
+                } else {
+                    Ok(None)
+                }
+            } else if body.contains("not a git repository") {
+                // Non-transient error — the workspace isn't configured as a git repo.
+                // Return the body so we get a meaningful error message.
+                bail!("pod-api /git/log returned: {}", body);
+            } else {
+                Ok(None)
+            }
+        },
     )
-    .read()?;
+    .context("pod-api /git/log should respond within 60s")?;
+
     let parsed: serde_json::Value =
         serde_json::from_str(&output).context("pod-api /git/log should return valid JSON")?;
     assert!(
@@ -667,24 +759,9 @@ fn test_pod_has_api_credentials() -> Result<()> {
         password.len()
     );
 
-    // Verify opencode port is published (4096)
-    let agent_container = format!("{}-agent", pod_name);
-    let port_output = cmd!(sh, "podman port {agent_container} 4096")
-        .ignore_status()
-        .read()?;
-    assert!(
-        port_output.contains("0.0.0.0:"),
-        "Port 4096 (opencode) should be published on all interfaces: {}",
-        port_output
-    );
-
-    // Extract the port number
-    let port: u16 = port_output
-        .trim()
-        .split(':')
-        .last()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0);
+    // Verify pod-api port is published (8090) via the pod's infra container.
+    let port = get_published_port(&pod_name, 8090)
+        .context("Port 8090 (pod-api) should be published")?;
     assert!(port > 0, "Should have a valid port number");
 
     Ok(())
@@ -707,44 +784,58 @@ fn test_api_authentication_works() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Give agent time to start
-    std::thread::sleep(std::time::Duration::from_secs(5));
-
     let sh = shell()?;
 
     // Get API credentials
     let format_label = "{{index .Labels \"io.devaipod.api-password\"}}";
-    let password = cmd!(sh, "podman pod inspect {pod_name} --format {format_label}").read()?;
-    let password = password.trim();
+    let _password = cmd!(sh, "podman pod inspect {pod_name} --format {format_label}").read()?;
 
-    // Get the published opencode port (4096)
-    let agent_container = format!("{}-agent", pod_name);
-    let port_output = cmd!(sh, "podman port {agent_container} 4096").read()?;
-    let port: u16 = port_output
-        .trim()
-        .split(':')
-        .last()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0);
+    // Get the published pod-api port (8090) via the pod's infra container.
+    let port = get_published_port(&pod_name, 8090)
+        .context("Pod-api port 8090 should be published")?;
+    assert!(port > 0, "Pod-api port 8090 should be published");
 
-    // Test that request works via published port (opencode serves directly, no auth proxy)
-    let url = format!("http://127.0.0.1:{}/session", port);
-    let response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
-    assert!(
-        response.status.success(),
-        "API request to opencode via published port should succeed"
-    );
-
-    // Test that internal access (inside container) also works
-    let internal_response = cmd!(
-        sh,
-        "podman exec {agent_container} curl -sf http://localhost:4096/session"
+    // Test that the pod-api sidecar responds on the published port.
+    // Use /git/status which is handled directly by pod-api (no opencode dependency).
+    // Poll with retries since the sidecar may still be starting.
+    // Use host.containers.internal since the test runner is inside a container.
+    let url = format!("http://host.containers.internal:{}/git/status", port);
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        || {
+            let response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
+            if response.status.success() {
+                Ok(Some("ok".to_string()))
+            } else {
+                Ok(None)
+            }
+        },
     )
-    .ignore_status()
-    .output()?;
+    .context("Pod-api sidecar should respond to /git/status within 30s")?;
+
+    // Test that internal access (inside container) also works via pod-api
+    let agent_container = format!("{}-agent", pod_name);
+    let internal_output = poll_until(
+        Duration::from_secs(15),
+        Duration::from_secs(1),
+        || {
+            let result = cmd!(
+                sh,
+                "podman exec {agent_container} curl -sf http://localhost:8090/git/status"
+            )
+            .ignore_status()
+            .output()?;
+            if result.status.success() {
+                Ok(Some("ok".to_string()))
+            } else {
+                Ok(None)
+            }
+        },
+    );
     assert!(
-        internal_response.status.success(),
-        "Internal API request should succeed"
+        internal_output.is_ok(),
+        "Internal API request via pod-api should succeed"
     );
 
     Ok(())

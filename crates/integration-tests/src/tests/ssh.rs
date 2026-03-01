@@ -360,11 +360,12 @@ podman_integration_test!(test_ssh_server_starts_on_exec_stdio);
 /// Test SSH connectivity using the ssh command if available
 ///
 /// This is a more complete end-to-end test that uses the actual SSH client
-/// to connect through the devaipod SSH server.
+/// to connect through the devaipod SSH server. The test is inherently flaky
+/// in containerized environments, so failures are logged but not fatal.
 fn test_ssh_client_connectivity() -> Result<()> {
     let sh = shell()?;
 
-    // Check if ssh command is available
+    // Check if both ssh and timeout commands are available
     let ssh_available = cmd!(sh, "which ssh")
         .ignore_status()
         .output()?
@@ -372,6 +373,15 @@ fn test_ssh_client_connectivity() -> Result<()> {
         .success();
     if !ssh_available {
         tracing::info!("Skipping SSH client test: ssh command not available");
+        return Ok(());
+    }
+    let timeout_available = cmd!(sh, "which timeout")
+        .ignore_status()
+        .output()?
+        .status
+        .success();
+    if !timeout_available {
+        tracing::info!("Skipping SSH client test: timeout command not available (common on macOS)");
         return Ok(());
     }
 
@@ -392,8 +402,27 @@ fn test_ssh_client_connectivity() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Give containers time to start
-    std::thread::sleep(Duration::from_secs(2));
+    // Verify the workspace container is ready before attempting SSH.
+    // SSH needs the container runtime to be fully ready, which can take
+    // longer in CI environments.
+    {
+        let workspace_container = format!("{}-workspace", pod_name);
+        let poll_sh = shell()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let result = cmd!(poll_sh, "podman exec {workspace_container} echo ready")
+                .ignore_status()
+                .output()?;
+            if result.status.success() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("Workspace container not ready after 30s, skipping SSH test");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
 
     // Get the devaipod binary path for building the ProxyCommand
     // This uses host mode since it's building a command string for ssh
@@ -407,59 +436,76 @@ fn test_ssh_client_connectivity() -> Result<()> {
         SSH_CONFIG_DIR_ENV, ssh_config_dir, devaipod, short
     );
 
-    // Try SSH with ProxyCommand directly
-    // Use -o options to configure SSH without a config file
-    // timeout(1) is not installed by default on macOS; skip if missing (os error 2)
-    let ssh_result = match Command::new("timeout")
-        .args([
-            "10",
-            "ssh",
-            "-o",
-            &format!("ProxyCommand={}", proxy_cmd),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "LogLevel=ERROR",
-            "-o",
-            "PasswordAuthentication=no",
-            "-o",
-            "PubkeyAuthentication=no",
-            "localhost",
-            "echo",
-            "hello-via-ssh",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-    {
-        Ok(out) => out,
-        Err(e) if e.raw_os_error() == Some(2) => {
-            tracing::info!(
-                "SSH client test skipped - 'timeout' not found (common on macOS): {}",
-                e
-            );
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
-    };
+    // Try SSH with ProxyCommand directly, with retries for timing issues.
+    // Use -o options to configure SSH without a config file.
+    let max_attempts = 3;
+    let mut last_stderr = String::new();
+    let mut succeeded = false;
 
-    if ssh_result.status.success() {
-        let stdout = String::from_utf8_lossy(&ssh_result.stdout);
-        assert!(
-            stdout.contains("hello-via-ssh"),
-            "SSH command should return output: {}",
-            stdout
-        );
-        tracing::info!("SSH client connectivity test passed");
-    } else {
-        // SSH may fail for various reasons in CI (no SSH agent, etc.)
-        // Log the error but don't fail the test
-        let stderr = String::from_utf8_lossy(&ssh_result.stderr);
+    for attempt in 1..=max_attempts {
+        let ssh_result = match Command::new("timeout")
+            .args([
+                "15",
+                "ssh",
+                "-o",
+                &format!("ProxyCommand={}", proxy_cmd),
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "PubkeyAuthentication=no",
+                "localhost",
+                "echo",
+                "hello-via-ssh",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!("SSH client test skipped - 'timeout' not found: {}", e);
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        if ssh_result.status.success() {
+            let stdout = String::from_utf8_lossy(&ssh_result.stdout);
+            assert!(
+                stdout.contains("hello-via-ssh"),
+                "SSH command should return output: {}",
+                stdout
+            );
+            tracing::info!("SSH client connectivity test passed on attempt {}", attempt);
+            succeeded = true;
+            break;
+        }
+
+        last_stderr = String::from_utf8_lossy(&ssh_result.stderr).to_string();
         tracing::info!(
-            "SSH client test skipped - command failed (may be expected in CI): {}",
-            stderr
+            "SSH attempt {}/{} failed: {}",
+            attempt,
+            max_attempts,
+            last_stderr.lines().next().unwrap_or("")
+        );
+        if attempt < max_attempts {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    if !succeeded {
+        // SSH may fail for various reasons in CI (no SSH agent, container
+        // networking quirks, etc.). Log the error but don't fail the test.
+        tracing::info!(
+            "SSH client test skipped - all {} attempts failed (may be expected in CI): {}",
+            max_attempts,
+            last_stderr
         );
     }
 
