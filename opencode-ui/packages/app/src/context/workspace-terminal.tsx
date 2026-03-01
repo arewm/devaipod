@@ -39,7 +39,7 @@ async function createPty(title: string): Promise<PtyInfo> {
   const res = await fetch(base, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title }),
+    body: JSON.stringify({ title, container: "workspace" }),
   })
   if (!res.ok) throw new Error(`Create PTY failed: ${res.status}`)
   return res.json()

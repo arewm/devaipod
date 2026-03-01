@@ -955,6 +955,7 @@ impl DevaipodPod {
             &agent_workspace_volume,
             &volume_name,
             &workspace_container,
+            &agent_container,
             &socket_path,
             &api_password,
             &workspace_folder,
@@ -2561,6 +2562,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
         agent_workspace_volume: &str,
         main_workspace_volume: &str,
         workspace_container_name: &str,
+        agent_container_name: &str,
         socket_path: &std::path::Path,
         opencode_password: &str,
         workspace_folder: &str,
@@ -2579,6 +2581,8 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             workspace_folder.to_string(),
             "--workspace-container".to_string(),
             workspace_container_name.to_string(),
+            "--agent-container".to_string(),
+            agent_container_name.to_string(),
             "--opencode-password".to_string(),
             opencode_password.to_string(),
         ];
@@ -3242,11 +3246,13 @@ mod tests {
         let agent_workspace_volume = "test-agent-workspace";
         let main_workspace_volume = "test-main-workspace";
         let workspace_container = "devaipod-test-workspace";
+        let agent_container = "devaipod-test-agent";
         let socket_path = std::path::Path::new("/run/podman/podman.sock");
         let container_config = DevaipodPod::api_container_config(
             agent_workspace_volume,
             main_workspace_volume,
             workspace_container,
+            agent_container,
             socket_path,
             "test-password-123",
             "/workspaces/bootc",
@@ -3276,6 +3282,8 @@ mod tests {
         assert!(cmd.contains(&POD_API_PORT.to_string()));
         assert!(cmd.contains(&"--workspace-container".to_string()));
         assert!(cmd.contains(&workspace_container.to_string()));
+        assert!(cmd.contains(&"--agent-container".to_string()));
+        assert!(cmd.contains(&agent_container.to_string()));
         // Workspace path must be the full path to the git repo, not just /workspaces
         let ws_idx = cmd.iter().position(|a| a == "--workspace").unwrap();
         assert_eq!(cmd[ws_idx + 1], "/workspaces/bootc");

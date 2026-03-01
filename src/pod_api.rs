@@ -53,6 +53,8 @@ struct AppState {
     pty_sessions: PtySessionManager,
     /// Name of the workspace container to exec into for PTY sessions.
     workspace_container: String,
+    /// Name of the agent container to exec into for agent PTY sessions.
+    agent_container: String,
     /// Password for authenticating to the opencode server (Basic auth).
     opencode_password: String,
 }
@@ -845,6 +847,8 @@ struct PtyInfo {
     cwd: String,
     status: String,
     pid: Option<u64>,
+    /// Which container this PTY session is running in (`"agent"` or `"workspace"`).
+    container: String,
 }
 
 /// Request body for `POST /pty`.
@@ -855,6 +859,8 @@ struct PtyCreateInput {
     cwd: Option<String>,
     title: Option<String>,
     env: Option<HashMap<String, String>>,
+    /// Target container: `"agent"` or `"workspace"`. Defaults to `"agent"`.
+    container: Option<String>,
 }
 
 /// Request body for `PUT /pty/{pty_id}`.
@@ -992,7 +998,13 @@ async fn pty_list(State(state): State<AppState>) -> Json<Vec<PtyInfo>> {
     Json(infos)
 }
 
-/// `POST /pty` — create a new PTY session via bollard exec into the workspace container.
+/// `POST /pty` — create a new PTY session via bollard exec into a container.
+///
+/// The `container` field in the request body selects the target: `"workspace"` for
+/// the workspace container, anything else (including absent) defaults to the agent
+/// container. This means the opencode SDK (which cannot add extra fields) naturally
+/// targets the agent container, while the workspace terminal frontend explicitly
+/// passes `"workspace"`.
 async fn pty_create(
     State(state): State<AppState>,
     Json(input): Json<PtyCreateInput>,
@@ -1008,10 +1020,18 @@ async fn pty_create(
     });
     let env = input.env.unwrap_or_default();
 
-    if state.workspace_container.is_empty() {
+    // Resolve which container to exec into.
+    let is_workspace = input.container.as_deref().is_some_and(|c| c == "workspace");
+    let (target_container, container_label) = if is_workspace {
+        (&state.workspace_container, "workspace")
+    } else {
+        (&state.agent_container, "agent")
+    };
+
+    if target_container.is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "No workspace container configured (--workspace-container)".to_string(),
+            format!("No {container_label} container configured (--{container_label}-container)"),
         ));
     }
 
@@ -1033,7 +1053,7 @@ async fn pty_create(
 
     let exec = docker
         .create_exec(
-            &state.workspace_container,
+            target_container,
             CreateExecOptions {
                 cmd: Some(cmd),
                 attach_stdin: Some(true),
@@ -1086,6 +1106,7 @@ async fn pty_create(
         cwd,
         status: "running".to_string(),
         pid: None,
+        container: container_label.to_string(),
     };
 
     let session_output = Arc::new(tokio::sync::Mutex::new(SessionOutput {
@@ -1724,6 +1745,9 @@ pub(crate) struct PodApiArgs {
     /// Name of the workspace container to exec into for PTY sessions.
     #[arg(long)]
     workspace_container: Option<String>,
+    /// Name of the agent container to exec into for agent PTY sessions.
+    #[arg(long)]
+    agent_container: Option<String>,
     /// Password for authenticating to the opencode server (Basic auth).
     #[arg(long, default_value = "")]
     opencode_password: String,
@@ -1763,6 +1787,7 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
         git_events_tx,
         pty_sessions: PtySessionManager::new(),
         workspace_container: args.workspace_container.unwrap_or_default(),
+        agent_container: args.agent_container.unwrap_or_default(),
         opencode_password: args.opencode_password,
     };
 
