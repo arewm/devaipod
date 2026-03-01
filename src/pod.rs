@@ -931,6 +931,7 @@ impl DevaipodPod {
             &workspace_container,
             &socket_path,
             &api_password,
+            &workspace_folder,
         );
         podman
             .create_container(&api_container_name, &self_image, pod_name, api_config)
@@ -2536,6 +2537,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
         workspace_container_name: &str,
         socket_path: &std::path::Path,
         opencode_password: &str,
+        workspace_folder: &str,
     ) -> ContainerConfig {
         use crate::podman::MountConfig;
 
@@ -2548,7 +2550,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             "--port".to_string(),
             POD_API_PORT.to_string(),
             "--workspace".to_string(),
-            "/workspaces".to_string(),
+            workspace_folder.to_string(),
             "--workspace-container".to_string(),
             workspace_container_name.to_string(),
             "--opencode-password".to_string(),
@@ -3221,6 +3223,7 @@ mod tests {
             workspace_container,
             socket_path,
             "test-password-123",
+            "/workspaces/bootc",
         );
 
         // Verify two named volumes are mounted
@@ -3239,7 +3242,7 @@ mod tests {
         assert_eq!(container_config.mounts.len(), 1);
         assert_eq!(container_config.mounts[0].target, "/run/podman/podman.sock");
 
-        // Verify command runs pod-api with workspace container name
+        // Verify command runs pod-api with workspace container name and correct workspace path
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "devaipod");
         assert_eq!(cmd[1], "pod-api");
@@ -3247,6 +3250,9 @@ mod tests {
         assert!(cmd.contains(&POD_API_PORT.to_string()));
         assert!(cmd.contains(&"--workspace-container".to_string()));
         assert!(cmd.contains(&workspace_container.to_string()));
+        // Workspace path must be the full path to the git repo, not just /workspaces
+        let ws_idx = cmd.iter().position(|a| a == "--workspace").unwrap();
+        assert_eq!(cmd[ws_idx + 1], "/workspaces/bootc");
 
         // Verify security restrictions
         assert!(container_config.drop_all_caps);
