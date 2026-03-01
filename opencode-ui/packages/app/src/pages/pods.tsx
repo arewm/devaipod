@@ -637,16 +637,21 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
               Start
             </Button>
           </Show>
-          <Button
-            variant="ghost"
-            size="small"
-            onClick={() => {
-              if (confirm(`Recreate workspace "${shortName()}"? It will be deleted and recreated with the same repo.`))
-                withErrorHandling(() => ctx.recreatePod(shortName()))
-            }}
-          >
-            Recreate
-          </Button>
+          {(() => {
+            const needsUpdate = () => ctx.enrichment[props.pod.Name]?.needs_update === true
+            return (
+              <Button
+                variant={needsUpdate() ? "secondary" : "ghost"}
+                size="small"
+                onClick={() => {
+                  if (confirm(`Recreate workspace "${shortName()}"? It will be deleted and recreated with the same repo.`))
+                    withErrorHandling(() => ctx.recreatePod(shortName()))
+                }}
+              >
+                {needsUpdate() ? "Recreate (update available)" : "Recreate"}
+              </Button>
+            )
+          })()}
           <Show when={!isRunning()}>
             <Button
               variant="ghost"

@@ -226,6 +226,32 @@ const GATOR_IMAGE: &str = "ghcr.io/cgwalters/service-gator:latest";
 // (see detect_own_container_image() in main.rs for the pattern).
 const DEVAIPOD_IMAGE_FALLBACK: &str = "ghcr.io/cgwalters/devaipod:latest";
 
+/// Detect the image ID (digest) of the running control plane container.
+/// Returns None when not running inside a container.
+pub(crate) async fn detect_self_image_id() -> Option<String> {
+    if std::env::var("DEVAIPOD_CONTAINER").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let socket_path = crate::podman::get_container_socket().ok()?;
+    let docker = bollard::Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .ok()?;
+    match docker.inspect_container("devaipod", None).await {
+        Ok(info) => {
+            let image_id = info.image;
+            tracing::debug!("Detected self image ID: {:?}", image_id);
+            image_id
+        }
+        Err(e) => {
+            tracing::warn!("Failed to detect self image ID: {e}");
+            None
+        }
+    }
+}
+
 /// Detect the image of the running devaipod control-plane container.
 ///
 /// Returns the image name if we can detect it, otherwise falls back to

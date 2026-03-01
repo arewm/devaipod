@@ -56,6 +56,7 @@ const POD_POLL_MS = 5_000
 const LAUNCH_POLL_MS = 3_000
 const AGENT_POLL_MS = 3_000
 const PROPOSAL_POLL_MS = 10_000
+const ENRICHMENT_POLL_MS = 15_000
 
 // ---------------------------------------------------------------------------
 // Context
@@ -71,6 +72,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       pods: [] as PodInfo[],
       launches: {} as Record<string, LaunchState>,
       agentStatus: {} as Record<string, AgentStatus>,
+      enrichment: {} as Record<string, { needs_update: boolean }>,
       proposals: [] as Proposal[],
       connected: undefined as boolean | undefined,
       error: undefined as string | undefined,
@@ -164,6 +166,19 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       )
     }
 
+    // -- Pod enrichment (update detection) -----------------------------------
+
+    async function fetchEnrichment() {
+      try {
+        const data = await apiFetch<Record<string, { needs_update: boolean }>>(
+          "/api/devaipod/pods/enrichment",
+        )
+        setStore("enrichment", data)
+      } catch {
+        // Ignore — enrichment is best-effort
+      }
+    }
+
     // -- Proposals ----------------------------------------------------------
 
     async function fetchProposals() {
@@ -194,6 +209,11 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     }, AGENT_POLL_MS)
     onCleanup(() => clearInterval(agentInterval))
 
+    const enrichmentInterval = setInterval(() => {
+      fetchEnrichment()
+    }, ENRICHMENT_POLL_MS)
+    onCleanup(() => clearInterval(enrichmentInterval))
+
     const proposalInterval = setInterval(() => {
       fetchProposals()
     }, PROPOSAL_POLL_MS)
@@ -208,6 +228,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         fetchPods()
         fetchLaunches()
         fetchAgentStatus()
+        fetchEnrichment()
         fetchProposals()
       })
     })
@@ -337,6 +358,9 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       },
       get agentStatus() {
         return store.agentStatus
+      },
+      get enrichment() {
+        return store.enrichment
       },
       get proposals() {
         return store.proposals

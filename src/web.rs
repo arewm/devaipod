@@ -156,6 +156,9 @@ pub(crate) struct AppState {
     static_dir: String,
     /// Background launch states so the UI can track in-flight launches.
     launches: LaunchMap,
+    /// Image ID (digest) of the running control plane container.
+    /// Used to detect pods whose API sidecar is running an older image.
+    self_image_id: Option<String>,
 }
 
 /// Query parameters for token authentication
@@ -1384,6 +1387,89 @@ async fn recreate_workspace(
     }))
 }
 
+/// Pod enrichment response: extra metadata computed server-side.
+///
+/// Currently reports whether each pod's API sidecar is running an older
+/// image than the control plane, so the UI can show "update available".
+#[derive(Debug, Serialize)]
+struct PodEnrichment {
+    needs_update: bool,
+}
+
+/// Return enrichment data for all devaipod pods.
+///
+/// Compares the image ID of each pod's `-api` sidecar container against
+/// the control plane's own image ID. If they differ the pod needs a
+/// recreate to pick up the new image.
+async fn pod_enrichment(
+    State(state): State<Arc<AppState>>,
+) -> Json<HashMap<String, PodEnrichment>> {
+    let mut result = HashMap::new();
+
+    let self_image_id = match &state.self_image_id {
+        Some(id) => id,
+        None => return Json(result), // Not in container, can't compare
+    };
+
+    let socket_path = match &state.socket_path {
+        Some(p) => p.clone(),
+        None => match get_container_socket() {
+            Ok(p) => p,
+            Err(_) => return Json(result),
+        },
+    };
+
+    let docker = match bollard::Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    ) {
+        Ok(d) => d,
+        Err(_) => return Json(result),
+    };
+
+    // List all containers whose name starts with "devaipod-" and ends with "-api"
+    let mut filters = HashMap::new();
+    filters.insert("name", vec!["devaipod-*-api"]);
+    let options = bollard::container::ListContainersOptions {
+        all: true,
+        filters,
+        ..Default::default()
+    };
+
+    let containers = match docker.list_containers(Some(options)).await {
+        Ok(c) => c,
+        Err(_) => return Json(result),
+    };
+
+    for container in containers {
+        let names = match &container.names {
+            Some(n) => n,
+            None => continue,
+        };
+        // Container names are prefixed with "/"
+        let api_name = match names.iter().find(|n| n.ends_with("-api")) {
+            Some(n) => n.trim_start_matches('/').to_string(),
+            None => continue,
+        };
+        // Derive pod name: "devaipod-foo-abc123-api" -> "devaipod-foo-abc123"
+        let pod_name = match api_name.strip_suffix("-api") {
+            Some(p) => p.to_string(),
+            None => continue,
+        };
+
+        let needs_update = container
+            .image_id
+            .as_ref()
+            .map(|id| id != self_image_id)
+            .unwrap_or(false);
+
+        result.insert(pod_name, PodEnrichment { needs_update });
+    }
+
+    Json(result)
+}
+
 /// Extract workspace name from devaipod run output
 ///
 /// Looks for the short workspace name (without devaipod- prefix) in the output.
@@ -1734,12 +1820,18 @@ fn derive_agent_status_from_messages(
 ///
 /// Exposed for tests so we can hit the router with in-process requests (fast)
 /// without starting a server or container.
-pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir: &str) -> Router {
+pub(crate) fn build_app(
+    token: String,
+    socket_path: Option<PathBuf>,
+    static_dir: &str,
+    self_image_id: Option<String>,
+) -> Router {
     let state = Arc::new(AppState {
         token: token.clone(),
         socket_path,
         static_dir: static_dir.to_string(),
         launches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        self_image_id,
     });
 
     // Build the API router with authentication
@@ -1771,6 +1863,7 @@ pub(crate) fn build_app(token: String, socket_path: Option<PathBuf>, static_dir:
         .route("/devaipod/proposals", get(list_proposals_api))
         .route("/devaipod/proposals/{id}/dismiss", post(dismiss_proposal))
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
+        .route("/devaipod/pods/enrichment", get(pod_enrichment))
         // PTY: proxy to the pod-api sidecar (direct PTY, no exec overhead)
         .route(
             "/devaipod/pods/{name}/pty",
@@ -1830,6 +1923,12 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
         );
     }
 
+    // Detect our own image ID so we can tell the UI which pods need updates
+    let self_image_id = crate::pod::detect_self_image_id().await;
+    if let Some(ref id) = self_image_id {
+        tracing::info!("Control plane image ID: {}", id);
+    }
+
     // Find static files directory
     // Try installed location first, then fall back to development location
     let static_dir = if std::path::Path::new("/usr/share/devaipod/dist").exists() {
@@ -1844,7 +1943,7 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
     };
     tracing::info!("Serving static files from: {}", static_dir);
 
-    let app = build_app(token.clone(), socket_path, static_dir);
+    let app = build_app(token.clone(), socket_path, static_dir, self_image_id);
 
     // Bind to [::] which accepts both IPv4 and IPv6 connections via dual-stack
     // (the Linux default).  Browsers typically try IPv6 first when resolving
@@ -1880,7 +1979,7 @@ mod tests {
     async fn test_agent_redirect() {
         let temp = tempfile::tempdir().expect("temp dir");
         let static_dir = temp.path().to_str().expect("path");
-        let app = build_app("test-token".into(), None, static_dir);
+        let app = build_app("test-token".into(), None, static_dir, None);
 
         // Without query params
         let req = Request::builder()
@@ -1912,7 +2011,7 @@ mod tests {
         );
 
         // With query params
-        let app2 = build_app("test-token".into(), None, static_dir);
+        let app2 = build_app("test-token".into(), None, static_dir, None);
         let req = Request::builder()
             .uri("/_devaipod/agent/test-pod?dir=abc&session=s1")
             .body(Body::empty())
