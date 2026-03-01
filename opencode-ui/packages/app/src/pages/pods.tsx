@@ -213,6 +213,7 @@ function LaunchForm(props: { onClose: () => void }) {
   const [scopes, setScopes] = createSignal<string[]>([])
   const [gatorImage, setGatorImage] = createSignal("")
   const [readOnly, setReadOnly] = createSignal(false)
+  const [devcontainerJson, setDevcontainerJson] = createSignal("")
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
 
@@ -252,6 +253,8 @@ function LaunchForm(props: { onClose: () => void }) {
       const gi = gatorImage().trim()
       if (gi) params.service_gator_image = gi
       if (readOnly()) params.service_gator_ro = true
+      const dcj = devcontainerJson().trim()
+      if (dcj) params.devcontainer_json = dcj
 
       await ctx.launchWorkspace(params)
       props.onClose()
@@ -353,6 +356,15 @@ function LaunchForm(props: { onClose: () => void }) {
                 placeholder="Default: ghcr.io/cgwalters/service-gator:latest"
                 value={gatorImage()}
                 onChange={setGatorImage}
+              />
+
+              <TextField
+                label="Devcontainer JSON override (optional)"
+                placeholder='{"image": "ghcr.io/bootc-dev/devenv-debian", "capAdd": ["SYS_ADMIN"], ...}'
+                description="Full devcontainer.json to use instead of the repo's. Accepts JSONC (comments allowed)."
+                value={devcontainerJson()}
+                onChange={setDevcontainerJson}
+                multiline
               />
             </Collapsible.Content>
           </Collapsible>

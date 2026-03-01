@@ -45,6 +45,7 @@ export interface LaunchWorkspaceParams {
   service_gator_scopes?: string[]
   service_gator_image?: string
   service_gator_ro?: boolean
+  devcontainer_json?: string
 }
 
 // ---------------------------------------------------------------------------

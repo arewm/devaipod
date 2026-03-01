@@ -988,6 +988,8 @@ struct RunRequest {
     /// Additional MCP servers to attach (name=url format)
     #[serde(default)]
     mcp_servers: Vec<String>,
+    /// Inline devcontainer JSON that replaces the repo's devcontainer.json
+    devcontainer_json: Option<String>,
 }
 
 /// Response for run endpoint
@@ -1077,6 +1079,10 @@ async fn run_workspace(
 
     for mcp in &req.mcp_servers {
         cmd.args(["--mcp", mcp]);
+    }
+
+    if let Some(ref json) = req.devcontainer_json {
+        cmd.args(["--devcontainer-json", json]);
     }
 
     // Prevent stdin reads from blocking the server process

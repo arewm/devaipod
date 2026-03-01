@@ -433,13 +433,31 @@ pub fn load(path: &Path) -> Result<DevcontainerConfig> {
         .with_context(|| format!("Failed to read {}", path.display()))?;
 
     // Parse JSONC (JSON with comments) - devcontainer.json uses this format
+    parse_jsonc(&content).with_context(|| format!("Failed to deserialize {}", path.display()))
+}
+
+/// Parse a devcontainer.json from an inline JSONC string.
+///
+/// This accepts the same format as a devcontainer.json file (JSON with comments).
+/// Used for the `--devcontainer-json` CLI flag and web UI override.
+///
+/// Only image-based configs are supported for inline JSON; `build` blocks require
+/// filesystem context that isn't available with inline overrides.
+pub fn parse_jsonc(content: &str) -> Result<DevcontainerConfig> {
     let config: DevcontainerConfig =
-        jsonc_parser::parse_to_serde_value(&content, &Default::default())
+        jsonc_parser::parse_to_serde_value(content, &Default::default())
             .map_err(|e| color_eyre::eyre::eyre!("Failed to parse JSONC: {}", e))?
             .map(serde_json::from_value)
             .transpose()
-            .with_context(|| format!("Failed to deserialize {}", path.display()))?
+            .context("Failed to deserialize devcontainer JSON")?
             .unwrap_or_default();
+
+    if config.build.is_some() && config.image.is_none() {
+        bail!(
+            "Inline --devcontainer-json with a 'build' block is not supported \
+             (build context paths cannot be resolved). Use 'image' instead."
+        );
+    }
 
     Ok(config)
 }
@@ -671,5 +689,49 @@ mod tests {
     fn test_security_opt_args_empty() {
         let config = DevcontainerConfig::default();
         assert!(config.security_opt_args().is_empty());
+    }
+
+    #[test]
+    fn test_parse_jsonc_inline() {
+        let json = r#"{
+            // This is a comment
+            "image": "ghcr.io/bootc-dev/devenv-debian",
+            "capAdd": ["SYS_ADMIN"],
+            "runArgs": ["--security-opt", "label=disable"]
+        }"#;
+        let config = super::parse_jsonc(json).unwrap();
+        assert_eq!(
+            config.image,
+            Some("ghcr.io/bootc-dev/devenv-debian".to_string())
+        );
+        assert_eq!(config.cap_add, vec!["SYS_ADMIN"]);
+        assert_eq!(config.run_args, vec!["--security-opt", "label=disable"]);
+    }
+
+    #[test]
+    fn test_parse_jsonc_empty_string() {
+        // Empty string produces default config (no image), which is valid JSON
+        // but will fail later at image_source() with a clear error
+        let config = super::parse_jsonc("").unwrap();
+        assert!(config.image.is_none());
+    }
+
+    #[test]
+    fn test_parse_jsonc_rejects_build_without_image() {
+        let json = r#"{"build": {"dockerfile": "Dockerfile"}}"#;
+        let result = super::parse_jsonc(json);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("build context paths cannot be resolved"));
+    }
+
+    #[test]
+    fn test_parse_jsonc_allows_build_with_image() {
+        // If both build and image are specified, image takes precedence (per devcontainer spec)
+        let json = r#"{"image": "debian", "build": {"dockerfile": "Dockerfile"}}"#;
+        let config = super::parse_jsonc(json).unwrap();
+        assert_eq!(config.image, Some("debian".to_string()));
     }
 }
