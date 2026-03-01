@@ -259,10 +259,13 @@ pub(crate) async fn detect_self_image_id() -> Option<String> {
 fn detect_self_image() -> String {
     // Only attempt detection when running inside the devaipod container
     if std::env::var("DEVAIPOD_CONTAINER").as_deref() == Ok("1") {
-        if let Ok(output) = std::process::Command::new("podman")
-            .args(["inspect", "devaipod", "--format", "{{.ImageName}}"])
-            .output()
-        {
+        let mut cmd = std::process::Command::new("podman");
+        // Use the correct socket path so podman-remote can reach the host daemon.
+        if let Ok(socket) = crate::podman::get_container_socket() {
+            cmd.args(["--url", &format!("unix://{}", socket.display())]);
+        }
+        cmd.args(["inspect", "devaipod", "--format", "{{.ImageName}}"]);
+        if let Ok(output) = cmd.output() {
             if output.status.success() {
                 let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !image.is_empty() {
