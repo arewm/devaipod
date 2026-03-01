@@ -22,6 +22,9 @@
     "--device", "/dev/net/tun",
     "--device", "/dev/kvm"
   ],
+  // newuidmap/newgidmap need SYS_ADMIN to set up nested user namespaces;
+  // the runArgs security options alone are not sufficient.
+  "capAdd": ["SYS_ADMIN"],
   "postCreateCommand": {
     // Our init script
     "devenv-init": "sudo /usr/local/bin/devenv-init.sh"
