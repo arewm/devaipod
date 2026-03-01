@@ -160,21 +160,36 @@ fn generate_proposal_id() -> String {
 // Pod introspection — shell out to podman CLI
 // ---------------------------------------------------------------------------
 
+use crate::{get_instance_id, INSTANCE_LABEL_KEY};
+
 /// List all devaipod pods with basic status info.
 ///
 /// Runs `podman pod ps --filter name=devaipod-* --format json` and returns
 /// the parsed JSON array. Each element contains fields like `Name`, `Status`,
 /// `Created`, etc. as defined by podman's JSON output.
+///
+/// When `DEVAIPOD_INSTANCE` is set, results are narrowed to pods carrying
+/// the matching label. When unset, no instance filtering is performed here
+/// because the advisor runs inside an isolated container environment where
+/// cross-instance contamination doesn't occur (unlike the host-side CLI/TUI).
 pub fn list_pods() -> Result<Vec<serde_json::Value>> {
+    let instance_id = get_instance_id();
+
+    let mut args = vec![
+        "pod".to_string(),
+        "ps".to_string(),
+        "--filter".to_string(),
+        "name=devaipod-*".to_string(),
+    ];
+    if let Some(ref id) = instance_id {
+        args.push("--filter".to_string());
+        args.push(format!("label={INSTANCE_LABEL_KEY}={id}"));
+    }
+    args.push("--format".to_string());
+    args.push("json".to_string());
+
     let output = std::process::Command::new("podman")
-        .args([
-            "pod",
-            "ps",
-            "--filter",
-            "name=devaipod-*",
-            "--format",
-            "json",
-        ])
+        .args(&args)
         .output()
         .context("Failed to run podman pod ps")?;
 
@@ -185,6 +200,7 @@ pub fn list_pods() -> Result<Vec<serde_json::Value>> {
 
     let pods: Vec<serde_json::Value> =
         serde_json::from_slice(&output.stdout).context("Parsing podman pod ps output")?;
+
     Ok(pods)
 }
 

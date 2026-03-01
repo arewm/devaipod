@@ -34,6 +34,23 @@ mod web;
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
 
+/// Environment variable name for the instance identifier.
+///
+/// When set, this value is stored as a label (`io.devaipod.instance`) on every
+/// pod created by this process, and all listing/filtering operations will only
+/// show pods whose label matches. This allows multiple independent devaipod
+/// sessions (e.g. integration tests vs. interactive use) to coexist without
+/// interfering with each other.
+pub(crate) const DEVAIPOD_INSTANCE_ENV: &str = "DEVAIPOD_INSTANCE";
+
+/// Pod/container label key used to record the instance identifier.
+pub(crate) const INSTANCE_LABEL_KEY: &str = "io.devaipod.instance";
+
+/// Return the current instance identifier, if any.
+pub(crate) fn get_instance_id() -> Option<String> {
+    std::env::var(DEVAIPOD_INSTANCE_ENV).ok().filter(|s| !s.is_empty())
+}
+
 /// Normalize a workspace name to a full pod name by adding the prefix
 ///
 /// The user-facing "short name" is what's shown by `devaipod list` and suggested
@@ -105,9 +122,19 @@ fn resolve_workspace(workspace: Option<&str>, latest: bool) -> Result<String> {
 
 /// Get the most recently created devaipod workspace
 fn get_latest_workspace() -> Result<String> {
-    let filter = format!("name={}*", POD_NAME_PREFIX);
+    let name_filter = format!("name={}*", POD_NAME_PREFIX);
+    let mut args = vec!["pod", "ps", "--filter", &name_filter];
+
+    // Narrow results by instance label when set
+    let label_filter;
+    if let Some(instance_id) = get_instance_id() {
+        label_filter = format!("label={INSTANCE_LABEL_KEY}={instance_id}");
+        args.extend(["--filter", &label_filter]);
+    }
+    args.push("--format=json");
+
     let output = podman_command()
-        .args(["pod", "ps", "--filter", &filter, "--format=json"])
+        .args(&args)
         .output()
         .context("Failed to run podman pod ps")?;
 
@@ -117,6 +144,19 @@ fn get_latest_workspace() -> Result<String> {
 
     let pods: Vec<serde_json::Value> =
         serde_json::from_slice(&output.stdout).context("Failed to parse pod list")?;
+
+    // When no instance is set, filter out pods that carry an instance label
+    let pods: Vec<&serde_json::Value> = if get_instance_id().is_none() {
+        pods.iter()
+            .filter(|pod| {
+                let name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("");
+                let labels = get_pod_labels(name);
+                pod_labels_match_instance(labels.as_ref())
+            })
+            .collect()
+    } else {
+        pods.iter().collect()
+    };
 
     if pods.is_empty() {
         bail!("No devaipod workspaces found. Create one with 'devaipod up' or 'devaipod run'.");
@@ -1793,7 +1833,7 @@ async fn create_workspace_from_local(
     tracing::debug!("Creating pod '{}'...", pod_name);
     let source = pod::WorkspaceSource::LocalRepo(git_info);
 
-    // Build extra labels for task description and mode
+    // Build extra labels for task description, mode, and instance
     let mut extra_labels = Vec::new();
     extra_labels.push((
         "io.devaipod.mode".to_string(),
@@ -1801,6 +1841,9 @@ async fn create_workspace_from_local(
     ));
     if let Some(ref task_desc) = opts.task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
+    }
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
     let devaipod_pod = pod::DevaipodPod::create(
@@ -2009,7 +2052,7 @@ async fn create_workspace_from_remote(
     };
     let source = pod::WorkspaceSource::RemoteRepo(remote_info);
 
-    // Build extra labels for task description and mode
+    // Build extra labels for task description, mode, and instance
     let mut extra_labels = Vec::new();
     extra_labels.push((
         "io.devaipod.mode".to_string(),
@@ -2017,6 +2060,9 @@ async fn create_workspace_from_remote(
     ));
     if let Some(ref task_desc) = opts.task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
+    }
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
     // Create the pod
@@ -2201,7 +2247,7 @@ async fn create_workspace_from_pr(
     // Create source from PR info
     let source = pod::WorkspaceSource::PullRequest(pr_info);
 
-    // Build extra labels for task description and mode
+    // Build extra labels for task description, mode, and instance
     let mut extra_labels = Vec::new();
     extra_labels.push((
         "io.devaipod.mode".to_string(),
@@ -2209,6 +2255,9 @@ async fn create_workspace_from_pr(
     ));
     if let Some(ref task_desc) = opts.task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
+    }
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
     // Create the pod
@@ -3717,11 +3766,45 @@ Host {pod}-worker.devaipod
     Ok(config_path)
 }
 
+/// Check whether a pod's labels match the current instance filter.
+///
+/// When `DEVAIPOD_INSTANCE` is set, only pods carrying a matching
+/// `io.devaipod.instance` label are included. When the env var is unset,
+/// pods that carry *any* instance label are excluded so that test/CI pods
+/// don't clutter the main view.
+fn pod_labels_match_instance(labels: Option<&serde_json::Value>) -> bool {
+    let instance_id = get_instance_id();
+    let pod_instance = labels
+        .and_then(|l| l.get(INSTANCE_LABEL_KEY))
+        .and_then(|v| v.as_str());
+
+    match (instance_id.as_deref(), pod_instance) {
+        // Both set – must match
+        (Some(want), Some(have)) => want == have,
+        // We want an instance but pod doesn't have one
+        (Some(_), None) => false,
+        // We don't want an instance but pod has one – hide it
+        (None, Some(_)) => false,
+        // Neither set – show it
+        (None, None) => true,
+    }
+}
+
 /// List devaipod pods using podman pod ps
 fn cmd_list(json_output: bool) -> Result<()> {
-    let filter = format!("name={}*", POD_NAME_PREFIX);
+    let name_filter = format!("name={}*", POD_NAME_PREFIX);
+    let mut args = vec!["pod", "ps", "--filter", &name_filter];
+
+    // When an instance is set, use podman's label filter for efficiency
+    let label_filter;
+    if let Some(instance_id) = get_instance_id() {
+        label_filter = format!("label={INSTANCE_LABEL_KEY}={instance_id}");
+        args.extend(["--filter", &label_filter]);
+    }
+    args.push("--format=json");
+
     let output = podman_command()
-        .args(["pod", "ps", "--filter", &filter, "--format=json"])
+        .args(&args)
         .output()
         .context("Failed to run podman pod ps")?;
 
@@ -3742,12 +3825,16 @@ fn cmd_list(json_output: bool) -> Result<()> {
         serde_json::from_slice(&output.stdout).unwrap_or_else(|_| Vec::new());
 
     if json_output {
-        // For JSON output, enrich with labels from pod inspect
+        // For JSON output, enrich with labels from pod inspect and filter by instance
         let mut enriched_pods = Vec::new();
         for pod in &pods {
             let mut enriched = pod.clone();
             if let Some(name) = pod.get("Name").and_then(|v| v.as_str()) {
-                if let Some(labels) = get_pod_labels(name) {
+                let labels = get_pod_labels(name);
+                if !pod_labels_match_instance(labels.as_ref()) {
+                    continue;
+                }
+                if let Some(labels) = labels {
                     enriched["Labels"] = labels;
                 }
             }
@@ -3797,7 +3884,12 @@ fn cmd_list(json_output: bool) -> Result<()> {
             .to_string();
 
         // Get labels from pod inspect (use full name for podman commands)
-        let (repo, pr, task, mode) = if let Some(labels) = get_pod_labels(full_name) {
+        // and filter by instance
+        let labels = get_pod_labels(full_name);
+        if !pod_labels_match_instance(labels.as_ref()) {
+            continue;
+        }
+        let (repo, pr, task, mode) = if let Some(labels) = labels {
             let repo = labels
                 .get("io.devaipod.repo")
                 .and_then(|v| v.as_str())
@@ -4330,10 +4422,13 @@ async fn cmd_rebuild(
 
     let enable_gator = config.service_gator.is_enabled();
 
-    // Build extra labels
+    // Build extra labels (including instance tag if set)
     let mut extra_labels = Vec::new();
     if let Some(ref task_desc) = task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
+    }
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
     // Recreate the pod - volumes already exist so they'll be reused

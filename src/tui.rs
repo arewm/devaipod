@@ -134,6 +134,21 @@ fn build_cache(instances: &[InstanceInfo]) -> TuiStateCache {
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
 
+use crate::{get_instance_id, INSTANCE_LABEL_KEY};
+
+/// Check whether a container's labels match the current instance filter.
+fn labels_match_instance(labels: Option<&HashMap<String, String>>) -> bool {
+    let instance_id = get_instance_id();
+    let pod_instance = labels.and_then(|l| l.get(INSTANCE_LABEL_KEY)).map(|s| s.as_str());
+
+    match (instance_id.as_deref(), pod_instance) {
+        (Some(want), Some(have)) => want == have,
+        (Some(_), None) => false,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
+}
+
 /// Minimum interval between git state refreshes for a single instance.
 /// Prevents excessive git command execution when multiple refresh triggers occur.
 const GIT_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(10);
@@ -498,6 +513,11 @@ impl App {
 
             // Extract labels from workspace container
             let labels = workspace.and_then(|w| w.labels.as_ref());
+
+            // Filter by instance: skip pods that don't belong to this instance
+            if !labels_match_instance(labels) {
+                continue;
+            }
 
             let repo = labels.and_then(|l| l.get("io.devaipod.repo")).cloned();
             let task = labels.and_then(|l| l.get("io.devaipod.task")).cloned();

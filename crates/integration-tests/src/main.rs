@@ -97,9 +97,23 @@ impl CapturedOutput {
     }
 }
 
+/// Build a base `Command` for running devaipod with the instance env var set.
+///
+/// Every integration-test invocation of devaipod carries
+/// `DEVAIPOD_INSTANCE=integration-test` so that pods are labeled and isolated
+/// from the user's normal interactive session.
+fn devaipod_command() -> Command {
+    let mut cmd = Command::new("devaipod");
+    cmd.env(
+        "DEVAIPOD_INSTANCE",
+        integration_tests::INTEGRATION_TEST_INSTANCE,
+    );
+    cmd
+}
+
 /// Run the devaipod command directly.
 pub(crate) fn run_devaipod(args: &[&str]) -> Result<CapturedOutput> {
-    let output = Command::new("devaipod")
+    let output = devaipod_command()
         .args(args)
         .output()
         .with_context(|| format!("Failed to run devaipod {:?}", args))?;
@@ -108,7 +122,7 @@ pub(crate) fn run_devaipod(args: &[&str]) -> Result<CapturedOutput> {
 
 /// Run the devaipod command in a specific directory.
 pub(crate) fn run_devaipod_in(dir: &std::path::Path, args: &[&str]) -> Result<CapturedOutput> {
-    let output = Command::new("devaipod")
+    let output = devaipod_command()
         .current_dir(dir)
         .args(args)
         .output()
@@ -122,7 +136,7 @@ pub(crate) fn run_devaipod_in_with_env(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> Result<CapturedOutput> {
-    let mut cmd = Command::new("devaipod");
+    let mut cmd = devaipod_command();
     cmd.current_dir(dir).args(args);
     for (k, v) in envs {
         cmd.env(k, v);
@@ -138,7 +152,7 @@ pub(crate) fn run_devaipod_with_env(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> Result<CapturedOutput> {
-    let mut cmd = Command::new("devaipod");
+    let mut cmd = devaipod_command();
     cmd.args(args);
     for (k, v) in envs {
         cmd.env(k, v);
@@ -351,6 +365,44 @@ impl Drop for PodGuard {
     }
 }
 
+/// Clean up any leaked pods from a previous integration test run.
+///
+/// Uses `podman pod ps --filter label=io.devaipod.instance=integration-test`
+/// to find and remove pods that were left behind by a crashed or interrupted
+/// test run.
+fn cleanup_leaked_test_pods() {
+    let label_filter = format!(
+        "label=io.devaipod.instance={}",
+        integration_tests::INTEGRATION_TEST_INSTANCE,
+    );
+    let output = Command::new("podman")
+        .args(["pod", "ps", "--filter", &label_filter, "--format", "{{.Name}}"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+
+    let names = String::from_utf8_lossy(&output.stdout);
+    for name in names.lines() {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        eprintln!("Cleaning up leaked test pod: {}", name);
+        let _ = Command::new("podman")
+            .args(["pod", "rm", "-f", name])
+            .output();
+        for suffix in integration_tests::POD_VOLUME_SUFFIXES {
+            let volume_name = format!("{name}{suffix}");
+            let _ = Command::new("podman")
+                .args(["volume", "rm", "-f", &volume_name])
+                .output();
+        }
+    }
+}
+
 fn main() {
     // Initialize tracing for better debug output
     tracing_subscriber::fmt()
@@ -366,6 +418,11 @@ fn main() {
     let has_podman = podman_available();
     if !has_podman {
         eprintln!("Note: podman not available, skipping podman-dependent tests");
+    }
+
+    // Clean up any pods leaked by a previous test run before starting new tests
+    if has_podman {
+        cleanup_leaked_test_pods();
     }
 
     // Collect readonly tests - these use the shared fixture

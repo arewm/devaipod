@@ -9,8 +9,13 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// Label used to identify pods/containers created by integration tests
-pub const INTEGRATION_TEST_LABEL: &str = "io.devaipod.integration-test=1";
+/// Value used for the DEVAIPOD_INSTANCE environment variable during tests.
+///
+/// This causes all pods created by integration tests to carry an
+/// `io.devaipod.instance=integration-test` label, isolating them from
+/// the user's normal devaipod session. If a test leaks a pod, the main
+/// instance won't see it.
+pub const INTEGRATION_TEST_INSTANCE: &str = "integration-test";
 
 /// Name used for the shared integration test pod
 pub const SHARED_POD_NAME: &str = "devaipod-integration-shared";
@@ -303,6 +308,7 @@ impl SharedFixture {
             .current_dir(&repo_path)
             .args(["up", ".", "--name", short_name])
             .env("DEVAIPOD_HOST_MODE", "1")
+            .env("DEVAIPOD_INSTANCE", INTEGRATION_TEST_INSTANCE)
             .env(SSH_CONFIG_DIR_ENV, ssh_config_dir.path())
             .output()
             .context("Failed to run devaipod up for shared fixture")?;
