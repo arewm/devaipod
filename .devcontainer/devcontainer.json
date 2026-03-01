@@ -1,18 +1,33 @@
 {
-  "name": "devaipod-dev",
-  "image": "ghcr.io/bootc-dev/devenv-debian:latest",
-  "runArgs": [
-    "--privileged"
-  ],
-  "remoteUser": "devenv",
-  "remoteEnv": {
-    "PATH": "${containerEnv:PATH}:/usr/local/cargo/bin"
-  },
+  "name": "bootc-devenv-debian",
+  // TODO override this back to prod image
+  "image": "ghcr.io/bootc-dev/devenv-debian",
   "customizations": {
     "vscode": {
+      // Abitrary, but most of our code is in one of these two
       "extensions": [
-        "rust-lang.rust-analyzer"
+        "rust-lang.rust-analyzer",
+        "golang.Go"
       ]
     }
+  },
+  "features": {},
+  "runArgs": [
+    // Minimal security options for nested podman (avoids --privileged):
+    // - label=disable: Required for mounting /proc in nested user namespace
+    // - unmask=/proc/*: Allows access to /proc paths needed for nested containers
+    "--security-opt", "label=disable",
+    "--security-opt", "unmask=/proc/*",
+    // Device access for nested containers and VMs
+    "--device", "/dev/net/tun",
+    "--device", "/dev/kvm"
+  ],
+  "postCreateCommand": {
+    // Our init script
+    "devenv-init": "sudo /usr/local/bin/devenv-init.sh"
+  },
+  "remoteEnv": {
+    "PATH": "${containerEnv:PATH}:/usr/local/cargo/bin"
   }
 }
+
