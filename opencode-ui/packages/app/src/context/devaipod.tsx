@@ -148,18 +148,17 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       const running = store.pods.filter((p) => (p.Status ?? "").toLowerCase() === "running")
       const results = await Promise.allSettled(
         running.map(async (pod) => {
-          const shortName = pod.Name.replace("devaipod-", "")
           const status = await apiFetch<AgentStatus>(
-            `/api/devaipod/pods/${encodeURIComponent(shortName)}/agent-status`,
+            `/api/devaipod/pods/${encodeURIComponent(pod.Name)}/agent-status`,
           )
-          return { shortName, status }
+          return { name: pod.Name, status }
         }),
       )
       setStore(
         produce((s) => {
           for (const r of results) {
             if (r.status === "fulfilled") {
-              s.agentStatus[r.value.shortName] = r.value.status
+              s.agentStatus[r.value.name] = r.value.status
             }
           }
         }),
@@ -239,17 +238,17 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       setRefreshCounter((c) => c + 1)
     }
 
-    async function openPod(shortName: string) {
+    async function openPod(fullName: string) {
       const info = await apiFetch<{
         latest_session?: { id: string; directory: string }
-      }>(`/api/devaipod/pods/${encodeURIComponent(shortName)}/opencode-info`)
+      }>(`/api/devaipod/pods/${encodeURIComponent(fullName)}/opencode-info`)
 
       let qs = ""
       if (info.latest_session) {
         const dir = btoa(info.latest_session.directory)
         qs = `?dir=${encodeURIComponent(dir)}&session=${encodeURIComponent(info.latest_session.id)}`
       }
-      window.location.href = `/_devaipod/agent/${encodeURIComponent(shortName)}/${qs}`
+      window.location.href = `/_devaipod/agent/${encodeURIComponent(fullName)}/${qs}`
     }
 
     async function startPod(fullName: string) {
@@ -273,8 +272,8 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       refresh()
     }
 
-    async function recreatePod(shortName: string) {
-      await apiFetch<void>(`/api/devaipod/pods/${encodeURIComponent(shortName)}/recreate`, {
+    async function recreatePod(fullName: string) {
+      await apiFetch<void>(`/api/devaipod/pods/${encodeURIComponent(fullName)}/recreate`, {
         method: "POST",
       })
       refresh()

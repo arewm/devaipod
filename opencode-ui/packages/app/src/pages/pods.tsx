@@ -83,9 +83,8 @@ function PodsPageContent() {
           e.preventDefault()
           const card = cards[idx]
           const isRunning = (card.Status ?? "").toLowerCase() === "running"
-          const shortName = card.Name.replace("devaipod-", "")
           if (isRunning) {
-            ctx.openPod(shortName).catch(alertError)
+            ctx.openPod(card.Name).catch(alertError)
           } else {
             ctx.startPod(card.Name).catch(alertError)
           }
@@ -474,7 +473,7 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
   const taskLabel = () => labels()["io.devaipod.task"] ?? ""
   const mode = () => labels()["io.devaipod.mode"] ?? ""
 
-  const agentStatus = () => ctx.agentStatus[shortName()]
+  const agentStatus = () => ctx.agentStatus[props.pod.Name]
 
   // Health status
   const health = createMemo(() => {
@@ -619,7 +618,7 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
             <Button
               variant="primary"
               size="small"
-              onClick={() => withErrorHandling(() => ctx.openPod(shortName()))}
+              onClick={() => withErrorHandling(() => ctx.openPod(props.pod.Name))}
             >
               Open
             </Button>
@@ -649,7 +648,7 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
                 size="small"
                 onClick={() => {
                   if (confirm(`Recreate workspace "${shortName()}"? It will be deleted and recreated with the same repo.`))
-                    withErrorHandling(() => ctx.recreatePod(shortName()))
+                    withErrorHandling(() => ctx.recreatePod(props.pod.Name))
                 }}
               >
                 {needsUpdate() ? "Recreate (update available)" : "Recreate"}

@@ -5642,6 +5642,24 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_does_not_roundtrip_for_devaipod_project() {
+        // When the project name itself is "devaipod", make_pod_name produces
+        // "devaipod-devaipod-XXXX". Stripping the prefix yields "devaipod-XXXX"
+        // which already starts with "devaipod-", so normalize_pod_name returns
+        // it unchanged instead of re-adding the prefix. This is a known
+        // limitation: the web frontend must pass the full pod name (as returned
+        // by Podman) rather than relying on the strip/normalize roundtrip.
+        let full_name = "devaipod-devaipod-a47a13";
+        let stripped = strip_pod_prefix(full_name);
+        assert_eq!(stripped, "devaipod-a47a13");
+        // normalize does NOT recover the original — this is expected:
+        assert_eq!(normalize_pod_name(stripped), "devaipod-a47a13");
+        assert_ne!(normalize_pod_name(stripped), full_name);
+        // But passing the full name through normalize is fine (idempotent):
+        assert_eq!(normalize_pod_name(full_name), full_name);
+    }
+
+    #[test]
     fn test_strip_pod_prefix() {
         assert_eq!(strip_pod_prefix("devaipod-myproject"), "myproject");
         assert_eq!(
