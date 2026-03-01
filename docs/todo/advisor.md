@@ -267,7 +267,7 @@ name.
 
 Proposal storage lives inside the advisor pod at `/var/lib/devaipod-drafts.json`
 (the `DraftStore`). The approval UI could integrate with the opencode web UI
-(see [opencode-web-enhancements.md](./opencode-web-enhancements.md)), or start
+(see [opencode-webui-fork.md](./opencode-webui-fork.md)), or start
 as plain CLI prompts via `devaipod advisor --proposals`.
 
 ### Worker orchestration

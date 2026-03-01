@@ -2,7 +2,7 @@
 
 This document analyzes what it would take to add Kubernetes support to devaipod — both running devaipod itself in Kubernetes and scheduling agent pods in Kubernetes clusters.
 
-> **Context**: devaipod currently uses Podman exclusively. See [webui.md](./webui.md) for the web UI architecture. The roadmap mentions Kubernetes support as a future idea.
+> **Context**: devaipod currently uses Podman exclusively. See [opencode-webui-fork.md](./opencode-webui-fork.md) for the web UI architecture. The roadmap mentions Kubernetes support as a future idea.
 
 ## Current Architecture Summary
 
@@ -468,5 +468,5 @@ The backend should be environment-agnostic. Config (namespace, storage class, re
 - [kube-rs](https://kube.rs/) — Rust Kubernetes client
 - [kube-rs features](https://kube.rs/features) — ws for exec, attach, port-forward
 - [Podman REST API](https://docs.podman.io/en/latest/_static/api.html)
-- [webui.md](./webui.md) — Web UI architecture
+- [opencode-webui-fork.md](./opencode-webui-fork.md) — Web UI architecture
 - [container-mode.md](../src/container-mode.md) — Current container deployment

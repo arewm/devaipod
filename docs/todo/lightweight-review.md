@@ -347,6 +347,4 @@ not participate in the push-after-review flow.
 ## References
 
 - [forgejo-integration.md](./forgejo-integration.md) — full Forgejo spec
-- [opencode-web-enhancements.md](./opencode-web-enhancements.md) — prior notes on review in opencode
-- [webui.md](./webui.md) — web UI design and status
-- [opencode-webui-fork.md](./opencode-webui-fork.md) — plan to extend vendored opencode SPA
+- [opencode-webui-fork.md](./opencode-webui-fork.md) — vendored opencode SPA architecture and phases
