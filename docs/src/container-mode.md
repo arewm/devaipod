@@ -13,10 +13,10 @@ Devaipod can run as a container image itself, rather than as a host binary. This
 # Pull the image
 podman pull ghcr.io/cgwalters/devaipod:latest
 
-# Run as a daemon
+# Run as a daemon (Linux rootless podman)
 podman run -d --name devaipod --privileged \
   --add-host=host.containers.internal:host-gateway \
-  -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
+  -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/docker.sock \
   -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
   ghcr.io/cgwalters/devaipod
 
@@ -53,28 +53,38 @@ A future option is a **per-pod gateway sidecar** (Rust): one small gateway conta
 per pod that proxies opencode (and optionally other services) with auth, exposing
 a single port per pod. See [per-pod-gateway-sidecar.md](../todo/per-pod-gateway-sidecar.md).
 
-### Podman Socket
+### Container Runtime Socket
 
-The container needs access to the host's podman socket to spawn sibling containers:
+The container needs access to the host's container runtime socket to spawn sibling containers. Mount it at `/run/docker.sock` inside the container — this is the well-known path that devaipod checks by default, and it works with both Docker and Podman.
 
+For **Podman** (Linux rootless):
 ```bash
--v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock
+-v $XDG_RUNTIME_DIR/podman/podman.sock:/run/docker.sock
 ```
 
+For **Docker**:
+```bash
+-v /var/run/docker.sock:/run/docker.sock
+```
+
+Alternatively, set the `DOCKER_HOST` environment variable instead of mounting a socket (e.g. `-e DOCKER_HOST=unix:///path/to/socket`).
+
 On systems using podman machine (macOS, Windows), use the appropriate socket path from `podman machine inspect`.
+
+> **Deprecation note:** The `DEVAIPOD_PODMAN_SOCKET` environment variable is deprecated. Use `DOCKER_HOST` instead.
 
 ### macOS and Windows (podman machine)
 
 On macOS and Windows, podman runs containers inside a Linux VM. The **volume source for the socket must be the path inside the VM**, not the host path. The Mac path (e.g. from `podman machine inspect`) is for the Mac client; the container runs in the VM, so we mount the VM's podman socket. For a rootful machine that is `/run/podman/podman.sock` in the VM.
 
-The `just container-run` recipe does this automatically: on Linux it mounts `$XDG_RUNTIME_DIR/podman/podman.sock`; when that is unset (macOS/Windows) it uses `-v /run/podman/podman.sock:/run/podman/podman.sock` so the daemon in the VM bind-mounts its own socket into the container.
+The `just container-run` recipe does this automatically: on Linux it mounts `$XDG_RUNTIME_DIR/podman/podman.sock`; when that is unset (macOS/Windows) it uses `-v /run/podman/podman.sock:/run/docker.sock` so the daemon in the VM bind-mounts its own socket into the container.
 
 To run manually on macOS:
 
 ```bash
 podman run -d --name devaipod --privileged --replace \
   --add-host=host.containers.internal:host-gateway \
-  -v /run/podman/podman.sock:/run/podman/podman.sock \
+  -v /run/podman/podman.sock:/run/docker.sock \
   -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
   ghcr.io/cgwalters/devaipod
 ```
@@ -185,7 +195,7 @@ mkdir -p ~/.ssh/config.d/devaipod
 # Run with the bind mount
 podman run -d --name devaipod --privileged \
   --add-host=host.containers.internal:host-gateway \
-  -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
+  -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/docker.sock \
   -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
   -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
   ghcr.io/cgwalters/devaipod

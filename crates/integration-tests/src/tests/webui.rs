@@ -94,15 +94,16 @@ impl WebContainerGuard {
         let container_name = Self::generate_name();
 
         // Socket for volume mount: on Linux use host path; on macOS/Windows podman runs in VM,
-        // so we must use -v /run/podman/podman.sock:/run/podman/podman.sock (VM path), not the Mac path.
+        // so we must use -v /run/podman/podman.sock:/run/docker.sock (VM path), not the Mac path.
+        // Target is always /run/docker.sock (well-known path).
         let (socket_mount, check_socket) = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR")
         {
             let path = format!("{}/podman/podman.sock", xdg_runtime);
-            (format!("{}:/run/podman/podman.sock", path), Some(path))
+            (format!("{}:/run/docker.sock", path), Some(path))
         } else {
             // macOS/Windows: container runs in VM; VM bind-mounts its own socket
             (
-                "/run/podman/podman.sock:/run/podman/podman.sock".to_string(),
+                "/run/podman/podman.sock:/run/docker.sock".to_string(),
                 std::env::var("DEVAIPOD_PODMAN_SOCKET").ok(),
             )
         };

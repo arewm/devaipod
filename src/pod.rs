@@ -949,8 +949,8 @@ impl DevaipodPod {
         // Create API sidecar container (devaipod pod-api)
         let api_container_name = format!("{}-api", pod_name);
         let self_image = detect_self_image();
-        let socket_path = crate::podman::get_host_socket_path()
-            .context("Cannot create API sidecar without podman socket")?;
+        let socket_path = crate::podman::get_container_socket()
+            .context("Cannot create API sidecar without container socket")?;
         let api_config = Self::api_container_config(
             &agent_workspace_volume,
             &volume_name,
@@ -2555,9 +2555,12 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
     /// This container runs `devaipod pod-api` and provides git/PTY REST APIs
     /// for the pod, accessible only within the pod via localhost.
     ///
-    /// The podman socket is bind-mounted so the sidecar can exec into the
-    /// workspace container for PTY sessions (giving users a shell with the
-    /// devcontainer's full tool set, not just the minimal devaipod image).
+    /// The container runtime socket is bind-mounted so the sidecar can exec
+    /// into the workspace container for PTY sessions. The same path is used
+    /// for both source and target: if we received the socket at
+    /// `/run/docker.sock`, we pass `-v /run/docker.sock:/run/docker.sock`.
+    /// This works because the host podman resolves the same path we were
+    /// given, and on macOS podman machine the VM paths match container paths.
     fn api_container_config(
         agent_workspace_volume: &str,
         main_workspace_volume: &str,
@@ -2587,17 +2590,18 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             opencode_password.to_string(),
         ];
 
-        // Bind-mount the podman socket so we can exec into the workspace
-        // container for PTY sessions.
+        // Bind-mount the container runtime socket using the same path for
+        // both source and target. The sidecar's get_container_socket() will
+        // find it at this path.
         let socket_str = socket_path.to_string_lossy();
         let socket_mount = MountConfig {
             source: socket_str.to_string(),
-            target: "/run/podman/podman.sock".to_string(),
+            target: socket_str.to_string(),
             readonly: false,
         };
 
         ContainerConfig {
-            // Bind mount: podman socket for exec-into-workspace PTY.
+            // Bind mount: container runtime socket for exec-into-workspace PTY.
             mounts: vec![socket_mount],
             // Named volumes:
             // 1. Agent workspace at /workspaces — read-write because git fetch/push
@@ -2618,12 +2622,12 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             user: None,
             command: Some(command),
             // Minimal privileges — drop all capabilities since the only
-            // privileged operation is connecting to the podman socket
+            // privileged operation is connecting to the container runtime socket
             // (file-permission-based, not capability-based).
             drop_all_caps: true,
             no_new_privileges: true,
             // Disable SELinux labeling so we can access the bind-mounted
-            // podman socket (which has the host's SELinux context).
+            // container runtime socket (which has the host's SELinux context).
             security_opts: vec!["label=disable".to_string()],
             ..Default::default()
         }
@@ -3247,7 +3251,7 @@ mod tests {
         let main_workspace_volume = "test-main-workspace";
         let workspace_container = "devaipod-test-workspace";
         let agent_container = "devaipod-test-agent";
-        let socket_path = std::path::Path::new("/run/podman/podman.sock");
+        let socket_path = std::path::Path::new("/run/docker.sock");
         let container_config = DevaipodPod::api_container_config(
             agent_workspace_volume,
             main_workspace_volume,
@@ -3270,9 +3274,10 @@ mod tests {
             "/mnt/main-workspace:ro"
         );
 
-        // Verify podman socket bind mount
+        // Verify socket bind mount uses the same path for source and target
         assert_eq!(container_config.mounts.len(), 1);
-        assert_eq!(container_config.mounts[0].target, "/run/podman/podman.sock");
+        assert_eq!(container_config.mounts[0].source, "/run/docker.sock");
+        assert_eq!(container_config.mounts[0].target, "/run/docker.sock");
 
         // Verify command runs pod-api with workspace container name and correct workspace path
         let cmd = container_config.command.as_ref().unwrap();

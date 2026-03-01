@@ -188,10 +188,11 @@ test-integration image=default_test_image: container-build build-integration
         exit 1
     fi
     # Linux: mount host socket directly. macOS: container runs in VM, mount VM socket path.
+    # Target is always /run/docker.sock (well-known path).
     if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-        VOL_MOUNT="-v $SOCKET:/run/podman/podman.sock"
+        VOL_MOUNT="-v $SOCKET:/run/docker.sock"
     else
-        VOL_MOUNT="-v /run/podman/podman.sock:/run/podman/podman.sock"
+        VOL_MOUNT="-v /run/podman/podman.sock:/run/docker.sock"
     fi
     echo "Running integration tests (image: {{ CONTAINER_IMAGE }}-integration:latest)..."
     # Share /tmp so test-created repos are visible to podman for bind-mounts.
@@ -233,6 +234,7 @@ container-push tag="latest": container-build
 # Uses host gateway (host.containers.internal) to reach pod-published ports.
 # Agent pods publish ports on 0.0.0.0 so they are reachable from the container network.
 # Socket: Linux uses XDG_RUNTIME_DIR; macOS/Windows use VM path /run/podman/podman.sock (container runs in VM).
+# The target mount point is always /run/docker.sock (the well-known path honored by devaipod).
 [group('container')]
 container-run: container-build
     #!/usr/bin/env bash
@@ -260,11 +262,12 @@ container-run: container-build
     # Linux: mount the host socket (path is on the host). macOS/podman machine: the container runs in the VM,
     # so the volume source must be the VM's path, not the Mac path. Use the VM's podman socket path so the
     # daemon (in the VM) bind-mounts its own socket into the container. Rootful VM uses /run/podman/podman.sock.
+    # Target is always /run/docker.sock (well-known path).
     if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-        VOL_MOUNT="-v $SOCKET:/run/podman/podman.sock"
+        VOL_MOUNT="-v $SOCKET:/run/docker.sock"
         ADD_HOST="--add-host=host.containers.internal:host-gateway"
     else
-        VOL_MOUNT="-v /run/podman/podman.sock:/run/podman/podman.sock"
+        VOL_MOUNT="-v /run/podman/podman.sock:/run/docker.sock"
         ADD_HOST=""
     fi
     podman run -d --name devaipod --privileged --replace \

@@ -1081,7 +1081,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
         eprintln!();
         eprintln!("To run inside the container:");
         eprintln!("  podman run -d --name devaipod -p 8080:8080 --privileged \\");
-        eprintln!("    -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \\");
+        eprintln!("    -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/docker.sock \\");
         eprintln!("    -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \\");
         eprintln!("    ghcr.io/cgwalters/devaipod");
         eprintln!();

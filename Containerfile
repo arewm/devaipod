@@ -11,7 +11,7 @@
 #   podman volume create devaipod-state   # optional; just container-run creates it
 #   podman run -d --name devaipod -p 8080:8080 --privileged \
 #     -v devaipod-state:/var/lib/devaipod \
-#     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
+#     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/docker.sock \
 #     -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
 #     ghcr.io/cgwalters/devaipod
 #
@@ -26,7 +26,7 @@
 #   podman run -d --name devaipod -p 8080:8080 --privileged \
 #     --secret devaipod-web-token \
 #     -v devaipod-state:/var/lib/devaipod \
-#     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/podman/podman.sock \
+#     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/docker.sock \
 #     -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
 #     ghcr.io/cgwalters/devaipod
 #
@@ -176,7 +176,7 @@ RUN --network=none \
 # -- integration test runner (minimal runtime image) --
 # Contains integration test binaries plus runtime deps needed to run tests.
 # Build: podman build --target integration-runner -t localhost/devaipod-integration .
-# Run:   podman run --rm --privileged -v /run/podman/podman.sock:/run/podman/podman.sock localhost/devaipod-integration
+# Run:   podman run --rm --privileged -v /run/podman/podman.sock:/run/docker.sock localhost/devaipod-integration
 FROM quay.io/centos/centos:stream10 AS integration-runner
 
 RUN dnf install -y \

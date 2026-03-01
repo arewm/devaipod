@@ -6,7 +6,7 @@
 //! - Pod and container lifecycle
 //!
 //! We expect to run inside a container with the host's podman/docker socket
-//! mounted at /run/podman/podman.sock or /var/run/docker.sock.
+//! mounted at /run/docker.sock (or set via DOCKER_HOST).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,162 +25,138 @@ use tokio::process::Command;
 
 use crate::devcontainer::ImageSource;
 
-/// Podman socket path (preferred)
+/// Modern canonical socket path (Docker and Podman)
+const DOCKER_SOCKET: &str = "/run/docker.sock";
+
+/// Traditional socket path (same on most Linux where /var/run -> /run)
+const DOCKER_SOCKET_VAR: &str = "/var/run/docker.sock";
+
+/// Legacy podman socket path (deprecated fallback)
 const PODMAN_SOCKET: &str = "/run/podman/podman.sock";
 
-/// Docker socket path (fallback, often symlinked to podman)
-const DOCKER_SOCKET: &str = "/var/run/docker.sock";
+/// Legacy environment variable (deprecated, use DOCKER_HOST instead)
+const PODMAN_SOCKET_ENV: &str = "DEVAIPOD_PODMAN_SOCKET";
 
-/// Environment variable to override the podman socket path.
-/// Useful when the socket is mounted at a non-default path (e.g. macOS podman machine
-/// where the socket filename differs).
-pub const PODMAN_SOCKET_ENV: &str = "DEVAIPOD_PODMAN_SOCKET";
-
-/// Find the container socket path
+/// Find the container runtime socket path.
 ///
-/// We expect to run inside a container with the host's podman/docker socket
-/// mounted at one of the well-known paths. Also supports running on a host
-/// system with rootless podman (XDG_RUNTIME_DIR).
+/// Probe order:
+/// 1. `DOCKER_HOST` env var (standard, `unix:///path` format)
+/// 2. `DEVAIPOD_PODMAN_SOCKET` env var (deprecated, warns)
+/// 3. `/run/docker.sock` (modern canonical path)
+/// 4. `/var/run/docker.sock` (traditional path)
+/// 5. `/run/podman/podman.sock` (deprecated fallback, warns)
+/// 6. `$XDG_RUNTIME_DIR/podman/podman.sock` (host rootless fallback, warns)
 pub fn get_container_socket() -> Result<PathBuf> {
-    // Explicit override (e.g. for macOS podman machine when socket dir is mounted)
-    if let Ok(path) = std::env::var(PODMAN_SOCKET_ENV) {
-        let path = PathBuf::from(path);
+    // 1. DOCKER_HOST - the standard env var honored by Docker, Podman, and all major tools
+    if let Ok(docker_host) = std::env::var("DOCKER_HOST") {
+        if let Some(path) = parse_docker_host(&docker_host) {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                tracing::debug!("Using {} (from DOCKER_HOST)", path.display());
+                return Ok(path);
+            }
+            tracing::warn!(
+                "DOCKER_HOST points to {} but socket does not exist",
+                path.display()
+            );
+        }
+        // If DOCKER_HOST was set but we couldn't use it, fall through to other probes
+    }
+
+    // 2. DEVAIPOD_PODMAN_SOCKET - deprecated, mapped to DOCKER_HOST equivalent
+    if let Ok(path_str) = std::env::var(PODMAN_SOCKET_ENV) {
+        let path = PathBuf::from(&path_str);
         if path.exists() {
-            tracing::debug!(
-                "Using {} for podman connection (from {})",
-                path.display(),
-                PODMAN_SOCKET_ENV
+            tracing::warn!(
+                "DEVAIPOD_PODMAN_SOCKET is deprecated; use DOCKER_HOST=unix://{} instead",
+                path.display()
             );
             return Ok(path);
         }
     }
 
-    // Prefer podman socket (container mount point)
-    let podman_sock = PathBuf::from(PODMAN_SOCKET);
-    if podman_sock.exists() {
-        tracing::debug!("Using {} for podman connection", PODMAN_SOCKET);
-        return Ok(podman_sock);
-    }
-
-    // Fall back to docker socket
+    // 3. /run/docker.sock - modern canonical path
     let docker_sock = PathBuf::from(DOCKER_SOCKET);
     if docker_sock.exists() {
-        tracing::debug!("Using {} for podman connection", DOCKER_SOCKET);
+        tracing::debug!("Using {}", DOCKER_SOCKET);
         return Ok(docker_sock);
     }
 
-    // Try XDG_RUNTIME_DIR for rootless podman on host
+    // 4. /var/run/docker.sock - traditional path
+    let docker_sock_var = PathBuf::from(DOCKER_SOCKET_VAR);
+    if docker_sock_var.exists() {
+        tracing::debug!("Using {}", DOCKER_SOCKET_VAR);
+        return Ok(docker_sock_var);
+    }
+
+    // 5. /run/podman/podman.sock - deprecated fallback
+    let podman_sock = PathBuf::from(PODMAN_SOCKET);
+    if podman_sock.exists() {
+        tracing::warn!(
+            "Found podman socket at {}; consider mounting it at {} or setting DOCKER_HOST instead",
+            PODMAN_SOCKET,
+            DOCKER_SOCKET
+        );
+        return Ok(podman_sock);
+    }
+
+    // 6. XDG_RUNTIME_DIR for rootless podman on host
     if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
         let xdg_sock = PathBuf::from(xdg_runtime).join("podman/podman.sock");
         if xdg_sock.exists() {
-            tracing::debug!("Using {} for podman connection", xdg_sock.display());
+            tracing::info!(
+                "Using rootless podman socket at {}; consider setting DOCKER_HOST=unix://{} instead",
+                xdg_sock.display(),
+                xdg_sock.display()
+            );
             return Ok(xdg_sock);
         }
     }
 
     bail!(
-        "No container socket found. Mount the host socket to {} or {}",
-        PODMAN_SOCKET,
-        DOCKER_SOCKET
+        "No container socket found. Mount the host socket at {} or set DOCKER_HOST",
+        DOCKER_SOCKET,
     )
 }
 
-/// Get the host-side filesystem path of the container socket.
+/// Parse a DOCKER_HOST value and extract the socket path for unix:// scheme.
 ///
-/// When running inside a container, the socket at `/run/podman/podman.sock`
-/// is a bind mount from the host. If we need to pass this socket as a bind
-/// mount source to a new container (via `podman --url` which talks to the
-/// host's podman), we must use the **host-side** path, not the container-
-/// internal path.
+/// Handles:
+/// - `unix:///path/to/sock` (standard URI, empty authority)
+/// - `unix://path/to/sock` (common shorthand)
 ///
-/// Resolution strategy:
-/// 1. If not in a container, return `get_container_socket()` directly.
-/// 2. Parse `/proc/self/mountinfo` to find the bind mount source for the
-///    socket. For rootless podman on Linux the socket lives on a per-user
-///    tmpfs (`/run/user/<uid>/`); we extract the uid from the mount's
-///    super-options and reconstruct the host path.
-/// 3. Fall back to the container-internal path (works on macOS podman
-///    machine where paths are consistent between VM and container).
-pub fn get_host_socket_path() -> Result<PathBuf> {
-    let container_path = get_container_socket()?;
-
-    // If not in container mode, the path is already a host path.
-    if !is_container_mode() {
-        return Ok(container_path);
+/// Returns None for non-unix schemes (with a warning).
+fn parse_docker_host(value: &str) -> Option<String> {
+    if let Some(rest) = value.strip_prefix("unix://") {
+        // Standard URI: unix:///path (triple slash = empty authority + absolute path)
+        // Also handle unix://path (double slash, treated as absolute)
+        let path = if rest.is_empty() {
+            tracing::warn!("DOCKER_HOST=unix:// has empty path, ignoring");
+            return None;
+        } else if rest.starts_with('/') {
+            // unix:///absolute/path -> /absolute/path
+            rest.to_string()
+        } else {
+            // unix://relative/path -> treat as /relative/path (common usage)
+            format!("/{rest}")
+        };
+        Some(path)
+    } else if value.starts_with("tcp://") {
+        tracing::warn!(
+            "DOCKER_HOST={} uses tcp:// which is not yet supported; ignoring",
+            value
+        );
+        None
+    } else if value.starts_with('/') {
+        // Bare path without scheme - be lenient
+        Some(value.to_string())
+    } else {
+        tracing::warn!(
+            "DOCKER_HOST={} has unsupported scheme; only unix:// is currently supported",
+            value
+        );
+        None
     }
-
-    // Parse /proc/self/mountinfo to find the host-side source of our socket
-    // bind mount.  Each line looks like:
-    //
-    //   ID PARENT MAJOR:MINOR ROOT MOUNT_POINT OPTS ... - FS_TYPE SOURCE SUPER_OPTS
-    //
-    // For a rootless podman socket bind-mounted into the container the line
-    // looks like:
-    //
-    //   2763 2848 0:110 /podman/podman.sock /run/podman/podman.sock \
-    //       rw,nosuid,nodev,relatime - tmpfs tmpfs \
-    //       rw,seclabel,size=…,uid=1002,gid=1002,…
-    //
-    // ROOT ("/podman/podman.sock") is the path *within* the tmpfs, and the
-    // tmpfs itself is mounted at /run/user/<uid> on the host.  We extract
-    // the uid from the super-options to reconstruct the full host path.
-    if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
-        let container_str = container_path.to_string_lossy();
-        for line in mountinfo.lines() {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 5 {
-                continue;
-            }
-            let mount_point = fields[4];
-            if mount_point != container_str.as_ref() {
-                continue;
-            }
-
-            let root = fields[3]; // path within the source filesystem
-
-            // Find the " - " separator to access FS_TYPE, SOURCE, SUPER_OPTS.
-            let Some(sep_pos) = fields.iter().position(|f| *f == "-") else {
-                continue;
-            };
-            let fs_type = fields.get(sep_pos + 1).copied().unwrap_or("");
-            let super_opts = fields.get(sep_pos + 3).copied().unwrap_or("");
-
-            // For a tmpfs mount (rootless podman on Linux), reconstruct the
-            // host path from the uid in the super-options.
-            if fs_type == "tmpfs" {
-                if let Some(uid) = super_opts.split(',').find_map(|kv| kv.strip_prefix("uid=")) {
-                    // Host path: /run/user/<uid>/<root>
-                    let host_path = PathBuf::from(format!("/run/user/{}{}", uid, root));
-                    tracing::debug!(
-                        "Resolved host socket path via mountinfo tmpfs uid: {} -> {}",
-                        container_str,
-                        host_path.display()
-                    );
-                    return Ok(host_path);
-                }
-            }
-
-            // For a regular bind mount where root is an absolute host path,
-            // use it directly (e.g. macOS podman machine or root podman).
-            if root != "/" {
-                let host_path = PathBuf::from(root);
-                if host_path.is_absolute() {
-                    tracing::debug!(
-                        "Resolved host socket path via mountinfo root: {} -> {}",
-                        container_str,
-                        host_path.display()
-                    );
-                    return Ok(host_path);
-                }
-            }
-        }
-    }
-
-    tracing::debug!(
-        "Could not resolve host socket path from mountinfo, using container path: {}",
-        container_path.display()
-    );
-    Ok(container_path)
 }
 
 /// Connect to the container socket and return a bollard Docker client
@@ -217,18 +193,16 @@ pub struct PodmanService {
 
 /// Check if we're running inside a container
 ///
-/// Detects container mode by checking for:
-/// 1. The well-known container socket mount at /run/podman/podman.sock
-/// 2. The /.dockerenv file (created by Docker/Podman)
-/// 3. The /run/.containerenv file (Podman-specific)
+/// Devaipod only runs in container mode (there is no host mode). This
+/// check exists for the few places where behavior differs slightly
+/// (e.g. using `host.containers.internal` vs `127.0.0.1`).
 pub fn is_container_mode() -> bool {
-    // Check for our documented container socket mount point
-    if std::path::Path::new(PODMAN_SOCKET).exists() {
-        return true;
-    }
-
-    // Check for standard container indicators
-    std::path::Path::new("/.dockerenv").exists()
+    // Check for our mounted socket
+    std::path::Path::new(DOCKER_SOCKET).exists()
+        || std::path::Path::new(DOCKER_SOCKET_VAR).exists()
+        || std::path::Path::new(PODMAN_SOCKET).exists()
+        // Standard container indicator files
+        || std::path::Path::new("/.dockerenv").exists()
         || std::path::Path::new("/run/.containerenv").exists()
 }
 
@@ -254,8 +228,8 @@ pub fn host_for_pod_services() -> String {
 impl PodmanService {
     /// Connect to podman via the mounted container socket
     ///
-    /// We expect to run inside a container with the host's podman/docker socket
-    /// mounted at /run/podman/podman.sock or /var/run/docker.sock.
+    /// We expect the host's container runtime socket to be mounted at
+    /// `/run/docker.sock` or configured via `DOCKER_HOST`.
     pub async fn connect() -> Result<Self> {
         let socket_path = get_container_socket()?;
         let client = connect_to_container_socket()?;
@@ -1614,5 +1588,53 @@ mod tests {
         // This test just verifies the function doesn't panic
         // The actual result depends on whether devcontainer CLI is installed
         let _available = devcontainer_cli_available();
+    }
+
+    #[test]
+    fn test_parse_docker_host_unix_triple_slash() {
+        // Standard URI format: unix:///absolute/path
+        assert_eq!(
+            parse_docker_host("unix:///run/docker.sock"),
+            Some("/run/docker.sock".to_string())
+        );
+        assert_eq!(
+            parse_docker_host("unix:///var/run/docker.sock"),
+            Some("/var/run/docker.sock".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_docker_host_unix_double_slash() {
+        // Common shorthand: unix://path (treated as absolute)
+        assert_eq!(
+            parse_docker_host("unix://run/docker.sock"),
+            Some("/run/docker.sock".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_docker_host_unix_empty() {
+        // Empty path after unix://
+        assert_eq!(parse_docker_host("unix://"), None);
+    }
+
+    #[test]
+    fn test_parse_docker_host_tcp() {
+        // tcp:// is not supported yet
+        assert_eq!(parse_docker_host("tcp://localhost:2375"), None);
+    }
+
+    #[test]
+    fn test_parse_docker_host_bare_path() {
+        // Bare absolute path without scheme
+        assert_eq!(
+            parse_docker_host("/run/docker.sock"),
+            Some("/run/docker.sock".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_docker_host_unsupported_scheme() {
+        assert_eq!(parse_docker_host("http://localhost:2375"), None);
     }
 }
