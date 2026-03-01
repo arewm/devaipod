@@ -37,3 +37,54 @@ This means a prompt injection attack or misbehaving agent cannot:
 devaipod is built for workflows where humans review AI-generated code before it becomes permanent. The default permissions (read + draft PR) reflect this: the agent can propose changes, but a human must mark them ready for merge.
 
 This isn't about distrusting AI capabilities—it's about maintaining auditability and preventing automation failures from having outsized impact.
+
+## Web UI Architecture
+
+The web UI is a vendored build of the [opencode](https://opencode.ai) SPA,
+built from source in the Containerfile with `VITE_DEVAIPOD=true`. It is
+served by a **pod-api sidecar** container that runs alongside each agent pod.
+
+The control plane handles pod lifecycle (create, start, stop, rebuild),
+authentication (cookie-based login), discovering each pod-api sidecar's
+published port, and serving the iframe wrapper with navigation. The `/pods`
+management page is an SPA route outside the opencode SDK provider stack.
+
+Each pod's sidecar handles everything else: serving the SPA, proxying
+opencode API calls to `localhost:4096` within the pod's network namespace,
+and providing git and PTY endpoints directly.
+
+```
+Browser → control plane:8080
+  ├─ /pods                    Pod management page (SPA route)
+  ├─ /_devaipod/agent/{name}/ Iframe wrapper (discovers pod-api port)
+  └─ /api/devaipod/...        Pod lifecycle, agent status, proposals
+
+Browser → pod-api:{port}      (via iframe, each pod has its own port/origin)
+  ├─ /                        Vendored opencode SPA (index.html)
+  ├─ /assets/*                SPA static files (JS, CSS, fonts)
+  ├─ /git/*                   Git endpoints (direct process, no exec overhead)
+  ├─ /pty/*                   Workspace PTY (WebSocket, bollard exec)
+  ├─ /git/events              SSE stream (inotify-based git watcher)
+  └─ /*                       Fallback: proxy to opencode at localhost:4096
+                              (session, rpc, event, config, etc.)
+                              with Basic auth, SSE keepalive for readiness
+```
+
+Each pod exposes only one published port (the pod-api sidecar at 8090
+internal, random host port). The opencode server port (4096) is NOT
+published — the sidecar proxies to it internally. Since each pod runs on
+its own origin (different host port), localStorage is naturally isolated
+per pod.
+
+### Why we vendor the opencode UI
+
+`opencode serve` does not serve its own web UI — non-API requests are
+proxied to `https://app.opencode.ai`. This is unsuitable for devaipod
+because cross-origin iframes are blocked by `X-Frame-Options`/CSP headers,
+the hosted UI would make API calls back to `app.opencode.ai` instead of the
+local backend, and air-gapped environments can't reach external services.
+
+Vendoring the built SPA eliminates all three problems. The opencode SPA
+detects it's not on `opencode.ai` and uses `window.location.origin` for API
+calls, which on the pod-api sidecar routes to the correct opencode server
+automatically.
