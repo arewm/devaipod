@@ -149,6 +149,7 @@ export function TerminalPanel(props: {
                         key: string,
                         vars?: Record<string, string | number | boolean>,
                       ) => string,
+                      kind: "agent",
                     })}
                   </div>
                 )}
@@ -191,6 +192,7 @@ export function TerminalPanel(props: {
                       key: string,
                       vars?: Record<string, string | number | boolean>,
                     ) => string,
+                    kind: "workspace",
                   })}
                 </span>
                 <IconButton

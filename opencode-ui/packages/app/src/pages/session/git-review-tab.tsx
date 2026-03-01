@@ -158,45 +158,36 @@ export function GitReviewTab(props: GitReviewTabProps) {
 
   return (
     <Show
-      when={podName}
+      when={!error()}
       fallback={
-        <div class="flex h-full items-center justify-center text-text-weak text-14-regular">
-          Not connected to a devaipod pod
+        <div class="flex h-full items-center justify-center text-text-danger text-14-regular">
+          Failed to load git data: {String(error())}
         </div>
       }
     >
       <Show
-        when={!error()}
+        when={!loading() || diffs().length > 0}
         fallback={
-          <div class="flex h-full items-center justify-center text-text-danger text-14-regular">
-            Failed to load git data: {String(error())}
-          </div>
+          <div class="flex h-full items-center justify-center text-text-weak text-14-regular">Loading...</div>
         }
       >
-        <Show
-          when={!loading() || diffs().length > 0}
-          fallback={
-            <div class="flex h-full items-center justify-center text-text-weak text-14-regular">Loading...</div>
-          }
-        >
-          <SessionReview
-            title={title()}
-            scrollRef={(el) => props.onScrollRef?.(el)}
-            classes={{
-              root: props.classes?.root ?? "pb-6",
-              header: props.classes?.header ?? "px-6",
-              container: props.classes?.container ?? "px-6",
-            }}
-            diffs={diffs()}
-            diffStyle={props.diffStyle}
-            onDiffStyleChange={props.onDiffStyleChange}
-            focusedFile={props.focusedFile}
-            onLineComment={props.onLineComment}
-            comments={props.comments}
-            focusedComment={props.focusedComment}
-            onFocusedCommentChange={props.onFocusedCommentChange}
-          />
-        </Show>
+        <SessionReview
+          title={title()}
+          scrollRef={(el) => props.onScrollRef?.(el)}
+          classes={{
+            root: props.classes?.root ?? "pb-6",
+            header: props.classes?.header ?? "px-6",
+            container: props.classes?.container ?? "px-6",
+          }}
+          diffs={diffs()}
+          diffStyle={props.diffStyle}
+          onDiffStyleChange={props.onDiffStyleChange}
+          focusedFile={props.focusedFile}
+          onLineComment={props.onLineComment}
+          comments={props.comments}
+          focusedComment={props.focusedComment}
+          onFocusedCommentChange={props.onFocusedCommentChange}
+        />
       </Show>
     </Show>
   )
