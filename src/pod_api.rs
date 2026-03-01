@@ -1439,6 +1439,49 @@ fn has_file_extension(path: &str) -> bool {
         .contains('.')
 }
 
+/// Whether a path (with leading `/` stripped) is an opencode REST/SSE API endpoint
+/// that should be proxied to the upstream opencode server rather than served as
+/// an SPA navigation route.
+///
+/// The list is derived from the opencode SDK's generated route table
+/// (`sdk.gen.ts`). Everything that is *not* in this list and does not have a
+/// file extension is treated as an SPA navigation path and served our vendored
+/// `index.html`.
+fn is_opencode_api_path(path: &str) -> bool {
+    // All known opencode API top-level path segments. A request matches if the
+    // trimmed path equals one of these exactly (e.g. `session`) *or* starts
+    // with one followed by `/` (e.g. `session/abc123/message`).
+    const API_SEGMENTS: &[&str] = &[
+        "session",
+        "global",
+        "event",
+        "auth",
+        "project",
+        "config",
+        "experimental",
+        "permission",
+        "question",
+        "provider",
+        "find",
+        "file",
+        "mcp",
+        "tui",
+        "instance",
+        "path",
+        "vcs",
+        "command",
+        "log",
+        "agent",
+        "skill",
+        "lsp",
+        "formatter",
+    ];
+
+    // Extract the first path segment for matching.
+    let first_segment = path.split('/').next().unwrap_or("");
+    API_SEGMENTS.contains(&first_segment)
+}
+
 /// Proxy an HTTP request to the opencode server at localhost:4096.
 ///
 /// Supports regular requests, SSE streaming, and HTTP Upgrade (WebSocket).
@@ -1577,15 +1620,17 @@ async fn proxy_to_opencode(
 /// Fallback handler: serves static files from the vendored UI or proxies to opencode.
 ///
 /// Priority:
-/// 1. If the path has a file extension → try serving from the vendored UI directory
-/// 2. Otherwise → proxy to the opencode server at localhost:4096
-/// 3. If the proxy target is unreachable and path is an event stream → SSE keepalive
-/// 4. For paths without extensions that aren't API calls (404 from opencode) → serve index.html
+/// 1. If the path has a file extension → try serving from the vendored UI directory,
+///    then fall through to the opencode proxy if the file isn't found locally.
+/// 2. If the path is a known opencode API route → proxy to localhost:4096.
+/// 3. Everything else (SPA navigation like `/`, `/:dir`, `/:dir/session/:id`) →
+///    serve our vendored `index.html` directly so that the opencode server's own
+///    index.html is never exposed to the browser.
 async fn fallback_handler(State(state): State<AppState>, request: Request) -> Response {
     let path = request.uri().path().to_string();
     let trimmed = path.trim_start_matches('/');
 
-    // Static files: serve from the vendored UI directory
+    // 1. Static files: serve from the vendored UI directory first.
     if has_file_extension(trimmed) {
         let file_req = Request::builder()
             .uri(request.uri().clone())
@@ -1602,25 +1647,23 @@ async fn fallback_handler(State(state): State<AppState>, request: Request) -> Re
         // File not found in UI dir — fall through to proxy (opencode may serve it)
     }
 
-    // Everything else: proxy to the opencode server
-    match proxy_to_opencode(trimmed, &state.opencode_password, request).await {
-        Ok(resp) => resp,
-        Err(status) => {
-            // For non-file paths, serve the SPA index.html as fallback
-            if !has_file_extension(trimmed) && !is_event_stream_path(trimmed) {
-                let index_html = format!("{}/index.html", OPENCODE_UI_PATH);
-                let serve_dir =
-                    ServeDir::new(OPENCODE_UI_PATH).fallback(ServeFile::new(&index_html));
-                let fallback_req = Request::builder().uri("/").body(Body::empty()).unwrap();
-                return serve_dir
-                    .oneshot(fallback_req)
-                    .await
-                    .unwrap()
-                    .into_response();
-            }
-            status.into_response()
-        }
+    // 2. Opencode API paths: proxy to the upstream opencode server.
+    if has_file_extension(trimmed) || is_opencode_api_path(trimmed) {
+        return match proxy_to_opencode(trimmed, &state.opencode_password, request).await {
+            Ok(resp) => resp,
+            Err(status) => status.into_response(),
+        };
     }
+
+    // 3. SPA fallback: serve our vendored index.html for all navigation routes.
+    let index_html = format!("{}/index.html", OPENCODE_UI_PATH);
+    let serve_dir = ServeDir::new(OPENCODE_UI_PATH).fallback(ServeFile::new(&index_html));
+    let fallback_req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    serve_dir
+        .oneshot(fallback_req)
+        .await
+        .unwrap()
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1698,4 +1741,80 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
         .context("pod-api server error")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_has_file_extension() {
+        assert!(has_file_extension("index.html"));
+        assert!(has_file_extension("assets/main.js"));
+        assert!(has_file_extension("deep/path/style.css"));
+        assert!(!has_file_extension(""));
+        assert!(!has_file_extension("session"));
+        assert!(!has_file_extension("mydir/session/abc123"));
+        assert!(!has_file_extension("global/health"));
+    }
+
+    #[test]
+    fn test_is_opencode_api_path_bare_segments() {
+        // All known API segments should match when used alone
+        for path in [
+            "session", "global", "event", "auth", "project", "config",
+            "experimental", "permission", "question", "provider", "find",
+            "file", "mcp", "tui", "instance", "path", "vcs", "command",
+            "log", "agent", "skill", "lsp", "formatter",
+        ] {
+            assert!(is_opencode_api_path(path), "expected API path: {path}");
+        }
+    }
+
+    #[test]
+    fn test_is_opencode_api_path_with_subpaths() {
+        assert!(is_opencode_api_path("session/abc123"));
+        assert!(is_opencode_api_path("session/abc123/message"));
+        assert!(is_opencode_api_path("session/abc123/message/msg456/part/p789"));
+        assert!(is_opencode_api_path("global/health"));
+        assert!(is_opencode_api_path("global/config"));
+        assert!(is_opencode_api_path("global/event"));
+        assert!(is_opencode_api_path("auth/github"));
+        assert!(is_opencode_api_path("project/current"));
+        assert!(is_opencode_api_path("config/providers"));
+        assert!(is_opencode_api_path("experimental/tool"));
+        assert!(is_opencode_api_path("permission/req123/reply"));
+        assert!(is_opencode_api_path("question/req456/reply"));
+        assert!(is_opencode_api_path("provider/openai/oauth/authorize"));
+        assert!(is_opencode_api_path("find/file"));
+        assert!(is_opencode_api_path("file/content"));
+        assert!(is_opencode_api_path("mcp/myserver/connect"));
+        assert!(is_opencode_api_path("tui/submit-prompt"));
+        assert!(is_opencode_api_path("instance/dispose"));
+        assert!(is_opencode_api_path("event/something"));
+    }
+
+    #[test]
+    fn test_is_opencode_api_path_rejects_spa_navigation() {
+        // Root path (trimmed to empty string)
+        assert!(!is_opencode_api_path(""));
+        // /:dir style SPA routes — arbitrary workspace directory names
+        assert!(!is_opencode_api_path("myproject"));
+        assert!(!is_opencode_api_path("some-workspace"));
+        assert!(!is_opencode_api_path("my-repo/session/abc123"));
+        // Random unknown paths should not be treated as API
+        assert!(!is_opencode_api_path("unknown"));
+        assert!(!is_opencode_api_path("foo/bar"));
+    }
+
+    #[test]
+    fn test_is_event_stream_path() {
+        assert!(is_event_stream_path("event"));
+        assert!(is_event_stream_path("event/something"));
+        assert!(is_event_stream_path("global"));
+        assert!(is_event_stream_path("global/event"));
+        assert!(!is_event_stream_path("session"));
+        assert!(!is_event_stream_path(""));
+        assert!(!is_event_stream_path("config"));
+    }
 }
