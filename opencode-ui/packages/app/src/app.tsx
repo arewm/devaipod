@@ -1,6 +1,6 @@
 import "@/index.css"
 import { ErrorBoundary, Suspense, lazy, type JSX, type ParentProps } from "solid-js"
-import { Router, Route } from "@solidjs/router"
+import { Router, Route, Navigate } from "@solidjs/router"
 import { MetaProvider } from "@solidjs/meta"
 import { Font } from "@opencode-ai/ui/font"
 import { MarkedProvider } from "@opencode-ai/ui/context/marked"
