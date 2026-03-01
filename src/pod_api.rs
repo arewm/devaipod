@@ -1495,15 +1495,57 @@ async fn proxy_to_opencode(
     let host = "127.0.0.1";
     let port = OPENCODE_UPSTREAM_PORT;
 
-    // Connect to the opencode server
-    let stream = match tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!("Cannot connect to opencode at {}:{}: {}", host, port, e);
-            if is_event_stream_path(path) {
+    // Connect to the opencode server.
+    // For SSE/event paths, return a keepalive stream immediately if unreachable.
+    // For regular API paths, retry a few times so the SPA doesn't see errors
+    // while opencode is still starting up after a rebuild.
+    let stream = if is_event_stream_path(path) {
+        match tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Cannot connect to opencode at {}:{}: {}", host, port, e);
                 return sse_keepalive_response("opencode not ready");
             }
-            return Err(StatusCode::BAD_GATEWAY);
+        }
+    } else {
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY: Duration = Duration::from_secs(1);
+        let mut last_err = None;
+        let mut connected = None;
+        for attempt in 0..MAX_RETRIES {
+            match tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Cannot connect to opencode at {}:{} (attempt {}/{}): {}",
+                        host,
+                        port,
+                        attempt + 1,
+                        MAX_RETRIES,
+                        e
+                    );
+                    last_err = Some(e);
+                    if attempt + 1 < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+        match connected {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    "opencode at {}:{} unreachable after {} attempts: {}",
+                    host,
+                    port,
+                    MAX_RETRIES,
+                    last_err.unwrap()
+                );
+                return Err(StatusCode::BAD_GATEWAY);
+            }
         }
     };
 
