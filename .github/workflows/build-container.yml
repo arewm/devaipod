@@ -53,6 +53,12 @@ jobs:
       - name: Build container
         run: just container-build
 
+      # Retag the locally-built image for the registry.
+      # The Justfile builds as localhost/devaipod for local dev; CI needs the
+      # registry name so that podman push targets the right destination.
+      - name: Tag for registry
+        run: podman tag localhost/devaipod:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
