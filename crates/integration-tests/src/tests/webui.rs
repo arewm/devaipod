@@ -96,17 +96,24 @@ impl WebContainerGuard {
         // Socket for volume mount: on Linux use host path; on macOS/Windows podman runs in VM,
         // so we must use -v /run/podman/podman.sock:/run/docker.sock (VM path), not the Mac path.
         // Target is always /run/docker.sock (well-known path).
-        let (socket_mount, check_socket) = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR")
-        {
-            let path = format!("{}/podman/podman.sock", xdg_runtime);
-            (format!("{}:/run/docker.sock", path), Some(path))
-        } else {
-            // macOS/Windows: container runs in VM; VM bind-mounts its own socket
-            (
-                "/run/podman/podman.sock:/run/docker.sock".to_string(),
-                std::env::var("DEVAIPOD_PODMAN_SOCKET").ok(),
-            )
-        };
+        // DEVAIPOD_HOST_SOCKET is passed so the container can use it as a bind mount source
+        // when creating sibling containers (the host podman resolves sources on the host filesystem).
+        let (host_socket, socket_mount, check_socket) =
+            if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+                let path = format!("{}/podman/podman.sock", xdg_runtime);
+                (
+                    path.clone(),
+                    format!("{}:/run/docker.sock", path),
+                    Some(path),
+                )
+            } else {
+                // macOS/Windows: container runs in VM; VM bind-mounts its own socket
+                (
+                    "/run/podman/podman.sock".to_string(),
+                    "/run/podman/podman.sock:/run/docker.sock".to_string(),
+                    std::env::var("DEVAIPOD_PODMAN_SOCKET").ok(),
+                )
+            };
 
         // Check podman is reachable (on macOS we may have Mac socket path for the binary, not for the mount)
         if let Some(ref path) = check_socket {
@@ -138,9 +145,10 @@ impl WebContainerGuard {
         );
 
         // Run the container (no port forwarding needed - we use podman exec)
+        let host_socket_env = format!("DEVAIPOD_HOST_SOCKET={}", host_socket);
         let run_output = cmd!(
             sh,
-            "podman run -d --name {container_name} --privileged -v {socket_mount} -v {config_mount} {image}"
+            "podman run -d --name {container_name} --privileged -v {socket_mount} -e {host_socket_env} -v {config_mount} {image}"
         )
         .ignore_status()
         .output()?;

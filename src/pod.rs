@@ -949,7 +949,7 @@ impl DevaipodPod {
         // Create API sidecar container (devaipod pod-api)
         let api_container_name = format!("{}-api", pod_name);
         let self_image = detect_self_image();
-        let socket_path = crate::podman::get_container_socket()
+        let socket_path = crate::podman::get_host_socket_path()
             .context("Cannot create API sidecar without container socket")?;
         let api_config = Self::api_container_config(
             &agent_workspace_volume,
@@ -2556,11 +2556,11 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
     /// for the pod, accessible only within the pod via localhost.
     ///
     /// The container runtime socket is bind-mounted so the sidecar can exec
-    /// into the workspace container for PTY sessions. The same path is used
-    /// for both source and target: if we received the socket at
-    /// `/run/docker.sock`, we pass `-v /run/docker.sock:/run/docker.sock`.
-    /// This works because the host podman resolves the same path we were
-    /// given, and on macOS podman machine the VM paths match container paths.
+    /// into the workspace container for PTY sessions. The `socket_path`
+    /// parameter is the **host-side** path (resolved via `get_host_socket_path`)
+    /// so the host podman can find it when creating the sibling container.
+    /// The target is always `/run/docker.sock` so the sidecar's
+    /// `get_container_socket()` finds it at the canonical location.
     fn api_container_config(
         agent_workspace_volume: &str,
         main_workspace_volume: &str,
@@ -2590,13 +2590,12 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             opencode_password.to_string(),
         ];
 
-        // Bind-mount the container runtime socket using the same path for
-        // both source and target. The sidecar's get_container_socket() will
-        // find it at this path.
-        let socket_str = socket_path.to_string_lossy();
+        // Bind-mount the container runtime socket. The source is the
+        // host-side path (resolved via mountinfo); the target is the
+        // canonical /run/docker.sock so the sidecar finds it.
         let socket_mount = MountConfig {
-            source: socket_str.to_string(),
-            target: socket_str.to_string(),
+            source: socket_path.to_string_lossy().to_string(),
+            target: "/run/docker.sock".to_string(),
             readonly: false,
         };
 
@@ -3251,7 +3250,8 @@ mod tests {
         let main_workspace_volume = "test-main-workspace";
         let workspace_container = "devaipod-test-workspace";
         let agent_container = "devaipod-test-agent";
-        let socket_path = std::path::Path::new("/run/docker.sock");
+        // Simulate a host-side socket path (as resolved by get_host_socket_path)
+        let socket_path = std::path::Path::new("/run/user/1000/podman/podman.sock");
         let container_config = DevaipodPod::api_container_config(
             agent_workspace_volume,
             main_workspace_volume,
@@ -3274,9 +3274,12 @@ mod tests {
             "/mnt/main-workspace:ro"
         );
 
-        // Verify socket bind mount uses the same path for source and target
+        // Verify socket bind mount: source is the host path, target is canonical
         assert_eq!(container_config.mounts.len(), 1);
-        assert_eq!(container_config.mounts[0].source, "/run/docker.sock");
+        assert_eq!(
+            container_config.mounts[0].source,
+            "/run/user/1000/podman/podman.sock"
+        );
         assert_eq!(container_config.mounts[0].target, "/run/docker.sock");
 
         // Verify command runs pod-api with workspace container name and correct workspace path

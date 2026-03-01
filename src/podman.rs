@@ -25,6 +25,14 @@ use tokio::process::Command;
 
 use crate::devcontainer::ImageSource;
 
+// TODO: Instead of requiring the launcher to mount the socket with `-v` and
+// pass DEVAIPOD_HOST_SOCKET, we could use the bootc approach: run with
+// `--privileged --pid=host` and use `open_tree`/`move_mount` via
+// `/proc/1/ns/mnt` to grab the socket from the host's mount namespace
+// directly.  See bootc's `ensure_mirrored_host_mount()` in
+// `crates/mount/src/mount.rs` for the implementation pattern.  This would
+// eliminate the `-v` socket mount and DEVAIPOD_HOST_SOCKET entirely.
+
 /// Modern canonical socket path (Docker and Podman)
 const DOCKER_SOCKET: &str = "/run/docker.sock";
 
@@ -157,6 +165,38 @@ fn parse_docker_host(value: &str) -> Option<String> {
         );
         None
     }
+}
+
+/// Get the host-side path of the container runtime socket.
+///
+/// When creating sibling containers, bind mount sources are resolved on
+/// the **host** filesystem, not inside our container. On rootless Linux
+/// the host path (e.g. `/run/user/1002/podman/podman.sock`) differs from
+/// the container-internal path (`/run/docker.sock`).
+///
+/// The launcher must set `DEVAIPOD_HOST_SOCKET` to the host-side path of
+/// the mounted socket so we can pass it as a bind mount source. If unset,
+/// we fall back to the container-internal path (which works when paths
+/// happen to match, e.g. macOS podman machine or rootful Docker).
+pub fn get_host_socket_path() -> Result<PathBuf> {
+    if let Ok(val) = std::env::var("DEVAIPOD_HOST_SOCKET") {
+        let path = PathBuf::from(&val);
+        tracing::debug!(
+            "Using host socket path from DEVAIPOD_HOST_SOCKET: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+
+    let container_path = get_container_socket()?;
+    if is_container_mode() {
+        tracing::warn!(
+            "DEVAIPOD_HOST_SOCKET not set; using container path {} as sibling mount source. \
+             This may fail on rootless Linux where host and container paths differ.",
+            container_path.display()
+        );
+    }
+    Ok(container_path)
 }
 
 /// Connect to the container socket and return a bollard Docker client
@@ -314,7 +354,8 @@ impl PodmanService {
         // For remote images, use podman pull --policy=newer via CLI
         // This pulls only if a newer version is available
         tracing::debug!("Ensuring image {} is up-to-date (--policy=newer)", image);
-        let output = tokio::process::Command::new("podman")
+        let output = self
+            .podman_command()
             .args(["pull", "--policy=newer", image])
             .output()
             .await

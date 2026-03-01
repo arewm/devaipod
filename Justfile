@@ -190,9 +190,9 @@ test-integration image=default_test_image: container-build build-integration
     # Linux: mount host socket directly. macOS: container runs in VM, mount VM socket path.
     # Target is always /run/docker.sock (well-known path).
     if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-        VOL_MOUNT="-v $SOCKET:/run/docker.sock"
+        HOST_SOCKET="$SOCKET"
     else
-        VOL_MOUNT="-v /run/podman/podman.sock:/run/docker.sock"
+        HOST_SOCKET="/run/podman/podman.sock"
     fi
     echo "Running integration tests (image: {{ CONTAINER_IMAGE }}-integration:latest)..."
     # Share /tmp so test-created repos are visible to podman for bind-mounts.
@@ -200,7 +200,8 @@ test-integration image=default_test_image: container-build build-integration
     # tests create repos under /tmp, so the paths must resolve identically
     # from both the runner and the podman service.
     podman run --rm --privileged \
-        $VOL_MOUNT \
+        -v "$HOST_SOCKET":/run/docker.sock \
+        -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
         -v /tmp:/tmp \
         -v "$CONFIG":/root/.config/devaipod.toml:ro \
         -e DEVAIPOD_TEST_IMAGE={{image}} \
@@ -263,17 +264,20 @@ container-run: container-build
     # so the volume source must be the VM's path, not the Mac path. Use the VM's podman socket path so the
     # daemon (in the VM) bind-mounts its own socket into the container. Rootful VM uses /run/podman/podman.sock.
     # Target is always /run/docker.sock (well-known path).
+    # HOST_SOCKET is passed as DEVAIPOD_HOST_SOCKET so the container can use it as a bind mount
+    # source when creating sibling containers (the host podman resolves sources on the host filesystem).
     if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-        VOL_MOUNT="-v $SOCKET:/run/docker.sock"
+        HOST_SOCKET="$SOCKET"
         ADD_HOST="--add-host=host.containers.internal:host-gateway"
     else
-        VOL_MOUNT="-v /run/podman/podman.sock:/run/docker.sock"
+        HOST_SOCKET="/run/podman/podman.sock"
         ADD_HOST=""
     fi
     podman run -d --name devaipod --privileged --replace \
         -p 8080:8080 \
         $ADD_HOST \
-        $VOL_MOUNT \
+        -v "$HOST_SOCKET":/run/docker.sock \
+        -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
         -v devaipod-state:/var/lib/devaipod \
         -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
         -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \

@@ -9,9 +9,11 @@
 #
 # Run (web UI mode - default):
 #   podman volume create devaipod-state   # optional; just container-run creates it
+#   SOCKET=$XDG_RUNTIME_DIR/podman/podman.sock
 #   podman run -d --name devaipod -p 8080:8080 --privileged \
 #     -v devaipod-state:/var/lib/devaipod \
-#     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/docker.sock \
+#     -v $SOCKET:/run/docker.sock \
+#     -e DEVAIPOD_HOST_SOCKET=$SOCKET \
 #     -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
 #     ghcr.io/cgwalters/devaipod
 #
@@ -23,10 +25,12 @@
 #
 # Run with stable auth token (via podman secret) instead of state volume:
 #   openssl rand -base64 32 | podman secret create devaipod-web-token -
+#   SOCKET=$XDG_RUNTIME_DIR/podman/podman.sock
 #   podman run -d --name devaipod -p 8080:8080 --privileged \
 #     --secret devaipod-web-token \
 #     -v devaipod-state:/var/lib/devaipod \
-#     -v $XDG_RUNTIME_DIR/podman/podman.sock:/run/docker.sock \
+#     -v $SOCKET:/run/docker.sock \
+#     -e DEVAIPOD_HOST_SOCKET=$SOCKET \
 #     -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
 #     ghcr.io/cgwalters/devaipod
 #
@@ -192,6 +196,7 @@ COPY --from=integration /usr/bin/devaipod-integration /usr/bin/devaipod-integrat
 COPY --from=integration /usr/bin/devaipod /usr/bin/devaipod
 
 ENV DEVAIPOD_CONTAINER=1
+ENV CONTAINER_HOST=unix:///run/docker.sock
 
 CMD ["/usr/bin/devaipod-integration"]
 
@@ -223,6 +228,9 @@ COPY --from=opencode-cli /usr/local/bin/opencode /usr/local/bin/opencode
 # Mark that we're running inside the official devaipod container
 # This is checked by `devaipod` to require running in container mode by default
 ENV DEVAIPOD_CONTAINER=1
+# Tell podman-remote (aliased as podman) where the socket is mounted.
+# Without this, bare `podman` commands default to /run/podman/podman.sock.
+ENV CONTAINER_HOST=unix:///run/docker.sock
 
 # Copy vendored opencode web UI fork (built from opencode-ui/ in the repo)
 # This is served at /opencode/ and proxies API calls to the agent's opencode server
