@@ -17,6 +17,7 @@ import { Tag } from "@opencode-ai/ui/tag"
 import { TextField } from "@opencode-ai/ui/text-field"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
 import { Checkbox } from "@opencode-ai/ui/checkbox"
+import { Switch as SwitchToggle } from "@opencode-ai/ui/switch"
 import { Spinner } from "@opencode-ai/ui/spinner"
 import {
   DevaipodProvider,
@@ -24,6 +25,8 @@ import {
   type PodInfo,
   type Proposal,
   type LaunchWorkspaceParams,
+  type GatorScopeConfig,
+  type GatorScopesResponse,
 } from "@/context/devaipod"
 
 // ---------------------------------------------------------------------------
@@ -212,7 +215,7 @@ function LaunchForm(props: { onClose: () => void }) {
   const [imageOverride, setImageOverride] = createSignal("")
   const [scopes, setScopes] = createSignal<string[]>([])
   const [gatorImage, setGatorImage] = createSignal("")
-  const [readOnly, setReadOnly] = createSignal(false)
+  const [readOnly, setReadOnly] = createSignal(true)
   const [devcontainerJson, setDevcontainerJson] = createSignal("")
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
@@ -348,7 +351,7 @@ function LaunchForm(props: { onClose: () => void }) {
                 checked={readOnly()}
                 onChange={setReadOnly}
               >
-                Read-only mode (suppress default write scopes)
+                Read-only mode (default; uncheck to enable write scopes)
               </Checkbox>
 
               <TextField
@@ -474,6 +477,7 @@ function LaunchCard(props: { podName: string; state: { state: string; error?: st
 function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void }) {
   const ctx = useDevaipod()
   const [collapsed, setCollapsed] = createSignal(false)
+  const [showGator, setShowGator] = createSignal(false)
   const [actionError, setActionError] = createSignal("")
 
   const shortName = () => props.pod.Name.replace("devaipod-", "")
@@ -680,6 +684,17 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
               Delete
             </Button>
           </Show>
+          <Show when={isRunning() && !isAdvisor()}>
+            <div class="ml-auto">
+              <Button
+                variant={showGator() ? "secondary" : "ghost"}
+                size="small"
+                onClick={() => setShowGator((v) => !v)}
+              >
+                Gator
+              </Button>
+            </div>
+          </Show>
         </div>
 
         {/* Action error */}
@@ -687,6 +702,11 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
           <Card variant="error" class="mx-4 mb-3 p-2">
             <span class="text-12-regular">{actionError()}</span>
           </Card>
+        </Show>
+
+        {/* Gator controls inline */}
+        <Show when={showGator()}>
+          <GatorControls podName={props.pod.Name} />
         </Show>
 
         {/* Advisor proposals inline */}
@@ -772,6 +792,171 @@ function ProposalCard(props: { proposal: Proposal }) {
         </Button>
       </div>
     </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Gator controls (inline in pod card)
+// ---------------------------------------------------------------------------
+
+function GatorControls(props: { podName: string }) {
+  const ctx = useDevaipod()
+  const [loading, setLoading] = createSignal(true)
+  const [gatorState, setGatorState] = createSignal<GatorScopesResponse | null>(null)
+  const [saving, setSaving] = createSignal(false)
+  const [error, setError] = createSignal("")
+
+  // Fetch current gator scopes
+  onMount(async () => {
+    try {
+      const resp = await ctx.getGatorScopes(props.podName)
+      setGatorState(resp)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  })
+
+  // Derive the "target repo" pattern — the first non-wildcard repo, or the wildcard
+  const targetRepo = createMemo(() => {
+    const scopes = gatorState()?.scopes
+    if (!scopes?.gh?.repos) return null
+    const repos = Object.keys(scopes.gh.repos)
+    return repos.find((r) => !r.includes("*")) ?? repos[0] ?? null
+  })
+
+  // Current permission state for the target repo
+  const repoPerms = createMemo(() => {
+    const repo = targetRepo()
+    if (!repo) return null
+    return gatorState()?.scopes?.gh?.repos?.[repo] ?? null
+  })
+
+  const hasDraftPr = createMemo(() => {
+    const p = repoPerms()
+    return !!(p?.["create-draft"] || p?.["push-new-branch"])
+  })
+
+  const hasDraftReview = createMemo(() => {
+    return !!repoPerms()?.["pending-review"]
+  })
+
+  async function togglePermission(
+    permission: "draft-pr" | "draft-review",
+    enabled: boolean,
+  ) {
+    const state = gatorState()
+    if (!state?.scopes) return
+
+    setSaving(true)
+    setError("")
+
+    try {
+      // Deep clone current scopes
+      const newScopes: GatorScopeConfig = JSON.parse(JSON.stringify(state.scopes))
+
+      if (!newScopes.gh) newScopes.gh = {}
+      if (!newScopes.gh.repos) newScopes.gh.repos = {}
+
+      // Find the target repo to update
+      const repo = targetRepo()
+      if (!repo) return
+
+      const perms = newScopes.gh.repos[repo] ?? { read: true }
+
+      if (permission === "draft-pr") {
+        perms["create-draft"] = enabled
+        perms["push-new-branch"] = enabled
+      } else {
+        perms["pending-review"] = enabled
+      }
+
+      newScopes.gh.repos[repo] = perms
+
+      const resp = await ctx.updateGatorScopes(props.podName, newScopes)
+      setGatorState(resp)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div class="px-4 pb-3 border-t border-border-base pt-3">
+      <div class="flex items-center gap-2 mb-3">
+        <Icon name="sliders" size="small" class="text-text-weak" />
+        <span class="text-12-medium text-text-secondary-base">Service Gator</span>
+      </div>
+
+      <Show when={loading()}>
+        <div class="flex items-center gap-2 text-12-regular text-text-weak">
+          <Spinner class="size-3.5" />
+          Loading permissions...
+        </div>
+      </Show>
+
+      <Show when={!loading() && !gatorState()?.enabled}>
+        <p class="text-12-regular text-text-weak">
+          Service-gator is not enabled for this workspace.
+        </p>
+      </Show>
+
+      <Show when={!loading() && gatorState()?.enabled}>
+        <Show
+          when={targetRepo()}
+          fallback={
+            <p class="text-12-regular text-text-weak">
+              Read-only access enabled. No repository scopes configured for write control.
+            </p>
+          }
+        >
+          <p class="text-11-regular text-text-weak mb-3">
+            <span class="font-mono">{targetRepo()}</span>
+          </p>
+
+          <div class="flex flex-col gap-3">
+            <div class="flex items-center justify-between">
+              <div>
+                <span class="text-12-medium text-text-strong">Draft PRs</span>
+                <p class="text-11-regular text-text-weak">Create draft pull requests and push branches</p>
+              </div>
+              <SwitchToggle
+                checked={hasDraftPr()}
+                disabled={saving()}
+                onChange={(checked) => togglePermission("draft-pr", checked)}
+              />
+            </div>
+
+            <div class="flex items-center justify-between">
+              <div>
+                <span class="text-12-medium text-text-strong">Draft Reviews</span>
+                <p class="text-11-regular text-text-weak">Create pending PR reviews with comments</p>
+              </div>
+              <SwitchToggle
+                checked={hasDraftReview()}
+                disabled={saving()}
+                onChange={(checked) => togglePermission("draft-review", checked)}
+              />
+            </div>
+          </div>
+
+          <Show when={saving()}>
+            <div class="flex items-center gap-2 mt-2 text-11-regular text-text-weak">
+              <Spinner class="size-3" />
+              Updating...
+            </div>
+          </Show>
+        </Show>
+      </Show>
+
+      <Show when={error()}>
+        <Card variant="error" class="mt-2 p-2">
+          <span class="text-11-regular">{error()}</span>
+        </Card>
+      </Show>
+    </div>
   )
 }
 
