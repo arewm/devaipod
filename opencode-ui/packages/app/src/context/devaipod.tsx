@@ -1,6 +1,6 @@
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { batch, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
-import { createStore, produce } from "solid-js/store"
+import { createStore, produce, reconcile } from "solid-js/store"
 import { apiFetch, getAuthToken } from "@/utils/devaipod-api"
 
 // ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         const all = await apiFetch<PodInfo[]>(`${PODMAN_PODS}/json`)
         const devaipodPods = sortPods(all.filter((p) => p.Name?.startsWith("devaipod-")))
         batch(() => {
-          setStore("pods", devaipodPods)
+          setStore("pods", reconcile(devaipodPods, { key: "Name", merge: false }))
           setStore("connected", true)
           setStore("error", undefined)
         })
@@ -121,7 +121,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       try {
         const launches = await apiFetch<Record<string, LaunchState>>("/api/devaipod/launches")
         const oldLaunches = store.launches
-        setStore("launches", launches)
+        setStore("launches", reconcile(launches))
 
         // Detect transitions that warrant a pod list refresh
         let needRefresh = false
@@ -173,7 +173,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         const data = await apiFetch<Record<string, { needs_update: boolean }>>(
           "/api/devaipod/pods/enrichment",
         )
-        setStore("enrichment", data)
+        setStore("enrichment", reconcile(data))
       } catch {
         // Ignore — enrichment is best-effort
       }
@@ -184,7 +184,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     async function fetchProposals() {
       try {
         const proposals = await apiFetch<Proposal[]>("/api/devaipod/proposals")
-        setStore("proposals", proposals.filter((p) => p.status === "pending"))
+        setStore("proposals", reconcile(proposals.filter((p) => p.status === "pending"), { key: "id", merge: false }))
       } catch {
         // Ignore
       }
