@@ -1,5 +1,7 @@
 # Alternative: Rust Sidecar for Worker Monitoring
 
+> **Status: Superseded.** The pod-api sidecar (`{pod}-api` container) now exists in each pod and handles monitoring, status, and agent lifecycle. The Python `worker_monitor.py` has been removed. The approach below (host-side nsenter into pod netns) was not pursued; instead, a container-based sidecar (pod-api) was implemented, which is simpler and more portable. This document is retained for historical context.
+
 This documents a potential future enhancement to replace the Python-based `worker_monitor.py` with a native Rust binary running on the host.
 
 ## Current Approach
@@ -68,9 +70,4 @@ let monitor_proc = Command::new("nsenter")
 
 ## Recommendation
 
-The Python approach is simpler and sufficient for now. Consider the Rust sidecar if:
-- Python availability becomes a real problem (unlikely given devcontainer images)
-- We want to consolidate monitoring into the devaipod binary
-- Quadlet integration is added (simplifies systemd lifecycle)
-
-A middle-ground option: add `devaipod worker status $POD_NAME` command that polls via published ports from the host, avoiding namespace complexity entirely.
+~~The Python approach is simpler and sufficient for now.~~ **Update:** Neither the Python approach nor the host-side nsenter approach was used. Instead, monitoring was implemented as part of the pod-api sidecar container, which runs in the pod network namespace naturally and provides a `/summary` endpoint for status queries. This is the "middle-ground option" mentioned below, realized as a proper container rather than a host process.

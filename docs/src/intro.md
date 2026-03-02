@@ -17,52 +17,31 @@ This tool is primarily authored by @cgwalters who would "un-invent" large langua
 
 If you want to use LLMs, but have concerns about e.g. [prompt injection](https://simonwillison.net/tags/prompt-injection/) attacks from un-sandboxed agent use especially with unbound access to your machine secrets (especially e.g. Github token): then devaipod can help you.
 
+To be clear, this project is itself extensively built with AI (mostly Claude Opus), but
+the author reviews the output (to varying degrees) - it's not "vibe coded". The emphasis
+of this project is more on making it easier to use AI in a sandboxed way, but of course
+there's a spectrum here, and nothing stops one from using it for closer-to-vibe-coding
+cases.
+
 ## How It Works
 
-devaipod uses podman pods to create a multi-container environment:
+devaipod implements a subset of the devcontainer specification, and launches multiple containers
+in a single pod when a task is created. At the current time, each task must have at least
+one git repository.
 
-1. Parses your project's `devcontainer.json` to determine the image
-2. Creates a podman pod with shared network namespace
-3. Starts containers:
-   - **workspace**: Your development environment with `opencode-connect` shim
-   - **task owner**: Orchestrates work, runs `opencode serve` on port 4096
-   - **worker**: Executes subtasks, runs `opencode serve` on port 4098
-   - **gator**: The [service-gator](https://github.com/cgwalters/service-gator) MCP server for controlled access to GitHub/JIRA
+0. `devaipod launch <git repository> <task>` is started (via web UI, TUI or CLI)
+1. Creates a workspace volume and clones that repository into it
+2. Creates a podman pod with multiple components (unsandboxed workspace, sandboxed agent, API pod)
 
-All containers share the same network namespace, allowing localhost communication between containers.
-
-```mermaid
-flowchart LR
-    subgraph pod[Podman Pod]
-        workspace[Workspace]
-        owner[Task Owner]
-        worker[Worker]
-        gator[Gator]
-    end
-    workspace -->|attach :4096| owner
-    owner -->|delegate :4098| worker
-    owner -->|MCP :8765| gator
-    worker -.->|MCP| gator
-    gator -->|scoped| github[GitHub API]
-```
-
-## Key Features
-
-- **Web UI** - browser-based dashboard for managing workspaces and monitoring agents (primary interface)
-- **Runs as a container** - distributed as `ghcr.io/cgwalters/devaipod:latest`, no host installation needed beyond podman
-- **Sandboxed agents** - task owner and worker containers are credential-isolated (no GH_TOKEN, etc.)
-- **Task kickoff** - give the task owner a task and it starts working immediately
-- **Auto service-gator** - remote URLs automatically get read + draft PR permissions
-- **API keys via podman secrets** - agents receive `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc. securely
-- **Network isolation** - optionally restrict agents to allowed LLM API domains via proxy
-- **TUI and CLI** - terminal-based attach/monitoring also available via `podman exec`
-- **macOS support** - works with podman machine on macOS
+Each devcontainer pod is isolated from each other by default, and from the host. pods only
+have what you explictly provide via environment variables, bind mounts etc.
+At the current time networking is unrestricted by default, but we aim to support restricting
+it further.
 
 ## Requirements
 
 - **podman** (rootless works, including inside toolbox containers)
 - A devcontainer image with `opencode` and `git` installed (e.g., [devenv-debian](https://github.com/bootc-dev/devenv-debian))
-- A `devcontainer.json` in your project, OR a default image configured in `~/.config/devaipod.toml`
 
 ## License
 

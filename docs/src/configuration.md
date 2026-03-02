@@ -120,25 +120,26 @@ Override configuration with CLI flags:
 
 ```bash
 # Read-only access to all GitHub repos
-devaipod up . --service-gator=github:readonly-all
+devaipod up https://github.com/org/repo --service-gator=github:readonly-all
 
 # Read + draft PR access to specific repo
-devaipod up . --service-gator=github:myorg/myrepo:read,create-draft
+devaipod up https://github.com/org/repo --service-gator=github:myorg/myrepo:read,create-draft
 
 # Custom image
-devaipod up . --service-gator=github:myorg/myrepo --service-gator-image localhost/service-gator:dev
+devaipod up https://github.com/org/repo --service-gator=github:myorg/myrepo --service-gator-image localhost/service-gator:dev
 ```
 
 See [Service-gator Integration](service-gator.md) for full details.
 
 ## Multi-Agent Orchestration
 
-Every devaipod workspace includes a worker container alongside the task owner agent. The task owner delegates subtasks to the worker and reviews its commits before merging.
-
-Configure worker behavior in `~/.config/devaipod.toml`:
+By default each workspace runs a single agent container. Multi-agent
+orchestration — where a worker container runs alongside the agent and
+receives delegated subtasks — is opt-in:
 
 ```toml
 [orchestration]
+enabled = true           # Create a worker container (default: false)
 worker_timeout = "30m"   # Timeout for worker subtasks
 
 [orchestration.worker]
@@ -147,10 +148,13 @@ worker_timeout = "30m"   # Timeout for worker subtasks
 gator = "readonly"
 ```
 
+When enabled, the agent delegates subtasks to the worker and reviews its
+commits before merging.
+
 **Worker gator options:**
 
 - `"readonly"`: Worker can only read from forge (no PRs, no pushes) — **default**
-- `"inherit"`: Worker gets same gator scopes as task owner
+- `"inherit"`: Worker gets same gator scopes as the agent
 - `"none"`: Worker has no gator access
 
 The worker is one step further from human review, so it has restricted access by default.

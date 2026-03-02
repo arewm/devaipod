@@ -7,24 +7,24 @@
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│  Podman Pod                                                        │
-│                                                                    │
-│  ┌─────────────────────┐  ┌─────────────────────┐                 │
-│  │ Workspace Container │  │ Gator Container     │                 │
-│  │ • Full dev env      │  │ • service-gator     │                 │
-│  │ • Has GH_TOKEN      │  │ • Has GH_TOKEN      │                 │
-│  │ • (trusted)         │  │ • Scope-restricted  │                 │
-│  └─────────────────────┘  └──────────┬──────────┘                 │
-│                                      │ MCP (HTTP)                  │
-│  ┌───────────────────────────────────┼──────────────────────────┐ │
-│  │ Agent Container (restricted)      │                          │ │
-│  │ • opencode serve                  │                          │ │
-│  │ • NO GH_TOKEN (no direct access)  │                          │ │
-│  │ • Connects to gator via MCP ──────┘                          │ │
-│  │ • Dropped capabilities, no-new-privileges                    │ │
-│  └──────────────────────────────────────────────────────────────┘ │
-└───────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Podman Pod                                                               │
+│                                                                           │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐        │
+│  │ Workspace         │  │ Gator Container  │  │ Pod-api Sidecar  │        │
+│  │ • Full dev env    │  │ • service-gator  │  │ • Serves web UI  │        │
+│  │ • Has GH_TOKEN    │  │ • Has GH_TOKEN   │  │ • Proxies to     │        │
+│  │ • (trusted)       │  │ • Scope-restrict │  │   agent (4096)   │        │
+│  └──────────────────┘  └────────┬─────────┘  └──────────────────┘        │
+│                                 │ MCP (HTTP)                              │
+│  ┌──────────────────────────────┼───────────────────────────────────────┐ │
+│  │ Agent Container (restricted) │                                       │ │
+│  │ • opencode serve             │                                       │ │
+│  │ • NO GH_TOKEN                │                                       │ │
+│  │ • Connects to gator via MCP ─┘                                       │ │
+│  │ • Same capabilities as workspace (supports nested containers)        │ │
+│  └──────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Recommended Setup: Global GitHub Read-Only
@@ -87,19 +87,19 @@ For one-off usage or overriding the config, use command-line flags:
 
 ```bash
 # Read-only access to all GitHub repos
-devaipod up . --service-gator=github:readonly-all
+devaipod up https://github.com/org/repo --service-gator=github:readonly-all
 
 # Read access to specific repos
-devaipod up . --service-gator=github:myorg/myrepo
+devaipod up https://github.com/org/repo --service-gator=github:myorg/myrepo
 
 # Read access to all repos in an org
-devaipod up . --service-gator=github:myorg/*
+devaipod up https://github.com/org/repo --service-gator=github:myorg/*
 
 # Write access to a specific repo
-devaipod up . --service-gator=github:myorg/myrepo:write
+devaipod up https://github.com/org/repo --service-gator=github:myorg/myrepo:write
 
 # Multiple scopes
-devaipod up . \
+devaipod up https://github.com/org/repo \
   --service-gator=github:myorg/frontend \
   --service-gator=github:myorg/backend:write
 ```
@@ -110,10 +110,10 @@ By default, devaipod pulls `ghcr.io/cgwalters/service-gator:latest`. To use a lo
 
 ```bash
 # Use a local development build
-devaipod up . --service-gator=github:myorg/myrepo --service-gator-image localhost/service-gator:dev
+devaipod up https://github.com/org/repo --service-gator=github:myorg/myrepo --service-gator-image localhost/service-gator:dev
 
 # Use a specific version
-devaipod up . --service-gator=github:myorg/myrepo --service-gator-image ghcr.io/cgwalters/service-gator:v0.2.0
+devaipod up https://github.com/org/repo --service-gator=github:myorg/myrepo --service-gator-image ghcr.io/cgwalters/service-gator:v0.2.0
 ```
 
 This is useful for testing local changes to service-gator or pinning to a specific version.
@@ -242,13 +242,14 @@ When you run `devaipod up`:
 2. **If service-gator is enabled**, devaipod creates a pod with:
    - **workspace container**: Full dev environment with trusted env vars (GH_TOKEN, etc.)
    - **gator container**: Runs `service-gator` with scopes and trusted env vars
+   - **pod-api sidecar**: Serves the web UI, proxies to the agent, provides git/PTY endpoints
    - **agent container**: Runs `opencode serve` with NO trusted env vars, configured to use gator MCP
 3. **The agent** can use GitHub/JIRA tools via MCP, but only with the configured scopes
 4. **Credentials never reach the agent** - they stay in the trusted containers
 
 ## Requirements
 
-- `GH_TOKEN` must be configured via `[trusted.env]` in devaipod.toml or set in your environment
+- `GH_TOKEN` must be available to the gator container — configure via `[trusted] secrets` (recommended) or `[trusted.env]` in devaipod.toml
 - For JIRA, `JIRA_API_TOKEN` should be in `[trusted.env]`
 
 The service-gator container image (`ghcr.io/cgwalters/service-gator`) is automatically pulled.
@@ -256,7 +257,7 @@ The service-gator container image (`ghcr.io/cgwalters/service-gator`) is automat
 ## Security Benefits
 
 1. **Credential Isolation**: API tokens are in workspace/gator containers only; the agent never sees them
-2. **Container Separation**: Agent runs in a separate container with dropped capabilities
+2. **Container Separation**: Agent runs in a separate container (same Linux capabilities as workspace to support nested containers, but no trusted credentials)
 3. **Fine-grained Scoping**: Grant exactly the permissions needed via CLI or config
 4. **MCP Protocol**: Agent communicates with external services only through the MCP interface
 

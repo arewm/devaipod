@@ -1,22 +1,24 @@
 # Minimize Code Injection into Containers
 
+> **Status: Partially implemented.** The `auth_proxy.py` script has been replaced by pod-api. The `workspace_monitor.py` polling/status logic has been replaced by the pod-api `/summary` endpoint and web UI. The `opencode-connect` shim and clone scripts are still injected. See status notes inline below.
+
 This document describes the plan to reduce/eliminate code injection into containers, moving logic into the host `devaipod` binary instead.
 
 ## Current State
 
 We currently inject:
 
-1. **`opencode-connect`** - Shell script in workspace container
+1. **`opencode-connect`** - Shell script in workspace container *(still in use)*
    - Finds root session via curl + Python
    - Runs `opencode attach`
    
-2. **`workspace_monitor.py`** - Python script (339 lines)
-   - Polls opencode API for session status
-   - Displays live status in terminal
-   - Handles Ctrl-C to drop to shell
-   - Sends initial task to agent
+2. ~~**`workspace_monitor.py`** - Python script (339 lines)~~ — **DONE**, replaced by pod-api `/summary` endpoint
+   - ~~Polls opencode API for session status~~
+   - ~~Displays live status in terminal~~
+   - ~~Handles Ctrl-C to drop to shell~~
+   - ~~Sends initial task to agent~~
 
-3. **Clone scripts** - Shell scripts for git operations
+3. **Clone scripts** - Shell scripts for git operations *(still in use)*
    - `clone_from_local_script()`
    - `clone_remote_script()`
    - `clone_pr_script()`
@@ -175,31 +177,30 @@ The git clone scripts are harder to replace because they run during container cr
 
 ## Migration Plan
 
-### Phase 1: Random port + Basic Auth infrastructure
-- [ ] Generate random password at pod creation
-- [ ] Set `OPENCODE_SERVER_PASSWORD` env var on agent container
-- [ ] Publish agent port to random host port: `-p 127.0.0.1::4096`
-- [ ] Store password in pod label: `io.devaipod.api-password`
-- [ ] Add helper functions: `get_published_port()`, `get_pod_api_password()`
-- [ ] Add `call_agent_api()` function using reqwest with Basic Auth
+### Phase 1: Random port + Basic Auth infrastructure — DONE (via pod-api)
+- [x] Generate random password at pod creation
+- [x] Set `OPENCODE_SERVER_PASSWORD` env var on agent container
+- [x] Publish agent port to random host port: `-p 127.0.0.1::4096`
+- [x] Store password in pod label: `io.devaipod.api-password`
+- [x] Add helper functions: `get_published_port()`, `get_pod_api_password()`
+- [x] Add `call_agent_api()` function using reqwest with Basic Auth
 
-### Phase 2: Host-side session detection
-- [ ] Add `find_root_session()` function using the new API access
-- [ ] Update `cmd_attach()` to query API from host, then exec `opencode attach`
-- [ ] Remove `opencode-connect` script injection
+### Phase 2: Host-side session detection — Partially done
+- [x] Add `find_root_session()` function using the new API access
+- [x] Update `cmd_attach()` to query API from host, then exec `opencode attach`
+- [ ] Remove `opencode-connect` script injection — *still in use*
 
-### Phase 3: Host-side monitoring  
-- [ ] Add `devaipod monitor <workspace>` command
-- [ ] Port status display logic from Python to Rust
-- [ ] Handle Ctrl-C → shell handoff
-- [ ] Remove `workspace_monitor.py` injection
+### Phase 3: Host-side monitoring — DONE (via pod-api /summary)
+- [x] ~~Add `devaipod monitor <workspace>` command~~ — replaced by pod-api `/summary` endpoint and web UI
+- [x] Port status display logic from Python to Rust (in pod-api)
+- [x] Remove `workspace_monitor.py` injection
 
-### Phase 4: Simplify workspace container
-- [ ] Change workspace container startup to simple sleep/bash
-- [ ] Send initial task from host after pod starts
+### Phase 4: Simplify workspace container — Partially done
+- [x] Change workspace container startup to simple sleep/bash
+- [x] Send initial task from host after pod starts
 - [ ] Update attach/ssh to work with simplified container
 
-### Phase 5: (Optional) Improve clone scripts
+### Phase 5: (Optional) Improve clone scripts — Not started
 - [ ] Consider init container pattern for cloning
 - [ ] Or keep scripts if they're working fine
 

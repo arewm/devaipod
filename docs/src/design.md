@@ -6,13 +6,13 @@ devaipod is designed as **mid-level infrastructure** for AI coding workflows.
 
 **More opinionated than raw tools**: Unlike running opencode or Claude Code directly, devaipod provides structure around sandboxing, credential isolation, and workspace lifecycle. You don't have to figure out container security yourself.
 
-**Less opinionated than full platforms**: Unlike monolithic solutions (OpenHands Cloud, Cursor), devaipod focuses on the primitives and leaves room for building different workflows on top. Want a web UI? Build one that talks to our pods. Prefer a TUI? That works too.
+**Less opinionated than full platforms**: Unlike monolithic solutions (OpenHands Cloud, Cursor), devaipod focuses on the primitives and leaves room for building different workflows on top. The included web UI is the primary interface, but the pod abstraction supports any frontend — TUI, custom dashboards, or API-driven automation.
 
 **Composable building blocks**: The pod abstraction and service-gator MCP are independent pieces. Use what you need, skip what you don't.
 
 This design enables:
 
-- Custom control planes (web UI, TUI, or API-driven)
+- Custom control planes (the included web UI, TUI, or API-driven)
 - Integration with existing CI/CD and review workflows
 - Different human-in-the-loop patterns for different teams
 - Extension via MCP servers and external tooling

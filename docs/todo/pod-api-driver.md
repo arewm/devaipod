@@ -1,5 +1,7 @@
 # Pod-API as Driver: Move Agent Lifecycle into the Sidecar
 
+> **Status: Partially implemented.** Phase 2 (`GET /summary` endpoint) is done. Phase 1 (`POST /task`) and Phase 3 (dead code removal) are still pending. See inline status notes below.
+
 ## Problem
 
 Today the control plane orchestrates the agent lifecycle with a fragile,
@@ -124,7 +126,7 @@ fetching raw sessions/messages and deriving status itself.
 
 ## Migration / ordering
 
-### Phase 1: `POST /task` endpoint on pod-api
+### Phase 1: `POST /task` endpoint on pod-api — Not yet implemented
 
 Add the endpoint. Pod-api receives the task, polls opencode, creates a
 session, sends the message. Control plane calls this instead of doing
@@ -141,7 +143,7 @@ richer pod-level summary). `derive_agent_status_from_messages()` now
 lives in `pod_api.rs` and the control plane's `agent_status()` is a
 thin proxy to `/summary`.
 
-### Phase 3: Remove dead code
+### Phase 3: Remove dead code — Not yet done
 
 Delete `start_agent_task()`, `send_initial_message()`, `check_agent_health()`,
 `opencode_api_get()`, `opencode_api_post()`, and the workspace-monitor

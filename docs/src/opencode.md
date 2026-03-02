@@ -32,11 +32,11 @@ OpenCode is configured via `~/.config/opencode/opencode.json`. Set this up in yo
 
 ```bash
 # Create workspace and get a shell
-devaipod up /path/to/project -S
+devaipod up https://github.com/org/repo -S
 # Then run 'opencode-connect' inside the workspace to connect to the agent
 
 # Create workspace with a task for the agent
-devaipod up . "fix the type errors in main.rs"
+devaipod up https://github.com/org/repo "fix the type errors in main.rs"
 
 # Run agent on a GitHub issue (issue URL is parsed, default task: "Fix <url>")
 devaipod run https://github.com/org/repo/issues/123
@@ -50,22 +50,27 @@ devaipod attach myworkspace
 devaipod uses a podman pod with multiple containers:
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│  Podman Pod                                                        │
-│                                                                    │
-│  ┌─────────────────────┐  ┌─────────────────────┐                 │
-│  │ Workspace Container │  │ Agent Container     │                 │
-│  │ • Full dev env      │  │ • opencode serve    │                 │
-│  │ • opencode-connect  │  │ • Port 4096         │                 │
-│  │ • Your dotfiles     │  │ • Isolated $HOME    │                 │
-│  └─────────────────────┘  └─────────────────────┘                 │
-│                                      │                             │
-│      attach ──────────────────────→ │ (localhost:4096)            │
-│                                                                    │
-└───────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Podman Pod (shared network namespace)                                    │
+│                                                                           │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐        │
+│  │ Workspace         │  │ Agent             │  │ Pod-api Sidecar  │        │
+│  │ • Full dev env    │  │ • opencode serve  │  │ • Serves opencode│        │
+│  │ • opencode-connect│  │ • Port 4096       │  │   SPA (vendored) │        │
+│  │ • Your dotfiles   │  │ • Isolated $HOME  │  │ • Proxies to     │        │
+│  └──────────────────┘  └──────────────────┘  │   agent (4096)   │        │
+│          │                       ▲             │ • Git/PTY APIs   │        │
+│          │  attach (TUI) ────────┘             └────────┬─────────┘        │
+│          │                                              │ port 8090        │
+└──────────│──────────────────────────────────────────────│──────────────────┘
+           │                                              │
+    opencode-connect                          Control plane (:8080)
+    (terminal attach)                         embeds via iframe
 ```
 
-The workspace container has an `opencode-connect` shim that runs `opencode attach` to connect to the sandboxed agent, automatically continuing any existing session. All containers share the same network namespace via the pod.
+The primary interface is the **control plane web UI at :8080**, which manages pods and embeds each pod's agent view in an iframe. The pod-api sidecar serves the vendored opencode SPA and proxies API calls to `localhost:4096` within the pod. See [design.md](design.md) for details on the architecture.
+
+The workspace container also has an `opencode-connect` shim that runs `opencode attach` for terminal-based access, automatically continuing any existing session. All containers share the same network namespace via the pod.
 
 ## Agent Support
 

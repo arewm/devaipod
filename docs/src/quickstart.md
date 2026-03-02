@@ -153,10 +153,10 @@ podman exec devaipod devaipod list
 A TUI is also available for terminal-based monitoring:
 
 ```bash
-# Attach to the task owner agent:
+# Attach to the agent:
 podman exec -ti devaipod devaipod attach <workspace>
 
-# Attach to the worker agent:
+# Attach to the worker (requires orchestration enabled):
 podman exec -ti devaipod devaipod attach <workspace> --worker
 
 # Get a shell in the workspace container:
@@ -233,16 +233,27 @@ devaipod container is stopped.
 │  └─────────────────────┘                   │               │
 │                                            │               │
 │  ┌─────────────────────┐     ┌─────────────┴─────────────┐ │
-│  │ devaipod container  │     │ Created workspace pods    │ │
-│  │ (daemon)            │────►│ - workspace container     │ │
-│  │                     │     │ - task owner container    │ │
-│  └─────────────────────┘     │ - worker container        │ │
-│           ▲                  │ - gator container         │ │
-│           │                  └───────────────────────────┘ │
-│  Web UI :8080 / podman exec                                │
-│  (primary: browser, also CLI/TUI)                          │
+│  │ devaipod container  │     │ Workspace pod             │ │
+│  │ (daemon)            │────►│ - {pod}-workspace         │ │
+│  │                     │     │ - {pod}-agent             │ │
+│  └─────────────────────┘     │ - {pod}-api (web UI,     │ │
+│           ▲                  │     proxy, git/PTY)       │ │
+│           │                  │ - {pod}-gator (optional)  │ │
+│  Web UI :8080 / podman exec  │ - {pod}-worker (opt-in)  │ │
+│  (primary: browser,          └───────────────────────────┘ │
+│   also CLI/TUI)                                            │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+Users interact through the **control plane web UI at :8080**, which is
+authenticated by default (a login token is generated on first start and
+printed to the container logs). The control plane manages pod lifecycle
+and embeds each pod's agent UI in an iframe. The pod-api sidecar is the
+only published port per pod (8090 internal, random host port); it serves
+the vendored opencode SPA, proxies to the opencode agent (port 4096,
+not published externally), and provides git/PTY endpoints. The opencode
+server itself requires Basic Auth with a per-pod password that the
+pod-api sidecar handles transparently.
 
 The devaipod container uses podman-remote to communicate with the host's
 podman daemon via the mounted socket. This allows it to create "sibling"

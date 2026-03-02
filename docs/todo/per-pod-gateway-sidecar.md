@@ -1,10 +1,12 @@
 # Per-Pod Gateway Sidecar (Rust)
 
+> **Status: Implemented.** This feature has been implemented as the **pod-api sidecar** (`{pod}-api` container). Each pod has a pod-api container that serves the vendored opencode web UI, proxies to opencode, provides git/PTY/summary endpoints, and handles authentication. The design below is retained for historical context.
+
 This document captures the plan to run a **gateway/proxy container as a sidecar in each pod**, implemented in Rust, providing a single authenticated entry point for all pod services. This aligns with the existing "expose services with auth" approach and avoids `--network host` (see [Quick Start](../src/quickstart.md)).
 
 ## Motivation
 
-Today we have:
+Before pod-api, we had:
 
 - **Central devaipod container** (optional): runs the web UI and talks to pod-published ports via `host.containers.internal` (host gateway). Each pod publishes the **auth proxy** port (4097) to a random host port.
 - **Per-pod auth**: Python `auth_proxy.py` in the agent container, listening on 4097 with Basic Auth, forwarding to opencode on 4096.
@@ -75,4 +77,4 @@ Benefits:
 
 ## Status
 
-**Planned.** Config types and secrets already have a `Sidecar` target for a future sidecar; the gateway is a concrete use case. Implementing the `devaipod gateway` subcommand and wiring it into pod creation is the main work; then switch the web UI and host gateway logic to use the gateway port and token.
+**Implemented as pod-api sidecar.** The gateway concept described here was realized as the `{pod}-api` container. Pod-api serves the vendored opencode web UI (built with `VITE_DEVAIPOD=true`), proxies to the opencode server, provides git review and PTY/terminal endpoints, handles authentication, and exposes a `/summary` endpoint. The `auth_proxy.py` script has been removed. The central devaipod web server talks to each pod's pod-api container rather than directly to opencode.
