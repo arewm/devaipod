@@ -1078,6 +1078,9 @@ impl PodmanService {
             args.push(format!("{}={}", key, value));
         }
 
+        // Extra args from devcontainer.json runArgs (passthrough)
+        args.extend(config.extra_create_args.iter().cloned());
+
         // Image
         args.push(image.to_string());
 
@@ -1590,6 +1593,10 @@ pub struct ContainerConfig {
     pub file_secrets: Vec<(String, String)>,
     /// Labels to attach to the container (key -> value)
     pub labels: HashMap<String, String>,
+    /// Additional arguments to pass through to `podman create` verbatim.
+    /// These come from devcontainer.json runArgs that aren't extracted
+    /// into typed fields.
+    pub extra_create_args: Vec<String>,
 }
 
 /// Mount configuration

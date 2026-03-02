@@ -372,6 +372,76 @@ impl DevcontainerConfig {
         }
         opts
     }
+
+    /// Get capabilities from runArgs (e.g., --cap-add=ALL or --cap-add SYS_ADMIN)
+    ///
+    /// Handles both `--cap-add=VALUE` and `--cap-add VALUE` formats.
+    /// Returns just the values (e.g., "ALL", "SYS_ADMIN"), not the flag itself.
+    pub fn cap_add_args(&self) -> Vec<String> {
+        let mut caps = Vec::new();
+        let mut iter = self.run_args.iter().peekable();
+
+        while let Some(arg) = iter.next() {
+            if let Some(value) = arg.strip_prefix("--cap-add=") {
+                // Format: --cap-add=VALUE
+                if !value.is_empty() {
+                    caps.push(value.to_string());
+                }
+            } else if arg == "--cap-add" {
+                // Format: --cap-add VALUE
+                if let Some(value) = iter.next() {
+                    if !value.starts_with('-') {
+                        caps.push(value.to_string());
+                    }
+                }
+            }
+        }
+        caps
+    }
+
+    /// Get runArgs entries that aren't handled by typed extraction methods.
+    ///
+    /// Returns args that should be passed through verbatim to `podman create`.
+    /// Known flags (--privileged, --device, --security-opt, --cap-add) are
+    /// extracted by their respective methods and excluded here.
+    pub fn passthrough_run_args(&self) -> Vec<String> {
+        let mut passthrough = Vec::new();
+        let mut iter = self.run_args.iter().peekable();
+
+        while let Some(arg) = iter.next() {
+            if arg == "--privileged" {
+                // Handled by has_privileged_run_arg()
+                continue;
+            }
+
+            // Flags that we extract into typed fields
+            let extracted_flags = ["--device", "--security-opt", "--cap-add"];
+            let is_extracted = extracted_flags
+                .iter()
+                .any(|flag| arg.starts_with(&format!("{}=", flag)) || arg == *flag);
+
+            if is_extracted {
+                // If it's the --flag value form (no =), skip the value too
+                if !arg.contains('=') {
+                    iter.next();
+                }
+                continue;
+            }
+
+            // Unknown flag — pass through verbatim
+            passthrough.push(arg.clone());
+            // If this looks like a flag with a space-separated value, include the value too
+            // (i.e., starts with -- and next arg doesn't start with --)
+            if arg.starts_with("--") && !arg.contains('=') {
+                if let Some(next) = iter.peek() {
+                    if !next.starts_with("--") {
+                        passthrough.push(iter.next().unwrap().clone());
+                    }
+                }
+            }
+        }
+        passthrough
+    }
 }
 
 /// Try to find devcontainer.json, returning None if not found
@@ -692,12 +762,59 @@ mod tests {
     }
 
     #[test]
+    fn test_cap_add_args_equals_format() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--cap-add=ALL", "--cap-add=SYS_ADMIN"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let caps = config.cap_add_args();
+        assert_eq!(caps.len(), 2);
+        assert!(caps.contains(&"ALL".to_string()));
+        assert!(caps.contains(&"SYS_ADMIN".to_string()));
+    }
+
+    #[test]
+    fn test_cap_add_args_space_format() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--cap-add", "ALL", "--cap-add", "SYS_PTRACE"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let caps = config.cap_add_args();
+        assert_eq!(caps.len(), 2);
+        assert!(caps.contains(&"ALL".to_string()));
+        assert!(caps.contains(&"SYS_PTRACE".to_string()));
+    }
+
+    #[test]
+    fn test_cap_add_args_empty() {
+        let config = DevcontainerConfig::default();
+        assert!(config.cap_add_args().is_empty());
+    }
+
+    #[test]
+    fn test_cap_add_args_mixed_with_other_flags() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--cap-add=NET_ADMIN", "--security-opt=label=disable", "--cap-add", "SYS_ADMIN"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let caps = config.cap_add_args();
+        assert_eq!(caps.len(), 2);
+        assert!(caps.contains(&"NET_ADMIN".to_string()));
+        assert!(caps.contains(&"SYS_ADMIN".to_string()));
+        // Other extractors should still work
+        assert_eq!(config.security_opt_args(), vec!["label=disable"]);
+    }
+
+    #[test]
     fn test_parse_jsonc_inline() {
         let json = r#"{
             // This is a comment
             "image": "ghcr.io/bootc-dev/devenv-debian",
             "capAdd": ["SYS_ADMIN"],
-            "runArgs": ["--security-opt", "label=disable"]
+            "runArgs": ["--security-opt", "label=disable", "--cap-add=NET_ADMIN"]
         }"#;
         let config = super::parse_jsonc(json).unwrap();
         assert_eq!(
@@ -705,7 +822,12 @@ mod tests {
             Some("ghcr.io/bootc-dev/devenv-debian".to_string())
         );
         assert_eq!(config.cap_add, vec!["SYS_ADMIN"]);
-        assert_eq!(config.run_args, vec!["--security-opt", "label=disable"]);
+        assert_eq!(
+            config.run_args,
+            vec!["--security-opt", "label=disable", "--cap-add=NET_ADMIN"]
+        );
+        // cap_add_args extracts from runArgs, separate from the structured capAdd field
+        assert_eq!(config.cap_add_args(), vec!["NET_ADMIN"]);
     }
 
     #[test]
@@ -733,5 +855,37 @@ mod tests {
         let json = r#"{"image": "debian", "build": {"dockerfile": "Dockerfile"}}"#;
         let config = super::parse_jsonc(json).unwrap();
         assert_eq!(config.image, Some("debian".to_string()));
+    }
+
+    #[test]
+    fn test_passthrough_run_args_known_filtered() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--privileged", "--device=/dev/kvm", "--security-opt", "label=disable", "--cap-add=ALL"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        // All known flags should be filtered out
+        assert!(config.passthrough_run_args().is_empty());
+    }
+
+    #[test]
+    fn test_passthrough_run_args_unknown_passed_through() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--cap-add=ALL", "--ulimit", "nofile=1024:1024", "--hostname=myhost"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let passthrough = config.passthrough_run_args();
+        // --cap-add=ALL should be filtered, rest passed through
+        assert_eq!(
+            passthrough,
+            vec!["--ulimit", "nofile=1024:1024", "--hostname=myhost"]
+        );
+    }
+
+    #[test]
+    fn test_passthrough_run_args_empty() {
+        let config = DevcontainerConfig::default();
+        assert!(config.passthrough_run_args().is_empty());
     }
 }

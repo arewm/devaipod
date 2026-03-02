@@ -404,6 +404,7 @@ impl DevaipodPod {
         };
 
         let config = devcontainer_config;
+
         // Derive project name from source (for PRs, use repo name; for local, use path)
         let project_name = source.project_name(project_path);
 
@@ -2171,7 +2172,16 @@ exec sleep infinity
                 ),
             ]),
             drop_all_caps: false,
-            cap_add: config.cap_add.clone(),
+            // Merge capabilities from both capAdd field and runArgs
+            cap_add: {
+                let mut caps = config.cap_add.clone();
+                for cap in config.cap_add_args() {
+                    if !caps.contains(&cap) {
+                        caps.push(cap);
+                    }
+                }
+                caps
+            },
             no_new_privileges: false,
             devices,
             // Merge security options from both securityOpt field and runArgs
@@ -2212,6 +2222,7 @@ exec sleep infinity
             secrets,
             file_secrets,
             labels: labels.iter().cloned().collect(),
+            extra_create_args: config.passthrough_run_args(),
             ..Default::default()
         }
     }
@@ -2300,7 +2311,7 @@ exec sleep infinity
         // Get security settings from devcontainer config to match workspace container.
         // In rootless podman, capabilities are relative to the user namespace, so the
         // agent container can safely have the same settings as workspace for nested containers.
-        let (devices, privileged, security_opts, cap_add) =
+        let (devices, privileged, security_opts, cap_add, extra_create_args) =
             if let Some(config) = devcontainer_config {
                 // Auto-detect development devices to pass through
                 let mut devices: Vec<String> = DEV_PASSTHROUGH_PATHS
@@ -2323,9 +2334,19 @@ exec sleep infinity
                     }
                 }
 
-                (devices, privileged, security_opts, config.cap_add.clone())
+                // Merge capabilities from both capAdd field and runArgs
+                let mut cap_add = config.cap_add.clone();
+                for cap in config.cap_add_args() {
+                    if !cap_add.contains(&cap) {
+                        cap_add.push(cap);
+                    }
+                }
+
+                let extra_create_args = config.passthrough_run_args();
+
+                (devices, privileged, security_opts, cap_add, extra_create_args)
             } else {
-                (vec![], false, vec![], vec![])
+                (vec![], false, vec![], vec![], vec![])
             };
 
         // If gcloud ADC is in bind_home, set GOOGLE_APPLICATION_CREDENTIALS to point to it
@@ -2462,6 +2483,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
                 mounts
             },
             file_secrets,
+            extra_create_args,
             ..Default::default()
         }
     }
@@ -2716,7 +2738,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
         let mounts = vec![];
 
         // Get security settings from devcontainer config (same as agent)
-        let (devices, privileged, security_opts, cap_add) =
+        let (devices, privileged, security_opts, cap_add, extra_create_args) =
             if let Some(config) = devcontainer_config {
                 let mut devices: Vec<String> = DEV_PASSTHROUGH_PATHS
                     .iter()
@@ -2735,9 +2757,19 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
                     }
                 }
 
-                (devices, privileged, security_opts, config.cap_add.clone())
+                // Merge capabilities from both capAdd field and runArgs
+                let mut cap_add = config.cap_add.clone();
+                for cap in config.cap_add_args() {
+                    if !cap_add.contains(&cap) {
+                        cap_add.push(cap);
+                    }
+                }
+
+                let extra_create_args = config.passthrough_run_args();
+
+                (devices, privileged, security_opts, cap_add, extra_create_args)
             } else {
-                (vec![], false, vec![], vec![])
+                (vec![], false, vec![], vec![], vec![])
             };
 
         // Handle gcloud ADC path (same as agent)
@@ -2861,6 +2893,7 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
             devices,
             security_opts,
             privileged,
+            extra_create_args,
             // Mount volumes:
             // - worker_workspace_volume at /workspaces: worker's own git clone (read-write)
             // - owner_workspace_volume at /mnt/owner-workspace:ro: task owner's workspace
@@ -3799,6 +3832,70 @@ mod tests {
     }
 
     #[test]
+    fn test_workspace_config_with_caps_from_run_args() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut config = DevcontainerConfig::default();
+        // Set capAdd structured field AND --cap-add in runArgs
+        config.cap_add = vec!["SYS_PTRACE".to_string()];
+        config.run_args = vec!["--cap-add=ALL".to_string()];
+
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+            "test-volume",
+            "test-agent-home",
+            "test-agent-workspace",
+            &global_config,
+            &[], // labels
+        );
+
+        // Both capAdd and --cap-add from runArgs should be merged
+        assert!(container_config.cap_add.contains(&"SYS_PTRACE".to_string()));
+        assert!(container_config.cap_add.contains(&"ALL".to_string()));
+        assert_eq!(container_config.cap_add.len(), 2);
+    }
+
+    #[test]
+    fn test_workspace_config_with_caps_dedup() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut config = DevcontainerConfig::default();
+        // Same capability in both sources should be deduplicated
+        config.cap_add = vec!["SYS_ADMIN".to_string()];
+        config.run_args = vec!["--cap-add=SYS_ADMIN".to_string()];
+
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+            "test-volume",
+            "test-agent-home",
+            "test-agent-workspace",
+            &global_config,
+            &[], // labels
+        );
+
+        // Should be deduplicated
+        assert_eq!(container_config.cap_add, vec!["SYS_ADMIN".to_string()]);
+    }
+
+    #[test]
     fn test_dotfiles_config_struct() {
         // Test that DotfilesConfig can be created and accessed
         let dotfiles = DotfilesConfig {
@@ -4088,6 +4185,44 @@ mod tests {
         assert!(
             !container_config.env.contains_key("OPENCODE_CONFIG_CONTENT"),
             "Worker with gator=none should not have MCP config"
+        );
+    }
+
+    #[test]
+    fn test_workspace_config_passthrough_run_args() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut config = DevcontainerConfig::default();
+        config.run_args = vec![
+            "--ulimit".to_string(),
+            "nofile=1024:1024".to_string(),
+            "--cap-add=ALL".to_string(),
+        ];
+
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+            "test-volume",
+            "test-agent-home",
+            "test-agent-workspace",
+            &global_config,
+            &[], // labels
+        );
+
+        // --cap-add=ALL should be extracted into cap_add, not in extra_create_args
+        assert!(container_config.cap_add.contains(&"ALL".to_string()));
+        // --ulimit and its value should be passed through
+        assert_eq!(
+            container_config.extra_create_args,
+            vec!["--ulimit", "nofile=1024:1024"]
         );
     }
 
