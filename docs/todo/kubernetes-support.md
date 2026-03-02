@@ -469,4 +469,4 @@ The backend should be environment-agnostic. Config (namespace, storage class, re
 - [kube-rs features](https://kube.rs/features) — ws for exec, attach, port-forward
 - [Podman REST API](https://docs.podman.io/en/latest/_static/api.html)
 - [opencode-webui-fork.md](./opencode-webui-fork.md) — Web UI architecture
-- [container-mode.md](../src/container-mode.md) — Current container deployment
+- [Quick Start](../src/quickstart.md) — Container deployment and setup

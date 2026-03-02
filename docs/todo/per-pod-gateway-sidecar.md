@@ -1,6 +1,6 @@
 # Per-Pod Gateway Sidecar (Rust)
 
-This document captures the plan to run a **gateway/proxy container as a sidecar in each pod**, implemented in Rust, providing a single authenticated entry point for all pod services. This aligns with the existing "expose services with auth" approach and avoids `--network host` (see [container-mode.md](../src/container-mode.md)).
+This document captures the plan to run a **gateway/proxy container as a sidecar in each pod**, implemented in Rust, providing a single authenticated entry point for all pod services. This aligns with the existing "expose services with auth" approach and avoids `--network host` (see [Quick Start](../src/quickstart.md)).
 
 ## Motivation
 
@@ -43,7 +43,7 @@ Benefits:
 | **auth_proxy.py** ([pod.rs](../../src/pod.rs)) | Replaced or fronted by the gateway: gateway implements Basic Auth and forwards to opencode:4096. |
 | **openai-compat-proxy.md** | "Proxy container in the pod" and "per-pod proxy" align with this: the **gateway** can host or route to the LLM proxy (or we add a separate LLM container and the gateway proxies to it). |
 | **rust-sidecar-monitoring.md** | That sidecar is a **host** process (nsenter into pod netns). Here we mean a **container** in the pod (simpler lifecycle, no host PID/nsenter). |
-| **container-mode.md** | Central devaipod container would talk to each pod’s **gateway** (one port per pod) instead of directly to auth proxy port; host gateway or podman exec to gateway both remain options. |
+| **container deployment** | Central devaipod container would talk to each pod’s **gateway** (one port per pod) instead of directly to auth proxy port; host gateway or podman exec to gateway both remain options. |
 
 ## Implementation Sketch
 

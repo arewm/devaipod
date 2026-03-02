@@ -6,7 +6,6 @@
 
 - [Quick Start](quickstart.md)
 - [Configuration](configuration.md)
-- [Container Mode](container-mode.md)
 - [Design Philosophy](design.md)
 
 # Security

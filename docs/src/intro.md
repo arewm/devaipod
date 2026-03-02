@@ -48,21 +48,20 @@ flowchart LR
 
 ## Key Features
 
-- **Native podman** - no devpod dependency for core workflow
+- **Web UI** - browser-based dashboard for managing workspaces and monitoring agents (primary interface)
+- **Runs as a container** - distributed as `ghcr.io/cgwalters/devaipod:latest`, no host installation needed beyond podman
 - **Sandboxed agents** - task owner and worker containers are credential-isolated (no GH_TOKEN, etc.)
 - **Task kickoff** - give the task owner a task and it starts working immediately
 - **Auto service-gator** - remote URLs automatically get read + draft PR permissions
-- **Workspace shim** - `opencode-connect` runs `opencode attach` to connect to the task owner
-- **API keys from environment** - agents receive `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.
+- **API keys via podman secrets** - agents receive `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc. securely
 - **Network isolation** - optionally restrict agents to allowed LLM API domains via proxy
-- **Env allowlist** - per-project env vars in devcontainer.json customizations
-- **Toolbox compatible** - works inside toolbox containers
+- **TUI and CLI** - terminal-based attach/monitoring also available via `podman exec`
 - **macOS support** - works with podman machine on macOS
 
 ## Requirements
 
 - **podman** (rootless works, including inside toolbox containers)
-- An image with `opencode` installed (e.g., [devenv-debian](https://github.com/bootc-dev/devenv-debian))
+- A devcontainer image with `opencode` and `git` installed (e.g., [devenv-debian](https://github.com/bootc-dev/devenv-debian))
 - A `devcontainer.json` in your project, OR a default image configured in `~/.config/devaipod.toml`
 
 ## License

@@ -1395,7 +1395,7 @@ echo "Dotfiles installed successfully"
                 bail!(
                     "Container mode: bind_home is not supported ({} paths configured). \
                      Use [trusted.secrets] in your config instead. See: \
-                     https://github.com/cgwalters/devaipod/blob/main/docs/src/container-mode.md",
+                     https://github.com/cgwalters/devaipod/blob/main/docs/src/quickstart.md",
                     total_paths
                 );
             }

@@ -1152,7 +1152,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
         eprintln!("  # or");
         eprintln!("  DEVAIPOD_HOST_MODE=1 devaipod <command>");
         eprintln!();
-        eprintln!("See https://github.com/cgwalters/devaipod/blob/main/docs/src/container-mode.md");
+        eprintln!("See https://github.com/cgwalters/devaipod/blob/main/docs/src/quickstart.md");
         std::process::exit(1);
     }
 
