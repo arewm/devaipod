@@ -2359,14 +2359,15 @@ exec sleep infinity
 
         // Add any additional MCP servers from config
         for (name, entry) in global_config.mcp.enabled_servers() {
-            mcp_servers.insert(
-                name.to_string(),
-                serde_json::json!({
-                    "type": "remote",
-                    "url": entry.url,
-                    "enabled": true
-                }),
-            );
+            let mut server_json = serde_json::json!({
+                "type": "remote",
+                "url": entry.url,
+                "enabled": true
+            });
+            if !entry.headers.is_empty() {
+                server_json["headers"] = serde_json::json!(entry.headers);
+            }
+            mcp_servers.insert(name.to_string(), server_json);
         }
 
         if !mcp_servers.is_empty() {
@@ -2778,14 +2779,15 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
 
         // Add any additional MCP servers from config
         for (name, entry) in global_config.mcp.enabled_servers() {
-            mcp_servers.insert(
-                name.to_string(),
-                serde_json::json!({
-                    "type": "remote",
-                    "url": entry.url,
-                    "enabled": true
-                }),
-            );
+            let mut server_json = serde_json::json!({
+                "type": "remote",
+                "url": entry.url,
+                "enabled": true
+            });
+            if !entry.headers.is_empty() {
+                server_json["headers"] = serde_json::json!(entry.headers);
+            }
+            mcp_servers.insert(name.to_string(), server_json);
         }
 
         if !mcp_servers.is_empty() {

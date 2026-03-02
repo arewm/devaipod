@@ -1362,6 +1362,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
         HostCommand::Gator { action } => cmd_gator(action).await,
         HostCommand::Web { port, open } => {
             let token = crate::web::load_or_generate_token();
+            let mcp_token = crate::web::load_or_generate_mcp_token();
             let url = format!("http://localhost:{}/?token={}", port, token);
 
             println!("devaipod v{}", env!("CARGO_PKG_VERSION"));
@@ -1376,7 +1377,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 let _ = std::process::Command::new("open").arg(&url).spawn();
             }
 
-            crate::web::run_web_server(port, token).await
+            crate::web::run_web_server(port, token, mcp_token).await
         }
         HostCommand::PodApi(args) => crate::pod_api::run(args).await,
         HostCommand::Advisor {
@@ -3044,7 +3045,10 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
         "http://{}:8080/api/devaipod/mcp",
         crate::podman::host_for_pod_services()
     );
-    let mcp_servers: Vec<String> = vec![format!("devaipod={}", mcp_url)];
+
+    // Load the MCP token so the advisor can authenticate to the MCP endpoint.
+    // This is a separate shared secret scoped to MCP, not the web API token.
+    let mcp_token = crate::web::load_or_generate_mcp_token();
 
     // Use the dotfiles repo as the advisor's workspace source — same
     // fallback that `devaipod up` / `devaipod run` use when no source
@@ -3052,8 +3056,24 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
     // repo to clone, and gives the advisor a familiar dev environment.
     let source = resolve_source(None, config)?;
 
+    // Build a modified config that includes the MCP server entry with the
+    // Authorization header. We reload the config and insert the entry
+    // directly so it flows through the normal config -> pod.rs pipeline
+    // (which now supports headers on McpServerEntry).
+    let mut advisor_config = config::load_config(None)?;
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", mcp_token));
+    advisor_config.mcp.servers.insert(
+        "devaipod".to_string(),
+        config::McpServerEntry {
+            url: mcp_url,
+            enabled: true,
+            headers,
+        },
+    );
+
     let pod_name = cmd_run(
-        config,
+        &advisor_config,
         source,
         Some(default_task),
         Some(&image),
@@ -3061,7 +3081,7 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
         &[],             // service-gator scopes from config
         None,
         true, // read-only service-gator
-        &mcp_servers,
+        &[],  // no CLI mcp_servers — entry is already in the config
         None, // no devcontainer override
     )
     .await?;

@@ -811,13 +811,15 @@ pub struct McpServersConfig {
 
 /// A single MCP server entry
 #[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
 pub struct McpServerEntry {
     /// URL of the MCP server endpoint
     pub url: String,
     /// Whether this server is enabled (default: true)
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// HTTP headers to send with requests (e.g. Authorization)
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 impl McpServersConfig {
@@ -849,6 +851,7 @@ impl McpServersConfig {
                     McpServerEntry {
                         url: url.to_string(),
                         enabled: true,
+                        headers: HashMap::new(),
                     },
                 );
             } else {
@@ -2243,5 +2246,47 @@ enabled = true
         assert!(config
             .merge_cli_servers(&["empty-url=".to_string()])
             .is_err());
+    }
+
+    #[test]
+    fn test_mcp_merge_cli_servers_empty_headers() {
+        let mut config = McpServersConfig::default();
+        config
+            .merge_cli_servers(&["test=http://localhost:8080/mcp".to_string()])
+            .unwrap();
+        assert!(
+            config.servers["test"].headers.is_empty(),
+            "CLI-parsed MCP entries should have empty headers"
+        );
+    }
+
+    #[test]
+    fn test_mcp_entry_headers_default_empty() {
+        let toml = r#"
+url = "http://localhost:8080/mcp"
+"#;
+        let entry: McpServerEntry = toml::from_str(toml).unwrap();
+        assert!(entry.headers.is_empty());
+        assert!(entry.enabled); // default true
+    }
+
+    #[test]
+    fn test_mcp_entry_with_headers_roundtrip() {
+        let toml = r#"
+url = "http://localhost:8080/mcp"
+
+[headers]
+Authorization = "Bearer abc123"
+X-Custom = "value"
+"#;
+        let entry: McpServerEntry = toml::from_str(toml).unwrap();
+        assert_eq!(entry.url, "http://localhost:8080/mcp");
+        assert!(entry.enabled);
+        assert_eq!(entry.headers.len(), 2);
+        assert_eq!(
+            entry.headers.get("Authorization"),
+            Some(&"Bearer abc123".to_string())
+        );
+        assert_eq!(entry.headers.get("X-Custom"), Some(&"value".to_string()));
     }
 }

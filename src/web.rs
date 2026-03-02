@@ -43,9 +43,20 @@ const DEFAULT_STATE_DIR: &str = "/var/lib/devaipod";
 /// Filename for the web auth token inside the state directory.
 const STATE_TOKEN_FILENAME: &str = "web-token";
 
+/// Path to the MCP token file when using podman/Kubernetes secrets.
+const MCP_TOKEN_SECRET_PATH: &str = "/run/secrets/devaipod-mcp-token";
+
+/// Filename for the MCP auth token inside the state directory.
+const MCP_STATE_TOKEN_FILENAME: &str = "mcp-token";
+
 fn state_token_path() -> std::path::PathBuf {
     let dir = std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
     std::path::PathBuf::from(dir).join(STATE_TOKEN_FILENAME)
+}
+
+fn mcp_state_token_path() -> std::path::PathBuf {
+    let dir = std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    std::path::PathBuf::from(dir).join(MCP_STATE_TOKEN_FILENAME)
 }
 
 const DEVAIPOD_AUTH_COOKIE: &str = "DEVAIPOD_AUTH";
@@ -127,6 +138,51 @@ pub fn load_or_generate_token() -> String {
     token
 }
 
+/// Load MCP token from secrets file, state volume, or generate a new one
+///
+/// Same priority as `load_or_generate_token` but uses MCP-specific paths.
+/// The MCP token is separate from the web API token and is only given to
+/// the advisor pod for authenticating MCP requests.
+pub fn load_or_generate_mcp_token() -> String {
+    // 1. Podman/Kubernetes secret (highest priority)
+    if let Ok(token) = std::fs::read_to_string(MCP_TOKEN_SECRET_PATH) {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            tracing::debug!("Loaded MCP token from {}", MCP_TOKEN_SECRET_PATH);
+            return trimmed.to_string();
+        }
+    }
+
+    // 2. State volume path
+    let state_path = mcp_state_token_path();
+    if let Ok(token) = std::fs::read_to_string(&state_path) {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            tracing::debug!("Loaded MCP token from {}", state_path.display());
+            return trimmed.to_string();
+        }
+    }
+
+    // 3. Generate and persist to state dir if it exists
+    let token = generate_token();
+    if let Some(parent) = state_path.parent() {
+        if parent.exists() {
+            if let Err(e) = std::fs::write(&state_path, &token) {
+                tracing::warn!(
+                    "Could not persist MCP token to {}: {}",
+                    state_path.display(),
+                    e
+                );
+            } else {
+                tracing::debug!("Generated and saved MCP token to {}", state_path.display());
+            }
+        }
+    } else {
+        tracing::debug!("Generated new MCP authentication token");
+    }
+    token
+}
+
 /// State of a background launch spawned by the web UI.
 ///
 /// Completed launches are removed from the map immediately (the pod becomes
@@ -150,6 +206,8 @@ type LaunchMap = Arc<tokio::sync::Mutex<HashMap<String, LaunchState>>>;
 pub(crate) struct AppState {
     /// Authentication token for API access
     token: String,
+    /// Authentication token for MCP endpoint (separate from web API token)
+    mcp_token: String,
     /// Path to the podman/docker socket (None if not available at startup)
     socket_path: Option<PathBuf>,
     /// Background launch states so the UI can track in-flight launches.
@@ -205,6 +263,29 @@ async fn auth_middleware(
         }
     }
 
+    Err(StatusCode::UNAUTHORIZED)
+}
+
+/// Authentication middleware for the MCP endpoint
+///
+/// Validates requests by checking the `Authorization: Bearer <mcp_token>` header.
+/// Only Bearer authentication is supported (no cookies, no query params).
+/// Returns 401 Unauthorized if missing or invalid.
+async fn mcp_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                if token == state.mcp_token {
+                    return Ok(next.run(request).await);
+                }
+            }
+        }
+    }
     Err(StatusCode::UNAUTHORIZED)
 }
 
@@ -1613,11 +1694,13 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
 /// without starting a server or container.
 pub(crate) fn build_app(
     token: String,
+    mcp_token: String,
     socket_path: Option<PathBuf>,
     self_image_id: Option<String>,
 ) -> Router {
     let state = Arc::new(AppState {
         token: token.clone(),
+        mcp_token,
         socket_path,
         launches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         self_image_id,
@@ -1680,11 +1763,19 @@ pub(crate) fn build_app(
         .route("/_devaipod/health", get(|| async { "ok" }))
         .route("/_devaipod/login", get(login))
         .route("/_devaipod/frontend-error", post(frontend_error_report))
-        // MCP endpoint for advisor tools — outside auth since the advisor
-        // pod connects without a bearer token. Only exposes pod metadata
-        // and a local draft-proposals JSON file.
-        // TODO: add lightweight auth (e.g. shared secret) for production use
-        .route("/api/devaipod/mcp", post(crate::mcp::handle_mcp))
+        // MCP endpoint for advisor tools — requires a separate MCP token
+        // (shared secret given only to the advisor pod). This prevents other
+        // pods from reaching the MCP endpoint via host.containers.internal.
+        .nest(
+            "/api/devaipod",
+            Router::new()
+                .route("/mcp", post(crate::mcp::handle_mcp))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    mcp_auth_middleware,
+                ))
+                .with_state(state.clone()),
+        )
         .nest("/api", api_router)
         .route("/", get(redirect_to_pods))
         .route("/pods", get(serve_spa_page))
@@ -1704,7 +1795,7 @@ pub(crate) fn build_app(
         .with_state(state)
 }
 
-pub async fn run_web_server(port: u16, token: String) -> Result<()> {
+pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Result<()> {
     // Try to get the podman socket path, but don't fail if not found
     // (allows server to start for static file serving even without podman)
     let socket_path = get_container_socket().ok();
@@ -1721,7 +1812,7 @@ pub async fn run_web_server(port: u16, token: String) -> Result<()> {
         tracing::info!("Control plane image ID: {}", id);
     }
 
-    let app = build_app(token.clone(), socket_path, self_image_id);
+    let app = build_app(token.clone(), mcp_token, socket_path, self_image_id);
 
     // Bind to [::] which accepts both IPv4 and IPv6 connections via dual-stack
     // (the Linux default).  Browsers typically try IPv6 first when resolving
@@ -1780,7 +1871,7 @@ mod tests {
     /// to /_devaipod/agent/{name}/ and preserve query parameters.
     #[tokio::test]
     async fn test_agent_redirect() {
-        let app = build_app("test-token".into(), None, None);
+        let app = build_app("test-token".into(), "test-mcp-token".into(), None, None);
 
         // Without query params
         let req = Request::builder()
@@ -1812,7 +1903,7 @@ mod tests {
         );
 
         // With query params
-        let app2 = build_app("test-token".into(), None, None);
+        let app2 = build_app("test-token".into(), "test-mcp-token".into(), None, None);
         let req = Request::builder()
             .uri("/_devaipod/agent/test-pod?dir=abc&session=s1")
             .body(Body::empty())
@@ -2038,6 +2129,140 @@ mod tests {
             request_line.contains("src"),
             "proxy must preserve path param value; request line: {}",
             request_line
+        );
+    }
+
+    /// MCP endpoint must return 401 without any authorization header.
+    #[tokio::test]
+    async fn test_mcp_endpoint_requires_auth() {
+        let app = build_app("test-token".into(), "test-mcp-token".into(), None, None);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/devaipod/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "MCP endpoint must return 401 without auth header"
+        );
+    }
+
+    /// MCP endpoint must reject a wrong Bearer token.
+    #[tokio::test]
+    async fn test_mcp_endpoint_rejects_wrong_token() {
+        let app = build_app("test-token".into(), "test-mcp-token".into(), None, None);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/devaipod/mcp")
+            .header("content-type", "application/json")
+            .header("Authorization", "Bearer wrong-token")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "MCP endpoint must reject wrong Bearer token"
+        );
+    }
+
+    /// MCP endpoint must reject the web API token — they are separate.
+    #[tokio::test]
+    async fn test_mcp_endpoint_rejects_web_token() {
+        let app = build_app("test-token".into(), "test-mcp-token".into(), None, None);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/devaipod/mcp")
+            .header("content-type", "application/json")
+            .header("Authorization", "Bearer test-token")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Web API token must NOT grant access to MCP endpoint"
+        );
+    }
+
+    /// MCP endpoint must accept the correct MCP token.
+    #[tokio::test]
+    async fn test_mcp_endpoint_accepts_valid_mcp_token() {
+        let app = build_app("test-token".into(), "test-mcp-token".into(), None, None);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/devaipod/mcp")
+            .header("content-type", "application/json")
+            .header("Authorization", "Bearer test-mcp-token")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "MCP endpoint must accept valid MCP token"
+        );
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result"], serde_json::json!({}));
+    }
+
+    /// MCP token must NOT grant access to regular API endpoints.
+    #[tokio::test]
+    async fn test_mcp_token_does_not_grant_api_access() {
+        let app = build_app("test-token".into(), "test-mcp-token".into(), None, None);
+
+        let req = Request::builder()
+            .uri("/api/devaipod/advisor/status")
+            .header("Authorization", "Bearer test-mcp-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "MCP token must NOT grant access to regular API endpoints"
         );
     }
 }

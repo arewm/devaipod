@@ -1623,3 +1623,80 @@ fn test_auth_proxy_api_request_without_auth() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_auth_proxy_api_request_without_auth);
+
+/// Verify the MCP endpoint requires authentication.
+///
+/// The MCP endpoint at `/api/devaipod/mcp` uses a separate shared secret
+/// (not the web API token). This test verifies that:
+/// - Unauthenticated requests are rejected (401)
+/// - The web API token does not grant MCP access (401)
+/// - A random/wrong token does not grant MCP access (401)
+///
+/// We cannot test the positive case (valid MCP token -> 200) because the
+/// MCP token is generated internally and not exposed in the container logs.
+/// That case is covered by unit tests in src/web.rs.
+///
+/// Tier 1: Parallel safe, no pod needed
+fn test_mcp_endpoint_requires_auth() -> Result<()> {
+    let fixture = WebFixture::get()?;
+    let container = fixture.container_name();
+    let sh = crate::shell()?;
+
+    let mcp_body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let url = "http://127.0.0.1:8080/api/devaipod/mcp";
+    let content_type = "Content-Type: application/json";
+
+    // Helper: extract HTTP status code from curl -w '\n%{http_code}' output
+    let extract_status = |output: &str| -> i32 {
+        output
+            .trim()
+            .lines()
+            .last()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1)
+    };
+
+    // 1. POST without auth -> 401
+    let output = cmd!(
+        sh,
+        "podman exec {container} curl -s -w \n%{http_code} --connect-timeout 5 --max-time 10 -X POST -H {content_type} -d {mcp_body} {url}"
+    )
+    .ignore_status()
+    .read()?;
+    assert_eq!(
+        extract_status(&output),
+        401,
+        "MCP endpoint without auth should return 401"
+    );
+
+    // 2. POST with the web API token -> 401 (tokens are separate)
+    let auth_header = format!("Authorization: Bearer {}", fixture.token());
+    let output = cmd!(
+        sh,
+        "podman exec {container} curl -s -w \n%{http_code} --connect-timeout 5 --max-time 10 -X POST -H {content_type} -H {auth_header} -d {mcp_body} {url}"
+    )
+    .ignore_status()
+    .read()?;
+    assert_eq!(
+        extract_status(&output),
+        401,
+        "MCP endpoint with web API token should return 401 (separate secrets)"
+    );
+
+    // 3. POST with a random wrong token -> 401
+    let wrong_auth = "Authorization: Bearer totally-wrong-token-12345";
+    let output = cmd!(
+        sh,
+        "podman exec {container} curl -s -w \n%{http_code} --connect-timeout 5 --max-time 10 -X POST -H {content_type} -H {wrong_auth} -d {mcp_body} {url}"
+    )
+    .ignore_status()
+    .read()?;
+    assert_eq!(
+        extract_status(&output),
+        401,
+        "MCP endpoint with wrong token should return 401"
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_mcp_endpoint_requires_auth);
