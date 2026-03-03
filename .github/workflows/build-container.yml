@@ -102,7 +102,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix={{branch}}-,format=short
+            type=sha,prefix={{branch}}-,format=short,enable=${{ github.ref_type != 'tag' }}
             type=ref,event=tag
 
       - name: Log in to Container Registry
