@@ -14,6 +14,7 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 | [OpenHands](https://github.com/All-Hands-AI/OpenHands) | MIT | Yes | Self-hostable, Docker-based |
 | [Ambient Code](https://github.com/ambient-code/platform) | MIT | Yes | Kubernetes-native, self-hosted |
 | [Gastown](https://github.com/steveyegge/gastown) | MIT | Yes | Multi-agent orchestration, no sandboxing |
+| [krunai](https://github.com/slp/krunai) | Apache-2.0 | Yes | MicroVM, but not container oriented |
 | [Auto-Claude](https://github.com/AndyMik90/Auto-Claude) | AGPL-3.0 | Yes | Desktop app, no sandboxing |
 | [Continue](https://github.com/continuedev/continue) | Apache-2.0 | Partial | CLI is local; "Mission Control" cloud is proprietary |
 | [SWE-agent](https://github.com/princeton-nlp/SWE-agent) | MIT | Partial | Core is open; [depends on Daytona cloud](https://www.daytona.io/dotfiles/langchain-s-open-swe-runs-on-daytona-here-s-why) for some features |
@@ -91,6 +92,14 @@ Gastown focuses on **orchestration** rather than **sandboxing**:
 - Isolation is via git worktrees (separate working directories) and prompt-based instructions to "stay in your worktree"
 
 Gastown and devaipod solve different problems and could be complementary: Gastown for orchestrating work distribution across many agents, devaipod for sandboxing individual agent execution with credential scoping.
+
+### krunai
+
+As far as I can see [krunai](https://github.com/slp/krunai) is really another virtual machine launcher, it doesn't truly do much special for AI workloads - or even arguably anything at all other than having an example init script that downloads a particular CLI tool.
+
+I think what devaipod is doing using devcontainers make sense as a mechanism to allow users to control their workload environment, and there's already good tooling to optionally launch podman/kube containers wrapped in VMs if desired.
+
+I also think in the general case one really wants good affordance for git integration, output review etc.
 
 ## Open Core (Partial Cloud Dependencies)
 
