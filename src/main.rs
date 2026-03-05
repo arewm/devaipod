@@ -5634,14 +5634,23 @@ fn configure_podman_service() -> Result<()> {
     // Create socket directory
     std::fs::create_dir_all(socket_dir).context("Failed to create /run/podman")?;
 
-    // Start podman service in background
-    ProcessCommand::new("podman")
-        .args(["system", "service", "--time=0"])
+    // Start podman service in background.
+    // Use pre_exec to set PR_SET_PDEATHSIG so the child dies with us.
+    let mut cmd = ProcessCommand::new("podman");
+    cmd.args(["system", "service", "--time=0"])
         .arg(format!("unix://{}", socket_path.display()))
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("Failed to start podman service")?;
+        .stderr(std::process::Stdio::null());
+
+    // Lifecycle-bind the child to this process: if we exit, the kernel
+    // sends SIGTERM to the podman service. No orphans, no timeouts.
+    #[cfg(target_os = "linux")]
+    {
+        use cap_std_ext::cmdext::CapStdExtCommandExt;
+        cmd.lifecycle_bind_to_parent_thread();
+    }
+
+    cmd.spawn().context("Failed to start podman service")?;
 
     // Wait for socket to appear and chmod it
     for _ in 0..50 {

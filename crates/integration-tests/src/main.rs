@@ -134,17 +134,25 @@ fn ensure_podman_socket() -> Option<PodmanServiceGuard> {
         }
     }
 
-    let child = match Command::new("podman")
-        .args([
-            "system",
-            "service",
-            "--time=0",
-            &format!("unix://{}", socket_path.display()),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+    let mut cmd = Command::new("podman");
+    cmd.args([
+        "system",
+        "service",
+        "--time=0",
+        &format!("unix://{}", socket_path.display()),
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+
+    // Lifecycle-bind the child to this process: if the test runner dies, the
+    // kernel sends SIGTERM to the podman service. No orphans, no timeouts.
+    #[cfg(target_os = "linux")]
     {
+        use cap_std_ext::cmdext::CapStdExtCommandExt;
+        cmd.lifecycle_bind_to_parent_thread();
+    }
+
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!("Failed to spawn podman system service: {e}");

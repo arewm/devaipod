@@ -185,9 +185,32 @@ pub(crate) fn ensure_podman_socket() -> Result<PathBuf> {
 
     let socket_path = auto_socket_path();
 
-    // If we already spawned and the socket exists, return it
-    if guard.is_some() && socket_path.exists() {
-        return Ok(socket_path);
+    // If we already spawned, check the child is still alive
+    if let Some(ref mut g) = *guard {
+        match g.child.try_wait() {
+            Ok(None) if socket_path.exists() => {
+                // Child alive and socket exists — all good
+                return Ok(socket_path);
+            }
+            Ok(None) => {
+                // Child alive but socket gone — unusual, give it a moment
+                tracing::debug!("Podman service running but socket missing, waiting...");
+                for _ in 0..20 {
+                    if socket_path.exists() {
+                        return Ok(socket_path);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // Still no socket — kill the stale child and respawn below
+                tracing::warn!("Podman service child alive but socket never appeared, respawning");
+            }
+            _ => {
+                // Child exited — clear the guard
+                tracing::debug!("Auto-spawned podman service has exited, will respawn if needed");
+            }
+        }
+        // Take and drop the old guard (kills the child if still alive)
+        *guard = None;
     }
 
     // Check if podman CLI is available
@@ -238,18 +261,29 @@ pub(crate) fn ensure_podman_socket() -> Result<PathBuf> {
         socket_path.display()
     );
 
-    // Spawn podman system service
-    let child = std::process::Command::new("podman")
-        .args([
-            "system",
-            "service",
-            "--time=0",
-            &format!("unix://{}", socket_path.display()),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("Failed to spawn podman system service")?;
+    // Spawn podman system service.
+    // Use pre_exec to set PR_SET_PDEATHSIG so the child is killed when we exit.
+    // This is strictly better than --time=N: no idle-timeout guessing, no
+    // window where orphans linger, and no risk of the service exiting mid-use.
+    let mut cmd = std::process::Command::new("podman");
+    cmd.args([
+        "system",
+        "service",
+        "--time=0",
+        &format!("unix://{}", socket_path.display()),
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+
+    // Lifecycle-bind the child to this process: if we exit, the kernel
+    // sends SIGTERM to the podman service. No orphans, no timeouts.
+    #[cfg(target_os = "linux")]
+    {
+        use cap_std_ext::cmdext::CapStdExtCommandExt;
+        cmd.lifecycle_bind_to_parent_thread();
+    }
+
+    let child = cmd.spawn().context("Failed to spawn podman system service")?;
 
     // Wait for the socket to appear
     for i in 0..50 {
