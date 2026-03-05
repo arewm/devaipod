@@ -339,7 +339,7 @@ fn test_readonly_api_git_log(fixture: &SharedFixture) -> Result<()> {
     let output = poll_until(Duration::from_secs(60), Duration::from_secs(1), || {
         let result = cmd!(
             sh,
-            "podman exec {agent} curl -s http://localhost:8090/git/log"
+            "podman exec {agent} curl -sf http://localhost:8090/git/log"
         )
         .ignore_status()
         .output()?;
@@ -356,6 +356,10 @@ fn test_readonly_api_git_log(fixture: &SharedFixture) -> Result<()> {
             // Return the body so we get a meaningful error message.
             bail!("pod-api /git/log returned: {}", body);
         } else {
+            tracing::debug!(
+                "curl /git/log failed (exit {:?}): {body}",
+                result.status.code()
+            );
             Ok(None)
         }
     })

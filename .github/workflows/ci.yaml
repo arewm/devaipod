@@ -39,6 +39,25 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
+  # Integration tests: run directly on the host with podman.
+  # Uses test-integration-local which skips web UI tests (no container image needed).
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup host (newer podman, just)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Pull test image
+        run: podman pull ghcr.io/bootc-dev/devenv-debian:latest
+
+      - name: Run integration tests
+        run: just test-integration-local
+
   # Security audit of dependencies
   audit:
     runs-on: ubuntu-latest
