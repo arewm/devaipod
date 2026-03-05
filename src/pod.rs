@@ -2600,6 +2600,15 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
 
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), "/tmp".to_string());
+        // The workspace volume is bind-mounted and may be owned by a different UID
+        // than the pod-api process. Tell git to trust it via environment-based config
+        // so `git log`, `git status`, etc. work regardless of ownership.
+        env.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+        env.insert(
+            "GIT_CONFIG_KEY_0".to_string(),
+            "safe.directory".to_string(),
+        );
+        env.insert("GIT_CONFIG_VALUE_0".to_string(), "*".to_string());
 
         let command = vec![
             "devaipod".to_string(),

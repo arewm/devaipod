@@ -354,6 +354,10 @@ const DIFF_RANGE_MAX_FILES: usize = 100;
 /// Run a git command in the workspace directory and return (exit_code, stdout, stderr).
 async fn run_git(workspace: &PathBuf, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>)> {
     let output = Command::new("git")
+        // The workspace is bind-mounted into the container and may be owned by a
+        // different UID than the pod-api process. Tell git to trust it regardless;
+        // we're inside a container where the mount was deliberate.
+        .args(["-c", "safe.directory=*"])
         .args(args)
         .current_dir(workspace)
         .output()
