@@ -2252,7 +2252,9 @@ fn build_router(state: AppState) -> Router {
 fn load_or_generate_admin_token() -> Result<String> {
     use std::io::Read;
 
-    let path = std::path::Path::new(ADMIN_TOKEN_PATH);
+    // Allow override via env var for testing outside of containers
+    let env_path = std::env::var("DEVAIPOD_ADMIN_TOKEN_PATH").ok();
+    let path = std::path::Path::new(env_path.as_deref().unwrap_or(ADMIN_TOKEN_PATH));
 
     // Try to read existing token
     if let Ok(mut file) = std::fs::File::open(path) {

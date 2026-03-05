@@ -218,6 +218,10 @@ fn start_pod_api(pod_api_port: u16, opencode_port: u16) -> Result<std::process::
             .output();
     }
 
+    // Use a temp path for the admin token (the default /var/lib/devaipod/
+    // requires root, which we don't have in local dev / devaipod-in-devaipod).
+    let token_path = workspace.join(".pod-api-token");
+
     let child = Command::new(&binary)
         .args([
             "pod-api",
@@ -230,6 +234,7 @@ fn start_pod_api(pod_api_port: u16, opencode_port: u16) -> Result<std::process::
             "--opencode-password",
             "",
         ])
+        .env("DEVAIPOD_ADMIN_TOKEN_PATH", &token_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

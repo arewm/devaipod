@@ -9,7 +9,9 @@
 //! mounted at /run/docker.sock (or set via DOCKER_HOST).
 
 use std::collections::HashMap;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use bollard::container::{
     LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
@@ -121,9 +123,155 @@ pub fn get_container_socket() -> Result<PathBuf> {
         }
     }
 
+    // 7. Last resort: try to spawn a local podman system service
+    if let Ok(path) = ensure_podman_socket() {
+        return Ok(path);
+    }
+
     bail!(
         "No container socket found. Mount the host socket at {} or set DOCKER_HOST",
         DOCKER_SOCKET,
+    )
+}
+
+/// Compute the fallback socket path for auto-spawned podman service.
+///
+/// Uses `$XDG_RUNTIME_DIR/podman/podman.sock` if available, otherwise
+/// falls back to `/tmp/devaipod-podman-$UID/podman.sock`.
+fn auto_socket_path() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(xdg).join("podman/podman.sock")
+    } else {
+        let uid = rustix::process::getuid().as_raw();
+        PathBuf::from(format!("/tmp/devaipod-podman-{}", uid)).join("podman.sock")
+    }
+}
+
+/// Guard that kills the podman system service child process on drop.
+///
+/// This lifecycle-binds the spawned podman service to the devaipod process:
+/// when devaipod exits (normally or abnormally), the child is killed.
+struct PodmanServiceGuard {
+    child: std::process::Child,
+}
+
+impl Drop for PodmanServiceGuard {
+    fn drop(&mut self) {
+        let pid = self.child.id();
+        tracing::debug!("Stopping auto-spawned podman service (pid {})", pid);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Global guard for the auto-spawned podman service process.
+///
+/// Using Mutex<Option<>> so we can spawn at most once per process lifetime.
+static PODMAN_SERVICE_GUARD: Mutex<Option<PodmanServiceGuard>> = Mutex::new(None);
+
+/// Ensure a podman socket is available, spawning `podman system service` if needed.
+///
+/// This is the last-resort fallback for environments where:
+/// - No socket is mounted (no `-v /run/docker.sock`)
+/// - No systemd socket activation is available (e.g. containers with podman-init as PID 1)
+/// - But the `podman` CLI is installed and functional
+///
+/// The spawned process is lifecycle-bound to the current process via a global
+/// guard that kills the child on drop.
+pub(crate) fn ensure_podman_socket() -> Result<PathBuf> {
+    let mut guard = PODMAN_SERVICE_GUARD
+        .lock()
+        .map_err(|e| color_eyre::eyre::eyre!("Lock poisoned: {}", e))?;
+
+    let socket_path = auto_socket_path();
+
+    // If we already spawned and the socket exists, return it
+    if guard.is_some() && socket_path.exists() {
+        return Ok(socket_path);
+    }
+
+    // Check if podman CLI is available
+    if !std::process::Command::new("podman")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        bail!("podman CLI not available, cannot auto-start socket service");
+    }
+
+    // If socket already exists (maybe started externally), verify it works
+    if socket_path.exists() {
+        if std::process::Command::new("podman")
+            .args(["--url", &format!("unix://{}", socket_path.display()), "info"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            tracing::info!(
+                "Found working podman socket at {} (externally managed)",
+                socket_path.display()
+            );
+            return Ok(socket_path);
+        }
+        // Socket file exists but is stale — remove it
+        tracing::debug!("Removing stale socket at {}", socket_path.display());
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // Create the socket directory with restricted permissions (0700).
+    // This prevents other users from connecting to our podman socket.
+    if let Some(parent) = socket_path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .with_context(|| format!("Failed to create socket directory {}", parent.display()))?;
+    }
+
+    tracing::info!(
+        "No container socket found; auto-starting podman service at {}",
+        socket_path.display()
+    );
+
+    // Spawn podman system service
+    let child = std::process::Command::new("podman")
+        .args([
+            "system",
+            "service",
+            "--time=0",
+            &format!("unix://{}", socket_path.display()),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to spawn podman system service")?;
+
+    // Wait for the socket to appear
+    for i in 0..50 {
+        if socket_path.exists() {
+            tracing::info!(
+                "Podman service started at {} (took ~{}ms)",
+                socket_path.display(),
+                i * 100,
+            );
+            *guard = Some(PodmanServiceGuard { child });
+            return Ok(socket_path);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Timed out — kill the process and fail
+    let mut child = child;
+    let _ = child.kill();
+    let _ = child.wait();
+    bail!(
+        "Podman service did not create socket at {} within 5 seconds",
+        socket_path.display()
     )
 }
 
