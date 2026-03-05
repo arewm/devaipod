@@ -13,6 +13,7 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 | [nono](https://nono.sh/) | Apache-2.0 | Yes | OS-level sandboxing (Landlock/Seatbelt), agent-agnostic |
 | [OpenHands](https://github.com/All-Hands-AI/OpenHands) | MIT | Yes | Self-hostable, Docker-based |
 | [Ambient Code](https://github.com/ambient-code/platform) | MIT | Yes | Kubernetes-native, self-hosted |
+| [Kortex](https://github.com/kortex-hub/kortex) | Apache-2.0 | Yes | Desktop GUI, AI + container/K8s management, Goose integration |
 | [Gastown](https://github.com/steveyegge/gastown) | MIT | Yes | Multi-agent orchestration, no sandboxing |
 | [krunai](https://github.com/slp/krunai) | Apache-2.0 | Yes | MicroVM, but not container oriented |
 | [Auto-Claude](https://github.com/AndyMik90/Auto-Claude) | AGPL-3.0 | Yes | Desktop app, no sandboxing |
@@ -72,6 +73,31 @@ The devaipod project would like to align more with Ambient Code. A few things:
 - [Podman support](https://github.com/ambient-code/platform/issues/431)
 - [Image needs to be pluggable](https://github.com/ambient-code/platform/pull/364)
 - It's possible to run locally with [minikube](https://minikube.sigs.k8s.io/) or [minc](https://github.com/minc-org/minc) in theory, but this adds some friction
+
+### Kortex
+
+(This section is 85% Opus 4.6+OpenCode research, only superficial human review)
+
+[Kortex](https://github.com/kortex-hub/kortex) is an Electron/Svelte desktop application for AI-powered container and Kubernetes management. Apache-2.0 licensed, evolved from [Podman Desktop](https://github.com/podman-desktop/podman-desktop).
+
+Kortex occupies a different niche than devaipod: rather than sandboxing AI agents, it provides a desktop GUI that integrates AI with container and Kubernetes management. It has a pluggable "flow provider" abstraction, with [Goose](https://github.com/block/goose) as the current implementation. Goose is downloaded and spawned as a CLI subprocess (`goose run --recipe <path>`); the flow provider interface is generic enough that other agents could be plugged in via extensions.
+
+Interesting aspects of the Goose integration:
+
+- **MCP passthrough**: When creating a flow, users select from MCP servers registered in Kortex. Credentials are retrieved from secure storage and embedded into the Goose recipe YAML as `extensions` with `streamable_http` URIs and auth headers. This is a form of credential management, though not scoped per-operation like service-gator.
+- **GUI on top of Goose**: Kortex adds a full web UI for flow creation (with AI-assisted parameter extraction from prompts), execution (xterm.js terminal streaming Goose stdout/stderr), and Kubernetes deployment (generates Job + Secret + ConfigMap YAML).
+- **K8s deployment**: Flows can be deployed as Kubernetes Jobs running a hardcoded `quay.io/kortex/goose` container image (built externally in [packit/ai-workflows](https://github.com/packit/ai-workflows/tree/main/goose-container)) with the recipe mounted via ConfigMap. The image is not user-configurable. The Job is minimal: single container, no sidecars, no resource limits, no security context.
+- **Chat-to-flow export**: Users can export chat conversations (powered by inference providers like Gemini) into Goose recipes, bridging interactive AI chat with automated workflows.
+
+Key differences from devaipod:
+
+- **No agent sandboxing**: Goose runs locally as a bare `child_process.spawn()` with full host access. No container wrapping for local execution at all.
+- **No devcontainer/devfile support**: Kortex has no concept of devcontainer.json or devfiles. The execution environment is either the host (local) or a hardcoded container image (K8s). Users cannot define or customize the runtime environment.
+- **Hardcoded image**: The K8s deployment image (`quay.io/kortex/goose:2025-09-03`) is a compile-time constant with no user override. The image just contains the goose binary; there's nothing else special in it.
+- **GUI-first vs CLI-first**: Desktop application vs terminal tool.
+- **AI manages infrastructure**: Kortex uses AI to help manage containers/K8s; devaipod uses containers to sandbox AI that writes code.
+
+The projects could be complementary: Kortex could manage the container/K8s infrastructure that devaipod pods run on. More concretely, Kortex's MCP integration means it could consume service-gator as a tool provider, which would add the credential scoping that Kortex currently lacks for its Goose integration.
 
 ### Auto-Claude
 
