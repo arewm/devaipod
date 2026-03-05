@@ -34,7 +34,7 @@ _podman_socket_format := "{" + "{" + ".ConnectionInfo.PodmanSocket.Path" + "}" +
 # Skips web UI tests (which need the container image).
 # Requires: podman installed. Socket is auto-started if missing.
 test-integration-local: build
-    DEVAIPOD_PATH=./target/debug/devaipod \
+    DEVAIPOD_PATH="{{justfile_directory()}}/target/debug/devaipod" \
     DEVAIPOD_HOST_MODE=1 \
         cargo test -p integration-tests
 
@@ -171,26 +171,60 @@ build-integration no_cache="":
 test-integration image=default_test_image: container-build build-integration
     #!/usr/bin/env bash
     set -euo pipefail
+    # Trap to clean up auto-started podman service on exit
+    PODMAN_PID=""
+    cleanup() {
+        if [ -n "$PODMAN_PID" ]; then
+            kill "$PODMAN_PID" 2>/dev/null || true
+            wait "$PODMAN_PID" 2>/dev/null || true
+        fi
+    }
+    trap cleanup EXIT
     CONFIG="${DEVAIPOD_CONFIG:-$HOME/.config/devaipod.toml}"
     if [ ! -f "$CONFIG" ]; then
-        echo "No config file found at $CONFIG. Run 'devaipod init' first."
-        exit 1
+        # Create a minimal config for CI / devaipod-in-devaipod environments
+        echo "No config at $CONFIG, creating minimal one for integration tests..."
+        mkdir -p "$(dirname "$CONFIG")"
+        echo "# Auto-generated for integration tests" > "$CONFIG"
     fi
     SOCKET=""
     if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "${XDG_RUNTIME_DIR}/podman/podman.sock" ]; then
         SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"
+    elif [ -n "${DOCKER_HOST:-}" ]; then
+        # Honor DOCKER_HOST (e.g. set by auto-spawned podman service)
+        SOCKET="${DOCKER_HOST#unix://}"
+    elif [ -S "/tmp/devaipod-podman-$(id -u)/podman.sock" ]; then
+        # Auto-spawned socket from ensure_podman_socket()
+        SOCKET="/tmp/devaipod-podman-$(id -u)/podman.sock"
     elif command -v podman &>/dev/null; then
         SOCKET=$(podman machine inspect --format '{{_podman_socket_format}}' 2>/dev/null || true)
     fi
+    # Last resort: try to auto-start podman system service
     if [ -z "$SOCKET" ] || [ ! -S "$SOCKET" ]; then
-        echo "Could not find podman socket. Linux: set XDG_RUNTIME_DIR. macOS: run 'podman machine start'."
-        exit 1
+        if command -v podman &>/dev/null; then
+            SOCKET="/tmp/devaipod-podman-$(id -u)/podman.sock"
+            mkdir -p "$(dirname "$SOCKET")"
+            echo "No podman socket found; auto-starting podman system service at $SOCKET..."
+            podman system service --time=120 "unix://$SOCKET" &
+            PODMAN_PID=$!
+            for i in $(seq 1 50); do [ -S "$SOCKET" ] && break; sleep 0.1; done
+            if [ ! -S "$SOCKET" ]; then
+                echo "Failed to start podman socket service"
+                exit 1
+            fi
+        else
+            echo "Could not find podman socket. Linux: set XDG_RUNTIME_DIR. macOS: run 'podman machine start'."
+            exit 1
+        fi
     fi
-    # Linux: mount host socket directly. macOS: container runs in VM, mount VM socket path.
-    # Target is always /run/docker.sock (well-known path).
-    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    # HOST_SOCKET is the path podman uses to resolve -v mounts.
+    # On Linux, the socket is on the host filesystem directly.
+    # On macOS, the container runs in a VM so we use the VM-side path.
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] || [[ "$SOCKET" == /tmp/* ]]; then
+        # Linux (systemd or auto-spawned): use the actual socket path
         HOST_SOCKET="$SOCKET"
     else
+        # macOS/podman machine: use the VM-side socket path
         HOST_SOCKET="/run/podman/podman.sock"
     fi
     echo "Running integration tests (image: {{ CONTAINER_IMAGE }}-integration:latest)..."
@@ -198,7 +232,14 @@ test-integration image=default_test_image: container-build build-integration
     # devaipod's init container bind-mounts <repo>/.git into workspace pods;
     # tests create repos under /tmp, so the paths must resolve identically
     # from both the runner and the podman service.
-    podman run --rm --privileged \
+    # Use --privileged when possible (host), fall back to --security-opt for
+    # nested containers (devaipod-in-devaipod) where --privileged may fail.
+    # Raise the pids limit so tests don't exhaust thread/process slots.
+    PRIV_FLAG="--privileged"
+    if ! podman run --rm --privileged alpine true 2>/dev/null; then
+        PRIV_FLAG="--security-opt label=disable"
+    fi
+    podman run --rm $PRIV_FLAG --pids-limit=-1 \
         -v "$HOST_SOCKET":/run/docker.sock \
         -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
         -v /tmp:/tmp \
