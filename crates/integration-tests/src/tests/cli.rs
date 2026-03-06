@@ -13,11 +13,13 @@ fn test_dry_run_shows_config() -> Result<()> {
     let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--dry-run"])?;
     output.assert_success("devaipod up --dry-run");
 
-    // Dry run should show what would be created
+    // Dry run should show what would be created.
+    // The message comes from tracing (stderr), so check combined output.
+    let combined = output.combined();
     assert!(
-        output.stdout.contains("Dry run") || output.stdout.contains("dry run"),
-        "Expected dry-run message. stdout:\n{}",
-        output.stdout
+        combined.contains("Dry run") || combined.contains("dry run"),
+        "Expected dry-run message. output:\n{}",
+        combined
     );
 
     Ok(())

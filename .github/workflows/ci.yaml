@@ -10,10 +10,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  # Primary CI: lint, unit tests, and integration tests on a single runner
+  # with podman available (via bootc-ubuntu-setup).
+  ci:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup host (newer podman, just)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      # Docker is pre-installed on GHA runners and its socket at
+      # /run/docker.sock shadows the podman socket.  Tests that use
+      # `podman --url` fail with 404 against Docker's API.
+      - name: Stop Docker (tests use podman)
+        run: sudo systemctl stop docker.socket docker.service && sudo rm -f /run/docker.sock
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -27,17 +38,20 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build
-        run: cargo build --workspace
-
-      - name: Run tests
-        run: cargo test --workspace
-
       - name: Check formatting
         run: cargo fmt -- --check
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
+
+      - name: Unit tests
+        run: just test
+
+      - name: Pull test image
+        run: podman pull ghcr.io/bootc-dev/devenv-debian:latest
+
+      - name: Integration tests
+        run: just test-integration-local
 
   # Security audit of dependencies
   audit:
@@ -49,7 +63,8 @@ jobs:
         run: cargo install cargo-audit
 
       - name: Run security audit
-        run: cargo audit
+        # RUSTSEC-2023-0071: rsa crate (transitive via russh), no fix available
+        run: cargo audit --ignore RUSTSEC-2023-0071
 
   # Test the devcontainer feature install script syntax
   shellcheck:

@@ -354,6 +354,10 @@ const DIFF_RANGE_MAX_FILES: usize = 100;
 /// Run a git command in the workspace directory and return (exit_code, stdout, stderr).
 async fn run_git(workspace: &PathBuf, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>)> {
     let output = Command::new("git")
+        // The workspace is bind-mounted into the container and may be owned by a
+        // different UID than the pod-api process. Tell git to trust it regardless;
+        // we're inside a container where the mount was deliberate.
+        .args(["-c", "safe.directory=*"])
         .args(args)
         .current_dir(workspace)
         .output()
@@ -731,6 +735,7 @@ async fn git_diff_range(
 /// Fetch the content of multiple files at a given git ref, concurrently.
 ///
 /// Returns a map from file path to content. Missing files map to empty strings.
+#[allow(clippy::ptr_arg)] // PathBuf needed: spawned tasks clone it, &Path would require 'static
 async fn fetch_file_contents(
     workspace: &PathBuf,
     git_ref: &str,
@@ -2252,7 +2257,9 @@ fn build_router(state: AppState) -> Router {
 fn load_or_generate_admin_token() -> Result<String> {
     use std::io::Read;
 
-    let path = std::path::Path::new(ADMIN_TOKEN_PATH);
+    // Allow override via env var for testing outside of containers
+    let env_path = std::env::var("DEVAIPOD_ADMIN_TOKEN_PATH").ok();
+    let path = std::path::Path::new(env_path.as_deref().unwrap_or(ADMIN_TOKEN_PATH));
 
     // Try to read existing token
     if let Ok(mut file) = std::fs::File::open(path) {

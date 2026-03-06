@@ -2075,10 +2075,12 @@ dependencies = [
 name = "integration-tests"
 version = "0.1.0"
 dependencies = [
+ "cap-std-ext",
  "color-eyre",
  "libtest-mimic",
  "linkme",
  "paste",
+ "rustix 1.1.3",
  "serde",
  "serde_json",
  "tempfile",

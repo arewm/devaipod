@@ -44,6 +44,10 @@ pub struct IntegrationTest {
     pub f: TestFn,
     /// Whether this test requires podman (should be skipped in environments without it)
     pub requires_podman: bool,
+    /// Whether this test requires the pre-built container image
+    /// (`DEVAIPOD_CONTAINER_IMAGE`). Tests with this flag are skipped
+    /// when running via `just test-integration-local`.
+    pub requires_container_image: bool,
 }
 
 impl IntegrationTest {
@@ -53,6 +57,7 @@ impl IntegrationTest {
             name,
             f,
             requires_podman: false,
+            requires_container_image: false,
         }
     }
 
@@ -62,6 +67,17 @@ impl IntegrationTest {
             name,
             f,
             requires_podman: true,
+            requires_container_image: false,
+        }
+    }
+
+    /// Create a new integration test that requires podman and the container image
+    pub const fn new_container(name: &'static str, f: TestFn) -> Self {
+        Self {
+            name,
+            f,
+            requires_podman: true,
+            requires_container_image: true,
         }
     }
 }
@@ -138,6 +154,21 @@ macro_rules! podman_integration_test {
             #[::linkme::distributed_slice($crate::INTEGRATION_TESTS)]
             static [<$fn_name:upper>]: $crate::IntegrationTest =
                 $crate::IntegrationTest::new_podman(stringify!($fn_name), $fn_name);
+        }
+    };
+}
+
+/// Register an integration test that requires the pre-built container image.
+///
+/// These tests need `DEVAIPOD_CONTAINER_IMAGE` set and are skipped by
+/// `just test-integration-local`.
+#[macro_export]
+macro_rules! container_integration_test {
+    ($fn_name:ident) => {
+        ::paste::paste! {
+            #[::linkme::distributed_slice($crate::INTEGRATION_TESTS)]
+            static [<$fn_name:upper>]: $crate::IntegrationTest =
+                $crate::IntegrationTest::new_container(stringify!($fn_name), $fn_name);
         }
     };
 }

@@ -17,6 +17,31 @@ use crate::{
     unique_test_name, PodGuard, SharedFixture, TestRepo,
 };
 
+/// Host to use when connecting to pod-published ports from the test runner.
+///
+/// When the test runner is inside the devaipod *test container* (the normal
+/// `just test-integration` path), published ports are on the podman host,
+/// reached via `host.containers.internal`.
+///
+/// When running in host mode (DEVAIPOD_HOST_MODE=1, e.g. local dev or
+/// devaipod-in-devaipod), the test runner and podman are in the same
+/// network namespace, so ports are on `127.0.0.1`.
+fn pod_service_host() -> &'static str {
+    // DEVAIPOD_HOST_MODE means we're running devaipod directly rather than
+    // through the containerized test runner infrastructure. In this mode,
+    // nested podman publishes ports on localhost.
+    if std::env::var("DEVAIPOD_HOST_MODE").as_deref() == Ok("1") {
+        return "127.0.0.1";
+    }
+    if std::path::Path::new("/run/.containerenv").exists()
+        || std::path::Path::new("/.dockerenv").exists()
+    {
+        "host.containers.internal"
+    } else {
+        "127.0.0.1"
+    }
+}
+
 /// Run podman inspect with a Go template format string.
 ///
 /// This uses std::process::Command instead of xshell's cmd! macro
@@ -225,9 +250,8 @@ fn test_readonly_api_responds(fixture: &SharedFixture) -> Result<()> {
 
     // Test /git/status which is handled directly by pod-api (no opencode dependency).
     // Poll with retries since the pod-api sidecar may still be starting.
-    // Use host.containers.internal since the test runner is inside a container
-    // and needs to reach ports published on the podman VM host.
-    let url = format!("http://host.containers.internal:{}/git/status", port);
+    let host = pod_service_host();
+    let url = format!("http://{}:{}/git/status", host, port);
     poll_until(Duration::from_secs(30), Duration::from_secs(1), || {
         let response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
         if response.status.success() {
@@ -315,7 +339,7 @@ fn test_readonly_api_git_log(fixture: &SharedFixture) -> Result<()> {
     let output = poll_until(Duration::from_secs(60), Duration::from_secs(1), || {
         let result = cmd!(
             sh,
-            "podman exec {agent} curl -s http://localhost:8090/git/log"
+            "podman exec {agent} curl -sf http://localhost:8090/git/log"
         )
         .ignore_status()
         .output()?;
@@ -332,6 +356,10 @@ fn test_readonly_api_git_log(fixture: &SharedFixture) -> Result<()> {
             // Return the body so we get a meaningful error message.
             bail!("pod-api /git/log returned: {}", body);
         } else {
+            tracing::debug!(
+                "curl /git/log failed (exit {:?}): {body}",
+                result.status.code()
+            );
             Ok(None)
         }
     })
@@ -851,8 +879,8 @@ fn test_api_authentication_works() -> Result<()> {
     // Test that the pod-api sidecar responds on the published port.
     // Use /git/status which is handled directly by pod-api (no opencode dependency).
     // Poll with retries since the sidecar may still be starting.
-    // Use host.containers.internal since the test runner is inside a container.
-    let url = format!("http://host.containers.internal:{}/git/status", port);
+    let host = pod_service_host();
+    let url = format!("http://{}:{}/git/status", host, port);
     poll_until(Duration::from_secs(30), Duration::from_secs(1), || {
         let response = cmd!(sh, "curl -sf {url}").ignore_status().output()?;
         if response.status.success() {

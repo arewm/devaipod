@@ -870,11 +870,11 @@ async fn agent_wrapper(Path(name): Path<String>, request: Request) -> Result<Res
         location.push('?');
         location.push_str(query);
     }
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, location)
         .body(Body::empty())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Query parameters for the agent UI page.
@@ -1784,7 +1784,6 @@ async fn get_pod_api_admin_token(pod_name: &str) -> Result<String, StatusCode> {
 ///
 /// Returns an error if the server fails to bind to the port.
 /// Podman socket availability is checked lazily when proxying requests.
-
 /// Build the web app router for a given token and socket path.
 ///
 /// Exposed for tests so we can hit the router with in-process requests (fast)
