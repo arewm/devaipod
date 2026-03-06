@@ -1,6 +1,4 @@
-# Docs build runs inside our devcontainer using devcontainers/ci.
-# This dogfoods our own setup and ensures consistency between
-# local development and CI. All commands should go through `just`.
+# Build docs via container and deploy to GitHub Pages.
 name: Deploy docs
 
 on:
@@ -19,14 +17,15 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup host (newer podman, just)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
       - name: Build docs
-        uses: devcontainers/ci@v0.3
-        with:
-          runCmd: just build-mdbook-to target/docs
+        run: just build-mdbook-to target/docs
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
