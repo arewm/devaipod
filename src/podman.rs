@@ -527,7 +527,7 @@ impl PodmanService {
     /// Ensure a gator image is up-to-date, using `--pull=newer` semantics
     ///
     /// This is used for service-gator images which may be local builds.
-    /// For remote images, pulls only if a newer version is available.
+    /// For remote images, pulls unconditionally.
     /// For local images (localhost/), skips the pull entirely.
     pub async fn ensure_gator_image(&self, image: &str) -> Result<()> {
         // Local images (localhost/) don't need pulling
@@ -539,12 +539,10 @@ impl PodmanService {
             color_eyre::eyre::bail!("Local image {} not found. Build it first.", image);
         }
 
-        // For remote images, use podman pull --policy=newer via CLI
-        // This pulls only if a newer version is available
-        tracing::debug!("Ensuring image {} is up-to-date (--policy=newer)", image);
+        tracing::debug!("Pulling image {}", image);
         let output = self
             .podman_command()
-            .args(["pull", "--policy=newer", image])
+            .args(["pull", image])
             .output()
             .await
             .context("Failed to run podman pull")?;
