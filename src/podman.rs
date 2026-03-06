@@ -228,7 +228,11 @@ pub(crate) fn ensure_podman_socket() -> Result<PathBuf> {
     // If socket already exists (maybe started externally), verify it works
     if socket_path.exists() {
         if std::process::Command::new("podman")
-            .args(["--url", &format!("unix://{}", socket_path.display()), "info"])
+            .args([
+                "--url",
+                &format!("unix://{}", socket_path.display()),
+                "info",
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -283,7 +287,9 @@ pub(crate) fn ensure_podman_socket() -> Result<PathBuf> {
         cmd.lifecycle_bind_to_parent_thread();
     }
 
-    let child = cmd.spawn().context("Failed to spawn podman system service")?;
+    let child = cmd
+        .spawn()
+        .context("Failed to spawn podman system service")?;
 
     // Wait for the socket to appear
     for i in 0..50 {
