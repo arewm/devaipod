@@ -735,6 +735,7 @@ async fn git_diff_range(
 /// Fetch the content of multiple files at a given git ref, concurrently.
 ///
 /// Returns a map from file path to content. Missing files map to empty strings.
+#[allow(clippy::ptr_arg)] // PathBuf needed: spawned tasks clone it, &Path would require 'static
 async fn fetch_file_contents(
     workspace: &PathBuf,
     git_ref: &str,

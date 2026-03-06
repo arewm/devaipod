@@ -2340,6 +2340,7 @@ async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Resul
 /// immediately. Use `devaipod attach <workspace>` to monitor the agent's progress.
 ///
 /// Returns the pod name for optional follow-up operations (e.g., attach).
+#[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     config: &config::Config,
     source: &str,

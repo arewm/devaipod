@@ -36,10 +36,11 @@ pub enum Priority {
 }
 
 /// Status of a draft proposal
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProposalStatus {
     /// Waiting for human review
+    #[default]
     Pending,
     /// Approved by human, pod launch pending or in progress
     Approved,
@@ -47,12 +48,6 @@ pub enum ProposalStatus {
     Dismissed,
     /// Expired (source issue closed, etc.)
     Expired,
-}
-
-impl Default for ProposalStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 /// A draft proposal for launching an agent pod
