@@ -49,7 +49,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use xshell::{cmd, Shell};
 
-use crate::podman_integration_test;
+use crate::container_integration_test;
 use crate::shell;
 
 /// Env var: the pre-built devaipod container image to test against.
@@ -604,7 +604,7 @@ fn test_web_container_starts() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_web_container_starts);
+container_integration_test!(test_web_container_starts);
 
 /// Verify GET /_devaipod/agent/{name}/ serves iframe wrapper (not the raw opencode SPA)
 ///
@@ -666,7 +666,7 @@ fn test_web_agent_ui_index_rewrites_asset_urls() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_web_agent_ui_index_rewrites_asset_urls);
+container_integration_test!(test_web_agent_ui_index_rewrites_asset_urls);
 
 /// Verify the login flow sets a cookie and the SPA is served at /pods.
 ///
@@ -727,7 +727,7 @@ fn test_web_ui_root_with_token() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_web_ui_root_with_token);
+container_integration_test!(test_web_ui_root_with_token);
 
 /// Verify POST /api/devaipod/run is wired and returns JSON (UI surface: launch from UI)
 ///
@@ -795,7 +795,7 @@ fn test_web_ui_run_endpoint() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_web_ui_run_endpoint);
+container_integration_test!(test_web_ui_run_endpoint);
 
 /// Verify auth works: 401 without token, 200 with valid token
 ///
@@ -839,7 +839,7 @@ fn test_web_container_auth() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_web_container_auth);
+container_integration_test!(test_web_container_auth);
 
 /// Verify the web API pod list returns valid data and includes any existing devaipod pods
 ///
@@ -891,7 +891,7 @@ fn test_web_container_pod_list() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_web_container_pod_list);
+container_integration_test!(test_web_container_pod_list);
 
 /// Verify the opencode-info endpoint returns 404 for non-existent pods
 /// and proper JSON structure for existing pods
@@ -983,7 +983,7 @@ fn test_web_container_opencode_info_endpoint() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_web_container_opencode_info_endpoint);
+container_integration_test!(test_web_container_opencode_info_endpoint);
 
 /// Test connectivity to a running devaipod pod's opencode proxy
 ///
@@ -1181,7 +1181,7 @@ fn test_web_container_opencode_connectivity() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_web_container_opencode_connectivity);
+container_integration_test!(test_web_container_opencode_connectivity);
 
 /// Verify cookie-based authentication persists across requests.
 ///
@@ -1390,7 +1390,7 @@ fn test_auth_proxy_cookie_persistence() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_auth_proxy_cookie_persistence);
+container_integration_test!(test_auth_proxy_cookie_persistence);
 
 /// Verify that 401 responses include WWW-Authenticate header.
 ///
@@ -1521,7 +1521,7 @@ fn test_auth_proxy_wrong_password_returns_401_with_www_authenticate() -> Result<
 
     Ok(())
 }
-podman_integration_test!(test_auth_proxy_wrong_password_returns_401_with_www_authenticate);
+container_integration_test!(test_auth_proxy_wrong_password_returns_401_with_www_authenticate);
 
 /// Test API-style requests (Accept: application/json) without auth.
 ///
@@ -1622,7 +1622,7 @@ fn test_auth_proxy_api_request_without_auth() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_auth_proxy_api_request_without_auth);
+container_integration_test!(test_auth_proxy_api_request_without_auth);
 
 /// Verify the MCP endpoint requires authentication.
 ///
@@ -1701,4 +1701,4 @@ fn test_mcp_endpoint_requires_auth() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_mcp_endpoint_requires_auth);
+container_integration_test!(test_mcp_endpoint_requires_auth);

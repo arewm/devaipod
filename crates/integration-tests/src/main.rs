@@ -30,8 +30,8 @@ impl Drop for PodmanServiceGuard {
 
 // Re-export from lib for test registration
 pub(crate) use integration_tests::{
-    integration_test, podman_integration_test, readonly_test, SharedFixture, INTEGRATION_TESTS,
-    READONLY_INTEGRATION_TESTS,
+    container_integration_test, integration_test, podman_integration_test, readonly_test,
+    SharedFixture, INTEGRATION_TESTS, READONLY_INTEGRATION_TESTS,
 };
 
 mod tests;
@@ -671,6 +671,8 @@ fn main() {
             .collect()
     };
 
+    let has_container_image = std::env::var("DEVAIPOD_CONTAINER_IMAGE").is_ok();
+
     // Collect mutating tests from the distributed slice
     let mutating_tests: Vec<Trial> = INTEGRATION_TESTS
         .iter()
@@ -678,11 +680,17 @@ fn main() {
             let name = test.name;
             let f = test.f;
             let requires_podman = test.requires_podman;
+            let requires_container_image = test.requires_container_image;
 
             let mut trial = Trial::test(name, move || f().map_err(|e| format!("{:?}", e).into()));
 
             // Mark podman tests as ignored if podman is not available
             if requires_podman && !has_podman {
+                trial = trial.with_ignored_flag(true);
+            }
+
+            // Mark container-image tests as ignored when image is not built
+            if requires_container_image && !has_container_image {
                 trial = trial.with_ignored_flag(true);
             }
 
