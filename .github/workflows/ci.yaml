@@ -50,8 +50,8 @@ jobs:
       - name: Pull test image
         run: podman pull ghcr.io/bootc-dev/devenv-debian:latest
 
-      - name: Integration tests
-        run: just test-integration-local
+      - name: Integration tests (containerized)
+        run: just test-integration
 
   # Security audit of dependencies
   audit:
