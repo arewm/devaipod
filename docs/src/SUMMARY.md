@@ -7,6 +7,7 @@
 - [Quick Start](quickstart.md)
 - [Configuration](configuration.md)
 - [Design Philosophy](design.md)
+- [Pod Architecture](architecture.md)
 
 # Security
 

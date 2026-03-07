@@ -24,6 +24,5 @@ include an `Assisted-by: TOOLNAME (MODELNAME)`. For example,
 
 ## Follow other guidelines
 
-Look at the project README.md and look for guidelines
-related to contribution, such as a CONTRIBUTING.md
-and follow those.
+You MUST read [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/src/architecture.md](docs/src/architecture.md) before making changes.
+They cover the architecture, testing, and code style for this project.
