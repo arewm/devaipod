@@ -93,13 +93,27 @@ impl WebContainerGuard {
         // Generate unique container name
         let container_name = Self::generate_name();
 
-        // Socket for volume mount: on Linux use host path; on macOS/Windows podman runs in VM,
-        // so we must use -v /run/podman/podman.sock:/run/docker.sock (VM path), not the Mac path.
+        // Socket for volume mount: resolve the host podman socket path.
         // Target is always /run/docker.sock (well-known path).
         // DEVAIPOD_HOST_SOCKET is passed so the container can use it as a bind mount source
         // when creating sibling containers (the host podman resolves sources on the host filesystem).
         let (host_socket, socket_mount, check_socket) =
-            if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+            if std::env::var("DEVAIPOD_CONTAINER").as_deref() == Ok("1") {
+                // Inside the integration-runner container: the Justfile mounts the
+                // host socket at /run/docker.sock and passes DEVAIPOD_HOST_SOCKET.
+                // We use DEVAIPOD_HOST_SOCKET for the volume mount source because
+                // podman resolves -v sources on the host filesystem, not inside
+                // this container.
+                let host = std::env::var("DEVAIPOD_HOST_SOCKET")
+                    .unwrap_or_else(|_| "/run/docker.sock".to_string());
+                (
+                    host.clone(),
+                    format!("{}:/run/docker.sock", host),
+                    // Check the local mount (inside this container) for reachability
+                    Some("/run/docker.sock".to_string()),
+                )
+            } else if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+                // Linux host: use XDG_RUNTIME_DIR podman socket
                 let path = format!("{}/podman/podman.sock", xdg_runtime);
                 (
                     path.clone(),

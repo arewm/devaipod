@@ -366,7 +366,7 @@ fn test_ssh_client_connectivity() -> Result<()> {
     let sh = shell()?;
 
     // Check if both ssh and timeout commands are available
-    let ssh_available = cmd!(sh, "which ssh")
+    let ssh_available = cmd!(sh, "sh -c 'command -v ssh'")
         .ignore_status()
         .output()?
         .status
@@ -375,7 +375,7 @@ fn test_ssh_client_connectivity() -> Result<()> {
         tracing::info!("Skipping SSH client test: ssh command not available");
         return Ok(());
     }
-    let timeout_available = cmd!(sh, "which timeout")
+    let timeout_available = cmd!(sh, "sh -c 'command -v timeout'")
         .ignore_status()
         .output()?
         .status
