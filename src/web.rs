@@ -1071,6 +1071,9 @@ struct RunRequest {
     mcp_servers: Vec<String>,
     /// Inline devcontainer JSON that replaces the repo's devcontainer.json
     devcontainer_json: Option<String>,
+    /// Use the devcontainer.json from dotfiles instead of the project's
+    #[serde(default)]
+    use_default_devcontainer: bool,
 }
 
 /// Response for run endpoint
@@ -1164,6 +1167,10 @@ async fn run_workspace(
 
     if let Some(ref json) = req.devcontainer_json {
         cmd.args(["--devcontainer-json", json]);
+    }
+
+    if req.use_default_devcontainer {
+        cmd.arg("--use-default-devcontainer");
     }
 
     // Prevent stdin reads from blocking the server process

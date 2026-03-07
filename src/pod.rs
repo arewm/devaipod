@@ -142,6 +142,27 @@ fn collect_config_devices(config: &DevcontainerConfig, devices: &mut Vec<String>
     }
 }
 
+/// Return the minimal security settings for nested container support.
+///
+/// Returns `(privileged, cap_add, security_opts)` with the targeted set of
+/// privileges needed for podman-in-podman without full `--privileged`.
+/// Also adds `/dev/net/tun` to `devices` if it exists on the host.
+fn nested_container_security(devices: &mut Vec<String>) -> (bool, Vec<String>, Vec<String>) {
+    let tun = "/dev/net/tun".to_string();
+    if Path::new(&tun).exists() && !devices.contains(&tun) {
+        devices.push(tun);
+    }
+    (
+        false,
+        vec!["SYS_ADMIN".to_string(), "NET_ADMIN".to_string()],
+        vec![
+            "unmask=/proc/*".to_string(),
+            "label=disable".to_string(),
+            "seccomp=unconfined".to_string(),
+        ],
+    )
+}
+
 /// Port for the opencode server in the agent container
 pub const OPENCODE_PORT: u16 = 4096;
 
@@ -2095,8 +2116,30 @@ fi
             tracing::debug!("Devices for workspace container: {:?}", devices);
         }
 
-        // Check if privileged mode is requested (either directly or via runArgs)
-        let privileged = config.privileged || config.has_privileged_run_arg();
+        // When nestedContainers is set, we ignore all security config from
+        // devcontainer.json (privileged, capAdd, securityOpt, runArgs) and apply
+        // our own known-good minimal set. This lets devcontainer.json use
+        // "privileged": true for compatibility with stock tooling while devaipod
+        // uses a tighter security profile.
+        let (privileged, cap_add, security_opts) =
+            if config.has_nested_containers() || global_config.container_nesting {
+                nested_container_security(&mut devices)
+            } else {
+                let privileged = config.privileged || config.has_privileged_run_arg();
+                let mut cap_add = config.cap_add.clone();
+                for cap in config.cap_add_args() {
+                    if !cap_add.contains(&cap) {
+                        cap_add.push(cap);
+                    }
+                }
+                let mut security_opts = config.security_opt.clone();
+                for opt in config.security_opt_args() {
+                    if !security_opts.contains(&opt) {
+                        security_opts.push(opt);
+                    }
+                }
+                (privileged, cap_add, security_opts)
+            };
 
         // Get secrets to mount with type=env - workspace also gets trusted secrets
         // (like GH_TOKEN) for authenticated git operations, gh CLI, etc.
@@ -2172,28 +2215,10 @@ exec sleep infinity
                 ),
             ]),
             drop_all_caps: false,
-            // Merge capabilities from both capAdd field and runArgs
-            cap_add: {
-                let mut caps = config.cap_add.clone();
-                for cap in config.cap_add_args() {
-                    if !caps.contains(&cap) {
-                        caps.push(cap);
-                    }
-                }
-                caps
-            },
+            cap_add,
             no_new_privileges: false,
             devices,
-            // Merge security options from both securityOpt field and runArgs
-            security_opts: {
-                let mut opts = config.security_opt.clone();
-                for opt in config.security_opt_args() {
-                    if !opts.contains(&opt) {
-                        opts.push(opt);
-                    }
-                }
-                opts
-            },
+            security_opts,
             privileged,
             // Mount volumes:
             // - workspace volume at /workspaces (main workspace clone)
@@ -2323,24 +2348,27 @@ exec sleep infinity
                 // Add devices from runArgs; only pass through if they exist on the host
                 collect_config_devices(config, &mut devices);
 
-                // Check if privileged mode is requested
-                let privileged = config.privileged || config.has_privileged_run_arg();
-
-                // Merge security options from both securityOpt field and runArgs
-                let mut security_opts = config.security_opt.clone();
-                for opt in config.security_opt_args() {
-                    if !security_opts.contains(&opt) {
-                        security_opts.push(opt);
-                    }
-                }
-
-                // Merge capabilities from both capAdd field and runArgs
-                let mut cap_add = config.cap_add.clone();
-                for cap in config.cap_add_args() {
-                    if !cap_add.contains(&cap) {
-                        cap_add.push(cap);
-                    }
-                }
+                // When nestedContainers is set, ignore all security config from
+                // devcontainer.json and apply our own minimal set.
+                let (privileged, cap_add, security_opts) =
+                    if config.has_nested_containers() || global_config.container_nesting {
+                        nested_container_security(&mut devices)
+                    } else {
+                        let privileged = config.privileged || config.has_privileged_run_arg();
+                        let mut security_opts = config.security_opt.clone();
+                        for opt in config.security_opt_args() {
+                            if !security_opts.contains(&opt) {
+                                security_opts.push(opt);
+                            }
+                        }
+                        let mut cap_add = config.cap_add.clone();
+                        for cap in config.cap_add_args() {
+                            if !cap_add.contains(&cap) {
+                                cap_add.push(cap);
+                            }
+                        }
+                        (privileged, cap_add, security_opts)
+                    };
 
                 let extra_create_args = config.passthrough_run_args();
 
@@ -2351,6 +2379,10 @@ exec sleep infinity
                     cap_add,
                     extra_create_args,
                 )
+            } else if global_config.container_nesting {
+                let mut devices = vec![];
+                let (privileged, cap_add, security_opts) = nested_container_security(&mut devices);
+                (devices, privileged, security_opts, cap_add, vec![])
             } else {
                 (vec![], false, vec![], vec![], vec![])
             };
@@ -2760,22 +2792,27 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
 
                 collect_config_devices(config, &mut devices);
 
-                let privileged = config.privileged || config.has_privileged_run_arg();
-
-                let mut security_opts = config.security_opt.clone();
-                for opt in config.security_opt_args() {
-                    if !security_opts.contains(&opt) {
-                        security_opts.push(opt);
-                    }
-                }
-
-                // Merge capabilities from both capAdd field and runArgs
-                let mut cap_add = config.cap_add.clone();
-                for cap in config.cap_add_args() {
-                    if !cap_add.contains(&cap) {
-                        cap_add.push(cap);
-                    }
-                }
+                // When nestedContainers is set, ignore all security config from
+                // devcontainer.json and apply our own minimal set.
+                let (privileged, cap_add, security_opts) =
+                    if config.has_nested_containers() || global_config.container_nesting {
+                        nested_container_security(&mut devices)
+                    } else {
+                        let privileged = config.privileged || config.has_privileged_run_arg();
+                        let mut security_opts = config.security_opt.clone();
+                        for opt in config.security_opt_args() {
+                            if !security_opts.contains(&opt) {
+                                security_opts.push(opt);
+                            }
+                        }
+                        let mut cap_add = config.cap_add.clone();
+                        for cap in config.cap_add_args() {
+                            if !cap_add.contains(&cap) {
+                                cap_add.push(cap);
+                            }
+                        }
+                        (privileged, cap_add, security_opts)
+                    };
 
                 let extra_create_args = config.passthrough_run_args();
 
@@ -2786,6 +2823,10 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
                     cap_add,
                     extra_create_args,
                 )
+            } else if global_config.container_nesting {
+                let mut devices = vec![];
+                let (privileged, cap_add, security_opts) = nested_container_security(&mut devices);
+                (devices, privileged, security_opts, cap_add, vec![])
             } else {
                 (vec![], false, vec![], vec![], vec![])
             };

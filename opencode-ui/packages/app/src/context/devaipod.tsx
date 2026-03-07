@@ -46,6 +46,7 @@ export interface LaunchWorkspaceParams {
   service_gator_image?: string
   service_gator_ro?: boolean
   devcontainer_json?: string
+  use_default_devcontainer?: boolean
 }
 
 /** GitHub repo permission flags from the gator config */

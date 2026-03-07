@@ -388,6 +388,14 @@ struct UpOptions {
     /// Example: --devcontainer-json '{"image": "debian", "capAdd": ["SYS_ADMIN"]}'
     #[arg(long, value_name = "JSON")]
     devcontainer_json: Option<String>,
+    /// Use the devcontainer.json from your dotfiles repo instead of the project's.
+    ///
+    /// When set, any devcontainer.json in the target repository is ignored and the
+    /// one from the dotfiles repository (configured in [dotfiles] in devaipod.toml)
+    /// is used instead. This is useful for ensuring your personal environment
+    /// settings (nested containers, lifecycle commands, etc.) always apply.
+    #[arg(long)]
+    use_default_devcontainer: bool,
 }
 
 /// Internal options for workspace creation (like `podman create` vs `podman run`)
@@ -415,6 +423,8 @@ struct CreateOptions {
     mcp_servers: Vec<String>,
     /// Inline devcontainer JSON that replaces the repo's devcontainer.json
     devcontainer_json: Option<String>,
+    /// Use the devcontainer.json from dotfiles instead of the project's
+    use_default_devcontainer: bool,
 }
 
 impl CreateOptions {
@@ -431,6 +441,7 @@ impl CreateOptions {
             service_gator_ro: false,
             mcp_servers: opts.mcp_servers.clone(),
             devcontainer_json: opts.devcontainer_json.clone(),
+            use_default_devcontainer: opts.use_default_devcontainer,
         }
     }
 }
@@ -740,6 +751,9 @@ enum HostCommand {
         /// Example: --devcontainer-json '{"image": "debian", "capAdd": ["SYS_ADMIN"]}'
         #[arg(long, value_name = "JSON")]
         devcontainer_json: Option<String>,
+        /// Use the devcontainer.json from your dotfiles repo instead of the project's
+        #[arg(long)]
+        use_default_devcontainer: bool,
     },
     /// Generate shell completions
     ///
@@ -1266,6 +1280,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             service_gator_ro,
             mcp_servers,
             devcontainer_json,
+            use_default_devcontainer,
         } => {
             let source = resolve_source(source.as_deref(), &config)?;
 
@@ -1340,6 +1355,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 service_gator_ro,
                 &mcp_servers,
                 devcontainer_json.as_deref(),
+                use_default_devcontainer,
             )
             .await?;
 
@@ -1639,6 +1655,139 @@ async fn create_workspace(
     Ok(result)
 }
 
+/// Resolve the devcontainer configuration for a project.
+///
+/// Searches in priority order:
+/// 1. Inline JSON override (--devcontainer-json)
+/// 2. devcontainer.json in the project source
+/// 3. devcontainer.json from the dotfiles repository (cloned to a temp dir)
+/// 4. --image override with default DevcontainerConfig
+/// 5. default-image from config with default DevcontainerConfig
+///
+/// The dotfiles fallback (step 3) allows users to define a default devcontainer
+/// configuration in their dotfiles repo that applies to projects without their
+/// own devcontainer.json. This is the natural place for user-level defaults
+/// like nested container support, default extensions, or lifecycle commands.
+async fn resolve_devcontainer_config(
+    config: &config::Config,
+    project_path: &Path,
+    opts: &CreateOptions,
+    source_description: &str,
+) -> Result<(devcontainer::DevcontainerConfig, Option<String>)> {
+    // 1. Inline JSON override takes highest priority
+    if let Some(ref json) = opts.devcontainer_json {
+        tracing::info!("Using inline devcontainer JSON override");
+        return Ok((
+            devcontainer::parse_jsonc(json).context("Failed to parse --devcontainer-json")?,
+            opts.image.clone(),
+        ));
+    }
+
+    // 2. Check the project source (unless user requested the dotfiles devcontainer)
+    if !opts.use_default_devcontainer {
+        if let Some(ref path) = devcontainer::try_find_devcontainer_json(project_path) {
+            return Ok((devcontainer::load(path)?, opts.image.clone()));
+        }
+    }
+
+    // 3. Check the dotfiles repository for a devcontainer.json
+    if let Some(ref dotfiles) = config.dotfiles {
+        let gh_token = git::get_github_token_with_secret(config);
+        match clone_dotfiles_for_devcontainer(&dotfiles.url, gh_token.as_deref()).await {
+            Ok(Some((dotfiles_config, _temp_dir))) => {
+                tracing::info!("Using devcontainer.json from dotfiles ({})", dotfiles.url);
+                // If the dotfiles devcontainer specifies an image, use it;
+                // otherwise fall through to image override / default-image.
+                let effective_image = opts.image.clone().or_else(|| {
+                    dotfiles_config
+                        .image
+                        .clone()
+                        .or_else(|| config.default_image.clone())
+                });
+                return Ok((dotfiles_config, effective_image));
+            }
+            Ok(None) => {
+                tracing::debug!("No devcontainer.json found in dotfiles repo");
+            }
+            Err(e) => {
+                tracing::debug!("Failed to check dotfiles for devcontainer.json: {:#}", e);
+            }
+        }
+    }
+
+    // 4. Image override
+    if opts.image.is_some() {
+        tracing::info!(
+            "No devcontainer.json found in {}, using defaults with --image override",
+            source_description
+        );
+        return Ok((
+            devcontainer::DevcontainerConfig::default(),
+            opts.image.clone(),
+        ));
+    }
+
+    // 5. Default image from config
+    if let Some(ref default_image) = config.default_image {
+        tracing::info!(
+            "No devcontainer.json found in {}, using default-image from config: {}",
+            source_description,
+            default_image
+        );
+        return Ok((
+            devcontainer::DevcontainerConfig::default(),
+            Some(default_image.clone()),
+        ));
+    }
+
+    bail!(
+        "No devcontainer.json found in {}.\n\
+         Either add a devcontainer.json, use --image, or set default-image in config.",
+        source_description
+    );
+}
+
+/// Clone the dotfiles repo to a temp directory and look for a devcontainer.json.
+///
+/// Returns `Ok(Some((config, temp_dir)))` if found, `Ok(None)` if the dotfiles
+/// repo has no devcontainer.json. The `TempDir` is returned so the caller keeps
+/// it alive for as long as the config may reference relative paths (e.g. Dockerfile builds).
+async fn clone_dotfiles_for_devcontainer(
+    dotfiles_url: &str,
+    gh_token: Option<&str>,
+) -> Result<Option<(devcontainer::DevcontainerConfig, tempfile::TempDir)>> {
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory for dotfiles")?;
+    let clone_url = git::authenticated_clone_url(dotfiles_url, gh_token);
+
+    let output = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            &clone_url,
+            temp_dir.path().to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .context("Failed to clone dotfiles repo")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Failed to clone dotfiles repo: {}", stderr.trim());
+    }
+
+    match devcontainer::try_find_devcontainer_json(temp_dir.path()) {
+        Some(path) => {
+            let config = devcontainer::load(&path)?;
+            Ok(Some((config, temp_dir)))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Create a workspace from a local git repository
 async fn create_workspace_from_local(
     config: &config::Config,
@@ -1712,40 +1861,13 @@ async fn create_workspace_from_local(
         }
     }
 
-    // Load devcontainer config: inline override > repo file > --image > default-image
-    let (devcontainer_config, effective_image) = if let Some(ref json) = opts.devcontainer_json {
-        tracing::info!("Using inline devcontainer JSON override");
-        (
-            devcontainer::parse_jsonc(json).context("Failed to parse --devcontainer-json")?,
-            opts.image.clone(),
-        )
-    } else {
-        let devcontainer_json_path = devcontainer::try_find_devcontainer_json(project_path);
-        if let Some(ref path) = devcontainer_json_path {
-            (devcontainer::load(path)?, opts.image.clone())
-        } else if opts.image.is_some() {
-            tracing::info!("No devcontainer.json found, using defaults with --image override");
-            (
-                devcontainer::DevcontainerConfig::default(),
-                opts.image.clone(),
-            )
-        } else if config.default_image.is_some() {
-            tracing::info!(
-                "No devcontainer.json found, using default-image from config: {}",
-                config.default_image.as_ref().unwrap()
-            );
-            (
-                devcontainer::DevcontainerConfig::default(),
-                config.default_image.clone(),
-            )
-        } else {
-            bail!(
-                "No devcontainer.json found in {}.\n\
-                 Either add a devcontainer.json, use --image, or set default-image in config.",
-                project_path.display()
-            );
-        }
-    };
+    let (devcontainer_config, effective_image) = resolve_devcontainer_config(
+        config,
+        project_path,
+        opts,
+        &project_path.display().to_string(),
+    )
+    .await?;
 
     // Derive project/pod name from path
     let project_name = project_path
@@ -1930,42 +2052,8 @@ async fn create_workspace_from_remote(
         "main".to_string() // Fallback
     };
 
-    // Load devcontainer config: inline override > repo file > --image > default-image
-    let (devcontainer_config, effective_image) = if let Some(ref json) = opts.devcontainer_json {
-        tracing::info!("Using inline devcontainer JSON override");
-        (
-            devcontainer::parse_jsonc(json).context("Failed to parse --devcontainer-json")?,
-            opts.image.clone(),
-        )
-    } else {
-        let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
-        if let Some(ref path) = devcontainer_json_path {
-            (devcontainer::load(path)?, opts.image.clone())
-        } else if opts.image.is_some() {
-            tracing::info!(
-                "No devcontainer.json found in repository, using defaults with --image override"
-            );
-            (
-                devcontainer::DevcontainerConfig::default(),
-                opts.image.clone(),
-            )
-        } else if config.default_image.is_some() {
-            tracing::info!(
-                "No devcontainer.json found in repository, using default-image from config: {}",
-                config.default_image.as_ref().unwrap()
-            );
-            (
-                devcontainer::DevcontainerConfig::default(),
-                config.default_image.clone(),
-            )
-        } else {
-            bail!(
-                "No devcontainer.json found in {}.\n\
-                 Either add a devcontainer.json to the repository, use --image, or set default-image in config.",
-                remote_url
-            );
-        }
-    };
+    let (devcontainer_config, effective_image) =
+        resolve_devcontainer_config(config, temp_path, opts, remote_url).await?;
 
     // Use explicit name if provided, otherwise generate a unique name
     let pod_name = if let Some(ref name) = opts.name {
@@ -2147,41 +2235,9 @@ async fn create_workspace_from_pr(
         bail!("Failed to clone PR head repository: {}", stderr);
     }
 
-    // Load devcontainer config: inline override > repo file > --image > default-image
-    let (devcontainer_config, effective_image) = if let Some(ref json) = opts.devcontainer_json {
-        tracing::info!("Using inline devcontainer JSON override");
-        (
-            devcontainer::parse_jsonc(json).context("Failed to parse --devcontainer-json")?,
-            opts.image.clone(),
-        )
-    } else {
-        let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
-        if let Some(ref path) = devcontainer_json_path {
-            (devcontainer::load(path)?, opts.image.clone())
-        } else if opts.image.is_some() {
-            tracing::info!(
-                "No devcontainer.json found in PR, using defaults with --image override"
-            );
-            (
-                devcontainer::DevcontainerConfig::default(),
-                opts.image.clone(),
-            )
-        } else if config.default_image.is_some() {
-            tracing::info!(
-                "No devcontainer.json found in PR, using default-image from config: {}",
-                config.default_image.as_ref().unwrap()
-            );
-            (
-                devcontainer::DevcontainerConfig::default(),
-                config.default_image.clone(),
-            )
-        } else {
-            bail!(
-                "No devcontainer.json found in PR.\n\
-                 Either add a devcontainer.json to the PR, use --image, or set default-image in config."
-            );
-        }
-    };
+    let pr_description = format!("{}#{}", pr_ref.repo, pr_ref.number);
+    let (devcontainer_config, effective_image) =
+        resolve_devcontainer_config(config, temp_path, opts, &pr_description).await?;
 
     // Use explicit name if provided, otherwise generate a unique name
     let pod_name = if let Some(ref name) = opts.name {
@@ -2352,6 +2408,7 @@ async fn cmd_run(
     service_gator_ro: bool,
     mcp_servers: &[String],
     devcontainer_json: Option<&str>,
+    use_default_devcontainer: bool,
 ) -> Result<String> {
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
@@ -2364,6 +2421,7 @@ async fn cmd_run(
         service_gator_ro,
         mcp_servers: mcp_servers.to_vec(),
         devcontainer_json: devcontainer_json.map(|s| s.to_string()),
+        use_default_devcontainer,
     };
 
     // Create the workspace - no SSH by default (async execution)
@@ -3081,9 +3139,10 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
         Some("advisor"), // Becomes devaipod-advisor via normalize_pod_name
         &[],             // service-gator scopes from config
         None,
-        true, // read-only service-gator
-        &[],  // no CLI mcp_servers — entry is already in the config
-        None, // no devcontainer override
+        true,  // read-only service-gator
+        &[],   // no CLI mcp_servers — entry is already in the config
+        None,  // no devcontainer override
+        false, // don't override project devcontainer
     )
     .await?;
 
@@ -4377,19 +4436,30 @@ async fn cmd_rebuild(
         bail!("Failed to clone repository: {}", stderr);
     }
 
-    // Load devcontainer.json
+    // Load devcontainer.json: repo > dotfiles fallback > image override > default-image
     let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
-    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
-        devcontainer::load(path)?
+    let (devcontainer_config, dotfiles_image) = if let Some(ref path) = devcontainer_json_path {
+        (devcontainer::load(path)?, None)
+    } else if let Some(ref dotfiles) = config.dotfiles {
+        // Try dotfiles repo as fallback
+        let gh_token = git::get_github_token_with_secret(config);
+        match clone_dotfiles_for_devcontainer(&dotfiles.url, gh_token.as_deref()).await {
+            Ok(Some((dc_config, _temp_dir))) => {
+                tracing::info!("Using devcontainer.json from dotfiles ({})", dotfiles.url);
+                let img = dc_config.image.clone();
+                (dc_config, img)
+            }
+            _ => (devcontainer::DevcontainerConfig::default(), None),
+        }
     } else if image_override.is_some() {
         tracing::info!("No devcontainer.json found, using defaults with image override");
-        devcontainer::DevcontainerConfig::default()
-    } else if config.default_image.is_some() {
+        (devcontainer::DevcontainerConfig::default(), None)
+    } else if let Some(ref default_image) = config.default_image {
         tracing::info!(
             "No devcontainer.json found, using default-image from config: {}",
-            config.default_image.as_ref().unwrap()
+            default_image
         );
-        devcontainer::DevcontainerConfig::default()
+        (devcontainer::DevcontainerConfig::default(), None)
     } else {
         bail!(
             "No devcontainer.json found in repository.\n\
@@ -4459,8 +4529,11 @@ async fn cmd_rebuild(
     // and contains the original task file, so it will be picked up on restart.
     tracing::info!("Recreating containers with new image...");
 
-    // Use image_override if provided, otherwise fall back to default_image from config
-    let effective_image_override = image_override.or(config.default_image.as_deref());
+    // Use image_override if provided, then dotfiles image, then default_image from config
+    let effective_image_override: Option<String> = image_override
+        .map(|s| s.to_string())
+        .or(dotfiles_image)
+        .or_else(|| config.default_image.clone());
 
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
@@ -4472,7 +4545,7 @@ async fn cmd_rebuild(
         &source,
         &extra_labels,
         None,
-        effective_image_override,
+        effective_image_override.as_deref(),
         None, // gator_image_override not yet supported for rebuild
         None, // task - agent home volume persists with original task
         config.orchestration.is_enabled(),

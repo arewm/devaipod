@@ -217,6 +217,7 @@ function LaunchForm(props: { onClose: () => void }) {
   const [gatorImage, setGatorImage] = createSignal("")
   const [readOnly, setReadOnly] = createSignal(true)
   const [devcontainerJson, setDevcontainerJson] = createSignal("")
+  const [useDefaultDevcontainer, setUseDefaultDevcontainer] = createSignal(false)
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
 
@@ -258,6 +259,7 @@ function LaunchForm(props: { onClose: () => void }) {
       if (readOnly()) params.service_gator_ro = true
       const dcj = devcontainerJson().trim()
       if (dcj) params.devcontainer_json = dcj
+      if (useDefaultDevcontainer()) params.use_default_devcontainer = true
 
       await ctx.launchWorkspace(params)
       props.onClose()
@@ -307,6 +309,13 @@ function LaunchForm(props: { onClose: () => void }) {
                 value={imageOverride()}
                 onChange={setImageOverride}
               />
+
+              <Checkbox
+                checked={useDefaultDevcontainer()}
+                onChange={setUseDefaultDevcontainer}
+              >
+                Use default devcontainer (from dotfiles repo instead of project's)
+              </Checkbox>
 
               <div>
                 <label class="text-12-regular text-text-weak block mb-1">Service-gator scopes</label>
