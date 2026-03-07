@@ -1143,6 +1143,7 @@ fn init_tracing(verbose: bool, quiet: bool) {
 
     tracing_subscriber::fmt()
         .event_format(format)
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
