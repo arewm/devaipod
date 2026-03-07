@@ -84,6 +84,16 @@ pub struct Config {
     /// Additional MCP servers to attach to agent pods
     #[serde(default)]
     pub mcp: McpServersConfig,
+
+    /// Enable nested container support even without a devcontainer.json.
+    /// When true, containers get the minimal privileges needed for
+    /// nested podman (SYS_ADMIN, NET_ADMIN, unmask=/proc/*, etc.)
+    /// without full --privileged.
+    ///
+    /// This is useful with `default-image` for repos that don't have
+    /// a devcontainer.json but still need nested container support.
+    #[serde(default, rename = "container-nesting")]
+    pub container_nesting: bool,
 }
 
 /// Configuration for binding paths from host home to container home
@@ -995,6 +1005,16 @@ mod tests {
         assert_eq!(config.secrets.len(), 0);
         assert!(config.dotfiles.is_none());
         assert!(config.default_image.is_none());
+        assert!(!config.container_nesting);
+    }
+
+    #[test]
+    fn test_parse_container_nesting() {
+        let toml = r#"
+container-nesting = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.container_nesting);
     }
 
     #[test]

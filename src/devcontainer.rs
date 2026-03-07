@@ -122,6 +122,16 @@ pub struct DevaipodCustomizations {
     /// This is an alternative to using DEVAIPOD_AGENT_* prefix.
     #[serde(default)]
     pub env_allowlist: Vec<String>,
+
+    /// When true, apply minimal privileges for nested container support
+    /// (unmask=/proc/*, SYS_ADMIN, NET_ADMIN, seccomp=unconfined, label=disable,
+    /// /dev/net/tun) instead of full --privileged.
+    ///
+    /// This allows devcontainer.json to use "privileged": true for compatibility
+    /// with stock devcontainer CLI tooling (Docker/Podman), while devaipod uses
+    /// more targeted security settings.
+    #[serde(default)]
+    pub nested_containers: bool,
 }
 
 fn default_workspace_folder() -> String {
@@ -314,6 +324,15 @@ impl DevcontainerConfig {
     /// Check if this configuration has any features defined
     pub fn has_features(&self) -> bool {
         !self.features.is_empty()
+    }
+
+    /// Check if devaipod nested containers mode is enabled
+    pub fn has_nested_containers(&self) -> bool {
+        self.customizations
+            .as_ref()
+            .and_then(|c| c.devaipod.as_ref())
+            .map(|d| d.nested_containers)
+            .unwrap_or(false)
     }
 
     /// Check if --privileged is in runArgs
@@ -887,5 +906,41 @@ mod tests {
     fn test_passthrough_run_args_empty() {
         let config = DevcontainerConfig::default();
         assert!(config.passthrough_run_args().is_empty());
+    }
+
+    #[test]
+    fn test_parse_nested_containers() {
+        let json = r#"{
+            "image": "foo",
+            "privileged": true,
+            "customizations": {
+                "devaipod": {
+                    "nestedContainers": true
+                }
+            }
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        assert!(config.has_nested_containers());
+        assert!(config.privileged); // raw field is still true
+    }
+
+    #[test]
+    fn test_nested_containers_default_false() {
+        let json = r#"{
+            "image": "foo",
+            "customizations": {
+                "devaipod": {
+                    "envAllowlist": ["FOO"]
+                }
+            }
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.has_nested_containers());
+    }
+
+    #[test]
+    fn test_nested_containers_no_customizations() {
+        let config = DevcontainerConfig::default();
+        assert!(!config.has_nested_containers());
     }
 }

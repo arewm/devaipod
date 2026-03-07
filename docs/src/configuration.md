@@ -7,8 +7,10 @@ devaipod is configured via `~/.config/devaipod.toml` and per-project `devcontain
 Create `~/.config/devaipod.toml`:
 
 ```toml
-# Default image for repositories without devcontainer.json (optional)
-default-image = "ghcr.io/bootc-dev/devenv-debian"
+# Dotfiles repository - its devcontainer.json is used as a fallback
+# when a project has no devcontainer.json of its own
+[dotfiles]
+url = "https://github.com/you/homegit"
 
 # Global environment variables for all containers
 [env]
@@ -45,26 +47,48 @@ port = 8765
 
 ## Using Without devcontainer.json
 
-Not all repositories include a `devcontainer.json`. There are two ways to use devaipod with these repos:
+Not all repositories include a `devcontainer.json`. The recommended approach is to
+put a default `devcontainer.json` in your dotfiles repository. When a project has no
+devcontainer.json, devaipod automatically checks your dotfiles repo for one.
 
-**Option 1: Set a default image globally** (recommended)
+**Dotfiles devcontainer.json** (recommended)
 
-Add to `~/.config/devaipod.toml`:
+Add a `.devcontainer/devcontainer.json` to your dotfiles repo (configured via
+`[dotfiles]` in devaipod.toml). This is the natural place for user-level defaults
+like your preferred image, nested container support, and lifecycle commands:
 
-```toml
-default-image = "ghcr.io/bootc-dev/devenv-debian"
+```json
+{
+  "image": "ghcr.io/bootc-dev/devenv-debian",
+  "customizations": {
+    "devaipod": { "nestedContainers": true }
+  },
+  "runArgs": ["--privileged"],
+  "postCreateCommand": {
+    "devenv-init": "sudo /usr/local/bin/devenv-init.sh"
+  }
+}
 ```
 
-This image will be used automatically for any repository that lacks a devcontainer.json.
+The `runArgs` with `--privileged` keeps compatibility with the stock devcontainer CLI,
+while `nestedContainers: true` tells devaipod to use a tighter set of capabilities
+instead.
 
-**Option 2: Specify an image per-invocation**
+To force the dotfiles devcontainer.json even when a project has its own, use
+`--use-default-devcontainer` (or the checkbox in the web UI).
 
-```bash
-devaipod up https://github.com/org/repo --image ghcr.io/bootc-dev/devenv-debian
-devaipod run https://github.com/org/repo --image ghcr.io/bootc-dev/devenv-debian -c 'fix typos'
-```
+The resolution order is:
 
-The `--image` flag takes precedence over both `default-image` and any devcontainer.json.
+1. `--devcontainer-json` inline override
+2. Project's devcontainer.json (skipped with `--use-default-devcontainer`)
+3. Dotfiles repo's devcontainer.json
+4. `--image` flag with default settings
+5. `default-image` from config with default settings
+
+**Other options**
+
+You can also specify `--image` per-invocation or set `default-image` in the config,
+but these only set the image without any lifecycle commands or customizations.
 
 ## Per-Project Configuration
 
