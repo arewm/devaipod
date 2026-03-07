@@ -2339,9 +2339,16 @@ pub(crate) struct PodApiArgs {
     opencode_port: u16,
 }
 
+/// Liveness/readiness probe for container healthchecks.
+async fn healthz() -> &'static str {
+    "ok"
+}
+
 /// Build the axum router (public for testing).
 fn build_router(state: AppState) -> Router {
     Router::new()
+        // Health endpoint for container healthchecks
+        .route("/healthz", get(healthz))
         // Pod summary: pre-computed agent status for the control plane
         .route("/summary", get(pod_summary))
         // Git endpoints

@@ -305,22 +305,25 @@ fn test_readonly_api_git_status(fixture: &SharedFixture) -> Result<()> {
     // The api container shares the pod network namespace, so we can reach it
     // from any container in the pod. Use the agent container which has curl.
     // Poll with retries since the pod-api sidecar may still be starting.
-    let output = poll_until(Duration::from_secs(30), Duration::from_secs(1), || {
+    let output = poll_until(Duration::from_secs(60), Duration::from_secs(1), || {
         let result = cmd!(
             sh,
             "podman exec {agent} curl -sf http://localhost:8090/git/status"
         )
         .ignore_status()
         .output()?;
+        let body = String::from_utf8_lossy(&result.stdout).trim().to_string();
         if result.status.success() {
-            Ok(Some(
-                String::from_utf8_lossy(&result.stdout).trim().to_string(),
-            ))
+            if body.starts_with('{') {
+                Ok(Some(body))
+            } else {
+                Ok(None)
+            }
         } else {
             Ok(None)
         }
     })
-    .context("pod-api /git/status should respond within 30s")?;
+    .context("pod-api /git/status should respond within 60s")?;
     let _parsed: serde_json::Value =
         serde_json::from_str(&output).context("pod-api /git/status should return valid JSON")?;
     Ok(())
@@ -384,22 +387,27 @@ fn test_readonly_api_summary(fixture: &SharedFixture) -> Result<()> {
     let agent = fixture.agent_container();
 
     // Poll with retries since the pod-api sidecar may still be starting.
-    let output = poll_until(Duration::from_secs(30), Duration::from_secs(1), || {
+    // Like /git/log, validate the body looks like JSON inside the loop
+    // to avoid accepting an empty or truncated startup response.
+    let output = poll_until(Duration::from_secs(60), Duration::from_secs(1), || {
         let result = cmd!(
             sh,
             "podman exec {agent} curl -sf http://localhost:8090/summary"
         )
         .ignore_status()
         .output()?;
+        let body = String::from_utf8_lossy(&result.stdout).trim().to_string();
         if result.status.success() {
-            Ok(Some(
-                String::from_utf8_lossy(&result.stdout).trim().to_string(),
-            ))
+            if body.starts_with('{') {
+                Ok(Some(body))
+            } else {
+                Ok(None)
+            }
         } else {
             Ok(None)
         }
     })
-    .context("pod-api /summary should respond within 30s")?;
+    .context("pod-api /summary should respond within 60s")?;
 
     let parsed: serde_json::Value =
         serde_json::from_str(&output).context("pod-api /summary should return valid JSON")?;

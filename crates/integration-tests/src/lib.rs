@@ -354,6 +354,35 @@ impl SharedFixture {
             );
         }
 
+        // Wait for the pod-api container to be healthy before returning.
+        // This ensures all readonly tests can immediately reach the API
+        // without per-test startup race conditions.
+        let api_container = format!("{SHARED_POD_NAME}-api");
+        tracing::info!("Waiting for {api_container} to become healthy...");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let inspect = Command::new("podman")
+                .args([
+                    "inspect",
+                    "--format",
+                    "{{.State.Health.Status}}",
+                    &api_container,
+                ])
+                .output()
+                .context("Failed to inspect pod-api container health")?;
+            let status = String::from_utf8_lossy(&inspect.stdout).trim().to_string();
+            if status == "healthy" {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                bail!(
+                    "pod-api container did not become healthy within 60s (status: {})",
+                    status
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
         tracing::info!("Shared fixture created with pod: {}", SHARED_POD_NAME);
 
         Ok(SharedFixture {

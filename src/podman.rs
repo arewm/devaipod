@@ -1264,6 +1264,24 @@ impl PodmanService {
             args.push(format!("{}={}", key, value));
         }
 
+        // Container healthcheck
+        if let Some(hc) = &config.healthcheck {
+            args.push("--health-cmd".to_string());
+            args.push(hc.cmd.join(" "));
+            if let Some(interval) = &hc.interval {
+                args.push("--health-interval".to_string());
+                args.push(interval.clone());
+            }
+            if let Some(retries) = hc.retries {
+                args.push("--health-retries".to_string());
+                args.push(retries.to_string());
+            }
+            if let Some(start_period) = &hc.start_period {
+                args.push("--health-start-period".to_string());
+                args.push(start_period.clone());
+            }
+        }
+
         // Extra args from devcontainer.json runArgs (passthrough)
         args.extend(config.extra_create_args.iter().cloned());
 
@@ -1783,6 +1801,22 @@ pub struct ContainerConfig {
     /// These come from devcontainer.json runArgs that aren't extracted
     /// into typed fields.
     pub extra_create_args: Vec<String>,
+    /// Container healthcheck command (e.g., `["curl", "-sf", "http://localhost:8090/healthz"]`).
+    /// When set, podman will run this command periodically to determine container health.
+    pub healthcheck: Option<HealthcheckConfig>,
+}
+
+/// Podman container healthcheck configuration
+#[derive(Debug, Clone)]
+pub struct HealthcheckConfig {
+    /// Command to run for the health check
+    pub cmd: Vec<String>,
+    /// Interval between checks (default: 30s)
+    pub interval: Option<String>,
+    /// Number of retries before marking unhealthy (default: 3)
+    pub retries: Option<u32>,
+    /// Grace period after container start before checks begin (default: 0s)
+    pub start_period: Option<String>,
 }
 
 /// Mount configuration
