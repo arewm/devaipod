@@ -1,11 +1,22 @@
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { batch, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
-import { apiFetch, getAuthToken } from "@/utils/devaipod-api"
+import { apiFetch } from "@/utils/devaipod-api"
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+/** Pod info from the unified /api/devaipod/pods endpoint (server-side naming). */
+interface RawUnifiedPod {
+  name: string
+  status: string
+  created: string
+  labels?: Record<string, string>
+  containers?: Array<{ Names: string; Status: string }>
+  agent_status?: AgentStatus
+  needs_update: boolean
+}
 
 export interface PodInfo {
   Name: string
@@ -82,9 +93,7 @@ export interface GatorScopesResponse {
 const PODMAN_PODS = "/api/podman/v5.0.0/libpod/pods"
 const POD_POLL_MS = 5_000
 const LAUNCH_POLL_MS = 3_000
-const AGENT_POLL_MS = 3_000
 const PROPOSAL_POLL_MS = 10_000
-const ENRICHMENT_POLL_MS = 15_000
 
 // ---------------------------------------------------------------------------
 // Context
@@ -108,29 +117,33 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
 
     const [refreshCounter, setRefreshCounter] = createSignal(0)
 
-    // -- Pod list -----------------------------------------------------------
-
-    function sortPods(pods: PodInfo[]): PodInfo[] {
-      return pods.slice().sort((a, b) => {
-        // Pin advisor to top
-        const aAdvisor = a.Name === "devaipod-advisor" ? 1 : 0
-        const bAdvisor = b.Name === "devaipod-advisor" ? 1 : 0
-        if (bAdvisor !== aAdvisor) return bAdvisor - aAdvisor
-        // Running pods first
-        const aRunning = (a.Status ?? "").toLowerCase() === "running" ? 1 : 0
-        const bRunning = (b.Status ?? "").toLowerCase() === "running" ? 1 : 0
-        if (bRunning !== aRunning) return bRunning - aRunning
-        // Newest first
-        return (b.Created ?? "").localeCompare(a.Created ?? "")
-      })
-    }
+    // -- Pod list (unified: pods + agent status + enrichment) ----------------
 
     async function fetchPods() {
       try {
-        const all = await apiFetch<PodInfo[]>(`${PODMAN_PODS}/json`)
-        const devaipodPods = sortPods(all.filter((p) => p.Name?.startsWith("devaipod-")))
+        const raw = await apiFetch<RawUnifiedPod[]>("/api/devaipod/pods")
+        // Map server-side field names to the PodInfo shape used by the UI
+        const pods: PodInfo[] = raw.map((p) => ({
+          Name: p.name,
+          Status: p.status,
+          Created: p.created,
+          Labels: p.labels,
+          Containers: p.containers,
+        }))
+        // Extract agent status and enrichment from the same response
+        const agentMap: Record<string, AgentStatus> = {}
+        const enrichMap: Record<string, { needs_update: boolean }> = {}
+        for (const p of raw) {
+          if (p.agent_status) {
+            agentMap[p.name] = p.agent_status
+          }
+          enrichMap[p.name] = { needs_update: p.needs_update }
+        }
         batch(() => {
-          setStore("pods", reconcile(devaipodPods, { key: "Name", merge: false }))
+          // Server already sorts (advisor first, running, then by date)
+          setStore("pods", reconcile(pods, { key: "Name", merge: false }))
+          setStore("agentStatus", reconcile(agentMap))
+          setStore("enrichment", reconcile(enrichMap))
           setStore("connected", true)
           setStore("error", undefined)
         })
@@ -170,42 +183,6 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       }
     }
 
-    // -- Agent status -------------------------------------------------------
-
-    async function fetchAgentStatus() {
-      const running = store.pods.filter((p) => (p.Status ?? "").toLowerCase() === "running")
-      const results = await Promise.allSettled(
-        running.map(async (pod) => {
-          const status = await apiFetch<AgentStatus>(
-            `/api/devaipod/pods/${encodeURIComponent(pod.Name)}/agent-status`,
-          )
-          return { name: pod.Name, status }
-        }),
-      )
-      setStore(
-        produce((s) => {
-          for (const r of results) {
-            if (r.status === "fulfilled") {
-              s.agentStatus[r.value.name] = r.value.status
-            }
-          }
-        }),
-      )
-    }
-
-    // -- Pod enrichment (update detection) -----------------------------------
-
-    async function fetchEnrichment() {
-      try {
-        const data = await apiFetch<Record<string, { needs_update: boolean }>>(
-          "/api/devaipod/pods/enrichment",
-        )
-        setStore("enrichment", reconcile(data))
-      } catch {
-        // Ignore — enrichment is best-effort
-      }
-    }
-
     // -- Proposals ----------------------------------------------------------
 
     async function fetchProposals() {
@@ -231,16 +208,6 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     }, LAUNCH_POLL_MS)
     onCleanup(() => clearInterval(launchInterval))
 
-    const agentInterval = setInterval(() => {
-      fetchAgentStatus()
-    }, AGENT_POLL_MS)
-    onCleanup(() => clearInterval(agentInterval))
-
-    const enrichmentInterval = setInterval(() => {
-      fetchEnrichment()
-    }, ENRICHMENT_POLL_MS)
-    onCleanup(() => clearInterval(enrichmentInterval))
-
     const proposalInterval = setInterval(() => {
       fetchProposals()
     }, PROPOSAL_POLL_MS)
@@ -254,8 +221,6 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       untrack(() => {
         fetchPods()
         fetchLaunches()
-        fetchAgentStatus()
-        fetchEnrichment()
         fetchProposals()
       })
     })

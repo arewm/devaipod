@@ -1565,6 +1565,324 @@ struct PodEnrichment {
     needs_update: bool,
 }
 
+// =============================================================================
+// Unified pod list endpoint (pods + agent status + enrichment in one response)
+// =============================================================================
+
+/// A single pod entry in the unified list response.
+///
+/// Merges podman pod metadata, agent status from the pod-api sidecar, and
+/// enrichment data (needs_update) into one object. This eliminates the
+/// multi-step fetch that caused UI layout shift.
+#[derive(Debug, Serialize)]
+struct UnifiedPodInfo {
+    /// Pod name (e.g. "devaipod-myproject-abc123")
+    name: String,
+    /// Pod status from podman (e.g. "Running", "Exited")
+    status: String,
+    /// Creation timestamp
+    created: String,
+    /// Pod labels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<HashMap<String, String>>,
+    /// Container info (names + status)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containers: Option<Vec<UnifiedContainerInfo>>,
+    /// Agent status from pod-api sidecar (None if pod is not running or unreachable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_status: Option<AgentStatusResponse>,
+    /// Whether the pod's sidecar image is outdated
+    needs_update: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UnifiedContainerInfo {
+    #[serde(rename = "Names")]
+    names: String,
+    #[serde(rename = "Status")]
+    status: String,
+}
+
+/// Raw pod JSON from the podman REST API (`/v5.0.0/libpod/pods/json`).
+///
+/// Only the fields the unified endpoint needs are deserialized.
+#[derive(Debug, Deserialize)]
+struct PodmanPodJson {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Status")]
+    status: Option<String>,
+    #[serde(rename = "Created")]
+    created: Option<String>,
+    #[serde(rename = "Labels")]
+    labels: Option<HashMap<String, String>>,
+    #[serde(rename = "Containers")]
+    containers: Option<Vec<PodmanContainerJson>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PodmanContainerJson {
+    #[serde(rename = "Names")]
+    names: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<String>,
+}
+
+/// Fetch the pod list from the podman unix socket.
+async fn fetch_podman_pods(socket_path: &std::path::Path) -> Vec<PodmanPodJson> {
+    let stream = match UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to connect to podman socket: {e}");
+            return vec![];
+        }
+    };
+
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!("Handshake with podman socket failed: {e}");
+            return vec![];
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::error!("Podman socket connection error: {e}");
+        }
+    });
+
+    let request = match hyper::Request::builder()
+        .uri("/v5.0.0/libpod/pods/json")
+        .header(header::HOST, "localhost")
+        .body(Body::empty())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to build podman request: {e}");
+            return vec![];
+        }
+    };
+
+    let response = match sender.send_request(request).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to send request to podman: {e}");
+            return vec![];
+        }
+    };
+
+    if !response.status().is_success() {
+        tracing::error!("Podman pods/json returned {}", response.status());
+        return vec![];
+    }
+
+    let body = match axum::body::to_bytes(Body::new(response.into_body()), 4 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("Failed to read podman response: {e}");
+            return vec![];
+        }
+    };
+
+    match serde_json::from_slice::<Vec<PodmanPodJson>>(&body) {
+        Ok(pods) => pods,
+        Err(e) => {
+            tracing::error!("Failed to parse podman pods JSON: {e}");
+            vec![]
+        }
+    }
+}
+
+/// `GET /api/devaipod/pods` -- unified pod list with agent status and enrichment.
+///
+/// Fetches podman pods, concurrently queries each running pod's pod-api sidecar
+/// for agent status, and includes enrichment (needs_update). Returns everything
+/// in a single response so the UI does not need multiple round-trips.
+async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<UnifiedPodInfo>> {
+    let socket_path = match &state.socket_path {
+        Some(p) => p.clone(),
+        None => match get_container_socket() {
+            Ok(p) => p,
+            Err(_) => return Json(vec![]),
+        },
+    };
+
+    // Fetch pods from podman and enrichment data concurrently
+    let enrichment_future = async {
+        let docker = bollard::Docker::connect_with_unix(
+            &format!("unix://{}", socket_path.display()),
+            120,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .ok();
+        match docker {
+            Some(d) => compute_enrichment_map(&d, state.self_image_id.as_deref()).await,
+            None => HashMap::new(),
+        }
+    };
+
+    let (all_pods, enrichment_map) =
+        tokio::join!(fetch_podman_pods(&socket_path), enrichment_future);
+
+    // Filter to devaipod pods
+    let devaipod_pods: Vec<_> = all_pods
+        .into_iter()
+        .filter(|p| p.name.starts_with("devaipod-"))
+        .collect();
+
+    if devaipod_pods.is_empty() {
+        return Json(vec![]);
+    }
+
+    // Concurrently fetch agent status for running pods
+    let host = host_for_pod_services();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut tasks = Vec::with_capacity(devaipod_pods.len());
+
+    for pod in &devaipod_pods {
+        let pod_name = pod.name.clone();
+        let pod_status = pod.status.as_deref().unwrap_or("Unknown").to_string();
+        let is_running = pod_status.eq_ignore_ascii_case("running");
+
+        let labels = pod.labels.clone();
+        let created = pod.created.clone().unwrap_or_default();
+
+        let containers: Option<Vec<UnifiedContainerInfo>> = pod.containers.as_ref().map(|cs| {
+            cs.iter()
+                .map(|c| UnifiedContainerInfo {
+                    names: c.names.clone().unwrap_or_default(),
+                    status: c.status.clone().unwrap_or_default(),
+                })
+                .collect()
+        });
+
+        let needs_update = enrichment_map.get(&pod_name).copied().unwrap_or(false);
+
+        let host = host.clone();
+        let client = client.clone();
+        let pod_name_clone = pod_name.clone();
+
+        let task = tokio::spawn(async move {
+            let agent_status = if is_running {
+                fetch_agent_status_for_pod(&client, &host, &pod_name_clone).await
+            } else {
+                None
+            };
+
+            UnifiedPodInfo {
+                name: pod_name,
+                status: pod_status,
+                created,
+                labels,
+                containers,
+                agent_status,
+                needs_update,
+            }
+        });
+
+        tasks.push(task);
+    }
+
+    let mut result = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        if let Ok(info) = task.await {
+            result.push(info);
+        }
+    }
+
+    // Sort: advisor first, then running pods, then by creation date descending
+    result.sort_by(|a, b| {
+        let a_advisor = u8::from(a.name == "devaipod-advisor");
+        let b_advisor = u8::from(b.name == "devaipod-advisor");
+        if b_advisor != a_advisor {
+            return b_advisor.cmp(&a_advisor);
+        }
+        let a_running = u8::from(a.status.eq_ignore_ascii_case("running"));
+        let b_running = u8::from(b.status.eq_ignore_ascii_case("running"));
+        if b_running != a_running {
+            return b_running.cmp(&a_running);
+        }
+        b.created.cmp(&a.created)
+    });
+
+    Json(result)
+}
+
+/// Fetch agent status from a pod's pod-api sidecar.
+///
+/// Returns None if the pod-api is unreachable or returns an error.
+async fn fetch_agent_status_for_pod(
+    client: &reqwest::Client,
+    host: &str,
+    pod_name: &str,
+) -> Option<AgentStatusResponse> {
+    let port = get_pod_api_port(pod_name).await.ok()?;
+    let resp = client
+        .get(format!("http://{}:{}/summary", host, port))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<AgentStatusResponse>().await.ok()
+}
+
+/// Build a map of pod_name -> needs_update by comparing api container image IDs.
+async fn compute_enrichment_map(
+    docker: &bollard::Docker,
+    self_image_id: Option<&str>,
+) -> HashMap<String, bool> {
+    let mut result = HashMap::new();
+
+    let self_image_id = match self_image_id {
+        Some(id) => id,
+        None => return result,
+    };
+
+    let mut filters = HashMap::new();
+    filters.insert("name", vec!["devaipod-*-api"]);
+    let options = bollard::container::ListContainersOptions {
+        all: true,
+        filters,
+        ..Default::default()
+    };
+
+    let containers = match docker.list_containers(Some(options)).await {
+        Ok(c) => c,
+        Err(_) => return result,
+    };
+
+    for container in containers {
+        let names = match &container.names {
+            Some(n) => n,
+            None => continue,
+        };
+        let api_name = match names.iter().find(|n| n.ends_with("-api")) {
+            Some(n) => n.trim_start_matches('/').to_string(),
+            None => continue,
+        };
+        let pod_name = match api_name.strip_suffix("-api") {
+            Some(p) => p.to_string(),
+            None => continue,
+        };
+        let needs_update = container
+            .image_id
+            .as_ref()
+            .map(|id| id != self_image_id)
+            .unwrap_or(false);
+        result.insert(pod_name, needs_update);
+    }
+
+    result
+}
+
 /// Return enrichment data for all devaipod pods.
 ///
 /// Compares the image ID of each pod's `-api` sidecar container against
@@ -2094,6 +2412,8 @@ pub(crate) fn build_app(
         )
         .route("/devaipod/prune", post(prune_done_pods))
         .route("/devaipod/pods/enrichment", get(pod_enrichment))
+        // Unified pod list: pods + agent status + enrichment in one response
+        .route("/devaipod/pods", get(list_pods_unified))
         // PTY: proxy to the pod-api sidecar (direct PTY, no exec overhead)
         .route(
             "/devaipod/pods/{name}/pty",
