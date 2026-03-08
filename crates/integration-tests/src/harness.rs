@@ -132,6 +132,65 @@ impl DevaipodHarness {
     pub fn token(&self) -> &str {
         &self.token
     }
+
+    /// Create a pod from a local repo path and wait for it to appear in the
+    /// pod list as "Running".
+    ///
+    /// Sends `POST /api/devaipod/run` with the given source path and pod name,
+    /// then polls the unified pod list until the pod shows up with a Running
+    /// status or the timeout expires.
+    ///
+    /// The pod is automatically registered for cleanup on drop.
+    pub fn create_pod(&mut self, source: &str, pod_name: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "source": source,
+            "name": pod_name,
+        });
+
+        let (status, resp) = self.post("/api/devaipod/run", &body.to_string())?;
+        if status != 200 {
+            bail!("POST /api/devaipod/run returned {status}: {resp}");
+        }
+
+        // Track for cleanup immediately (even if pod creation fails, the
+        // name may have been partially created).
+        let full_name = if pod_name.starts_with("devaipod-") {
+            pod_name.to_string()
+        } else {
+            format!("devaipod-{pod_name}")
+        };
+        self.track_pod(&full_name);
+
+        // Poll the unified pod list until the pod appears and is Running,
+        // or the API container is healthy. Pod creation is async (the web
+        // server spawns `devaipod run` in the background), so we need to
+        // wait for it to complete.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if Instant::now() > deadline {
+                bail!("Pod '{full_name}' did not become Running within 120s");
+            }
+
+            if let Ok((200, body)) = self.get("/api/devaipod/pods") {
+                if let Ok(pods) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+                    if let Some(pod) = pods.iter().find(|p| {
+                        p.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|n| n == full_name)
+                            .unwrap_or(false)
+                    }) {
+                        let status = pod.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                        if status.eq_ignore_ascii_case("running") {
+                            tracing::info!("Pod '{full_name}' is Running");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
 }
 
 impl Drop for DevaipodHarness {

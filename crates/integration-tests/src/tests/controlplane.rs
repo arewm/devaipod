@@ -10,7 +10,7 @@
 use color_eyre::Result;
 use integration_tests::harness::DevaipodHarness;
 
-use crate::{container_integration_test, podman_integration_test};
+use crate::{container_integration_test, podman_integration_test, TestRepo};
 
 use super::WebFixture;
 
@@ -235,3 +235,98 @@ fn test_harness_health_and_pod_list() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_harness_health_and_pod_list);
+
+/// End-to-end test: create a pod via the API and exercise completion-status.
+///
+/// Uses [`DevaipodHarness`] to start a real devaipod web server, creates a
+/// pod from a local test repo (no network required), and verifies the
+/// completion-status roundtrip through the full stack: control plane →
+/// pod-api sidecar → disk → back.
+///
+/// The agent container runs mock-opencode (via `DEVAIPOD_MOCK_AGENT=1`),
+/// so no real AI provider is needed.
+fn test_harness_completion_status_e2e() -> Result<()> {
+    let mut harness = DevaipodHarness::start()?;
+    let repo = TestRepo::new()?;
+
+    // Create a pod from the local test repo.
+    let pod_name = crate::unique_test_name("cs-e2e");
+    let short = crate::short_name(&pod_name);
+
+    harness.create_pod(repo.repo_path.to_str().unwrap(), short)?;
+
+    // Wait a bit for the pod-api sidecar to become healthy.
+    let api_container = format!("{pod_name}-api");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let output = std::process::Command::new("podman")
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Health.Status}}",
+                &api_container,
+            ])
+            .output()?;
+        let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if status == "healthy" {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            color_eyre::eyre::bail!(
+                "pod-api container did not become healthy within 60s (status: {status})"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    let cs_path = format!("/api/devaipod/pods/{short}/completion-status");
+
+    // 1. GET default → "active"
+    let (status, body) = harness.get(&cs_path)?;
+    assert_eq!(status, 200, "GET completion-status: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        json["status"].as_str(),
+        Some("active"),
+        "default should be 'active': {body}"
+    );
+
+    // 2. PUT "done"
+    let (status, body) = harness.put(&cs_path, r#"{"status":"done"}"#)?;
+    assert_eq!(status, 200, "PUT done: {body}");
+
+    // 3. GET → "done"
+    let (status, body) = harness.get(&cs_path)?;
+    assert_eq!(status, 200);
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        json["status"].as_str(),
+        Some("done"),
+        "should be 'done' after PUT: {body}"
+    );
+
+    // 4. Verify unified pod list reflects completion_status
+    let (status, body) = harness.get("/api/devaipod/pods")?;
+    assert_eq!(status, 200);
+    let pods: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    let our_pod = pods
+        .iter()
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(&pod_name));
+    if let Some(pod) = our_pod {
+        if let Some(agent) = pod.get("agent_status") {
+            assert_eq!(
+                agent.get("completion_status").and_then(|v| v.as_str()),
+                Some("done"),
+                "unified list should show 'done'"
+            );
+        }
+    }
+
+    // 5. Reset to active
+    let (status, _) = harness.put(&cs_path, r#"{"status":"active"}"#)?;
+    assert_eq!(status, 200, "reset to active should succeed");
+
+    tracing::info!("Completion status e2e test passed for pod '{pod_name}'");
+    Ok(())
+}
+podman_integration_test!(test_harness_completion_status_e2e);
