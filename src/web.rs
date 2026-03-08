@@ -23,6 +23,7 @@ use axum::{
 };
 use base64::prelude::*;
 use color_eyre::eyre::{Context, Result};
+use futures_util::StreamExt;
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
@@ -201,6 +202,28 @@ enum LaunchState {
 /// In-flight launches tracked by the web server, keyed by pod name.
 type LaunchMap = Arc<tokio::sync::Mutex<HashMap<String, LaunchState>>>;
 
+/// Cached pod list without agent status (which is fetched on-demand).
+///
+/// The event watcher maintains this cache so that `list_pods_unified` does not
+/// need to hit the podman socket on every poll request.
+type PodCache = Arc<tokio::sync::RwLock<Vec<CachedPodInfo>>>;
+
+/// Pod metadata cached by the event watcher.
+///
+/// Contains everything from `UnifiedPodInfo` except `agent_status`, which is
+/// fetched on-demand from each pod's pod-api sidecar.
+#[derive(Debug, Clone, Serialize)]
+struct CachedPodInfo {
+    name: String,
+    status: String,
+    created: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containers: Option<Vec<UnifiedContainerInfo>>,
+    needs_update: bool,
+}
+
 /// Shared state for the web server
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -215,6 +238,8 @@ pub(crate) struct AppState {
     /// Image ID (digest) of the running control plane container.
     /// Used to detect pods whose API sidecar is running an older image.
     self_image_id: Option<String>,
+    /// Cached pod list maintained by the background event watcher.
+    pod_cache: PodCache,
 }
 
 /// Query parameters for token authentication
@@ -836,6 +861,8 @@ fn agent_iframe_wrapper(name: &str, base_url: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;");
     let escaped_url = base_url.replace('&', "&amp;").replace('"', "&quot;");
+    // URL-encode the name for API calls (the raw name, not the HTML-escaped one)
+    let url_name = urlencoding::encode(name);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -844,18 +871,77 @@ fn agent_iframe_wrapper(name: &str, base_url: &str) -> String {
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 html,body{{height:100%;overflow:hidden;background:#1c1717}}
-#dbar{{height:44px;display:flex;align-items:center;padding:0 12px;
+#dbar{{height:44px;display:flex;align-items:center;padding:0 12px;gap:8px;
   background:#1c1717;border-bottom:1px solid rgba(255,255,255,0.12)}}
-#dbar a{{color:#e8e2e2;text-decoration:none;font-size:14px;font-weight:500;
+#dbar a,#dbar button{{color:#e8e2e2;text-decoration:none;font-size:14px;font-weight:500;
   font-family:Inter,system-ui,sans-serif;
-  padding:6px 14px;border-radius:6px;
+  padding:6px 14px;border-radius:6px;cursor:pointer;
   background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);
   transition:background 0.15s,border-color 0.15s}}
-#dbar a:hover{{background:rgba(255,255,255,0.14);border-color:rgba(255,255,255,0.25)}}
+#dbar a:hover,#dbar button:hover{{background:rgba(255,255,255,0.14);border-color:rgba(255,255,255,0.25)}}
+#dbar button.done{{background:rgba(34,197,94,0.15);border-color:rgba(34,197,94,0.4);color:#86efac}}
+#dbar button.done:hover{{background:rgba(34,197,94,0.25);border-color:rgba(34,197,94,0.6)}}
+#dbar .spacer{{flex:1}}
 iframe{{width:100%;height:calc(100% - 44px);border:none}}
 </style></head><body>
-<div id="dbar"><a href="/pods">&#8592; Pods</a></div>
+<div id="dbar">
+  <a href="/pods">&#8592; Pods</a>
+  <button id="done-btn" onclick="toggleDone()" title="Mark this pod as done">Loading...</button>
+  <span class="spacer"></span>
+</div>
 <iframe id="oc" src="{escaped_url}" allow="clipboard-read; clipboard-write"></iframe>
+<script>
+let isDone = false;
+const podName = "{url_name}";
+const btn = document.getElementById("done-btn");
+
+async function fetchStatus() {{
+  try {{
+    const r = await fetch("/api/devaipod/pods/" + podName + "/completion-status", {{credentials:"include"}});
+    if (r.ok) {{
+      const d = await r.json();
+      isDone = d.status === "done";
+      updateBtn();
+    }}
+  }} catch(e) {{ btn.textContent = "Status unavailable"; }}
+}}
+
+function updateBtn() {{
+  if (isDone) {{
+    btn.textContent = "Marked Done";
+    btn.classList.add("done");
+    btn.title = "Click to mark as incomplete";
+  }} else {{
+    btn.textContent = "Mark as Done";
+    btn.classList.remove("done");
+    btn.title = "Click to mark this pod as done";
+  }}
+}}
+
+async function toggleDone() {{
+  const newStatus = isDone ? "active" : "done";
+  btn.textContent = "Updating...";
+  try {{
+    const r = await fetch("/api/devaipod/pods/" + podName + "/completion-status", {{
+      method: "PUT",
+      credentials: "include",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{status: newStatus}})
+    }});
+    if (r.ok) {{
+      const d = await r.json();
+      isDone = d.status === "done";
+    }} else {{
+      isDone = !isDone; // revert
+    }}
+  }} catch(e) {{
+    // revert on error
+  }}
+  updateBtn();
+}}
+
+fetchStatus();
+</script>
 </body></html>"#
     )
 }
@@ -1504,6 +1590,434 @@ struct PodEnrichment {
     needs_update: bool,
 }
 
+// =============================================================================
+// Unified pod list endpoint (pods + agent status + enrichment in one response)
+// =============================================================================
+
+/// A single pod entry in the unified list response.
+///
+/// Merges podman pod metadata, agent status from the pod-api sidecar, and
+/// enrichment data (needs_update) into one object. This eliminates the
+/// multi-step fetch that caused UI layout shift.
+#[derive(Debug, Serialize)]
+struct UnifiedPodInfo {
+    /// Pod name (e.g. "devaipod-myproject-abc123")
+    name: String,
+    /// Pod status from podman (e.g. "Running", "Exited")
+    status: String,
+    /// Creation timestamp
+    created: String,
+    /// Pod labels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<HashMap<String, String>>,
+    /// Container info (names + status)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containers: Option<Vec<UnifiedContainerInfo>>,
+    /// Agent status from pod-api sidecar (None if pod is not running or unreachable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_status: Option<AgentStatusResponse>,
+    /// Whether the pod's sidecar image is outdated
+    needs_update: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UnifiedContainerInfo {
+    #[serde(rename = "Names")]
+    names: String,
+    #[serde(rename = "Status")]
+    status: String,
+}
+
+/// Raw pod JSON from the podman REST API (`/v5.0.0/libpod/pods/json`).
+///
+/// Only the fields the unified endpoint needs are deserialized.
+#[derive(Debug, Deserialize)]
+struct PodmanPodJson {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Status")]
+    status: Option<String>,
+    #[serde(rename = "Created")]
+    created: Option<String>,
+    #[serde(rename = "Labels")]
+    labels: Option<HashMap<String, String>>,
+    #[serde(rename = "Containers")]
+    containers: Option<Vec<PodmanContainerJson>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PodmanContainerJson {
+    #[serde(rename = "Names")]
+    names: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<String>,
+}
+
+/// Fetch the pod list from the podman unix socket.
+async fn fetch_podman_pods(socket_path: &std::path::Path) -> Vec<PodmanPodJson> {
+    let stream = match UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to connect to podman socket: {e}");
+            return vec![];
+        }
+    };
+
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!("Handshake with podman socket failed: {e}");
+            return vec![];
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::error!("Podman socket connection error: {e}");
+        }
+    });
+
+    let request = match hyper::Request::builder()
+        .uri("/v5.0.0/libpod/pods/json")
+        .header(header::HOST, "localhost")
+        .body(Body::empty())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to build podman request: {e}");
+            return vec![];
+        }
+    };
+
+    let response = match sender.send_request(request).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to send request to podman: {e}");
+            return vec![];
+        }
+    };
+
+    if !response.status().is_success() {
+        tracing::error!("Podman pods/json returned {}", response.status());
+        return vec![];
+    }
+
+    let body = match axum::body::to_bytes(Body::new(response.into_body()), 4 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("Failed to read podman response: {e}");
+            return vec![];
+        }
+    };
+
+    match serde_json::from_slice::<Vec<PodmanPodJson>>(&body) {
+        Ok(pods) => pods,
+        Err(e) => {
+            tracing::error!("Failed to parse podman pods JSON: {e}");
+            vec![]
+        }
+    }
+}
+
+/// `GET /api/devaipod/pods` -- unified pod list with agent status and enrichment.
+///
+/// Reads the cached pod list (maintained by the background event watcher) and
+/// concurrently fetches agent status from each running pod's pod-api sidecar.
+/// The cache is populated at startup and updated whenever podman container
+/// events fire, so this handler never hits the podman socket directly.
+async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<UnifiedPodInfo>> {
+    let cached_pods = state.pod_cache.read().await.clone();
+
+    if cached_pods.is_empty() {
+        return Json(vec![]);
+    }
+
+    // Concurrently fetch agent status for running pods
+    let host = host_for_pod_services();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut tasks = Vec::with_capacity(cached_pods.len());
+
+    for pod in cached_pods {
+        let is_running = pod.status.eq_ignore_ascii_case("running");
+        let host = host.clone();
+        let client = client.clone();
+        let pod_name = pod.name.clone();
+
+        let task = tokio::spawn(async move {
+            let agent_status = if is_running {
+                fetch_agent_status_for_pod(&client, &host, &pod_name).await
+            } else {
+                None
+            };
+
+            UnifiedPodInfo {
+                name: pod.name,
+                status: pod.status,
+                created: pod.created,
+                labels: pod.labels,
+                containers: pod.containers,
+                agent_status,
+                needs_update: pod.needs_update,
+            }
+        });
+
+        tasks.push(task);
+    }
+
+    let mut result = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        if let Ok(info) = task.await {
+            result.push(info);
+        }
+    }
+
+    // The cache is already sorted, but agent_status fetch is concurrent
+    // and the spawn order is preserved, so no re-sort needed.
+    Json(result)
+}
+
+/// Fetch agent status from a pod's pod-api sidecar.
+///
+/// Returns None if the pod-api is unreachable or returns an error.
+async fn fetch_agent_status_for_pod(
+    client: &reqwest::Client,
+    host: &str,
+    pod_name: &str,
+) -> Option<AgentStatusResponse> {
+    let port = get_pod_api_port(pod_name).await.ok()?;
+    let resp = client
+        .get(format!("http://{}:{}/summary", host, port))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<AgentStatusResponse>().await.ok()
+}
+
+/// Build a map of pod_name -> needs_update by comparing api container image IDs.
+async fn compute_enrichment_map(
+    docker: &bollard::Docker,
+    self_image_id: Option<&str>,
+) -> HashMap<String, bool> {
+    let mut result = HashMap::new();
+
+    let self_image_id = match self_image_id {
+        Some(id) => id,
+        None => return result,
+    };
+
+    let mut filters = HashMap::new();
+    filters.insert("name", vec!["devaipod-*-api"]);
+    let options = bollard::container::ListContainersOptions {
+        all: true,
+        filters,
+        ..Default::default()
+    };
+
+    let containers = match docker.list_containers(Some(options)).await {
+        Ok(c) => c,
+        Err(_) => return result,
+    };
+
+    for container in containers {
+        let names = match &container.names {
+            Some(n) => n,
+            None => continue,
+        };
+        let api_name = match names.iter().find(|n| n.ends_with("-api")) {
+            Some(n) => n.trim_start_matches('/').to_string(),
+            None => continue,
+        };
+        let pod_name = match api_name.strip_suffix("-api") {
+            Some(p) => p.to_string(),
+            None => continue,
+        };
+        let needs_update = container
+            .image_id
+            .as_ref()
+            .map(|id| id != self_image_id)
+            .unwrap_or(false);
+        result.insert(pod_name, needs_update);
+    }
+
+    result
+}
+
+/// Refresh the pod cache: fetch pods from podman + enrichment, store the result.
+///
+/// This is called once at startup and again whenever a relevant podman event
+/// fires. It replaces the entire cache atomically.
+async fn refresh_pod_cache(
+    socket_path: &std::path::Path,
+    self_image_id: Option<&str>,
+    cache: &PodCache,
+) {
+    let enrichment_future = async {
+        let docker = bollard::Docker::connect_with_unix(
+            &format!("unix://{}", socket_path.display()),
+            120,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .ok();
+        match docker {
+            Some(d) => compute_enrichment_map(&d, self_image_id).await,
+            None => HashMap::new(),
+        }
+    };
+
+    let (all_pods, enrichment_map) =
+        tokio::join!(fetch_podman_pods(socket_path), enrichment_future);
+
+    let mut pods: Vec<CachedPodInfo> = all_pods
+        .into_iter()
+        .filter(|p| p.name.starts_with("devaipod-"))
+        .map(|pod| {
+            let needs_update = enrichment_map.get(&pod.name).copied().unwrap_or(false);
+            let containers = pod.containers.as_ref().map(|cs| {
+                cs.iter()
+                    .map(|c| UnifiedContainerInfo {
+                        names: c.names.clone().unwrap_or_default(),
+                        status: c.status.clone().unwrap_or_default(),
+                    })
+                    .collect()
+            });
+            CachedPodInfo {
+                name: pod.name,
+                status: pod.status.unwrap_or_else(|| "Unknown".to_string()),
+                created: pod.created.unwrap_or_default(),
+                labels: pod.labels,
+                containers,
+                needs_update,
+            }
+        })
+        .collect();
+
+    // Sort: advisor first, then running pods, then by creation date descending
+    pods.sort_by(|a, b| {
+        let a_advisor = u8::from(a.name == "devaipod-advisor");
+        let b_advisor = u8::from(b.name == "devaipod-advisor");
+        if b_advisor != a_advisor {
+            return b_advisor.cmp(&a_advisor);
+        }
+        let a_running = u8::from(a.status.eq_ignore_ascii_case("running"));
+        let b_running = u8::from(b.status.eq_ignore_ascii_case("running"));
+        if b_running != a_running {
+            return b_running.cmp(&a_running);
+        }
+        b.created.cmp(&a.created)
+    });
+
+    let count = pods.len();
+    *cache.write().await = pods;
+    tracing::debug!("Pod cache refreshed: {} pods", count);
+}
+
+/// Spawn a background task that watches podman events and refreshes the pod cache.
+///
+/// The watcher subscribes to container events (start, stop, die, create, remove)
+/// via bollard's streaming events API. On any relevant event it triggers a full
+/// cache refresh (rather than incremental updates, which would be fragile).
+///
+/// If the event stream disconnects, the watcher reconnects after a short delay.
+fn spawn_pod_event_watcher(socket_path: PathBuf, self_image_id: Option<String>, cache: PodCache) {
+    tokio::spawn(async move {
+        loop {
+            let docker = match bollard::Docker::connect_with_unix(
+                &format!("unix://{}", socket_path.display()),
+                120,
+                bollard::API_DEFAULT_VERSION,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Event watcher: failed to connect to podman: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            // Filter to container events only. Podman does not expose a
+            // separate "pod" event type through the Docker-compat API, but
+            // container lifecycle events (start/stop/die/remove) cover all the
+            // state transitions we care about.
+            let mut filters = HashMap::new();
+            filters.insert("type".to_string(), vec!["container".to_string()]);
+            let options = bollard::system::EventsOptions {
+                since: None,
+                until: None,
+                filters,
+            };
+
+            let mut stream = docker.events(Some(options));
+
+            tracing::info!("Event watcher: subscribed to podman container events");
+
+            // Debounce: when many events arrive in quick succession (e.g. pod
+            // start fires events for every container), we wait briefly before
+            // refreshing so we only do one fetch per burst.
+            let debounce = std::time::Duration::from_millis(500);
+            let mut pending_refresh = false;
+            let sleep = tokio::time::sleep(debounce);
+            tokio::pin!(sleep);
+
+            loop {
+                tokio::select! {
+                    event = stream.next() => {
+                        match event {
+                            Some(Ok(msg)) => {
+                                // Only refresh on events related to devaipod containers.
+                                let dominated = if let Some(ref actor) = msg.actor {
+                                    actor.attributes.as_ref().is_some_and(|attrs| {
+                                        attrs
+                                            .get("name")
+                                            .is_some_and(|n| n.starts_with("devaipod-"))
+                                    })
+                                } else {
+                                    false
+                                };
+
+                                if dominated {
+                                    let action = msg.action.as_deref().unwrap_or("?");
+                                    tracing::debug!("Event watcher: devaipod event action={action}");
+                                    pending_refresh = true;
+                                    // Reset the debounce timer
+                                    sleep.as_mut().reset(tokio::time::Instant::now() + debounce);
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("Event watcher: stream error: {e}");
+                                break;
+                            }
+                            None => {
+                                tracing::warn!("Event watcher: stream ended");
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut sleep, if pending_refresh => {
+                        pending_refresh = false;
+                        refresh_pod_cache(
+                            &socket_path,
+                            self_image_id.as_deref(),
+                            &cache,
+                        ).await;
+                    }
+                }
+            }
+
+            // Stream disconnected; reconnect after a short delay.
+            tracing::info!("Event watcher: reconnecting in 5s");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+}
+
 /// Return enrichment data for all devaipod pods.
 ///
 /// Compares the image ID of each pod's `-api` sidecar container against
@@ -1620,6 +2134,9 @@ struct AgentStatusResponse {
     recent_output: Vec<String>,
     last_message_ts: Option<i64>,
     session_count: usize,
+    /// Pod completion status: "active" or "done".
+    #[serde(default)]
+    completion_status: Option<String>,
 }
 
 impl AgentStatusResponse {
@@ -1632,6 +2149,7 @@ impl AgentStatusResponse {
             recent_output: vec![],
             last_message_ts: None,
             session_count: 0,
+            completion_status: None,
         }
     }
 }
@@ -1774,6 +2292,187 @@ async fn get_pod_api_admin_token(pod_name: &str) -> Result<String, StatusCode> {
     Ok(token)
 }
 
+/// Public wrapper for get_pod_api_port (used by CLI commands).
+pub async fn get_pod_api_port_pub(pod_name: &str) -> Result<u16, StatusCode> {
+    get_pod_api_port(pod_name).await
+}
+
+/// Public wrapper for get_pod_api_admin_token (used by CLI commands).
+pub async fn get_pod_api_admin_token_pub(pod_name: &str) -> Result<String, StatusCode> {
+    get_pod_api_admin_token(pod_name).await
+}
+
+/// Proxy GET /completion-status to the pod-api sidecar.
+async fn get_pod_completion_status(
+    Path(name): Path<String>,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    proxy_to_pod_api(&name, "completion-status".to_string(), request).await
+}
+
+/// Proxy PUT /completion-status to the pod-api sidecar (with admin token injection).
+async fn update_pod_completion_status(
+    Path(name): Path<String>,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    let pod_name = normalize_pod_name(&name);
+    let admin_token = get_pod_api_admin_token(&pod_name).await?;
+    let port = get_pod_api_port(&pod_name).await.map_err(|code| {
+        if code == StatusCode::NOT_FOUND {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            code
+        }
+    })?;
+    let host = host_for_pod_services();
+
+    let (parts, body) = request.into_parts();
+    let mut builder = hyper::Request::builder()
+        .method(parts.method.clone())
+        .uri("/completion-status")
+        .header(header::HOST, format!("{}:{}", host, port))
+        .header(header::AUTHORIZATION, format!("Bearer {}", admin_token));
+    for (key, value) in parts.headers.iter() {
+        if key != header::HOST && key != header::AUTHORIZATION {
+            builder = builder.header(key, value);
+        }
+    }
+    let proxy_req = builder
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    proxy_to_upstream(&host, port, "completion-status".to_string(), proxy_req).await
+}
+
+/// Response for the prune endpoint.
+#[derive(Debug, Serialize)]
+struct PruneResponse {
+    /// Number of pods deleted.
+    deleted: usize,
+    /// Names of pods that were deleted.
+    pod_names: Vec<String>,
+    /// Any errors encountered (pod name -> error message).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<String>,
+}
+
+/// Delete all pods marked as "done".
+///
+/// Iterates over all devaipod pods, checks their completion status via the
+/// pod-api sidecar, and deletes those marked as "done".
+async fn prune_done_pods() -> Result<Json<PruneResponse>, StatusCode> {
+    use bollard::Docker;
+
+    let socket_path = get_container_socket().map_err(|e| {
+        tracing::error!("No container socket: {}", e);
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    let docker = Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to connect to container socket: {}", e);
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    // List all devaipod pods
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("name", vec!["devaipod-*-agent"]);
+    let options = bollard::container::ListContainersOptions {
+        all: true,
+        filters,
+        ..Default::default()
+    };
+    let containers = docker.list_containers(Some(options)).await.map_err(|e| {
+        tracing::error!("Failed to list containers: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Collect unique pod names
+    let mut pod_names: Vec<String> = Vec::new();
+    for container in &containers {
+        if let Some(names) = &container.names {
+            for name in names {
+                let name = name.trim_start_matches('/');
+                if let Some(pod_name) = name.strip_suffix("-agent") {
+                    if pod_name.starts_with("devaipod-")
+                        && !pod_names.contains(&pod_name.to_string())
+                    {
+                        pod_names.push(pod_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let host = host_for_pod_services();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+
+    for pod_name in &pod_names {
+        // Check completion status via pod-api sidecar
+        let port = match get_pod_api_port(pod_name).await {
+            Ok(p) => p,
+            Err(_) => continue, // Skip pods without pod-api
+        };
+
+        let resp = match client
+            .get(format!("http://{}:{}/completion-status", host, port))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+
+        #[derive(Deserialize)]
+        struct StatusResp {
+            status: String,
+        }
+        let status: StatusResp = match resp.json().await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if status.status != "done" {
+            continue;
+        }
+
+        // Delete the pod
+        tracing::info!("Pruning done pod: {}", pod_name);
+        let output = tokio::process::Command::new("podman")
+            .args(["pod", "rm", "-f", pod_name])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                deleted.push(pod_name.clone());
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                errors.push(format!("{}: {}", pod_name, stderr.trim()));
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", pod_name, e));
+            }
+        }
+    }
+
+    Ok(Json(PruneResponse {
+        deleted: deleted.len(),
+        pod_names: deleted,
+        errors,
+    }))
+}
+
 /// Run the web server
 ///
 /// Starts an HTTP server on the specified port with:
@@ -1795,11 +2494,27 @@ async fn get_pod_api_admin_token(pod_name: &str) -> Result<String, StatusCode> {
 ///
 /// Exposed for tests so we can hit the router with in-process requests (fast)
 /// without starting a server or container.
+#[cfg(test)]
 pub(crate) fn build_app(
     token: String,
     mcp_token: String,
     socket_path: Option<PathBuf>,
     self_image_id: Option<String>,
+) -> Router {
+    let pod_cache: PodCache = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    build_app_with_cache(token, mcp_token, socket_path, self_image_id, pod_cache)
+}
+
+/// Build the web app router with a pre-existing pod cache.
+///
+/// This variant is used by `run_web_server` so the cache can be shared with
+/// the background event watcher.
+fn build_app_with_cache(
+    token: String,
+    mcp_token: String,
+    socket_path: Option<PathBuf>,
+    self_image_id: Option<String>,
+    pod_cache: PodCache,
 ) -> Router {
     let state = Arc::new(AppState {
         token: token.clone(),
@@ -1807,6 +2522,7 @@ pub(crate) fn build_app(
         socket_path,
         launches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         self_image_id,
+        pod_cache,
     });
 
     // Build the API router with authentication
@@ -1842,7 +2558,14 @@ pub(crate) fn build_app(
             "/devaipod/pods/{name}/gator-scopes",
             get(get_gator_scopes).put(update_gator_scopes),
         )
+        .route(
+            "/devaipod/pods/{name}/completion-status",
+            get(get_pod_completion_status).put(update_pod_completion_status),
+        )
+        .route("/devaipod/prune", post(prune_done_pods))
         .route("/devaipod/pods/enrichment", get(pod_enrichment))
+        // Unified pod list: pods + agent status + enrichment in one response
+        .route("/devaipod/pods", get(list_pods_unified))
         // PTY: proxy to the pod-api sidecar (direct PTY, no exec overhead)
         .route(
             "/devaipod/pods/{name}/pty",
@@ -1919,7 +2642,25 @@ pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Resu
         tracing::info!("Control plane image ID: {}", id);
     }
 
-    let app = build_app(token.clone(), mcp_token, socket_path, self_image_id);
+    // Create a shared pod cache and populate it before the server starts
+    // accepting requests. The same Arc is given to both the router and the
+    // background event watcher.
+    let pod_cache: PodCache = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
+    if let Some(ref sp) = socket_path {
+        refresh_pod_cache(sp, self_image_id.as_deref(), &pod_cache).await;
+        tracing::info!("Initial pod cache populated");
+
+        spawn_pod_event_watcher(sp.clone(), self_image_id.clone(), pod_cache.clone());
+    }
+
+    let app = build_app_with_cache(
+        token.clone(),
+        mcp_token,
+        socket_path,
+        self_image_id,
+        pod_cache,
+    );
 
     // Bind to [::] which accepts both IPv4 and IPv6 connections via dual-stack
     // (the Linux default).  Browsers typically try IPv6 first when resolving

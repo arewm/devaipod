@@ -2698,6 +2698,17 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             // Disable SELinux labeling so we can access the bind-mounted
             // container runtime socket (which has the host's SELinux context).
             security_opts: vec!["label=disable".to_string()],
+            // Healthcheck: verify the HTTP server is responding.
+            healthcheck: Some(crate::podman::HealthcheckConfig {
+                cmd: vec![
+                    "curl".to_string(),
+                    "-sf".to_string(),
+                    format!("http://localhost:{}/healthz", POD_API_PORT),
+                ],
+                interval: Some("5s".to_string()),
+                retries: Some(3),
+                start_period: Some("5s".to_string()),
+            }),
             ..Default::default()
         }
     }

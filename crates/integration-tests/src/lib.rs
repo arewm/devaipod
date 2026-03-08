@@ -1,7 +1,36 @@
-//! Shared library code for integration tests
+//! Shared library code for devaipod integration tests.
 //!
-//! This module contains macros and utilities for registering and running
-//! integration tests for devaipod.
+//! This crate provides macros and types for registering tests, plus the
+//! [`SharedFixture`] used by readonly tests.
+//!
+//! # Test registration macros
+//!
+//! Tests are registered via [`linkme`] distributed slices, not the standard
+//! `#[test]` attribute. Each macro corresponds to a test category:
+//!
+//! - [`integration_test!`] — basic tests (no podman needed)
+//! - [`podman_integration_test!`] — tests that create/destroy their own pods
+//! - [`container_integration_test!`] — tests requiring the pre-built container
+//!   image (`DEVAIPOD_CONTAINER_IMAGE`); skipped by `just test-integration-local`
+//! - [`readonly_test!`] — tests that share a single pod via [`SharedFixture`]
+//!   and must not mutate pod state
+//!
+//! # Shared fixture
+//!
+//! [`SharedFixture`] creates a pod (`devaipod-integration-shared`) once via
+//! [`OnceLock`] and reuses it across all `readonly_test!` tests. It waits for
+//! the pod-api healthcheck to report healthy before returning, so tests can
+//! query the API immediately.
+//!
+//! # Volume cleanup
+//!
+//! Each pod creates up to 5 named volumes (see [`POD_VOLUME_SUFFIXES`]).
+//! [`SharedFixture::cleanup`] removes these on teardown. Tests that create
+//! their own pods should use `PodGuard` (in the test runner binary) which
+//! removes pods and volumes on drop. Volumes can leak if a test run is
+//! killed by SIGKILL; run `podman volume prune` periodically.
+//!
+//! [`OnceLock`]: std::sync::OnceLock
 
 // Unfortunately needed here to work with linkme
 #![allow(unsafe_code)]
@@ -352,6 +381,35 @@ impl SharedFixture {
                 stdout,
                 stderr
             );
+        }
+
+        // Wait for the pod-api container to be healthy before returning.
+        // This ensures all readonly tests can immediately reach the API
+        // without per-test startup race conditions.
+        let api_container = format!("{SHARED_POD_NAME}-api");
+        tracing::info!("Waiting for {api_container} to become healthy...");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let inspect = Command::new("podman")
+                .args([
+                    "inspect",
+                    "--format",
+                    "{{.State.Health.Status}}",
+                    &api_container,
+                ])
+                .output()
+                .context("Failed to inspect pod-api container health")?;
+            let status = String::from_utf8_lossy(&inspect.stdout).trim().to_string();
+            if status == "healthy" {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                bail!(
+                    "pod-api container did not become healthy within 60s (status: {})",
+                    status
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
 
         tracing::info!("Shared fixture created with pod: {}", SHARED_POD_NAME);

@@ -1,7 +1,48 @@
-//! Integration tests for devaipod
+//! Integration test runner for devaipod.
 //!
-//! Run with: cargo test -p integration-tests
-//! Or: DEVAIPOD_PATH=./target/debug/devaipod cargo test -p integration-tests
+//! This binary uses [`libtest_mimic`] instead of the built-in test harness so
+//! that tests can be registered at link time via [`linkme`] distributed slices
+//! (see `integration_tests::INTEGRATION_TESTS` and `READONLY_INTEGRATION_TESTS`).
+//!
+//! # Key infrastructure
+//!
+//! - **`PodGuard`** — RAII guard that force-removes pods and their named
+//!   volumes on drop. Every test that calls `devaipod up` should register
+//!   the pod name with a guard so cleanup happens even on panic/failure.
+//! - **`TestRepo`** — creates a temporary git repo with a `devcontainer.json`,
+//!   suitable for passing to `devaipod up`.
+//! - **`CapturedOutput`** — wraps `std::process::Output` with decoded strings
+//!   and helpers like `assert_success()` and `extract_pod_name()`.
+//! - **Leaked pod cleanup** — on startup, `cleanup_leaked_test_pods()` removes
+//!   any pods labelled `io.devaipod.instance=integration-test` left behind by
+//!   a previous crashed run.
+//! - **Synthetic config** — `setup_synthetic_config()` creates a minimal
+//!   `devaipod.toml` in a tempdir and sets `XDG_CONFIG_HOME`, isolating tests
+//!   from the user's real config (which may reference missing podman secrets).
+//! - **Auto-spawned podman socket** — `ensure_podman_socket()` starts
+//!   `podman system service` if no socket exists (needed in environments
+//!   without systemd, e.g. devaipod-in-devaipod).
+//!
+//! # Test modules
+//!
+//! Tests are organized in `tests/`:
+//!
+//! | Module | Coverage |
+//! |--------|----------|
+//! | `cli` | CLI commands: up, delete, list, exec, stop/start |
+//! | `container` | Container properties, readonly API queries |
+//! | `pod_api` | Pod-api HTTP endpoints (summary, completion) |
+//! | `webui` | Web UI container: auth, proxy, MCP |
+//! | `ssh` | SSH config generation, server, client connectivity |
+//! | `advisor` | Advisor/orchestration commands |
+//! | `orchestration` | Multi-agent orchestration config |
+//!
+//! # Running
+//!
+//! ```sh
+//! just test-integration        # containerized (canonical, used by CI)
+//! just test-integration-local  # host binary, faster iteration
+//! ```
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

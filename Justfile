@@ -29,9 +29,10 @@ default_test_image := "ghcr.io/bootc-dev/devenv-debian:latest"
 # Go template for podman machine socket path (literal braces)
 _podman_socket_format := "{" + "{" + ".ConnectionInfo.PodmanSocket.Path" + "}" + "}"
 
-# Run integration tests directly on the host (no container build required).
-# Faster than test-integration: builds the binary and runs tests directly.
-# Skips web UI tests (which need the container image).
+# Run integration tests directly on the host (for quick iteration).
+# Builds only the binary, not the container image — sidecar containers
+# use the published image. Tests that depend on unreleased sidecar
+# features will fail; use `just test-integration` for full correctness.
 # Requires: podman installed. Socket is auto-started if missing.
 test-integration-local: build
     DEVAIPOD_PATH="{{justfile_directory()}}/target/debug/devaipod" \

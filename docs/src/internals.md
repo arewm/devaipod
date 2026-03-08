@@ -10,13 +10,12 @@ To build the rustdoc documentation locally:
 cargo doc --workspace --no-deps --document-private-items
 ```
 
-## Key source files
+## Key UI source files
+
+For the core Rust source files, see [Architecture](architecture.md).
 
 | File | Purpose |
 |------|---------|
-| `src/pod_api.rs` | Pod-api sidecar: git, PTY, opencode proxy, static UI |
-| `src/web.rs` | Control plane: auth, pod management, iframe wrapper |
-| `src/pod.rs` | Pod/container creation, sidecar config |
 | `opencode-ui/packages/app/src/context/devaipod.tsx` | Pod management context |
 | `opencode-ui/packages/app/src/pages/pods.tsx` | Pod management page |
 | `opencode-ui/packages/app/src/context/workspace-terminal.tsx` | Workspace PTY client |
