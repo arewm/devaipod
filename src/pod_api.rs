@@ -2113,9 +2113,15 @@ fn gator_config_path(workspace: &std::path::Path) -> PathBuf {
     workspace.join(crate::service_gator::GATOR_CONFIG_PATH)
 }
 
-/// Resolve the completion status file path from the workspace root.
-fn completion_status_path(workspace: &std::path::Path) -> PathBuf {
-    workspace.join(".devaipod/completion-status.json")
+/// Resolve the completion status file path.
+///
+/// Stored under `/var/lib/devaipod/` rather than in the workspace directory
+/// because the pod-api container drops all capabilities (including
+/// `DAC_OVERRIDE`), so it cannot write to workspace directories owned by a
+/// different UID. `/var/lib/devaipod/` is on the container's own overlay
+/// filesystem and is always writable.
+fn completion_status_path(_workspace: &std::path::Path) -> PathBuf {
+    PathBuf::from("/var/lib/devaipod/completion-status.json")
 }
 
 /// Read the current completion status from disk.
