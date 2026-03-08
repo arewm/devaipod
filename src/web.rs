@@ -23,6 +23,7 @@ use axum::{
 };
 use base64::prelude::*;
 use color_eyre::eyre::{Context, Result};
+use futures_util::StreamExt;
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
@@ -201,6 +202,28 @@ enum LaunchState {
 /// In-flight launches tracked by the web server, keyed by pod name.
 type LaunchMap = Arc<tokio::sync::Mutex<HashMap<String, LaunchState>>>;
 
+/// Cached pod list without agent status (which is fetched on-demand).
+///
+/// The event watcher maintains this cache so that `list_pods_unified` does not
+/// need to hit the podman socket on every poll request.
+type PodCache = Arc<tokio::sync::RwLock<Vec<CachedPodInfo>>>;
+
+/// Pod metadata cached by the event watcher.
+///
+/// Contains everything from `UnifiedPodInfo` except `agent_status`, which is
+/// fetched on-demand from each pod's pod-api sidecar.
+#[derive(Debug, Clone, Serialize)]
+struct CachedPodInfo {
+    name: String,
+    status: String,
+    created: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containers: Option<Vec<UnifiedContainerInfo>>,
+    needs_update: bool,
+}
+
 /// Shared state for the web server
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -215,6 +238,8 @@ pub(crate) struct AppState {
     /// Image ID (digest) of the running control plane container.
     /// Used to detect pods whose API sidecar is running an older image.
     self_image_id: Option<String>,
+    /// Cached pod list maintained by the background event watcher.
+    pod_cache: PodCache,
 }
 
 /// Query parameters for token authentication
@@ -1595,7 +1620,7 @@ struct UnifiedPodInfo {
     needs_update: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct UnifiedContainerInfo {
     #[serde(rename = "Names")]
     names: String,
@@ -1697,42 +1722,14 @@ async fn fetch_podman_pods(socket_path: &std::path::Path) -> Vec<PodmanPodJson> 
 
 /// `GET /api/devaipod/pods` -- unified pod list with agent status and enrichment.
 ///
-/// Fetches podman pods, concurrently queries each running pod's pod-api sidecar
-/// for agent status, and includes enrichment (needs_update). Returns everything
-/// in a single response so the UI does not need multiple round-trips.
+/// Reads the cached pod list (maintained by the background event watcher) and
+/// concurrently fetches agent status from each running pod's pod-api sidecar.
+/// The cache is populated at startup and updated whenever podman container
+/// events fire, so this handler never hits the podman socket directly.
 async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<UnifiedPodInfo>> {
-    let socket_path = match &state.socket_path {
-        Some(p) => p.clone(),
-        None => match get_container_socket() {
-            Ok(p) => p,
-            Err(_) => return Json(vec![]),
-        },
-    };
+    let cached_pods = state.pod_cache.read().await.clone();
 
-    // Fetch pods from podman and enrichment data concurrently
-    let enrichment_future = async {
-        let docker = bollard::Docker::connect_with_unix(
-            &format!("unix://{}", socket_path.display()),
-            120,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .ok();
-        match docker {
-            Some(d) => compute_enrichment_map(&d, state.self_image_id.as_deref()).await,
-            None => HashMap::new(),
-        }
-    };
-
-    let (all_pods, enrichment_map) =
-        tokio::join!(fetch_podman_pods(&socket_path), enrichment_future);
-
-    // Filter to devaipod pods
-    let devaipod_pods: Vec<_> = all_pods
-        .into_iter()
-        .filter(|p| p.name.starts_with("devaipod-"))
-        .collect();
-
-    if devaipod_pods.is_empty() {
+    if cached_pods.is_empty() {
         return Json(vec![]);
     }
 
@@ -1743,46 +1740,29 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    let mut tasks = Vec::with_capacity(devaipod_pods.len());
+    let mut tasks = Vec::with_capacity(cached_pods.len());
 
-    for pod in &devaipod_pods {
-        let pod_name = pod.name.clone();
-        let pod_status = pod.status.as_deref().unwrap_or("Unknown").to_string();
-        let is_running = pod_status.eq_ignore_ascii_case("running");
-
-        let labels = pod.labels.clone();
-        let created = pod.created.clone().unwrap_or_default();
-
-        let containers: Option<Vec<UnifiedContainerInfo>> = pod.containers.as_ref().map(|cs| {
-            cs.iter()
-                .map(|c| UnifiedContainerInfo {
-                    names: c.names.clone().unwrap_or_default(),
-                    status: c.status.clone().unwrap_or_default(),
-                })
-                .collect()
-        });
-
-        let needs_update = enrichment_map.get(&pod_name).copied().unwrap_or(false);
-
+    for pod in cached_pods {
+        let is_running = pod.status.eq_ignore_ascii_case("running");
         let host = host.clone();
         let client = client.clone();
-        let pod_name_clone = pod_name.clone();
+        let pod_name = pod.name.clone();
 
         let task = tokio::spawn(async move {
             let agent_status = if is_running {
-                fetch_agent_status_for_pod(&client, &host, &pod_name_clone).await
+                fetch_agent_status_for_pod(&client, &host, &pod_name).await
             } else {
                 None
             };
 
             UnifiedPodInfo {
-                name: pod_name,
-                status: pod_status,
-                created,
-                labels,
-                containers,
+                name: pod.name,
+                status: pod.status,
+                created: pod.created,
+                labels: pod.labels,
+                containers: pod.containers,
                 agent_status,
-                needs_update,
+                needs_update: pod.needs_update,
             }
         });
 
@@ -1796,21 +1776,8 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
         }
     }
 
-    // Sort: advisor first, then running pods, then by creation date descending
-    result.sort_by(|a, b| {
-        let a_advisor = u8::from(a.name == "devaipod-advisor");
-        let b_advisor = u8::from(b.name == "devaipod-advisor");
-        if b_advisor != a_advisor {
-            return b_advisor.cmp(&a_advisor);
-        }
-        let a_running = u8::from(a.status.eq_ignore_ascii_case("running"));
-        let b_running = u8::from(b.status.eq_ignore_ascii_case("running"));
-        if b_running != a_running {
-            return b_running.cmp(&a_running);
-        }
-        b.created.cmp(&a.created)
-    });
-
+    // The cache is already sorted, but agent_status fetch is concurrent
+    // and the spawn order is preserved, so no re-sort needed.
     Json(result)
 }
 
@@ -1881,6 +1848,174 @@ async fn compute_enrichment_map(
     }
 
     result
+}
+
+/// Refresh the pod cache: fetch pods from podman + enrichment, store the result.
+///
+/// This is called once at startup and again whenever a relevant podman event
+/// fires. It replaces the entire cache atomically.
+async fn refresh_pod_cache(
+    socket_path: &std::path::Path,
+    self_image_id: Option<&str>,
+    cache: &PodCache,
+) {
+    let enrichment_future = async {
+        let docker = bollard::Docker::connect_with_unix(
+            &format!("unix://{}", socket_path.display()),
+            120,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .ok();
+        match docker {
+            Some(d) => compute_enrichment_map(&d, self_image_id).await,
+            None => HashMap::new(),
+        }
+    };
+
+    let (all_pods, enrichment_map) =
+        tokio::join!(fetch_podman_pods(socket_path), enrichment_future);
+
+    let mut pods: Vec<CachedPodInfo> = all_pods
+        .into_iter()
+        .filter(|p| p.name.starts_with("devaipod-"))
+        .map(|pod| {
+            let needs_update = enrichment_map.get(&pod.name).copied().unwrap_or(false);
+            let containers = pod.containers.as_ref().map(|cs| {
+                cs.iter()
+                    .map(|c| UnifiedContainerInfo {
+                        names: c.names.clone().unwrap_or_default(),
+                        status: c.status.clone().unwrap_or_default(),
+                    })
+                    .collect()
+            });
+            CachedPodInfo {
+                name: pod.name,
+                status: pod.status.unwrap_or_else(|| "Unknown".to_string()),
+                created: pod.created.unwrap_or_default(),
+                labels: pod.labels,
+                containers,
+                needs_update,
+            }
+        })
+        .collect();
+
+    // Sort: advisor first, then running pods, then by creation date descending
+    pods.sort_by(|a, b| {
+        let a_advisor = u8::from(a.name == "devaipod-advisor");
+        let b_advisor = u8::from(b.name == "devaipod-advisor");
+        if b_advisor != a_advisor {
+            return b_advisor.cmp(&a_advisor);
+        }
+        let a_running = u8::from(a.status.eq_ignore_ascii_case("running"));
+        let b_running = u8::from(b.status.eq_ignore_ascii_case("running"));
+        if b_running != a_running {
+            return b_running.cmp(&a_running);
+        }
+        b.created.cmp(&a.created)
+    });
+
+    let count = pods.len();
+    *cache.write().await = pods;
+    tracing::debug!("Pod cache refreshed: {} pods", count);
+}
+
+/// Spawn a background task that watches podman events and refreshes the pod cache.
+///
+/// The watcher subscribes to container events (start, stop, die, create, remove)
+/// via bollard's streaming events API. On any relevant event it triggers a full
+/// cache refresh (rather than incremental updates, which would be fragile).
+///
+/// If the event stream disconnects, the watcher reconnects after a short delay.
+fn spawn_pod_event_watcher(socket_path: PathBuf, self_image_id: Option<String>, cache: PodCache) {
+    tokio::spawn(async move {
+        loop {
+            let docker = match bollard::Docker::connect_with_unix(
+                &format!("unix://{}", socket_path.display()),
+                120,
+                bollard::API_DEFAULT_VERSION,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Event watcher: failed to connect to podman: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            // Filter to container events only. Podman does not expose a
+            // separate "pod" event type through the Docker-compat API, but
+            // container lifecycle events (start/stop/die/remove) cover all the
+            // state transitions we care about.
+            let mut filters = HashMap::new();
+            filters.insert("type".to_string(), vec!["container".to_string()]);
+            let options = bollard::system::EventsOptions {
+                since: None,
+                until: None,
+                filters,
+            };
+
+            let mut stream = docker.events(Some(options));
+
+            tracing::info!("Event watcher: subscribed to podman container events");
+
+            // Debounce: when many events arrive in quick succession (e.g. pod
+            // start fires events for every container), we wait briefly before
+            // refreshing so we only do one fetch per burst.
+            let debounce = std::time::Duration::from_millis(500);
+            let mut pending_refresh = false;
+            let sleep = tokio::time::sleep(debounce);
+            tokio::pin!(sleep);
+
+            loop {
+                tokio::select! {
+                    event = stream.next() => {
+                        match event {
+                            Some(Ok(msg)) => {
+                                // Only refresh on events related to devaipod containers.
+                                let dominated = if let Some(ref actor) = msg.actor {
+                                    actor.attributes.as_ref().is_some_and(|attrs| {
+                                        attrs
+                                            .get("name")
+                                            .is_some_and(|n| n.starts_with("devaipod-"))
+                                    })
+                                } else {
+                                    false
+                                };
+
+                                if dominated {
+                                    let action = msg.action.as_deref().unwrap_or("?");
+                                    tracing::debug!("Event watcher: devaipod event action={action}");
+                                    pending_refresh = true;
+                                    // Reset the debounce timer
+                                    sleep.as_mut().reset(tokio::time::Instant::now() + debounce);
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("Event watcher: stream error: {e}");
+                                break;
+                            }
+                            None => {
+                                tracing::warn!("Event watcher: stream ended");
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut sleep, if pending_refresh => {
+                        pending_refresh = false;
+                        refresh_pod_cache(
+                            &socket_path,
+                            self_image_id.as_deref(),
+                            &cache,
+                        ).await;
+                    }
+                }
+            }
+
+            // Stream disconnected; reconnect after a short delay.
+            tracing::info!("Event watcher: reconnecting in 5s");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 }
 
 /// Return enrichment data for all devaipod pods.
@@ -2359,11 +2494,27 @@ async fn prune_done_pods() -> Result<Json<PruneResponse>, StatusCode> {
 ///
 /// Exposed for tests so we can hit the router with in-process requests (fast)
 /// without starting a server or container.
+#[cfg(test)]
 pub(crate) fn build_app(
     token: String,
     mcp_token: String,
     socket_path: Option<PathBuf>,
     self_image_id: Option<String>,
+) -> Router {
+    let pod_cache: PodCache = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    build_app_with_cache(token, mcp_token, socket_path, self_image_id, pod_cache)
+}
+
+/// Build the web app router with a pre-existing pod cache.
+///
+/// This variant is used by `run_web_server` so the cache can be shared with
+/// the background event watcher.
+fn build_app_with_cache(
+    token: String,
+    mcp_token: String,
+    socket_path: Option<PathBuf>,
+    self_image_id: Option<String>,
+    pod_cache: PodCache,
 ) -> Router {
     let state = Arc::new(AppState {
         token: token.clone(),
@@ -2371,6 +2522,7 @@ pub(crate) fn build_app(
         socket_path,
         launches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         self_image_id,
+        pod_cache,
     });
 
     // Build the API router with authentication
@@ -2490,7 +2642,25 @@ pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Resu
         tracing::info!("Control plane image ID: {}", id);
     }
 
-    let app = build_app(token.clone(), mcp_token, socket_path, self_image_id);
+    // Create a shared pod cache and populate it before the server starts
+    // accepting requests. The same Arc is given to both the router and the
+    // background event watcher.
+    let pod_cache: PodCache = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
+    if let Some(ref sp) = socket_path {
+        refresh_pod_cache(sp, self_image_id.as_deref(), &pod_cache).await;
+        tracing::info!("Initial pod cache populated");
+
+        spawn_pod_event_watcher(sp.clone(), self_image_id.clone(), pod_cache.clone());
+    }
+
+    let app = build_app_with_cache(
+        token.clone(),
+        mcp_token,
+        socket_path,
+        self_image_id,
+        pod_cache,
+    );
 
     // Bind to [::] which accepts both IPv4 and IPv6 connections via dual-stack
     // (the Linux default).  Browsers typically try IPv6 first when resolving
