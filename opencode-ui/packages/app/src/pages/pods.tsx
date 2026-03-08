@@ -45,11 +45,14 @@ export default function PodsPage() {
 // Main content
 // ---------------------------------------------------------------------------
 
+type PodFilter = "all" | "running" | "stopped" | "done"
+
 function PodsPageContent() {
   const ctx = useDevaipod()
 
   const [showForm, setShowForm] = createSignal(false)
   const [focusedIdx, setFocusedIdx] = createSignal(-1)
+  const [filter, setFilter] = createSignal<PodFilter>("all")
 
   // Keyboard shortcuts
   onMount(() => {
@@ -70,7 +73,7 @@ function PodsPageContent() {
       }
 
       if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !isInput) {
-        const total = ctx.pods.length
+        const total = filteredPods().length
         if (total === 0) return
         e.preventDefault()
         setFocusedIdx((prev) => {
@@ -81,7 +84,7 @@ function PodsPageContent() {
 
       if (e.key === "Enter" && !isInput) {
         const idx = focusedIdx()
-        const cards = ctx.pods
+        const cards = filteredPods()
         if (idx >= 0 && idx < cards.length) {
           e.preventDefault()
           const card = cards[idx]
@@ -96,6 +99,40 @@ function PodsPageContent() {
     }
     document.addEventListener("keydown", handler)
     onCleanup(() => document.removeEventListener("keydown", handler))
+  })
+
+  // Derive completion status for a pod from agent status
+  const podCompletionStatus = (podName: string) =>
+    ctx.agentStatus[podName]?.completion_status ?? "active"
+
+  const isPodRunning = (pod: PodInfo) =>
+    (pod.Status ?? "").toLowerCase() === "running"
+
+  const isPodDone = (podName: string) =>
+    podCompletionStatus(podName) === "done"
+
+  // Filter counts for the filter bar
+  const filterCounts = createMemo(() => {
+    const pods = ctx.pods
+    let running = 0, stopped = 0, done = 0
+    for (const p of pods) {
+      if (isPodDone(p.Name)) done++
+      else if (isPodRunning(p)) running++
+      else stopped++
+    }
+    return { all: pods.length, running, stopped, done }
+  })
+
+  // Filtered pod list
+  const filteredPods = createMemo(() => {
+    const f = filter()
+    if (f === "all") return ctx.pods
+    return ctx.pods.filter((p) => {
+      if (f === "done") return isPodDone(p.Name)
+      if (f === "running") return isPodRunning(p) && !isPodDone(p.Name)
+      // "stopped"
+      return !isPodRunning(p) && !isPodDone(p.Name)
+    })
   })
 
   const existingPodNames = createMemo(() => new Set(ctx.pods.map((p) => p.Name)))
@@ -160,6 +197,31 @@ function PodsPageContent() {
         </Show>
       </div>
 
+      {/* Filter bar */}
+      <Show when={ctx.pods.length > 0}>
+        <div class="flex gap-1 mb-4">
+          <For each={["all", "running", "stopped", "done"] as PodFilter[]}>
+            {(f) => {
+              const count = () => filterCounts()[f]
+              return (
+                <button
+                  type="button"
+                  class="px-2.5 py-1 rounded text-12-regular transition-colors cursor-pointer"
+                  classList={{
+                    "bg-fill-element-active text-text-strong": filter() === f,
+                    "text-text-weak hover:text-text-secondary-base hover:bg-fill-element-base": filter() !== f,
+                  }}
+                  onClick={() => setFilter(f)}
+                >
+                  {f.charAt(0).toUpperCase() + f.slice(1)}
+                  <span class="ml-1 opacity-60">{count()}</span>
+                </button>
+              )
+            }}
+          </For>
+        </div>
+      </Show>
+
       {/* Advisor placeholder when no advisor pod exists */}
       <Show when={!ctx.hasAdvisor()}>
         <AdvisorPlaceholder />
@@ -185,17 +247,26 @@ function PodsPageContent() {
           </Show>
         }
       >
-        <div class="flex flex-col gap-3">
-          <For each={ctx.pods}>
-            {(pod, index) => (
-              <PodCard
-                pod={pod}
-                focused={focusedIdx() === index()}
-                onFocus={() => setFocusedIdx(index())}
-              />
-            )}
-          </For>
-        </div>
+        <Show
+          when={filteredPods().length > 0}
+          fallback={
+            <div class="flex flex-col items-center justify-center py-8 text-text-weak">
+              <p class="text-12-regular">No {filter()} workspaces</p>
+            </div>
+          }
+        >
+          <div class="flex flex-col gap-3">
+            <For each={filteredPods()}>
+              {(pod, index) => (
+                <PodCard
+                  pod={pod}
+                  focused={focusedIdx() === index()}
+                  onFocus={() => setFocusedIdx(index())}
+                />
+              )}
+            </For>
+          </div>
+        </Show>
       </Show>
     </div>
     </div>
@@ -499,6 +570,7 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
   const mode = () => labels()["io.devaipod.mode"] ?? ""
 
   const agentStatus = () => ctx.agentStatus[props.pod.Name]
+  const isDone = () => agentStatus()?.completion_status === "done"
 
   // Health status
   const health = createMemo(() => {
@@ -578,6 +650,11 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
       >
         <span class="text-14-medium text-text-strong">{shortName()}</span>
         <div class="flex items-center gap-2">
+          <Show when={isDone()}>
+            <span class="text-10-regular uppercase px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-400">
+              Done
+            </span>
+          </Show>
           <span
             class="text-10-regular uppercase px-1.5 py-0.5 rounded"
             classList={{ [healthTagClass()]: true }}
