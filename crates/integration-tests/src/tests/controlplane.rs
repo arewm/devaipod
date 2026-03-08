@@ -3,10 +3,14 @@
 //! Tests for the unified pod list endpoint (`GET /api/devaipod/pods`) and the
 //! completion-status (done/active) workflow proxied through the control plane
 //! to the pod-api sidecar.
+//!
+//! Tests prefixed `test_harness_` use [`DevaipodHarness`] which starts
+//! `devaipod web` directly on the host (no container image required).
 
 use color_eyre::Result;
+use integration_tests::harness::DevaipodHarness;
 
-use crate::container_integration_test;
+use crate::{container_integration_test, podman_integration_test};
 
 use super::WebFixture;
 
@@ -184,3 +188,50 @@ fn test_completion_status_roundtrip() -> Result<()> {
     Ok(())
 }
 container_integration_test!(test_completion_status_roundtrip);
+
+/// Smoke test using the [`DevaipodHarness`] (no container image required).
+///
+/// Starts `devaipod web` on a random port and verifies that the health
+/// endpoint responds with 200 and the pod list endpoint returns a valid
+/// (possibly empty) JSON array.
+fn test_harness_health_and_pod_list() -> Result<()> {
+    let harness = DevaipodHarness::start()?;
+
+    // Health endpoint (no auth needed).
+    let (status, body) = harness.get("/_devaipod/health")?;
+    assert_eq!(
+        status, 200,
+        "health should return 200, got {status}: {body}"
+    );
+    assert!(
+        body.contains("ok"),
+        "health body should contain 'ok': {body}"
+    );
+
+    // Pod list (requires auth — the harness sends Bearer token automatically).
+    let (status, body) = harness.get("/api/devaipod/pods")?;
+    assert_eq!(
+        status,
+        200,
+        "GET /api/devaipod/pods should return 200, got {status}: {}",
+        &body[..body.len().min(300)]
+    );
+
+    let pods: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| {
+        color_eyre::eyre::eyre!(
+            "Failed to parse pod list: {} - body: {}",
+            e,
+            &body[..body.len().min(500)]
+        )
+    })?;
+
+    // Without a running pod the array may be empty — that's fine.
+    tracing::info!(
+        "Harness pod list returned {} entries (port {})",
+        pods.len(),
+        harness.port()
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_harness_health_and_pod_list);

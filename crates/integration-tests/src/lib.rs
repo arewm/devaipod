@@ -35,6 +35,8 @@
 // Unfortunately needed here to work with linkme
 #![allow(unsafe_code)]
 
+pub mod harness;
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
