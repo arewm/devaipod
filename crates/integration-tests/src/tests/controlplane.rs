@@ -1,7 +1,8 @@
 //! Control plane integration tests.
 //!
-//! Tests for the unified pod list endpoint (`GET /api/devaipod/pods`) which
-//! returns pod metadata, agent status, and enrichment in a single response.
+//! Tests for the unified pod list endpoint (`GET /api/devaipod/pods`) and the
+//! completion-status (done/active) workflow proxied through the control plane
+//! to the pod-api sidecar.
 
 use color_eyre::Result;
 
@@ -67,3 +68,119 @@ fn test_unified_pod_list() -> Result<()> {
     Ok(())
 }
 container_integration_test!(test_unified_pod_list);
+
+/// Find the short name of the first running pod from the unified pod list.
+///
+/// Returns `None` if no running pod is found.
+fn find_running_pod(fixture: &WebFixture, token: &str) -> Result<Option<String>> {
+    let (status, body) = fixture.curl_in_container("/api/devaipod/pods", Some(token))?;
+    if status != 200 {
+        return Ok(None);
+    }
+    let pods: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
+    for pod in &pods {
+        let name = match pod.get("name").and_then(|v| v.as_str()) {
+            Some(n) if n.starts_with("devaipod-") => n,
+            _ => continue,
+        };
+        let status = pod.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status.eq_ignore_ascii_case("running") {
+            let short = name.strip_prefix("devaipod-").unwrap_or(name);
+            return Ok(Some(short.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Exercise the completion-status (done/active) roundtrip through the
+/// control plane proxy.
+///
+/// This tests the full stack: control plane receives the PUT, injects the
+/// admin token, proxies to the pod-api sidecar, which writes the status to
+/// `/var/lib/devaipod/completion-status.json`. Then GET reads it back.
+///
+/// The test resets the status to "active" at the end so it doesn't affect
+/// other tests sharing the same WebFixture.
+fn test_completion_status_roundtrip() -> Result<()> {
+    let fixture = WebFixture::get()?;
+    let token = fixture.token().to_string();
+
+    let short_name = match find_running_pod(fixture, &token)? {
+        Some(n) => n,
+        None => {
+            tracing::info!("No running pods, skipping completion-status test");
+            return Ok(());
+        }
+    };
+
+    let path = format!("/api/devaipod/pods/{}/completion-status", short_name);
+
+    // 1. GET — default should be "active"
+    let (status, body) = fixture.curl_in_container(&path, Some(&token))?;
+    assert_eq!(
+        status, 200,
+        "GET completion-status should return 200: {body}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        json["status"].as_str(),
+        Some("active"),
+        "Default completion status should be 'active', got: {body}"
+    );
+
+    // 2. PUT "done"
+    let (status, body) =
+        fixture.curl_with_method("PUT", &path, Some(r#"{"status":"done"}"#), Some(&token))?;
+    assert_eq!(
+        status, 200,
+        "PUT completion-status should return 200: {body}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        json["status"].as_str(),
+        Some("done"),
+        "PUT response should confirm 'done': {body}"
+    );
+
+    // 3. GET — should now be "done"
+    let (status, body) = fixture.curl_in_container(&path, Some(&token))?;
+    assert_eq!(status, 200);
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        json["status"].as_str(),
+        Some("done"),
+        "After PUT, GET should return 'done': {body}"
+    );
+
+    // 4. Verify it shows up in the unified pod list's agent_status
+    let (status, body) = fixture.curl_in_container("/api/devaipod/pods", Some(&token))?;
+    assert_eq!(status, 200);
+    let pods: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    let our_pod = pods.iter().find(|p| {
+        p.get("name")
+            .and_then(|v| v.as_str())
+            .map(|n| n.ends_with(&short_name))
+            .unwrap_or(false)
+    });
+    if let Some(pod) = our_pod {
+        if let Some(agent) = pod.get("agent_status") {
+            assert_eq!(
+                agent.get("completion_status").and_then(|v| v.as_str()),
+                Some("done"),
+                "Unified pod list should reflect 'done' in agent_status"
+            );
+        }
+    }
+
+    // 5. Reset to "active" (cleanup for shared fixture)
+    let (status, _) =
+        fixture.curl_with_method("PUT", &path, Some(r#"{"status":"active"}"#), Some(&token))?;
+    assert_eq!(status, 200, "Reset to 'active' should succeed");
+
+    tracing::info!(
+        "Completion status roundtrip passed for pod '{}'",
+        short_name
+    );
+    Ok(())
+}
+container_integration_test!(test_completion_status_roundtrip);
