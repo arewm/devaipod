@@ -2472,6 +2472,67 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Mock opencode server for integration testing
+// ---------------------------------------------------------------------------
+
+/// Run a minimal mock opencode server for integration testing.
+///
+/// Serves canned session and message data so that the pod-api sidecar can
+/// query "opencode" without a real AI provider. The responses make the agent
+/// appear idle (finished, stop).
+pub(crate) async fn run_mock_opencode(port: u16) -> Result<()> {
+    let app = Router::new()
+        .route("/session", get(mock_sessions))
+        .route("/session/{id}/message", get(mock_messages));
+
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!("Mock opencode server listening on 0.0.0.0:{}", port);
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind mock-opencode to {addr}"))?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::web::shutdown_signal())
+        .await
+        .context("mock-opencode server error")?;
+
+    tracing::info!("Mock opencode server shut down gracefully");
+    Ok(())
+}
+
+/// `GET /session` — return a canned session list (one root session).
+async fn mock_sessions() -> Json<serde_json::Value> {
+    Json(serde_json::json!([
+        {
+            "id": "mock-session-001",
+            "slug": "mock-session",
+            "projectID": "proj_001",
+            "directory": "/workspaces/test",
+            "title": "Mock session",
+            "version": "1.0.0",
+            "time": {"created": 1_700_000_000_000_i64, "updated": 1_700_000_100_000_i64}
+        }
+    ]))
+}
+
+/// `GET /session/:id/message` — return canned messages showing an idle agent.
+async fn mock_messages(Path(_id): Path<String>) -> Json<serde_json::Value> {
+    Json(serde_json::json!([
+        {
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1_700_000_001_000_i64, "completed": 1_700_000_002_000_i64},
+                "finish": "stop"
+            },
+            "parts": [
+                {"type": "text", "text": "Ready for testing."}
+            ]
+        }
+    ]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

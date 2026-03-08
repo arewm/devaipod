@@ -2319,6 +2319,13 @@ exec sleep infinity
             }
         }
 
+        // Forward DEVAIPOD_MOCK_AGENT to the agent container for integration testing.
+        // When set, the agent startup script runs `devaipod mock-opencode` instead of
+        // the real opencode server.
+        if let Ok(val) = std::env::var("DEVAIPOD_MOCK_AGENT") {
+            env.insert("DEVAIPOD_MOCK_AGENT".to_string(), val);
+        }
+
         // Forward env vars from devcontainer.json's customizations.devaipod.env_allowlist
         if let Some(config) = devcontainer_config {
             for (key, value) in config.collect_allowlist_env_vars() {
@@ -2462,6 +2469,12 @@ exec sleep infinity
 while [ ! -f {state} ]; do
     sleep 0.1
 done
+
+# Mock mode: run devaipod mock-opencode instead of the real opencode server.
+# Used by integration tests to avoid needing a real AI provider.
+if [ -n "${{DEVAIPOD_MOCK_AGENT}}" ]; then
+    exec devaipod mock-opencode --port {opencode_port}
+fi
 
 # Run opencode serve, bound to 0.0.0.0 so it's accessible from the published port
 exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
