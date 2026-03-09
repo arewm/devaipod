@@ -642,13 +642,18 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
         "border-l-2 border-l-violet-600": isAdvisor(),
       }}
     >
-      {/* Header — click to toggle */}
-      <button
-        type="button"
-        class="w-full flex items-center justify-between p-4 cursor-pointer select-none text-left"
-        onClick={() => setCollapsed((c) => !c)}
-      >
-        <span class="text-14-medium text-text-strong">{shortName()}</span>
+      {/* Header */}
+      <div class="w-full flex items-center justify-between p-4">
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="text-14-medium text-text-strong truncate">{shortName()}</span>
+          <IconButton
+            icon="copy"
+            size="small"
+            variant="ghost"
+            title="Copy pod name"
+            onClick={() => navigator.clipboard.writeText(shortName())}
+          />
+        </div>
         <div class="flex items-center gap-2">
           <Show when={isDone()}>
             <span class="text-10-regular uppercase px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-400">
@@ -661,14 +666,17 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
           >
             {health().label}
           </span>
-          <Icon
-            name="chevron-down"
+          <IconButton
+            icon="chevron-down"
             size="small"
+            variant="ghost"
+            title={collapsed() ? "Expand" : "Collapse"}
             class="transition-transform"
             classList={{ "rotate-[-90deg]": collapsed() }}
+            onClick={() => setCollapsed((c) => !c)}
           />
         </div>
-      </button>
+      </div>
 
       <Show when={!collapsed()}>
         {/* Metadata */}
