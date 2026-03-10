@@ -2470,10 +2470,34 @@ while [ ! -f {state} ]; do
     sleep 0.1
 done
 
-# Mock mode: run devaipod mock-opencode instead of the real opencode server.
+# Mock mode: run inline mock server instead of the real opencode server.
 # Used by integration tests to avoid needing a real AI provider.
+# Uses Python3 (available in all devcontainer images) so no extra binary
+# is required in the agent container.
 if [ -n "${{DEVAIPOD_MOCK_AGENT}}" ]; then
-    exec devaipod mock-opencode --port {opencode_port}
+    exec python3 -u -c "
+import json, http.server, socketserver
+
+SESSION = json.dumps([dict(id='mock-001',slug='mock',projectID='p',directory='/workspaces/test',title='Mock',version='1.0.0',time=dict(created=1700000000000,updated=1700000100000))])
+MESSAGE = json.dumps([dict(info=dict(role='assistant',time=dict(created=1700000001000,completed=1700000002000),finish='stop'),parts=[dict(type='text',text='Ready.')])])
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith('/session') and '/message' in self.path:
+            body = MESSAGE
+        elif self.path.startswith('/session'):
+            body = SESSION
+        else:
+            self.send_error(404); return
+        self.send_response(200)
+        self.send_header('Content-Type','application/json')
+        self.end_headers()
+        self.wfile.write(body.encode())
+    def log_message(self, *a): pass
+
+print('Mock opencode on port {opencode_port}', flush=True)
+socketserver.TCPServer(('0.0.0.0',{opencode_port}),H).serve_forever()
+"
 fi
 
 # Run opencode serve, bound to 0.0.0.0 so it's accessible from the published port
