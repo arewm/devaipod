@@ -53,18 +53,15 @@ jobs:
       - name: Integration tests (containerized)
         run: just test-integration
 
-  # Security audit of dependencies
-  audit:
-    runs-on: ubuntu-latest
+  # Check for security vulnerabilities and license compliance
+  cargo-deny:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run security audit
-        # RUSTSEC-2023-0071: rsa crate (transitive via russh), no fix available
-        run: cargo audit --ignore RUSTSEC-2023-0071
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          log-level: warn
+          command: check advisories licenses sources
 
   # Test the devcontainer feature install script syntax
   shellcheck:

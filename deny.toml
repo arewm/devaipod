@@ -1,0 +1,40 @@
+# cargo-deny configuration
+# See https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Advisories we've evaluated and determined are acceptable for this project.
+ignore = [
+    # rsa crate (transitive via russh) — no fix available upstream
+    "RUSTSEC-2023-0071",
+    # instant is unmaintained (transitive via notify) — no fix until notify upgrades
+    "RUSTSEC-2024-0384",
+    # paste is unmaintained (transitive via ratatui) — no fix until ratatui upgrades
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # r-efi is a platform interface crate (EFI headers), only relevant on
+    # UEFI platforms and not linked into our binary on Linux.
+    "LGPL-2.1-or-later",
+]
+private = { ignore = true }
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
