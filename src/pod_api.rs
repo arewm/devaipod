@@ -42,9 +42,25 @@ const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
 /// Default port for the opencode server inside the pod.
 const DEFAULT_OPENCODE_PORT: u16 = 4096;
 
+/// Default directory for pod-api state (admin token, completion status, etc.).
+///
+/// In containers this is `/var/lib/devaipod/`; tests can override it via
+/// the `DEVAIPOD_STATE_DIR` environment variable.
+const DEFAULT_STATE_DIR: &str = "/var/lib/devaipod";
+
 /// Path where pod-api persists its admin token.
 /// The control plane retrieves this via `podman exec <container> cat <path>`.
 pub(crate) const ADMIN_TOKEN_PATH: &str = "/var/lib/devaipod/pod-api-token";
+
+/// Resolve the pod-api state directory.
+///
+/// Returns the value of `DEVAIPOD_STATE_DIR` if set, otherwise
+/// [`DEFAULT_STATE_DIR`].  The directory is created if it doesn't
+/// exist yet.
+fn state_dir() -> PathBuf {
+    let dir = std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    PathBuf::from(dir)
+}
 
 /// Server state shared across all handlers.
 #[derive(Clone)]
@@ -2115,13 +2131,15 @@ fn gator_config_path(workspace: &std::path::Path) -> PathBuf {
 
 /// Resolve the completion status file path.
 ///
-/// Stored under `/var/lib/devaipod/` rather than in the workspace directory
-/// because the pod-api container drops all capabilities (including
-/// `DAC_OVERRIDE`), so it cannot write to workspace directories owned by a
-/// different UID. `/var/lib/devaipod/` is on the container's own overlay
-/// filesystem and is always writable.
+/// Stored under the pod-api state directory (default `/var/lib/devaipod/`)
+/// rather than in the workspace directory because the pod-api container
+/// drops all capabilities (including `DAC_OVERRIDE`), so it cannot write
+/// to workspace directories owned by a different UID. The state directory
+/// is on the container's own overlay filesystem and is always writable.
+///
+/// Override via `DEVAIPOD_STATE_DIR` for testing outside of containers.
 fn completion_status_path(_workspace: &std::path::Path) -> PathBuf {
-    PathBuf::from("/var/lib/devaipod/completion-status.json")
+    state_dir().join("completion-status.json")
 }
 
 /// Read the current completion status from disk.
@@ -2401,9 +2419,19 @@ fn build_router(state: AppState) -> Router {
 fn load_or_generate_admin_token() -> Result<String> {
     use std::io::Read;
 
-    // Allow override via env var for testing outside of containers
+    // Allow override via env var for testing outside of containers.
+    // Falls back to DEVAIPOD_STATE_DIR/pod-api-token if set, otherwise
+    // the hardcoded ADMIN_TOKEN_PATH.
+    let resolved_path;
     let env_path = std::env::var("DEVAIPOD_ADMIN_TOKEN_PATH").ok();
-    let path = std::path::Path::new(env_path.as_deref().unwrap_or(ADMIN_TOKEN_PATH));
+    let path = if let Some(ref p) = env_path {
+        std::path::Path::new(p.as_str())
+    } else if std::env::var("DEVAIPOD_STATE_DIR").is_ok() {
+        resolved_path = state_dir().join("pod-api-token");
+        resolved_path.as_path()
+    } else {
+        std::path::Path::new(ADMIN_TOKEN_PATH)
+    };
 
     // Try to read existing token
     if let Ok(mut file) = std::fs::File::open(path) {
