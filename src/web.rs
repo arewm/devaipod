@@ -437,6 +437,7 @@ const DOCS_PATH: &str = "/usr/share/devaipod/docs";
 /// Returns the direct URL to access the opencode web UI.
 /// On 404 returns JSON body so the frontend can show "Pod or agent not found".
 async fn opencode_info(
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<OpencodeInfoResponse>, (StatusCode, Json<ApiErrorBody>)> {
     let pod_name = normalize_pod_name(&name);
@@ -451,8 +452,13 @@ async fn opencode_info(
         (code, Json(ApiErrorBody { error: msg }))
     })?;
 
-    // Build URL for the opencode web UI (via pod-api sidecar)
-    let url = format!("http://localhost:{}/", port);
+    // Build URL for the opencode web UI (via pod-api sidecar).
+    // Use the request's Host header so the URL works for remote access too
+    // (e.g. when the control plane is accessed via http://xenon:8080/).
+    // Respect X-Forwarded-Proto so HTTPS reverse proxies produce https:// URLs.
+    let host = extract_request_host(&headers);
+    let scheme = extract_request_scheme(&headers);
+    let url = format!("{}://{}:{}/", scheme, host, port);
 
     // Fetch the most recent session via the pod-api sidecar (which proxies to
     // the opencode server internally and handles auth).
@@ -506,6 +512,43 @@ async fn fetch_latest_session(pod_api_port: u16) -> Option<LatestSessionInfo> {
             id: id.to_string(),
             directory: dir.to_string(),
         })
+}
+
+/// Extract the hostname from the incoming request for use in browser-facing URLs.
+///
+/// Checks `X-Forwarded-Host` first (for reverse proxy setups), then falls back
+/// to the standard `Host` header.  The port portion is stripped since callers
+/// combine the hostname with a specific pod-api port.  Returns `"localhost"` if
+/// no header is present (e.g. HTTP/1.0 without Host).
+fn extract_request_host(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .map(|h| {
+            // Strip the port suffix (e.g. "xenon:8080" -> "xenon").
+            // Be careful with IPv6 literals like "[::1]:8080".
+            if h.starts_with('[') {
+                // IPv6 literal: find the closing ']' then strip :port after it
+                h.find(']').map(|i| &h[..=i]).unwrap_or(h)
+            } else {
+                h.split(':').next().unwrap_or(h)
+            }
+        })
+        .unwrap_or("localhost")
+}
+
+/// Extract the URL scheme from the incoming request for browser-facing URLs.
+///
+/// Checks `X-Forwarded-Proto` (set by reverse proxies that terminate TLS),
+/// falling back to `"http"`.  The pod-api sidecars always speak plain HTTP,
+/// but when a reverse proxy forwards the published ports over HTTPS the
+/// browser needs `https://` URLs to avoid mixed-content issues.
+fn extract_request_scheme(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http")
 }
 
 /// Get the published host port for the pod-api sidecar container.
@@ -920,6 +963,7 @@ function updateBtn() {{
 
 async function toggleDone() {{
   const newStatus = isDone ? "active" : "done";
+  const wasDone = isDone;
   btn.textContent = "Updating...";
   try {{
     const r = await fetch("/api/devaipod/pods/" + podName + "/completion-status", {{
@@ -932,10 +976,10 @@ async function toggleDone() {{
       const d = await r.json();
       isDone = d.status === "done";
     }} else {{
-      isDone = !isDone; // revert
+      isDone = wasDone; // revert to previous state on error
     }}
   }} catch(e) {{
-    // revert on error
+    isDone = wasDone; // revert on network error
   }}
   updateBtn();
 }}
@@ -985,6 +1029,7 @@ struct AgentQuery {
 async fn agent_ui_root(
     Path(name): Path<String>,
     Query(query): Query<AgentQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let pod_name = normalize_pod_name(&name);
 
@@ -997,17 +1042,21 @@ async fn agent_ui_root(
         (code, msg)
     })?;
 
-    // The iframe URL is rendered in the user's browser on the host, so we must
-    // use localhost — not host.containers.internal (which is only resolvable
-    // inside containers).  Published ports are bound to 0.0.0.0 on the host.
-    let host = "localhost";
+    // The iframe URL is rendered in the user's browser, so we use the hostname
+    // from the incoming request.  This way remote access (e.g. http://xenon:8080/)
+    // produces an iframe pointing at http://xenon:{port}/ instead of localhost.
+    // Published ports are bound to 0.0.0.0 on the host so they are reachable
+    // from any interface.
+    // Respect X-Forwarded-Proto so HTTPS reverse proxies produce https:// URLs.
+    let host = extract_request_host(&headers);
+    let scheme = extract_request_scheme(&headers);
 
     // Build the base URL, optionally including the session deep-link path.
     let base_url = match (query.dir.as_deref(), query.session.as_deref()) {
         (Some(dir), Some(session)) => {
-            format!("http://{host}:{port}/{dir}/session/{session}")
+            format!("{scheme}://{host}:{port}/{dir}/session/{session}")
         }
-        _ => format!("http://{host}:{port}/"),
+        _ => format!("{scheme}://{host}:{port}/"),
     };
 
     Ok(Response::builder()
@@ -2177,16 +2226,44 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
     };
 
     // Proxy to pod-api's /summary endpoint.
-    match client
-        .get(format!("http://{}:{}/summary", host, port))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => match resp.json::<AgentStatusResponse>().await {
-            Ok(summary) => Json(summary),
-            Err(_) => Json(AgentStatusResponse::with_activity("Unknown")),
-        },
-        _ => Json(AgentStatusResponse::with_activity("Unknown")),
+    let url = format!("http://{}:{}/summary", host, port);
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            // Read the raw body first so we can log it on deserialization failure
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(pod = %pod_name, "Failed to read /summary body: {e}");
+                    return Json(AgentStatusResponse::with_activity("Unknown"));
+                }
+            };
+            match serde_json::from_str::<AgentStatusResponse>(&body) {
+                Ok(summary) => {
+                    tracing::debug!(
+                        pod = %pod_name,
+                        activity = %summary.activity,
+                        completion_status = ?summary.completion_status,
+                        "agent-status from pod-api"
+                    );
+                    Json(summary)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pod = %pod_name,
+                        "Failed to parse /summary response: {e}; body: {body}"
+                    );
+                    Json(AgentStatusResponse::with_activity("Unknown"))
+                }
+            }
+        }
+        Ok(resp) => {
+            tracing::debug!(pod = %pod_name, status = %resp.status(), "Non-success from pod-api /summary");
+            Json(AgentStatusResponse::with_activity("Unknown"))
+        }
+        Err(e) => {
+            tracing::debug!(pod = %pod_name, "Failed to reach pod-api /summary: {e}");
+            Json(AgentStatusResponse::with_activity("Unknown"))
+        }
     }
 }
 
@@ -2797,6 +2874,61 @@ mod tests {
             html.contains("&lt;script&gt;"),
             "angle brackets must be escaped"
         );
+    }
+
+    #[test]
+    fn test_extract_request_host() {
+        // No headers → fallback to localhost
+        let headers = HeaderMap::new();
+        assert_eq!(extract_request_host(&headers), "localhost");
+
+        // hostname:port → strip port
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "xenon:8080".parse().unwrap());
+        assert_eq!(extract_request_host(&headers), "xenon");
+
+        // hostname without port
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "xenon".parse().unwrap());
+        assert_eq!(extract_request_host(&headers), "xenon");
+
+        // IPv4 address
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "192.168.1.5:8080".parse().unwrap());
+        assert_eq!(extract_request_host(&headers), "192.168.1.5");
+
+        // IPv6 literal with port
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "[::1]:8080".parse().unwrap());
+        assert_eq!(extract_request_host(&headers), "[::1]");
+
+        // IPv6 literal without port
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "[::1]".parse().unwrap());
+        assert_eq!(extract_request_host(&headers), "[::1]");
+
+        // X-Forwarded-Host takes priority over Host
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "internal:8080".parse().unwrap());
+        headers.insert("x-forwarded-host", "proxy.example.com:443".parse().unwrap());
+        assert_eq!(extract_request_host(&headers), "proxy.example.com");
+    }
+
+    #[test]
+    fn test_extract_request_scheme() {
+        // No headers → default to http
+        let headers = HeaderMap::new();
+        assert_eq!(extract_request_scheme(&headers), "http");
+
+        // X-Forwarded-Proto: https
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(extract_request_scheme(&headers), "https");
+
+        // X-Forwarded-Proto: http (explicit)
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(extract_request_scheme(&headers), "http");
     }
 
     #[test]

@@ -525,6 +525,23 @@ export default function Layout(props: ParentProps) {
     ),
   )
 
+  // When navigating directly to /:dir (e.g. inside a devaipod iframe),
+  // ensure the directory is added to the projects list so currentProject()
+  // resolves and the session sidebar renders.
+  createEffect(
+    on(
+      () => ({ ready: pageReady(), layoutReady: layoutReady(), dir: params.dir }),
+      (value) => {
+        if (!value.ready) return
+        if (!value.layoutReady) return
+        if (!value.dir) return
+        const directory = decode64(value.dir)
+        if (!directory) return
+        layout.projects.open(directory)
+      },
+    ),
+  )
+
   const workspaceName = (directory: string, projectId?: string, branch?: string) => {
     const key = workspaceKey(directory)
     const direct = store.workspaceName[key] ?? store.workspaceName[directory]
