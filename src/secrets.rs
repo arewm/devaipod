@@ -75,7 +75,7 @@ impl SecretArg {
 
 /// Secret declaration from devcontainer.json
 /// Fields are parsed but not currently displayed (used for validation).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
 pub struct DevcontainerSecretDecl {
     #[serde(default)]

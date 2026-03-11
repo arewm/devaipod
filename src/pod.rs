@@ -2141,10 +2141,26 @@ fi
                 (privileged, cap_add, security_opts)
             };
 
-        // Get secrets to mount with type=env - workspace also gets trusted secrets
-        // (like GH_TOKEN) for authenticated git operations, gh CLI, etc.
-        // Note: agent container does NOT get these secrets for security.
-        let secrets = global_config.trusted_env.secret_mounts();
+        // Get secrets to mount with type=env - workspace gets both trusted secrets
+        // (like GH_TOKEN) and devcontainer-declared secrets (like ANTHROPIC_API_KEY).
+        // Note: agent container does NOT get trusted secrets for security.
+        let mut secrets = global_config.trusted_env.secret_mounts();
+
+        // Filter out devcontainer secrets that collide with trusted secrets.
+        // Trusted secrets always win to prevent malicious devcontainer.json from shadowing them.
+        let trusted_env_vars: std::collections::HashSet<String> =
+            secrets.iter().map(|(env_var, _)| env_var.clone()).collect();
+        let devcontainer_secrets = config.devcontainer_secret_mounts();
+        for (env_var, secret_name) in devcontainer_secrets {
+            if trusted_env_vars.contains(&env_var) {
+                tracing::warn!(
+                    "Ignoring devcontainer secret '{}' for env var '{}' - shadowed by trusted secret",
+                    secret_name, env_var
+                );
+            } else {
+                secrets.push((env_var, secret_name));
+            }
+        }
 
         // Get file-based secrets (mounted as files, env var points to path)
         // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
@@ -2449,6 +2465,15 @@ exec sleep infinity
             );
         }
 
+        // Get devcontainer-declared secrets (like ANTHROPIC_API_KEY, OPENAI_API_KEY).
+        // These go to the agent container since they're project-declared LLM keys.
+        // Note: trusted secrets (like GH_TOKEN) do NOT go to agent for security.
+        let secrets = if let Some(config) = devcontainer_config {
+            config.devcontainer_secret_mounts()
+        } else {
+            Vec::new()
+        };
+
         // Get file-based secrets (mounted as files, env var points to path)
         // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
         let file_secrets = global_config.trusted_env.file_secret_mounts();
@@ -2520,6 +2545,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
                 }
                 mounts
             },
+            secrets,
             file_secrets,
             extra_create_args,
             ..Default::default()
@@ -2560,8 +2586,8 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
         // These are the credentials that service-gator needs to access external services
         env.extend(global_config.trusted_env.collect());
 
-        // Get secrets to mount with type=env - these become env vars directly
-        // No need for *_FILE pattern; podman sets the env var from the secret value
+        // Get secrets to mount with type=env - gator gets only trusted secrets
+        // (like GH_TOKEN for forge access). Gator is a forge proxy and doesn't need LLM keys.
         let secrets = global_config.trusted_env.secret_mounts();
 
         // Get file-based secrets (mounted as files, env var points to path)
@@ -4305,5 +4331,216 @@ mod tests {
 
         assert_eq!(worker, "test-project-worker");
         assert_eq!(worker_workspace_volume, "test-project-worker-workspace");
+    }
+
+    #[test]
+    fn test_workspace_container_with_devcontainer_secrets() {
+        // Test that devcontainer.json secrets are passed to workspace container
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let json = r#"{
+            "image": "foo",
+            "secrets": {
+                "ANTHROPIC_API_KEY": {},
+                "OPENAI_API_KEY": {}
+            }
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let global_config = crate::config::Config::default();
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+            "test-volume",
+            "test-agent-home",
+            "test-agent-workspace",
+            &global_config,
+            &[], // labels
+        );
+
+        // Should have devcontainer secrets
+        assert_eq!(container_config.secrets.len(), 2);
+        assert!(container_config.secrets.contains(&(
+            "ANTHROPIC_API_KEY".to_string(),
+            "ANTHROPIC_API_KEY".to_string()
+        )));
+        assert!(container_config
+            .secrets
+            .contains(&("OPENAI_API_KEY".to_string(), "OPENAI_API_KEY".to_string())));
+    }
+
+    #[test]
+    fn test_agent_container_with_devcontainer_secrets() {
+        // Test that devcontainer.json secrets are passed to agent container
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let json = r#"{
+            "image": "foo",
+            "secrets": {
+                "ANTHROPIC_API_KEY": {},
+                "OPENAI_API_KEY": {}
+            }
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let global_config = crate::config::Config::default();
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            Some(&config),
+            false, // enable_gator
+            false, // enable_orchestration
+            "test-workspace-vol",
+            "test-agent-workspace-vol",
+            "test-agent-home-vol",
+            None, // worker_workspace_volume
+            &global_config,
+        );
+
+        // Should have devcontainer secrets (LLM keys go to agent)
+        assert_eq!(container_config.secrets.len(), 2);
+        assert!(container_config.secrets.contains(&(
+            "ANTHROPIC_API_KEY".to_string(),
+            "ANTHROPIC_API_KEY".to_string()
+        )));
+        assert!(container_config
+            .secrets
+            .contains(&("OPENAI_API_KEY".to_string(), "OPENAI_API_KEY".to_string())));
+    }
+
+    #[test]
+    fn test_gator_container_does_not_get_devcontainer_secrets() {
+        // Verify that gator (forge proxy) does NOT get devcontainer secrets
+        // Gator only needs trusted secrets for forge access, not LLM keys
+        let agent_workspace_volume = "test-agent-workspace";
+        let workspace_folder = "/workspaces";
+        let main_workspace_volume = "test-main-workspace";
+        let global_config = crate::config::Config::default();
+
+        let container_config = DevaipodPod::gator_container_config(
+            agent_workspace_volume,
+            workspace_folder,
+            main_workspace_volume,
+            &global_config,
+        );
+
+        // Gator should not have any secrets (no trusted secrets configured)
+        assert_eq!(container_config.secrets.len(), 0);
+    }
+
+    #[test]
+    fn test_workspace_container_with_both_secret_types() {
+        // Test that both trusted and devcontainer secrets are merged
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let json = r#"{
+            "image": "foo",
+            "secrets": {
+                "ANTHROPIC_API_KEY": {}
+            }
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+
+        let mut global_config = crate::config::Config::default();
+        global_config.trusted_env.secrets = vec!["GH_TOKEN=gh_token".to_string()];
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+            "test-volume",
+            "test-agent-home",
+            "test-agent-workspace",
+            &global_config,
+            &[], // labels
+        );
+
+        // Should have both trusted and devcontainer secrets
+        assert_eq!(container_config.secrets.len(), 2);
+        assert!(container_config
+            .secrets
+            .contains(&("GH_TOKEN".to_string(), "gh_token".to_string())));
+        assert!(container_config.secrets.contains(&(
+            "ANTHROPIC_API_KEY".to_string(),
+            "ANTHROPIC_API_KEY".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_workspace_container_secret_collision_trusted_wins() {
+        // Test that trusted secrets take precedence over devcontainer secrets with same env var name
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        // Devcontainer declares GH_TOKEN (malicious attempt to shadow trusted secret)
+        let json = r#"{
+            "image": "foo",
+            "secrets": {
+                "GH_TOKEN": {},
+                "ANTHROPIC_API_KEY": {}
+            }
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+
+        // Global config has trusted GH_TOKEN
+        let mut global_config = crate::config::Config::default();
+        global_config.trusted_env.secrets = vec!["GH_TOKEN=gh_token_trusted".to_string()];
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+            "test-volume",
+            "test-agent-home",
+            "test-agent-workspace",
+            &global_config,
+            &[], // labels
+        );
+
+        // Should have 2 secrets: trusted GH_TOKEN and devcontainer ANTHROPIC_API_KEY
+        // The devcontainer GH_TOKEN should be filtered out
+        assert_eq!(container_config.secrets.len(), 2);
+
+        // Verify trusted GH_TOKEN is present (not the devcontainer one)
+        assert!(container_config
+            .secrets
+            .contains(&("GH_TOKEN".to_string(), "gh_token_trusted".to_string())));
+
+        // Verify devcontainer ANTHROPIC_API_KEY is present
+        assert!(container_config.secrets.contains(&(
+            "ANTHROPIC_API_KEY".to_string(),
+            "ANTHROPIC_API_KEY".to_string()
+        )));
+
+        // Make sure there's no duplicate GH_TOKEN entry
+        let gh_token_count = container_config
+            .secrets
+            .iter()
+            .filter(|(env_var, _)| env_var == "GH_TOKEN")
+            .count();
+        assert_eq!(gh_token_count, 1);
     }
 }

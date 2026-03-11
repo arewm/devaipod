@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::secrets::DevcontainerSecretDecl;
+
 /// Parsed devcontainer.json configuration
 ///
 /// We only parse the fields we need for our multi-container setup.
@@ -92,6 +94,12 @@ pub struct DevcontainerConfig {
     /// Additional arguments to pass to podman/docker run
     #[serde(default)]
     pub run_args: Vec<String>,
+
+    /// Secrets configuration from devcontainer.json
+    /// Maps secret names to their declarations (description, documentation URL, etc.)
+    /// The key is used as both the environment variable name and the podman secret name.
+    #[serde(default)]
+    pub secrets: HashMap<String, DevcontainerSecretDecl>,
 }
 
 /// Tool-specific customizations in devcontainer.json
@@ -161,6 +169,7 @@ impl Default for DevcontainerConfig {
             security_opt: Vec::new(),
             customizations: None,
             run_args: Vec::new(),
+            secrets: HashMap::new(),
         }
     }
 }
@@ -460,6 +469,22 @@ impl DevcontainerConfig {
             }
         }
         passthrough
+    }
+
+    /// Get (env_var_name, secret_name) pairs for devcontainer.json secrets.
+    ///
+    /// For devcontainer.json, the convention is that the secret key is used as
+    /// both the environment variable name and the podman secret name.
+    /// Returns a vector of tuples where each tuple contains:
+    /// - The environment variable name to set
+    /// - The podman secret name containing the value
+    ///
+    /// This follows the same pattern as `TrustedEnvConfig::secret_mounts()`.
+    pub fn devcontainer_secret_mounts(&self) -> Vec<(String, String)> {
+        self.secrets
+            .keys()
+            .map(|secret_name| (secret_name.clone(), secret_name.clone()))
+            .collect()
     }
 }
 
@@ -942,5 +967,57 @@ mod tests {
     fn test_nested_containers_no_customizations() {
         let config = DevcontainerConfig::default();
         assert!(!config.has_nested_containers());
+    }
+
+    #[test]
+    fn test_parse_devcontainer_secrets() {
+        let json = r#"{
+            "image": "foo",
+            "secrets": {
+                "ANTHROPIC_API_KEY": {
+                    "description": "API key for Anthropic Claude"
+                },
+                "OPENAI_API_KEY": {
+                    "description": "API key for OpenAI",
+                    "documentationUrl": "https://platform.openai.com/api-keys"
+                }
+            }
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.secrets.len(), 2);
+        assert!(config.secrets.contains_key("ANTHROPIC_API_KEY"));
+        assert!(config.secrets.contains_key("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn test_devcontainer_secret_mounts() {
+        let json = r#"{
+            "image": "foo",
+            "secrets": {
+                "ANTHROPIC_API_KEY": {
+                    "description": "API key for Anthropic Claude"
+                },
+                "OPENAI_API_KEY": {}
+            }
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let secret_mounts = config.devcontainer_secret_mounts();
+
+        // Should have 2 secrets, each mapping key to key
+        assert_eq!(secret_mounts.len(), 2);
+        assert!(secret_mounts.contains(&(
+            "ANTHROPIC_API_KEY".to_string(),
+            "ANTHROPIC_API_KEY".to_string()
+        )));
+        assert!(
+            secret_mounts.contains(&("OPENAI_API_KEY".to_string(), "OPENAI_API_KEY".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_devcontainer_secret_mounts_empty() {
+        let config = DevcontainerConfig::default();
+        let secret_mounts = config.devcontainer_secret_mounts();
+        assert!(secret_mounts.is_empty());
     }
 }
