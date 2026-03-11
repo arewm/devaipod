@@ -51,6 +51,13 @@ echo "$ANTHROPIC_API_KEY" | podman secret create anthropic_api_key -
 echo "$GH_TOKEN" | podman secret create gh_token -
 ```
 
+> **macOS note:** On macOS with podman machine, verify secrets are visible
+> inside the VM with `podman secret list`. If you switched machines or
+> secrets aren't showing up, you may need to recreate them.
+
+> **GHCR note:** If you get a 403 pulling `ghcr.io/cgwalters/service-gator`,
+> you may need to authenticate: `podman login ghcr.io`
+
 ### Create a configuration file
 
 Create `~/.config/devaipod.toml` referencing your secrets (see
