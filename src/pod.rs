@@ -278,6 +278,13 @@ pub(crate) async fn detect_self_image_id() -> Option<String> {
 /// Returns the image name if we can detect it, otherwise falls back to
 /// `DEVAIPOD_IMAGE_FALLBACK`.
 fn detect_self_image() -> String {
+    // Explicit override — used by integration tests to point at the
+    // locally-built image instead of the published registry image.
+    if let Ok(image) = std::env::var("DEVAIPOD_CONTAINER_IMAGE") {
+        tracing::debug!("Using image from DEVAIPOD_CONTAINER_IMAGE: {image}");
+        return image;
+    }
+
     // Only attempt detection when running inside the devaipod container
     if std::env::var("DEVAIPOD_CONTAINER").as_deref() == Ok("1") {
         let mut cmd = std::process::Command::new("podman");
@@ -290,7 +297,7 @@ fn detect_self_image() -> String {
             if output.status.success() {
                 let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !image.is_empty() {
-                    tracing::debug!("Detected devaipod self-image: {}", image);
+                    tracing::debug!("Detected devaipod self-image: {image}");
                     return image;
                 }
             }
