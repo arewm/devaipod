@@ -884,6 +884,19 @@ enum HostCommand {
     ///   devaipod pod-api --port 9000                  # Custom port
     ///   devaipod pod-api --workspace /home/user/repo  # Custom workspace path
     PodApi(pod_api::PodApiArgs),
+
+    /// Mock opencode server for integration testing.
+    ///
+    /// Serves a minimal HTTP API on the specified port that mimics the opencode
+    /// session/message endpoints. Used by integration tests so the pod-api
+    /// sidecar has a functioning "opencode" to talk to without needing a real
+    /// AI provider.
+    #[command(hide = true)]
+    MockOpencode {
+        /// Port to listen on
+        #[arg(long, default_value = "4096")]
+        port: u16,
+    },
     /// Manage service-gator scopes for a workspace
     ///
     /// Service-gator provides scope-restricted access to external services
@@ -1155,7 +1168,10 @@ fn init_tracing(verbose: bool, quiet: bool) {
 fn command_requires_config(cmd: &HostCommand) -> bool {
     !matches!(
         cmd,
-        HostCommand::Init { .. } | HostCommand::Completions { .. } | HostCommand::PodApi(_)
+        HostCommand::Init { .. }
+            | HostCommand::Completions { .. }
+            | HostCommand::PodApi(_)
+            | HostCommand::MockOpencode { .. }
     )
 }
 
@@ -1163,7 +1179,10 @@ fn command_requires_config(cmd: &HostCommand) -> bool {
 fn command_allowed_on_host(cmd: &HostCommand) -> bool {
     matches!(
         cmd,
-        HostCommand::Init { .. } | HostCommand::Completions { .. } | HostCommand::PodApi(_)
+        HostCommand::Init { .. }
+            | HostCommand::Completions { .. }
+            | HostCommand::PodApi(_)
+            | HostCommand::MockOpencode { .. }
     )
 }
 
@@ -1425,6 +1444,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             crate::web::run_web_server(port, token, mcp_token).await
         }
         HostCommand::PodApi(args) => crate::pod_api::run(args).await,
+        HostCommand::MockOpencode { port } => crate::pod_api::run_mock_opencode(port).await,
         HostCommand::Advisor {
             task,
             status,

@@ -42,9 +42,25 @@ const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
 /// Default port for the opencode server inside the pod.
 const DEFAULT_OPENCODE_PORT: u16 = 4096;
 
+/// Default directory for pod-api state (admin token, completion status, etc.).
+///
+/// In containers this is `/var/lib/devaipod/`; tests can override it via
+/// the `DEVAIPOD_STATE_DIR` environment variable.
+const DEFAULT_STATE_DIR: &str = "/var/lib/devaipod";
+
 /// Path where pod-api persists its admin token.
 /// The control plane retrieves this via `podman exec <container> cat <path>`.
 pub(crate) const ADMIN_TOKEN_PATH: &str = "/var/lib/devaipod/pod-api-token";
+
+/// Resolve the pod-api state directory.
+///
+/// Returns the value of `DEVAIPOD_STATE_DIR` if set, otherwise
+/// [`DEFAULT_STATE_DIR`].  The caller is responsible for ensuring the
+/// directory exists (it is pre-created in the container image).
+fn state_dir() -> PathBuf {
+    let dir = std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    PathBuf::from(dir)
+}
 
 /// Server state shared across all handlers.
 #[derive(Clone)]
@@ -2113,9 +2129,17 @@ fn gator_config_path(workspace: &std::path::Path) -> PathBuf {
     workspace.join(crate::service_gator::GATOR_CONFIG_PATH)
 }
 
-/// Resolve the completion status file path from the workspace root.
-fn completion_status_path(workspace: &std::path::Path) -> PathBuf {
-    workspace.join(".devaipod/completion-status.json")
+/// Resolve the completion status file path.
+///
+/// Stored under the pod-api state directory (default `/var/lib/devaipod/`)
+/// rather than in the workspace directory because the pod-api container
+/// drops all capabilities (including `DAC_OVERRIDE`), so it cannot write
+/// to workspace directories owned by a different UID. The state directory
+/// is on the container's own overlay filesystem and is always writable.
+///
+/// Override via `DEVAIPOD_STATE_DIR` for testing outside of containers.
+fn completion_status_path(_workspace: &std::path::Path) -> PathBuf {
+    state_dir().join("completion-status.json")
 }
 
 /// Read the current completion status from disk.
@@ -2288,20 +2312,24 @@ async fn update_completion_status(
     })?;
 
     let path = completion_status_path(&state.workspace);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            tracing::error!("Failed to create completion status dir: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    }
+    // The state directory (/var/lib/devaipod/) is pre-created in the
+    // container image and also by load_or_generate_admin_token() at startup.
+    // We skip create_dir_all here because tokio::fs::create_dir_all triggers
+    // a capability check (mkdir syscall) that fails with EPERM when all
+    // capabilities are dropped, even when the directory already exists in
+    // some overlayfs configurations.
 
     let temp_path = path.with_extension("json.tmp");
     tokio::fs::write(&temp_path, &json).await.map_err(|e| {
-        tracing::error!("Failed to write completion status: {}", e);
+        tracing::error!(
+            "Failed to write completion status to {:?}: {}",
+            temp_path,
+            e
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     tokio::fs::rename(&temp_path, &path).await.map_err(|e| {
-        tracing::error!("Failed to rename completion status file: {}", e);
+        tracing::error!("Failed to rename {:?} -> {:?}: {}", temp_path, path, e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -2395,9 +2423,19 @@ fn build_router(state: AppState) -> Router {
 fn load_or_generate_admin_token() -> Result<String> {
     use std::io::Read;
 
-    // Allow override via env var for testing outside of containers
+    // Allow override via env var for testing outside of containers.
+    // Falls back to DEVAIPOD_STATE_DIR/pod-api-token if set, otherwise
+    // the hardcoded ADMIN_TOKEN_PATH.
+    let resolved_path;
     let env_path = std::env::var("DEVAIPOD_ADMIN_TOKEN_PATH").ok();
-    let path = std::path::Path::new(env_path.as_deref().unwrap_or(ADMIN_TOKEN_PATH));
+    let path = if let Some(ref p) = env_path {
+        std::path::Path::new(p.as_str())
+    } else if std::env::var("DEVAIPOD_STATE_DIR").is_ok() {
+        resolved_path = state_dir().join("pod-api-token");
+        resolved_path.as_path()
+    } else {
+        std::path::Path::new(ADMIN_TOKEN_PATH)
+    };
 
     // Try to read existing token
     if let Ok(mut file) = std::fs::File::open(path) {
@@ -2405,7 +2443,7 @@ fn load_or_generate_admin_token() -> Result<String> {
         file.read_to_string(&mut token)?;
         let token = token.trim().to_string();
         if !token.is_empty() {
-            tracing::debug!("Loaded admin token from {}", ADMIN_TOKEN_PATH);
+            tracing::debug!("Loaded admin token from {}", path.display());
             return Ok(token);
         }
     }
@@ -2416,12 +2454,13 @@ fn load_or_generate_admin_token() -> Result<String> {
     let bytes: [u8; 16] = rng.random();
     let token: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
-    // Persist it
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    // Persist it.
+    // The state directory (/var/lib/devaipod/) is pre-created in the
+    // container image.  We avoid create_dir_all here because mkdir on
+    // an existing overlayfs directory can return EPERM when all Linux
+    // capabilities are dropped (the pod-api runs with drop_all_caps).
     std::fs::write(path, &token)?;
-    tracing::info!("Generated admin token at {}", ADMIN_TOKEN_PATH);
+    tracing::info!("Generated admin token at {}", path.display());
 
     Ok(token)
 }
@@ -2464,6 +2503,67 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
 
     tracing::info!("pod-api shut down gracefully");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mock opencode server for integration testing
+// ---------------------------------------------------------------------------
+
+/// Run a minimal mock opencode server for integration testing.
+///
+/// Serves canned session and message data so that the pod-api sidecar can
+/// query "opencode" without a real AI provider. The responses make the agent
+/// appear idle (finished, stop).
+pub(crate) async fn run_mock_opencode(port: u16) -> Result<()> {
+    let app = Router::new()
+        .route("/session", get(mock_sessions))
+        .route("/session/{id}/message", get(mock_messages));
+
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!("Mock opencode server listening on 0.0.0.0:{}", port);
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind mock-opencode to {addr}"))?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::web::shutdown_signal())
+        .await
+        .context("mock-opencode server error")?;
+
+    tracing::info!("Mock opencode server shut down gracefully");
+    Ok(())
+}
+
+/// `GET /session` — return a canned session list (one root session).
+async fn mock_sessions() -> Json<serde_json::Value> {
+    Json(serde_json::json!([
+        {
+            "id": "mock-session-001",
+            "slug": "mock-session",
+            "projectID": "proj_001",
+            "directory": "/workspaces/test",
+            "title": "Mock session",
+            "version": "1.0.0",
+            "time": {"created": 1_700_000_000_000_i64, "updated": 1_700_000_100_000_i64}
+        }
+    ]))
+}
+
+/// `GET /session/:id/message` — return canned messages showing an idle agent.
+async fn mock_messages(Path(_id): Path<String>) -> Json<serde_json::Value> {
+    Json(serde_json::json!([
+        {
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1_700_000_001_000_i64, "completed": 1_700_000_002_000_i64},
+                "finish": "stop"
+            },
+            "parts": [
+                {"type": "text", "text": "Ready for testing."}
+            ]
+        }
+    ]))
 }
 
 #[cfg(test)]

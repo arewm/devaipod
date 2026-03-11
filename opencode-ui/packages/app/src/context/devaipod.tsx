@@ -31,6 +31,7 @@ export interface AgentStatus {
   current_tool?: string
   status_line?: string
   session_count?: number
+  completion_status?: "active" | "done"
 }
 
 export interface LaunchState {

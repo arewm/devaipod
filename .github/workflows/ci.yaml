@@ -52,19 +52,24 @@ jobs:
 
       - name: Integration tests (containerized)
         run: just test-integration
+      # Debug run: re-run only the failing tests with verbose output
+      - name: Debug failing tests (host mode)
+        if: failure()
+        run: |
+          DEVAIPOD_PATH="${PWD}/target/debug/devaipod" \
+          DEVAIPOD_HOST_MODE=1 \
+          RUST_LOG=devaipod=debug \
+            cargo test -p integration-tests -- test_harness_completion_status_e2e --nocapture 2>&1 || true
 
-  # Security audit of dependencies
-  audit:
-    runs-on: ubuntu-latest
+  # Check for security vulnerabilities and license compliance
+  cargo-deny:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run security audit
-        # RUSTSEC-2023-0071: rsa crate (transitive via russh), no fix available
-        run: cargo audit --ignore RUSTSEC-2023-0071
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          log-level: warn
+          command: check advisories licenses sources
 
   # Test the devcontainer feature install script syntax
   shellcheck:

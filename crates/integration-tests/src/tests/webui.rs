@@ -160,9 +160,12 @@ impl WebContainerGuard {
 
         // Run the container (no port forwarding needed - we use podman exec)
         let host_socket_env = format!("DEVAIPOD_HOST_SOCKET={}", host_socket);
+        // Pass the container image name so detect_self_image() uses the
+        // locally-built image for pod-api sidecars instead of the published one.
+        let container_image_env = format!("DEVAIPOD_CONTAINER_IMAGE={}", image);
         let run_output = cmd!(
             sh,
-            "podman run -d --name {container_name} --privileged -v {socket_mount} -e {host_socket_env} -v {config_mount} {image}"
+            "podman run -d --name {container_name} --privileged -v {socket_mount} -e {host_socket_env} -e {container_image_env} -v {config_mount} {image}"
         )
         .ignore_status()
         .output()?;
@@ -398,6 +401,60 @@ impl WebContainerGuard {
         Ok((status_code, body))
     }
 
+    /// Run curl with a custom HTTP method, optional body, and optional auth token.
+    ///
+    /// Useful for PUT/POST requests with JSON payloads. Returns (status_code, body).
+    fn curl_in_container_with_method(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        auth_token: Option<&str>,
+    ) -> Result<(i32, String)> {
+        let url = format!("http://127.0.0.1:8080{}", path);
+        let mut args: Vec<String> = vec![
+            "exec".into(),
+            self.container_name.clone(),
+            "curl".into(),
+            "-s".into(),
+            "-w".into(),
+            "\n%{http_code}".into(),
+            "--connect-timeout".into(),
+            "5".into(),
+            "--max-time".into(),
+            "30".into(),
+            "-X".into(),
+            method.into(),
+        ];
+        if let Some(token) = auth_token {
+            args.push("-H".into());
+            args.push(format!("Authorization: Bearer {}", token));
+        }
+        if let Some(data) = body {
+            args.push("-H".into());
+            args.push("Content-Type: application/json".into());
+            args.push("-d".into());
+            args.push(data.into());
+        }
+        args.push(url);
+
+        let output = Command::new("podman").args(&args).output()?;
+        let combined = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = combined.trim().lines().collect();
+
+        if lines.is_empty() {
+            return Ok((-1, String::new()));
+        }
+
+        let status_code: i32 = lines.last().and_then(|s| s.parse().ok()).unwrap_or(-1);
+        let resp_body = if lines.len() > 1 {
+            lines[..lines.len() - 1].join("\n")
+        } else {
+            String::new()
+        };
+        Ok((status_code, resp_body))
+    }
+
     /// Wait for the server to be ready by polling the health endpoint
     fn wait_ready(&self, timeout: Duration) -> Result<()> {
         let start = std::time::Instant::now();
@@ -534,6 +591,18 @@ impl WebFixture {
     ) -> Result<(String, i32, String, String)> {
         self.guard
             .curl_in_container_full_headers(path, max_time_secs, cookie)
+    }
+
+    /// Run curl with a custom HTTP method, optional body, and optional auth token.
+    pub fn curl_with_method(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        auth_token: Option<&str>,
+    ) -> Result<(i32, String)> {
+        self.guard
+            .curl_in_container_with_method(method, path, body, auth_token)
     }
 
     /// Get the container name (for advanced operations like podman exec)
