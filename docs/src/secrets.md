@@ -42,6 +42,23 @@ When devaipod starts:
 
 This approach keeps secrets out of the container environment and process listings while using podman's built-in environment variable injection.
 
+### File-based Secrets
+
+Some credentials need to be available as files rather than environment
+variables. Use `file_secrets` for this:
+
+```toml
+[trusted]
+file_secrets = ["GOOGLE_APPLICATION_CREDENTIALS=google_adc"]
+```
+
+This mounts the podman secret as a file at `/run/secrets/google_adc` and
+sets `GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/google_adc`.
+
+```bash
+podman secret create google_adc ~/.config/gcloud/application_default_credentials.json
+```
+
 ## LLM API Keys (devcontainer.json)
 
 1. **Declare secrets in devcontainer.json:**
@@ -76,20 +93,24 @@ This approach keeps secrets out of the container environment and process listing
 
 ### Vertex AI / gcloud ADC
 
-For Google Cloud Vertex AI, bind-mount your gcloud config:
+For Google Cloud Vertex AI, use `file_secrets` to mount your application
+default credentials:
 
-```json
-{
-  "mounts": [{
-    "source": "${localEnv:HOME}/.config/gcloud",
-    "target": "/home/devenv/.config/gcloud",
-    "type": "bind"
-  }],
-  "containerEnv": {
-    "GOOGLE_CLOUD_PROJECT": "${localEnv:GOOGLE_CLOUD_PROJECT}"
-  }
-}
+```bash
+podman secret create google_adc ~/.config/gcloud/application_default_credentials.json
 ```
+
+```toml
+[trusted]
+file_secrets = ["GOOGLE_APPLICATION_CREDENTIALS=google_adc"]
+
+[env.vars]
+GOOGLE_CLOUD_PROJECT = "your-project-id"
+```
+
+> **Note:** devcontainer.json `mounts` are parsed but not yet wired into
+> container creation. Use `file_secrets` or `[env]` for credentials that
+> need to reach containers.
 
 ### Environment Variables
 

@@ -30,6 +30,10 @@ allowlist = ["GH_TOKEN", "GITLAB_TOKEN", "JIRA_API_TOKEN"]
 [trusted]
 secrets = ["GH_TOKEN=gh_token", "GITLAB_TOKEN=gitlab_token"]
 
+# File-based secrets (mounted as files, env var points to path)
+# Useful for credentials like gcloud ADC that expect a file path
+file_secrets = ["GOOGLE_APPLICATION_CREDENTIALS=google_adc"]
+
 # GPU passthrough (optional)
 [gpu]
 enabled = true  # or "auto" to detect
