@@ -55,8 +55,8 @@ pub(crate) const ADMIN_TOKEN_PATH: &str = "/var/lib/devaipod/pod-api-token";
 /// Resolve the pod-api state directory.
 ///
 /// Returns the value of `DEVAIPOD_STATE_DIR` if set, otherwise
-/// [`DEFAULT_STATE_DIR`].  The directory is created if it doesn't
-/// exist yet.
+/// [`DEFAULT_STATE_DIR`].  The caller is responsible for ensuring the
+/// directory exists (it is pre-created in the container image).
 fn state_dir() -> PathBuf {
     let dir = std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
     PathBuf::from(dir)
@@ -2312,20 +2312,24 @@ async fn update_completion_status(
     })?;
 
     let path = completion_status_path(&state.workspace);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            tracing::error!("Failed to create completion status dir: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    }
+    // The state directory (/var/lib/devaipod/) is pre-created in the
+    // container image and also by load_or_generate_admin_token() at startup.
+    // We skip create_dir_all here because tokio::fs::create_dir_all triggers
+    // a capability check (mkdir syscall) that fails with EPERM when all
+    // capabilities are dropped, even when the directory already exists in
+    // some overlayfs configurations.
 
     let temp_path = path.with_extension("json.tmp");
     tokio::fs::write(&temp_path, &json).await.map_err(|e| {
-        tracing::error!("Failed to write completion status: {}", e);
+        tracing::error!(
+            "Failed to write completion status to {:?}: {}",
+            temp_path,
+            e
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     tokio::fs::rename(&temp_path, &path).await.map_err(|e| {
-        tracing::error!("Failed to rename completion status file: {}", e);
+        tracing::error!("Failed to rename {:?} -> {:?}: {}", temp_path, path, e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -2439,7 +2443,7 @@ fn load_or_generate_admin_token() -> Result<String> {
         file.read_to_string(&mut token)?;
         let token = token.trim().to_string();
         if !token.is_empty() {
-            tracing::debug!("Loaded admin token from {}", ADMIN_TOKEN_PATH);
+            tracing::debug!("Loaded admin token from {}", path.display());
             return Ok(token);
         }
     }
@@ -2450,12 +2454,13 @@ fn load_or_generate_admin_token() -> Result<String> {
     let bytes: [u8; 16] = rng.random();
     let token: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
-    // Persist it
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    // Persist it.
+    // The state directory (/var/lib/devaipod/) is pre-created in the
+    // container image.  We avoid create_dir_all here because mkdir on
+    // an existing overlayfs directory can return EPERM when all Linux
+    // capabilities are dropped (the pod-api runs with drop_all_caps).
     std::fs::write(path, &token)?;
-    tracing::info!("Generated admin token at {}", ADMIN_TOKEN_PATH);
+    tracing::info!("Generated admin token at {}", path.display());
 
     Ok(token)
 }

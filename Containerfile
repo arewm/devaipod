@@ -222,8 +222,8 @@ RUN dnf install -y \
     && dnf clean all \
     && ln -sf /usr/bin/podman-remote /usr/bin/podman
 
-# Create config directory
-RUN mkdir -p /root/.config
+# Create config and state directories
+RUN mkdir -p /root/.config /var/lib/devaipod
 
 COPY --from=build /usr/bin/devaipod /usr/bin/devaipod
 
