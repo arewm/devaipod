@@ -160,9 +160,12 @@ impl WebContainerGuard {
 
         // Run the container (no port forwarding needed - we use podman exec)
         let host_socket_env = format!("DEVAIPOD_HOST_SOCKET={}", host_socket);
+        // Pass the container image name so detect_self_image() uses the
+        // locally-built image for pod-api sidecars instead of the published one.
+        let container_image_env = format!("DEVAIPOD_CONTAINER_IMAGE={}", image);
         let run_output = cmd!(
             sh,
-            "podman run -d --name {container_name} --privileged -v {socket_mount} -e {host_socket_env} -v {config_mount} {image}"
+            "podman run -d --name {container_name} --privileged -v {socket_mount} -e {host_socket_env} -e {container_image_env} -v {config_mount} {image}"
         )
         .ignore_status()
         .output()?;

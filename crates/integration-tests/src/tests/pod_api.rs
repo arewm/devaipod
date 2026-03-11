@@ -221,7 +221,10 @@ fn start_pod_api(pod_api_port: u16, opencode_port: u16) -> Result<std::process::
     // Override the state directory so the admin token and completion status
     // files are written under the workspace (the default /var/lib/devaipod/
     // requires root, which we don't have in local dev / devaipod-in-devaipod).
+    // Pre-create it because the pod-api avoids create_dir_all at runtime
+    // (mkdir on overlayfs can EPERM when capabilities are dropped).
     let state_dir = workspace.join(".devaipod-state");
+    std::fs::create_dir_all(&state_dir)?;
 
     let child = Command::new(&binary)
         .args([

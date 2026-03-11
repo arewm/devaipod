@@ -73,9 +73,13 @@ fn test_unified_pod_list() -> Result<()> {
 }
 container_integration_test!(test_unified_pod_list);
 
-/// Find the short name of the first running pod from the unified pod list.
+/// Find the short name of the shared integration pod from the unified pod list.
 ///
-/// Returns `None` if no running pod is found.
+/// Specifically looks for the `devaipod-integration-shared` pod (the
+/// WebFixture's pod) to avoid accidentally picking up a pod created by
+/// a concurrently running test that may be mid-teardown.
+///
+/// Returns `None` if the shared pod is not found or not running.
 fn find_running_pod(fixture: &WebFixture, token: &str) -> Result<Option<String>> {
     let (status, body) = fixture.curl_in_container("/api/devaipod/pods", Some(token))?;
     if status != 200 {
@@ -84,9 +88,14 @@ fn find_running_pod(fixture: &WebFixture, token: &str) -> Result<Option<String>>
     let pods: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
     for pod in &pods {
         let name = match pod.get("name").and_then(|v| v.as_str()) {
-            Some(n) if n.starts_with("devaipod-") => n,
-            _ => continue,
+            Some(n) => n,
+            None => continue,
         };
+        // Only match the shared integration pod — other pods may belong
+        // to concurrent tests and can disappear at any time.
+        if name != integration_tests::SHARED_POD_NAME {
+            continue;
+        }
         let status = pod.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status.eq_ignore_ascii_case("running") {
             let short = name.strip_prefix("devaipod-").unwrap_or(name);
@@ -121,10 +130,21 @@ fn test_completion_status_roundtrip() -> Result<()> {
 
     // 1. GET — default should be "active"
     let (status, body) = fixture.curl_in_container(&path, Some(&token))?;
-    assert_eq!(
-        status, 200,
-        "GET completion-status should return 200: {body}"
-    );
+    if status != 200 {
+        // This runs inside a container, so use curl to the control plane's
+        // own containers endpoint for debug info.  Also try a direct curl
+        // to the pod-api port (discovered from podman inspect).
+        let debug_body = fixture
+            .curl_in_container("/api/devaipod/pods", Some(&token))
+            .map(|(_, b)| b)
+            .unwrap_or_else(|e| format!("(failed: {e})"));
+        panic!(
+            "GET completion-status returned {status} (expected 200)\n\
+             body: {body}\n\
+             pod name used: {short_name}\n\
+             pods list: {debug_body}"
+        );
+    }
     let json: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(
         json["status"].as_str(),
@@ -293,7 +313,27 @@ fn test_harness_completion_status_e2e() -> Result<()> {
 
     // 2. PUT "done"
     let (status, body) = harness.put(&cs_path, r#"{"status":"done"}"#)?;
-    assert_eq!(status, 200, "PUT done: {body}");
+    if status != 200 {
+        // Collect debug info for the assertion message
+        let api_container = format!("{pod_name}-api");
+        let api_logs = std::process::Command::new("podman")
+            .args(["logs", "--tail", "30", &api_container])
+            .output()
+            .map(|o| {
+                format!(
+                    "stdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_else(|e| format!("(failed to get logs: {e})"));
+        let web_stderr = harness.recent_stderr(30);
+        panic!(
+            "PUT done failed with {status}: {body}\n\
+             === pod-api ({api_container}) logs ===\n{api_logs}\n\
+             === devaipod web stderr ===\n{web_stderr}"
+        );
+    }
 
     // 3. GET → "done"
     let (status, body) = harness.get(&cs_path)?;

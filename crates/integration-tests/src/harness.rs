@@ -33,6 +33,10 @@ pub struct DevaipodHarness {
     pods: Vec<String>,
     /// Background thread draining stdout (kept alive to avoid SIGPIPE)
     _stdout_drainer: Option<std::thread::JoinHandle<()>>,
+    /// Background thread draining stderr into a shared buffer
+    _stderr_drainer: Option<std::thread::JoinHandle<()>>,
+    /// Recent stderr lines from the web server (ring buffer)
+    stderr_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl DevaipodHarness {
@@ -46,8 +50,8 @@ impl DevaipodHarness {
         let port = find_free_port()?;
         let binary = std::env::var("DEVAIPOD_PATH").unwrap_or_else(|_| "devaipod".to_string());
 
-        let mut child = Command::new(&binary)
-            .args(["web", "--port", &port.to_string()])
+        let mut cmd = Command::new(&binary);
+        cmd.args(["web", "--port", &port.to_string()])
             .env("DEVAIPOD_INSTANCE", crate::INTEGRATION_TEST_INSTANCE)
             .env("DEVAIPOD_HOST_MODE", "1")
             // When the web server spawns `devaipod run` to create pods, this
@@ -56,7 +60,13 @@ impl DevaipodHarness {
             // real opencode server.
             .env("DEVAIPOD_MOCK_AGENT", "1")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Propagate DEVAIPOD_CONTAINER_IMAGE so `detect_self_image()` in the
+        // web server uses the locally-built image instead of the published one.
+        if let Ok(img) = std::env::var("DEVAIPOD_CONTAINER_IMAGE") {
+            cmd.env("DEVAIPOD_CONTAINER_IMAGE", img);
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to start devaipod web on port {port}"))?;
 
@@ -84,6 +94,29 @@ impl DevaipodHarness {
             }
         });
 
+        // Drain stderr into a shared ring buffer so tests can inspect it
+        // on failure.  Also prevents deadlock from a full pipe buffer.
+        let stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let stderr = child.stderr.take().context("No stderr from child")?;
+        let stderr_lines_clone = stderr_lines.clone();
+        let stderr_drainer = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                let mut buf = stderr_lines_clone.lock().unwrap();
+                buf.push(line);
+                // Keep only the last 200 lines
+                if buf.len() > 200 {
+                    let drain = buf.len() - 200;
+                    buf.drain(..drain);
+                }
+            }
+        });
+
         let token = rx
             .recv_timeout(Duration::from_secs(30))
             .map_err(|_| color_eyre::eyre::eyre!("Timeout waiting for token in devaipod output"))?;
@@ -97,6 +130,8 @@ impl DevaipodHarness {
             token,
             pods: Vec::new(),
             _stdout_drainer: Some(drainer),
+            _stderr_drainer: Some(stderr_drainer),
+            stderr_lines,
         })
     }
 
@@ -131,6 +166,13 @@ impl DevaipodHarness {
     /// Get the auth token.
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Return the last `n` lines from the web server's stderr.
+    pub fn recent_stderr(&self, n: usize) -> String {
+        let buf = self.stderr_lines.lock().unwrap();
+        let start = buf.len().saturating_sub(n);
+        buf[start..].join("\n")
     }
 
     /// Create a pod from a local repo path and wait for it to appear in the
