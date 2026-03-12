@@ -63,6 +63,9 @@ browser, commit-range review, and pod management in a single SPA built on
 opencode's existing SolidJS/TS stack. Forgejo remains an option for when
 we need local CI/CD.
 
+For TUI and broader UI improvements (session titles, card layout, attach
+experience), see [ui.md](./ui.md).
+
 # Kubernetes support
 
 We should also support spawning remote pods given

@@ -229,6 +229,8 @@ pub struct InstanceInfo {
     pub repo: Option<String>,
     /// Current task description from labels
     pub task: Option<String>,
+    /// Human-readable session title (from pod-api or labels)
+    pub title: Option<String>,
     /// Mode (up, run, etc.)
     pub mode: Option<String>,
     /// Whether the agent is healthy
@@ -523,6 +525,7 @@ impl App {
 
             let repo = labels.and_then(|l| l.get("io.devaipod.repo")).cloned();
             let task = labels.and_then(|l| l.get("io.devaipod.task")).cloned();
+            let title = labels.and_then(|l| l.get("io.devaipod.title")).cloned();
             let mode = labels.and_then(|l| l.get("io.devaipod.mode")).cloned();
 
             // Determine overall status
@@ -682,6 +685,7 @@ impl App {
                 status,
                 repo,
                 task,
+                title,
                 mode,
                 agent_healthy: Some(agent_healthy),
                 created,
@@ -2819,10 +2823,16 @@ fn render_instance_card(
     // Created timestamp (short format)
     let created = instance.created.as_deref().unwrap_or("-").to_string();
 
+    let display_name = if let Some(ref title) = instance.title {
+        format!("{} \u{2014} {}", instance.name, title)
+    } else {
+        instance.name.clone()
+    };
+
     lines.push(Line::from(vec![
         prefix,
         Span::styled(
-            instance.name.clone(),
+            display_name,
             Style::default().bold().fg(if is_selected {
                 Color::White
             } else {
@@ -3218,6 +3228,7 @@ mod tests {
                 status: "Running".to_string(),
                 repo: Some("github.com/user/myproject".to_string()),
                 task: Some("Implement new feature".to_string()),
+                title: None,
                 mode: Some("up".to_string()),
                 agent_healthy: Some(true),
                 created: Some("2024-01-15 10:30".to_string()),
@@ -3251,6 +3262,7 @@ mod tests {
                 status: "Exited".to_string(),
                 repo: Some("github.com/org/otherrepo".to_string()),
                 task: None,
+                title: None,
                 mode: Some("run".to_string()),
                 agent_healthy: Some(false),
                 created: Some("2024-01-14 14:00".to_string()),
@@ -3277,6 +3289,7 @@ mod tests {
                 status: "Degraded".to_string(),
                 repo: None,
                 task: Some("Fix bug in authentication".to_string()),
+                title: None,
                 mode: None,
                 agent_healthy: None,
                 created: None,

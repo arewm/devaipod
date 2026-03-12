@@ -32,6 +32,7 @@ export interface AgentStatus {
   status_line?: string
   session_count?: number
   completion_status?: "active" | "done"
+  title?: string
 }
 
 export interface LaunchState {
@@ -332,6 +333,28 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       fetchProposals()
     }
 
+    async function getTitle(fullName: string): Promise<{ title: string | null }> {
+      return apiFetch<{ title: string | null }>(
+        `/api/devaipod/pods/${encodeURIComponent(fullName)}/pod-api/title`,
+      )
+    }
+
+    async function updateTitle(
+      fullName: string,
+      title: string,
+    ): Promise<{ title: string | null }> {
+      const result = await apiFetch<{ title: string | null }>(
+        `/api/devaipod/pods/${encodeURIComponent(fullName)}/pod-api/title`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ title }),
+        },
+      )
+      // Trigger a pod list refresh so the title shows up immediately
+      setRefreshCounter((c) => c + 1)
+      return result
+    }
+
     async function getGatorScopes(fullName: string): Promise<GatorScopesResponse> {
       return apiFetch<GatorScopesResponse>(
         `/api/devaipod/pods/${encodeURIComponent(fullName)}/gator-scopes`,
@@ -395,6 +418,8 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       launchAdvisor,
       dismissLaunch,
       dismissProposal,
+      getTitle,
+      updateTitle,
       getGatorScopes,
       updateGatorScopes,
     }
