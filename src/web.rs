@@ -929,6 +929,7 @@ iframe{{width:100%;height:calc(100% - 44px);border:none}}
 </style></head><body>
 <div id="dbar">
   <a href="/pods">&#8592; Pods</a>
+  <span id="pod-title" style="font-size:14px;font-weight:500;font-family:Inter,system-ui,sans-serif;color:#e8e2e2;opacity:0.7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%">{escaped_name}</span>
   <button id="done-btn" onclick="toggleDone()" title="Mark this pod as done">Loading...</button>
   <span class="spacer"></span>
 </div>
@@ -985,6 +986,21 @@ async function toggleDone() {{
 }}
 
 fetchStatus();
+
+const titleEl = document.getElementById("pod-title");
+async function fetchTitle() {{
+  try {{
+    const r = await fetch("/api/devaipod/pods/" + podName + "/agent-status", {{credentials:"include"}});
+    if (r.ok) {{
+      const d = await r.json();
+      if (d.title) {{
+        titleEl.textContent = d.title;
+        document.title = d.title + " - devaipod";
+      }}
+    }}
+  }} catch(e) {{}}
+}}
+fetchTitle();
 </script>
 </body></html>"#
     )
@@ -2186,6 +2202,9 @@ struct AgentStatusResponse {
     /// Pod completion status: "active" or "done".
     #[serde(default)]
     completion_status: Option<String>,
+    /// Human-readable session title (from pod-api state).
+    #[serde(default)]
+    title: Option<String>,
 }
 
 impl AgentStatusResponse {
@@ -2199,6 +2218,7 @@ impl AgentStatusResponse {
             last_message_ts: None,
             session_count: 0,
             completion_status: None,
+            title: None,
         }
     }
 }

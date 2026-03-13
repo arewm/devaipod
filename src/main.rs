@@ -327,6 +327,9 @@ struct UpOptions {
     /// Task description for the AI agent (also stored as workspace description)
     #[arg(value_name = "TASK")]
     task: Option<String>,
+    /// Human-readable title for this session (e.g. "refactoring auth")
+    #[arg(long, value_name = "TITLE")]
+    title: Option<String>,
     /// Store task description but don't send it to the agent as a prompt
     #[arg(short = 'n', long)]
     no_prompt: bool,
@@ -407,6 +410,8 @@ struct UpOptions {
 struct CreateOptions {
     /// Task description for the AI agent
     task: Option<String>,
+    /// Human-readable title for this session
+    title: Option<String>,
     /// Use a specific container image instead of building from devcontainer.json
     image: Option<String>,
     /// Explicit pod name (default: derived from source with unique suffix)
@@ -432,6 +437,7 @@ impl CreateOptions {
     fn from_up_options(opts: &UpOptions) -> Self {
         Self {
             task: opts.task.clone(),
+            title: opts.title.clone(),
             image: opts.image.clone(),
             name: opts.name.clone(),
             service_gator_scopes: opts.service_gator_scopes.clone(),
@@ -940,6 +946,22 @@ enum HostCommand {
         name: Option<String>,
     },
 
+    /// Get or set the session title for a pod
+    ///
+    /// The title is human-readable metadata for the session, separate from
+    /// the auto-generated pod name and from the agent task.
+    ///
+    /// Examples:
+    ///   devaipod title myworkspace                    # Show current title
+    ///   devaipod title myworkspace "refactoring auth"  # Set title
+    Title {
+        /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// New title (omit to show current title)
+        title: Option<String>,
+    },
+
     /// Internal helper commands (not for direct user use)
     ///
     /// These commands are used internally for remote development integration.
@@ -1442,6 +1464,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
             }
 
             crate::web::run_web_server(port, token, mcp_token).await
+        }
+        HostCommand::Title { name, title } => {
+            cmd_title(&normalize_pod_name(&name), title.as_deref()).await
         }
         HostCommand::PodApi(args) => crate::pod_api::run(args).await,
         HostCommand::MockOpencode { port } => crate::pod_api::run_mock_opencode(port).await,
@@ -2016,6 +2041,9 @@ async fn create_workspace_from_local(
     if let Some(ref task_desc) = opts.task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
     }
+    if let Some(ref title) = opts.title {
+        extra_labels.push(("io.devaipod.title".to_string(), title.clone()));
+    }
     if let Some(instance_id) = get_instance_id() {
         extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
@@ -2201,6 +2229,9 @@ async fn create_workspace_from_remote(
     if let Some(ref task_desc) = opts.task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
     }
+    if let Some(ref title) = opts.title {
+        extra_labels.push(("io.devaipod.title".to_string(), title.clone()));
+    }
     if let Some(instance_id) = get_instance_id() {
         extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
@@ -2364,6 +2395,9 @@ async fn create_workspace_from_pr(
     if let Some(ref task_desc) = opts.task {
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
     }
+    if let Some(ref title) = opts.title {
+        extra_labels.push(("io.devaipod.title".to_string(), title.clone()));
+    }
     if let Some(instance_id) = get_instance_id() {
         extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
@@ -2462,6 +2496,7 @@ async fn cmd_run(
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
         task: command.map(|s| s.to_string()),
+        title: None,
         image: image.map(|s| s.to_string()),
         name: explicit_name.map(|s| s.to_string()),
         service_gator_scopes: service_gator_scopes.to_vec(),
@@ -2749,6 +2784,88 @@ async fn cmd_dry_run(config: &config::Config, source: &str, opts: &UpOptions) ->
         tracing::info!("  gator enabled: {}", service_gator_config.is_enabled());
         if let Some(ref img) = opts.service_gator_image {
             tracing::info!("  gator image: {}", img);
+        }
+    }
+
+    Ok(())
+}
+
+/// Get or set the session title for a pod
+async fn cmd_title(pod_name: &str, new_title: Option<&str>) -> Result<()> {
+    let short = strip_pod_prefix(pod_name);
+
+    // Try to reach the pod-api sidecar
+    let port = crate::web::get_pod_api_port_pub(pod_name).await;
+
+    match new_title {
+        Some(title) => {
+            // Set title via pod-api
+            let port = port.map_err(|_| {
+                color_eyre::eyre::eyre!("Could not find pod-api port. Is the pod running?")
+            })?;
+
+            let host = crate::podman::host_for_pod_services();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .context("Failed to create HTTP client")?;
+
+            let resp = client
+                .put(format!("http://{host}:{port}/title"))
+                .header("Content-Type", "application/json")
+                .body(serde_json::json!({"title": title}).to_string())
+                .send()
+                .await
+                .context("Failed to update title")?;
+
+            if !resp.status().is_success() {
+                bail!("Failed to update title: HTTP {}", resp.status());
+            }
+
+            tracing::info!("Set title for '{short}': {title}");
+        }
+        None => {
+            // Get title — try pod-api first, fall back to label
+            if let Ok(port) = port {
+                let host = crate::podman::host_for_pod_services();
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .context("Failed to create HTTP client")?;
+
+                let resp = client
+                    .get(format!("http://{host}:{port}/title"))
+                    .send()
+                    .await;
+
+                if let Ok(resp) = resp {
+                    if resp.status().is_success() {
+                        #[derive(serde::Deserialize)]
+                        struct TitleResp {
+                            title: Option<String>,
+                        }
+                        if let Ok(t) = resp.json::<TitleResp>().await {
+                            match t.title {
+                                Some(title) => println!("{title}"),
+                                None => println!("(no title set)"),
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            // Fall back to pod label
+            let labels = get_pod_labels(pod_name);
+            let title = labels
+                .as_ref()
+                .and_then(|l| l.get("io.devaipod.title"))
+                .and_then(|v| v.as_str());
+
+            match title {
+                Some(t) => println!("{}", t),
+                None => println!("(no title set)"),
+            }
         }
     }
 
@@ -4147,6 +4264,8 @@ fn cmd_list(json_output: bool) -> Result<()> {
         pr: Option<String>,
         task: Option<String>,
         mode: Option<String>,
+        #[allow(dead_code)] // Used in JSON output enrichment
+        title: Option<String>,
         agent_status: Option<bool>,
     }
 
@@ -4176,7 +4295,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
         if !pod_labels_match_instance(labels.as_ref()) {
             continue;
         }
-        let (repo, pr, task, mode) = if let Some(labels) = labels {
+        let (repo, pr, task, mode, title) = if let Some(labels) = labels {
             let repo = labels
                 .get("io.devaipod.repo")
                 .and_then(|v| v.as_str())
@@ -4193,9 +4312,13 @@ fn cmd_list(json_output: bool) -> Result<()> {
                 .get("io.devaipod.mode")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            (repo, pr, task, mode)
+            let title = labels
+                .get("io.devaipod.title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            (repo, pr, task, mode, title)
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
 
         // Check agent status for running pods
@@ -4214,6 +4337,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
             pr,
             task,
             mode,
+            title,
             agent_status,
         });
     }

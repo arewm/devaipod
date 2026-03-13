@@ -1469,6 +1469,8 @@ struct PodSummaryResponse {
     session_count: usize,
     /// Pod completion status: "active" or "done".
     completion_status: CompletionStatus,
+    /// Human-readable session title.
+    title: Option<String>,
 }
 
 /// Maximum number of output lines to return in the summary.
@@ -1481,6 +1483,15 @@ const SUMMARY_MAX_LINES: usize = 3;
 /// status summary. The control plane can proxy this directly instead of
 /// reimplementing the derivation logic.
 async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> {
+    let title = {
+        let path = title_path();
+        tokio::fs::read_to_string(&path)
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
     let unknown = PodSummaryResponse {
         activity: "Unknown".to_string(),
         status_line: None,
@@ -1489,6 +1500,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
         last_message_ts: None,
         session_count: 0,
         completion_status: CompletionStatus::default(),
+        title: title.clone(),
     };
 
     let client = match reqwest::Client::builder()
@@ -1531,6 +1543,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
             last_message_ts: None,
             session_count: 0,
             completion_status,
+            title: title.clone(),
         });
     }
 
@@ -1579,6 +1592,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
         last_message_ts,
         session_count,
         completion_status,
+        title,
     })
 }
 
@@ -2124,6 +2138,18 @@ struct CompletionStatusUpdateRequest {
     status: CompletionStatus,
 }
 
+/// Response for GET /title.
+#[derive(Debug, Serialize)]
+struct TitleResponse {
+    title: Option<String>,
+}
+
+/// Request body for PUT /title.
+#[derive(Debug, Deserialize)]
+struct TitleUpdateRequest {
+    title: String,
+}
+
 /// Resolve the gator config file path from the workspace root.
 fn gator_config_path(workspace: &std::path::Path) -> PathBuf {
     workspace.join(crate::service_gator::GATOR_CONFIG_PATH)
@@ -2140,6 +2166,11 @@ fn gator_config_path(workspace: &std::path::Path) -> PathBuf {
 /// Override via `DEVAIPOD_STATE_DIR` for testing outside of containers.
 fn completion_status_path(_workspace: &std::path::Path) -> PathBuf {
     state_dir().join("completion-status.json")
+}
+
+/// Resolve the title file path.
+fn title_path() -> PathBuf {
+    state_dir().join("title.txt")
 }
 
 /// Read the current completion status from disk.
@@ -2341,6 +2372,45 @@ async fn update_completion_status(
 }
 
 // ---------------------------------------------------------------------------
+// Title endpoints
+// ---------------------------------------------------------------------------
+
+/// `GET /title` — read the current session title.
+async fn get_title() -> Json<TitleResponse> {
+    let path = title_path();
+    let title = tokio::fs::read_to_string(&path)
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Json(TitleResponse { title })
+}
+
+/// `PUT /title` — update the session title.
+///
+/// Does NOT require admin token — the title is user-editable metadata,
+/// not a security-sensitive setting.
+async fn update_title(
+    Json(req): Json<TitleUpdateRequest>,
+) -> Result<Json<TitleResponse>, StatusCode> {
+    let path = title_path();
+    let temp_path = path.with_extension("txt.tmp");
+    tokio::fs::write(&temp_path, req.title.trim())
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to write title to {:?}: {}", temp_path, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    tokio::fs::rename(&temp_path, &path).await.map_err(|e| {
+        tracing::error!("Failed to rename {:?} -> {:?}: {}", temp_path, path, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let title = Some(req.title.trim().to_string()).filter(|s| !s.is_empty());
+    tracing::info!("Updated session title to {:?}", title);
+    Ok(Json(TitleResponse { title }))
+}
+
+// ---------------------------------------------------------------------------
 // Server entrypoint
 // ---------------------------------------------------------------------------
 
@@ -2398,6 +2468,8 @@ fn build_router(state: AppState) -> Router {
             "/completion-status",
             get(get_completion_status).put(update_completion_status),
         )
+        // Session title
+        .route("/title", get(get_title).put(update_title))
         // PTY endpoints
         .route("/pty", get(pty_list).post(pty_create))
         .route(

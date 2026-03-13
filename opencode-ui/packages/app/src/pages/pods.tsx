@@ -557,7 +557,7 @@ function LaunchCard(props: { podName: string; state: { state: string; error?: st
 function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void }) {
   const ctx = useDevaipod()
   const [collapsed, setCollapsed] = createSignal(false)
-  const [showGator, setShowGator] = createSignal(false)
+  const [showSettings, setShowSettings] = createSignal(false)
   const [actionError, setActionError] = createSignal("")
 
   const shortName = () => props.pod.Name.replace("devaipod-", "")
@@ -570,6 +570,8 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
   const mode = () => labels()["io.devaipod.mode"] ?? ""
 
   const agentStatus = () => ctx.agentStatus[props.pod.Name]
+  // Title from agent status (pod-api) takes precedence over the creation-time label
+  const title = () => agentStatus()?.title || labels()["io.devaipod.title"] || ""
   const isDone = () => agentStatus()?.completion_status === "done"
 
   // Health status
@@ -645,7 +647,12 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
       {/* Header */}
       <div class="w-full flex items-center justify-between p-4">
         <div class="flex items-center gap-2 min-w-0">
-          <span class="text-14-medium text-text-strong truncate">{shortName()}</span>
+          <Show when={title()} fallback={
+            <span class="text-14-medium text-text-strong truncate">{shortName()}</span>
+          }>
+            <span class="text-14-medium text-text-strong truncate" title={title()}>{title()}</span>
+            <span class="text-11-regular text-text-weak truncate">{shortName()}</span>
+          </Show>
           <IconButton
             icon="copy"
             size="small"
@@ -781,11 +788,11 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
           <Show when={isRunning() && !isAdvisor()}>
             <div class="ml-auto">
               <Button
-                variant={showGator() ? "secondary" : "ghost"}
+                variant={showSettings() ? "secondary" : "ghost"}
                 size="small"
-                onClick={() => setShowGator((v) => !v)}
+                onClick={() => setShowSettings((v) => !v)}
               >
-                Gator
+                Settings
               </Button>
             </div>
           </Show>
@@ -798,9 +805,9 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
           </Card>
         </Show>
 
-        {/* Gator controls inline */}
-        <Show when={showGator()}>
-          <GatorControls podName={props.pod.Name} />
+        {/* Devaipod settings inline */}
+        <Show when={showSettings()}>
+          <DevaipodSettings podName={props.pod.Name} />
         </Show>
 
         {/* Advisor proposals inline */}
@@ -886,6 +893,127 @@ function ProposalCard(props: { proposal: Proposal }) {
         </Button>
       </div>
     </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Devaipod settings (inline in pod card)
+// ---------------------------------------------------------------------------
+
+function DevaipodSettings(props: { podName: string }) {
+  const ctx = useDevaipod()
+  const [titleValue, setTitleValue] = createSignal("")
+  const [titleLoading, setTitleLoading] = createSignal(true)
+  const [titleSaving, setTitleSaving] = createSignal(false)
+  const [titleError, setTitleError] = createSignal("")
+  const [titleEditing, setTitleEditing] = createSignal(false)
+
+  // Load current title on mount
+  onMount(async () => {
+    try {
+      const resp = await ctx.getTitle(props.podName)
+      setTitleValue(resp?.title ?? "")
+    } catch {
+      // Fall back to label if pod-api unreachable
+      const pod = ctx.pods.find((p) => p.Name === props.podName)
+      setTitleValue(pod?.Labels?.["io.devaipod.title"] ?? "")
+    } finally {
+      setTitleLoading(false)
+    }
+  })
+
+  async function saveTitle() {
+    setTitleSaving(true)
+    setTitleError("")
+    try {
+      const resp = await ctx.updateTitle(props.podName, titleValue())
+      setTitleValue(resp?.title ?? titleValue())
+      setTitleEditing(false)
+    } catch (err) {
+      setTitleError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setTitleSaving(false)
+    }
+  }
+
+  return (
+    <div class="border-t border-border-base">
+      {/* Title section */}
+      <div class="px-4 pt-3 pb-3">
+        <div class="flex items-center gap-2 mb-3">
+          <Icon name="settings-gear" size="small" class="text-text-weak" />
+          <span class="text-12-medium text-text-secondary-base">Session Settings</span>
+        </div>
+
+        <Show when={titleLoading()}>
+          <div class="flex items-center gap-2 text-12-regular text-text-weak">
+            <Spinner class="size-3.5" />
+            Loading...
+          </div>
+        </Show>
+
+        <Show when={!titleLoading()}>
+          <div class="mb-1">
+            <span class="text-12-medium text-text-strong">Title</span>
+            <p class="text-11-regular text-text-weak">A short description of this session</p>
+          </div>
+          <Show when={titleEditing()} fallback={
+            <div class="flex items-center gap-2">
+              <span class="text-12-regular text-text-secondary-base flex-1 truncate">
+                {titleValue() || "(no title)"}
+              </span>
+              <Button
+                variant="ghost"
+                size="small"
+                onClick={() => setTitleEditing(true)}
+              >
+                Edit
+              </Button>
+            </div>
+          }>
+            <div class="flex items-center gap-2">
+              <input
+                type="text"
+                class="flex-1 text-12-regular bg-background-base border border-border-base rounded px-2 py-1 text-text-strong focus:outline-none focus:border-border-active-base"
+                value={titleValue()}
+                onInput={(e) => setTitleValue(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") saveTitle()
+                  if (e.key === "Escape") setTitleEditing(false)
+                }}
+                placeholder="e.g. refactoring auth middleware"
+                autofocus
+                disabled={titleSaving()}
+              />
+              <Button
+                variant="primary"
+                size="small"
+                onClick={saveTitle}
+                disabled={titleSaving()}
+              >
+                {titleSaving() ? "Saving..." : "Save"}
+              </Button>
+              <Button
+                variant="ghost"
+                size="small"
+                onClick={() => setTitleEditing(false)}
+                disabled={titleSaving()}
+              >
+                Cancel
+              </Button>
+            </div>
+          </Show>
+          <Show when={titleError()}>
+            <Card variant="error" class="mt-2 p-2">
+              <span class="text-11-regular">{titleError()}</span>
+            </Card>
+          </Show>
+        </Show>
+      </div>
+
+      {/* Gator controls as a subsection */}
+      <GatorControls podName={props.podName} />
+    </div>
   )
 }
 
