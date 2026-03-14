@@ -289,7 +289,10 @@ The kubeconfig comes from the local filesystem, typically via cloud provider CLI
 LLM API keys exist locally but need to reach the remote agent container — either
 as a Kubernetes Secret (better for rotation, avoids keys in pod specs) or injected
 as env vars in the pod spec at creation time. The Secret approach requires write
-access to Secrets in the target namespace.
+access to Secrets in the target namespace. For either approach, credentials
+should be mounted on a tmpfs `emptyDir` volume (RAM-only, never persisted to
+disk) so they can't be recovered from PVC snapshots — a pattern paude uses for
+its OpenShift backend.
 
 ### Network connectivity
 
@@ -298,8 +301,15 @@ Options: port-forward (most portable, but fragile — needs reconnection logic),
 NodePort/LB per workspace (wasteful), or VPN/tunnel (Tailscale, WireGuard,
 Telepresence — cleanest but requires external setup).
 
-The pragmatic first step is port-forward with automatic reconnection. It works
-everywhere and needs no cluster-side changes.
+An alternative worth considering: [paude](../src/related-projects.md)'s OpenShift
+backend avoids the port-forward problem entirely by tunneling git operations
+through `oc exec` stdin/stdout using git's `ext::` protocol. The agent makes
+commits inside the pod; the local machine does `git pull` through the exec
+tunnel. This sidesteps fragile port-forwards for the code sync path, though
+devaipod's web UI proxy and pod-api sidecar still need a persistent connection.
+
+The pragmatic first step is port-forward with automatic reconnection for the
+web UI and pod-api, combined with exec-tunneled git for code sync.
 
 ### Storage divergence
 
