@@ -68,8 +68,10 @@ experience), see [ui.md](./ui.md).
 
 # Kubernetes support
 
-We should also support spawning remote pods given
-a kubeconfig.
+**Status: Research complete, see [kubernetes.md](./kubernetes.md)**
+
+Three deployment models: devaipod in k8s, spawning workspace pods in a cluster,
+and hybrid local-devaipod with remote kubeconfig.
 
 # Local Forgejo instance
 
