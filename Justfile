@@ -19,6 +19,15 @@ check: install-hooks
     @mkdir -p target
     @git write-tree > target/checks-run
 
+# CI-equivalent clippy gate: only correctness and suspicious lints.
+# The full set of warnings in Cargo.toml [workspace.lints] is for
+# local development awareness; validate gates on the narrower set.
+CLIPPY_CI := "-A clippy::all -D clippy::correctness -D clippy::suspicious -Dunused_imports -Ddead_code"
+
+validate: install-hooks
+    cargo fmt -- --check
+    cargo clippy --workspace -- {{ CLIPPY_CI }}
+
 # Run unit tests (no container runtime required)
 test:
     cargo test
