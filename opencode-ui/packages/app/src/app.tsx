@@ -33,6 +33,7 @@ import { ErrorPage } from "./pages/error"
 const Home = lazy(() => import("@/pages/home"))
 const Session = lazy(() => import("@/pages/session"))
 const Pods = lazy(() => import("@/pages/pods"))
+const Agent = lazy(() => import("@/pages/agent"))
 const Loading = () => <div class="size-full" />
 
 const HomeRoute = () => (
@@ -168,6 +169,12 @@ const PodsRoute = () => (
   </Suspense>
 )
 
+const AgentRoute = () => (
+  <Suspense fallback={<Loading />}>
+    <Agent />
+  </Suspense>
+)
+
 export function AppInterface(props: { defaultUrl?: string; children?: JSX.Element; isSidecar?: boolean }) {
   const platform = usePlatform()
   const storedDefaultServerUrl = getStoredDefaultServerUrl(platform)
@@ -183,8 +190,9 @@ export function AppInterface(props: { defaultUrl?: string; children?: JSX.Elemen
 
   return (
     <Router>
-      {/* /pods — standalone page, no opencode server needed */}
+      {/* /pods and /agent/:name — standalone pages, no opencode server needed */}
       <Route path="/pods" component={PodsRoute} />
+      <Route path="/agent/:name" component={AgentRoute} />
 
       {/* Everything else goes through the full opencode provider stack */}
       <Route

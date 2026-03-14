@@ -234,16 +234,10 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     }
 
     async function openPod(fullName: string) {
-      const info = await apiFetch<{
-        latest_session?: { id: string; directory: string }
-      }>(`/api/devaipod/pods/${encodeURIComponent(fullName)}/opencode-info`)
-
-      let qs = ""
-      if (info.latest_session) {
-        const dir = btoa(info.latest_session.directory)
-        qs = `?dir=${encodeURIComponent(dir)}&session=${encodeURIComponent(info.latest_session.id)}`
-      }
-      window.location.href = `/_devaipod/agent/${encodeURIComponent(fullName)}/${qs}`
+      const shortName = fullName.replace(/^devaipod-/, "")
+      // Navigate to the SPA agent page; the agent page discovers the
+      // iframe URL itself via the opencode-info API.
+      window.location.href = `/agent/${encodeURIComponent(shortName)}`
     }
 
     async function startPod(fullName: string) {
