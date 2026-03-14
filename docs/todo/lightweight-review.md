@@ -1,350 +1,299 @@
 # Lightweight Agent Change Review
 
-**Background**: The [forgejo-integration.md](./forgejo-integration.md) spec describes
-a full local Forgejo instance for agent code review and CI/CD. While comprehensive,
-it adds significant moving parts (~200-400MB RAM, mirroring logic, Forgejo lifecycle
-management, sync workflows). This document explores lighter-weight alternatives that
-get us a usable review workflow sooner, potentially as stepping stones toward
-the full Forgejo integration if we decide we need it.
+Right now the agent is sandboxed by default with read-only
+credentials - getting changes out of its git repository
+is a bit painful, and reviewing in the opencode UI is
+also suboptimal (no true native git UI there, though
+opencode has a hacky "changes" that we disable).
 
-The core requirements are:
+We want to increase security *and* convenience.
 
-1. Human can review a set of commits (like a PR diff), not just raw `git diff`
-2. Inline comments on specific lines route back to the agent as context
-3. Accept/reject controls per commit or per batch
-4. Approved changes can be synced upstream (push, create PR, etc.)
-5. The workspace container has GH_TOKEN for pushing (it's trusted; the
-   human controls the review UI)
+The workflow should support a full spectrum of operations:
 
-OpenCode today already has a "changes" interface where clicking a change
-sends file+line context plus a comment to the agent. That's a real foundation.
+- Autonomous (headless) pod that can run all the way to
+  e.g. creating a draft PR that a human reviews there,
+  and can act on any comments.
+- Interactive pod started with task but that's fully read-only by default but
+  can request review. The human can easily see the git
+  diffs, comment on changes. The human can approve
+  draft PR creation etc.
+- Fully interactive: A devcontainer with an idle agent
+  by default. The human may attach an IDE (connecting over
+  SSH) or perform some initial edits directly. They
+  can then have the agent take over.
 
-However, opencode's session diffs are based on a **shadow git repository**
-(separate from the project's `.git`) that snapshots the working tree at
-LLM step boundaries. This can get out of sync — e.g. when the agent runs
-`git checkout`/`rebase`/`reset`, or when external processes modify files.
-Building review on top of the **real git commit history** avoids this
-entirely: commits are immutable, and `git diff base..head` is always
-correct regardless of what happened in between.
+🤖 Assisted-by: OpenCode (claude-opus-4-6)
 
-## Options
+The following text is LLM generated with human review.
 
-### Option A: Extend the OpenCode Web UI (Recommended starting point)
+---
 
-OpenCode's web UI already shows file changes and supports inline commenting
-that feeds back to the agent. Extend it with commit-level review:
+## Responsibility Split: Pod-api vs Service-gator
 
-**What to add:**
-- Commit-range diff view: select a base and head commit, see grouped changes
-  (like GitHub's "compare" or PR files view)
-- Per-commit or per-range approve/reject buttons
-- "Push approved" action that calls the devaipod control plane API, which
-  in turn talks to service-gator to push
+**Pod-api owns all git operations. Service-gator owns only the
+GitHub/forge API.** Previously `git_push_local` lived in
+service-gator, requiring duplicated git credential plumbing.
+Moving all git operations to pod-api simplifies the auth story:
+pod-api already has both workspace volumes mounted and receives
+GH_TOKEN for push.
 
-**Architecture:**
+**Pod-api** (has GH_TOKEN, has both workspaces mounted):
+- Read agent commits (hardened against `.git/config` RCE)
+- Fetch agent commits into the trusted main workspace
+- Create/update branches, push to origin
+- MCP tools so the agent can request branch operations
 
-The workspace container already has the agent's git set up as a remote
-called `agent` (see `REMOTE_AGENT` in `src/git.rs`). The control plane
-runs `git fetch agent` in the workspace to pull agent commits, then reads
-from the workspace's copy. Git's content-addressed hashing ensures data
-fetched from the untrusted agent is trustworthy. The workspace has
-GH_TOKEN and pushes directly after human approval — no service-gator
-mediation needed for the push itself.
+**Service-gator** (GitHub API only):
+- Create draft PRs, update PR descriptions, add labels/reviewers
+- No git operations, no `git push`, no local repo access
 
-```
-┌─────────────────────────────────────────────┐
-│ Browser: OpenCode web UI                    │
-│  • Changes view (already exists)            │
-│  • + Commit-range diff view                 │
-│  • + Approve / Request Changes buttons      │
-│  • + "Sync to upstream" button              │
-└──────────────────┬──────────────────────────┘
-                   │ HTTP/WS (already exists)
-                   ▼
-┌─────────────────────────────────────────────┐
-│ devaipod control plane                      │
-│  • Proxies opencode API (already exists)    │
-│  • + Review state endpoints                 │
-│  • + git fetch agent / git log / git diff   │
-│  • + git push origin (after approval)       │
-└──────────────────┬──────────────────────────┘
-                   │
-          ┌────────┴────────┐
-          ▼                 ▼
-   ┌─────────────┐  ┌──────────────────────┐
-   │ agent pod   │  │ workspace container  │
-   │ (opencode)  │  │ (has GH_TOKEN,       │
-   └─────────────┘  │  agent git remote)   │
-                    └──────────────────────┘
-```
+## Core Mechanism: Fetching Agent Commits
 
-**Pros:**
-- Builds on existing UI and infrastructure, no new services
-- Inline commenting already routes to the agent
-- Minimal new code: commit-range diff API endpoint + thin UI on top
-- No container lifecycle to manage
-- opencode upstream may accept generic review features
+The fetch operation -- pulling agent commits from the agent workspace
+into the trusted main workspace -- is the shared primitive across all
+scenarios. Three things can trigger it:
 
-**Cons:**
-- Diff viewer quality depends on what opencode provides (may need Monaco/similar)
-- Not a "real forge" experience (no CI integration, no PR semantics)
+- **Agent requests it**: calls pod-api MCP tool `create_or_update_branch`,
+  which fetches then pushes the branch to origin.
+- **Human clicks Fetch**: in the review UI, pulls latest agent commits
+  for review before deciding whether to approve a push.
+- **Auto-fetch**: `GitWatcher` detects ref changes via inotify and
+  fetches automatically in the background.
 
-**Isolation variant:** Run the opencode web frontend in a separate container
-from the opencode backend. The frontend container serves static assets and
-proxies API calls to the backend. This gives:
-- Network isolation: frontend container has no direct access to workspace
-  filesystem or credentials
-- The control plane can inject the sync/push controls without modifying the
-  agent container at all
-- Aligns with existing architecture (control plane already proxies opencode)
+All three run the same `git fetch` under the hood. What differs is
+what happens *after* the fetch: the agent may push and create a PR
+autonomously, or the human may review and approve manually.
 
-### Option B: Dedicated Review Container (Thin Custom UI)
+## Scenarios
 
-A small standalone container running a purpose-built review UI. Not a full
-forge, just a git diff viewer with review controls.
+These map to the three modes described in the introduction.
 
-**What it does:**
-- Mounts the agent's git repo read-only (or clones from it)
-- Serves a web UI for browsing commits, viewing diffs, leaving comments
-- Comments are sent to the agent via the opencode API (or written to a
-  shared file/queue the agent polls)
-- Has a "push" button that calls service-gator
+### Autonomous headless pod (draft PR flow)
 
-**Implementation:** Could be a Rust (axum + askama/maud) or even a vendored
-JS diff viewer (e.g., react-diff-viewer) with a minimal backend.
+The agent runs a task end-to-end and produces a draft PR for
+human review on GitHub. No devaipod UI needed during execution.
 
-**Pros:**
-- Complete control over the review UX
-- Isolated from agent — read-only access to git
-- Could be very lightweight (~20MB container, ~10MB RAM)
+1. Agent makes commits in its workspace.
+2. Agent calls pod-api MCP: `create_or_update_branch("fix-xyz")`.
+   Pod-api fetches agent commits into main workspace, pushes branch.
+3. Agent calls service-gator: `create_draft_pr("fix-xyz", "Fix xyz")`.
+4. Agent can iterate: push more commits to the branch, update the
+   PR description, respond to review comments -- all autonomously.
+5. Human reviews on GitHub when ready, converts draft to ready.
 
-**Cons:**
-- We're building a diff viewer from scratch (or assembling one from parts)
-- Duplicates effort if we later adopt Forgejo
-- Another container to manage
+### Interactive pod with review gate
 
-### Option C: git-appraise or Similar Review-in-Git
+The agent works on a task while the human monitors in the
+devaipod UI. The agent cannot push without human approval.
 
-Use a tool like [git-appraise](https://github.com/google/git-appraise) that
-stores reviews as git notes. The human runs review commands locally, the agent
-reads review notes from the repo.
+1. Agent makes commits in its workspace.
+2. Auto-fetch pulls commits into main workspace (or the human
+   clicks Fetch in the UI).
+3. Browser receives SSE `git.updated` event, refreshes commit log.
+4. Human reviews diffs in the Changes tab. Must expand and view
+   every changed file before the push button enables.
+5. Human can leave inline comments (routed back to agent).
+6. Human clicks **Approve & Push** (optionally with Signed-off-by).
+7. Pod-api pushes from the main workspace.
 
-**Pros:**
-- No additional services
-- Reviews travel with the repo
-- Very Unix-philosophy
+This enforces a mini-GitHub-PR process: you cannot approve without
+actually looking at the changed files.
 
-**Cons:**
-- git-appraise is largely unmaintained
-- No web UI without building one
-- Awkward UX for inline comments
+### Fully interactive with IDE
 
-### Option D: Forgejo (Full Spec)
+The human works directly in the workspace (via SSH/IDE), possibly
+making initial edits, then hands off to the agent. The same review
+flow applies when the agent produces commits -- the human sees them
+in the Changes tab and can approve or comment. The human's own
+commits (made via IDE) are already in the main workspace and don't
+need the review gate.
 
-As described in [forgejo-integration.md](./forgejo-integration.md). Provides
-a real forge experience but with higher resource and complexity cost.
-Still the right long-term answer if we want local CI/CD (Forgejo Actions)
-or if the lightweight options prove insufficient.
-
-## Recommendation
-
-Start with **Option A** (extend OpenCode web UI). The key insight is that
-opencode *already* has the hardest part: a changes view that sends inline
-comments to the agent with file+line context. What's missing is:
-
-1. A commit-range selector (show me commits 3..7 as a unified diff)
-2. Explicit approve/reject state
-3. A "sync upstream" action via the control plane
-
-These are incremental additions to existing infrastructure. The isolation
-variant (frontend in separate container) is worth pursuing but not blocking;
-the control plane proxy already provides a natural boundary.
-
-If the diff viewer quality proves insufficient, we can integrate Monaco
-(which opencode may already use or plan to use) before jumping to Forgejo.
-
-Reserve **Option D** (Forgejo) for when we need local CI/CD or when we have
-multiple repos and want a unified dashboard. It's not mutually exclusive —
-if we build commit-range review in OpenCode, that work is useful regardless.
-
-## Implementation Status
-
-We're pursuing Option A. The vendored opencode web UI has been extended
-with a `GitReviewTab` SolidJS component that replaces the default
-session-level review panel when a `DEVAIPOD_AGENT_POD` cookie is present.
-The component reuses the existing `SessionReview` diff renderer and
-inline comment system from `@opencode-ai/ui`.
-
-### What's done
-
-**Backend (pod-api sidecar in `src/pod_api.rs`, proxied via `src/web.rs`):**
-
-All git and PTY endpoints now run in the pod-api sidecar container, which
-mounts the agent's workspace volume directly. Commands run as local
-`tokio::process::Command` calls — no exec-into-container overhead. The
-control plane proxies requests to the sidecar. Legacy exec-based git
-endpoints remain in `web.rs` but are no longer the primary path.
-
-- `GET /git/log` — structured commit log with `base`/`head` range params.
-  Uses NUL/RS-delimited `git log` format.
-- `GET /git/diff-range` — per-file diffs with before/after content via
-  `git show`, concurrent file fetching, max 100 files.
-- `POST /git/fetch-agent` — runs `git fetch agent` directly.
-- `POST /git/push` — runs `git push origin <branch>` directly.
-- `GET /git/events` — inotify-based SSE stream of git ref changes
-  (debounced, pushes `git.updated` events to frontend).
-- Input validation (`is_valid_git_ref`) to block shell injection.
-- Older/simpler endpoints: `GET /git/status`, `GET /git/diff`,
-  `GET /git/commits`.
-- PTY endpoints (`GET/POST /pty`, `GET/PUT/DELETE /pty/{id}`,
-  `GET /pty/{id}/connect`) — direct PTY spawning via `rustix::pty`
-  with `AsyncFd` I/O. Replaces the exec-based `web_terminal.rs`.
-- Git remote setup during pod creation (`src/pod.rs` `setup_git_remotes()`)
-  configures bidirectional `agent`/`workspace` remotes between containers,
-  using read-only volume mounts — no network needed for fetch.
-
-**Frontend:**
-
-- `GitReviewTab` component (`opencode-ui/.../git-review-tab.tsx`, ~210 lines):
-  fetches commit log, provides a base-commit selector dropdown, fetches
-  per-file diffs for the selected range, and delegates rendering to
-  `SessionReview` (which provides unified/split diff view, line commenting).
-- Wired into `session.tsx`: conditionally replaces the standard opencode
-  review panel when the devaipod cookie is detected.
-
-### What's remaining
-
-1. **Fetch trigger in UI** — The `GitReviewTab` reads `agent/HEAD` but
-   never calls `POST /git/fetch-agent`. The user has no way to refresh
-   agent commits from the UI. Need a "Refresh" button or auto-fetch on
-   tab open.
-
-2. **Push/sync button** — The `POST /git/push` endpoint exists but no
-   frontend button calls it. Need an "Approve & Push" or "Sync upstream"
-   control in the review panel.
-
-3. **Review state tracking** — No backend state machine for
-   approve/reject/sync. The push endpoint has no approval gate. The
-   design calls for a `ReviewState` struct tracking pending/approved/
-   rejected/synced commit ranges, but none of this is implemented yet.
-   This may be fine to defer — a simple "push what's visible" flow
-   (without formal state tracking) could be a useful first step.
-
-4. **Merge/cherry-pick flow** — The workspace container has the `agent`
-   remote, but there's no endpoint for merging or cherry-picking agent
-   commits into the workspace branch before pushing. Currently the
-   push just pushes whatever the workspace branch points to.
-
-### Implementation path forward
-
-The backend endpoints are complete for the core read path (git + PTY),
-all running in the pod-api sidecar with no exec overhead. The immediate
-next steps are frontend: add a fetch button and a push button to the
-`GitReviewTab`, then decide whether review state tracking is needed
-before we can ship a usable flow.
-
-The backend endpoints below are from the original design and remain relevant.
-
-## Implementation Sketch (Option A)
-
-### API Endpoints
+## Architecture
 
 ```
-# Implemented:
-GET  /api/devaipod/pods/{name}/git/log?base={sha}&head={sha}
-     Returns commit list in range (structured objects with parent SHAs)
+┌─ Browser ────────────────────────────────────────────────────────┐
+│  OpenCode web UI (served by pod-api in iframe)                   │
+│  Changes tab → GitReviewTab component                            │
+│  • Commit log with base-commit selector                          │
+│  • Per-file diffs (unified or split view)                        │
+│  • Inline commenting (routes back to agent)                      │
+│  • Viewed-files tracking (N/M viewed)                            │
+│  • Fetch button, Approve & Push button, Signed-off-by checkbox   │
+└──────────────┬───────────────────────────────────────────────────┘
+               │ HTTP (relative URLs, same origin)
+               ▼
+┌─ Pod-api sidecar (root, DAC_OVERRIDE, our image) ───────────────┐
+│                                                                  │
+│  Agent workspace at /workspaces/{project} (RW)                   │
+│    → git_cmd() hardened: hooks, fsmonitor, cred helpers disabled  │
+│    → GET /git/log, /git/diff-range, /git/status, /git/events    │
+│                                                                  │
+│  Main workspace at /mnt/main-workspace/{project} (RW)            │
+│    → git_cmd_trusted(): only safe.directory override             │
+│    → POST /git/fetch-agent, /git/push, /git/create-branch       │
+│    → Auto-fetch on GitWatcher ref change events                  │
+│                                                                  │
+│  MCP tools for agent:                                            │
+│    → create_or_update_branch(name) — fetch + push branch         │
+│                                                                  │
+│  Has GH_TOKEN for push operations                                │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
 
-GET  /api/devaipod/pods/{name}/git/diff-range?base={sha}&head={sha}
-     Returns per-file diffs with before/after content
-
-POST /api/devaipod/pods/{name}/git/fetch-agent
-     Runs git fetch agent in workspace container
-
-POST /api/devaipod/pods/{name}/git/push
-     Runs git push origin <branch> in workspace container
-
-# Not yet implemented:
-GET  /api/devaipod/pods/{name}/review
-     Returns current review state (pending commits, approved set, etc.)
-
-POST /api/devaipod/pods/{name}/review
-     Body: { "action": "approve|reject|request-changes", "commits": [...], "comment": "..." }
+┌─ Service-gator (separate container, GitHub API only) ───────────┐
+│  create_draft_pr, update_pr, add_labels, add_reviewers           │
+│  No git binary, no local repo access, no git push                │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### Review State
+### Dual-workspace trust model
 
-Persisted in the control plane (SQLite or flat file per pod):
+Push operates on the **main workspace** (`/mnt/main-workspace/`),
+not the agent workspace. The main workspace:
 
-```rust
-struct ReviewState {
-    /// Commits the agent has produced, grouped into "review sets"
-    pending: Vec<CommitRange>,
-    /// Ranges the human has approved
-    approved: Vec<CommitRange>,
-    /// Ranges the human has rejected (with comments sent back to agent)
-    rejected: Vec<CommitRange>,
-    /// Ranges that have been synced upstream
-    synced: Vec<CommitRange>,
-}
+- Has push credentials (GH_TOKEN via trusted secrets)
+- Has `.git/config` controlled by our clone scripts (agent can't write)
+- Receives agent commits via auto-fetch on ref changes
 
-// CommitRange tracks by SHA. If the agent rebases or amends after a
-// rejection, the old SHAs become invalid. Policy: rejected ranges are
-// archived (kept for history) and the new commits appear as fresh
-// "pending" entries. The control plane detects SHA invalidation by
-// checking if the SHAs still exist in the repo's history. This is
-// simpler than tracking PR-style "force push" semantics — we just
-// treat post-rejection work as a new review round.
-```
+Pod-api needs `DAC_OVERRIDE` to write to the main workspace git
+directory (owned by UID 1000) while running as root with all other
+capabilities dropped.
 
-### Sync Flow
+### Where the review panel lives in the UI
 
-```
-Human clicks "Sync" in UI
-  → POST /api/devaipod/pods/{name}/sync
-  → Control plane verifies commits are in "approved" state
-  → Control plane runs `git push origin {branch}` in workspace container
-  → Workspace has GH_TOKEN, push goes directly to upstream
-  → UI shows sync status
-```
+The Changes tab appears in the session side panel. On desktop:
 
-### Push Enforcement
+- **File tree closed**: dedicated "review" tab in the side panel.
+- **File tree open**: review content under the file tree's "changes" tab.
 
-Since the workspace container has GH_TOKEN and the human controls the
-review UI, the push gate is straightforward: the control plane only runs
-`git push` when the commits being pushed are in "approved" state. The
-agent container has no push credentials and no direct access to the
-upstream remote — it can only produce commits locally.
+Both render the same `GitReviewTab` component.
 
-The control plane is the sole actor that triggers pushes, and it only
-does so after explicit human approval in the review UI. This makes the
-review UI a hard gate, not a suggestion, without requiring service-gator
-to mediate the push flow or maintain an allow-list of approved SHAs.
+## Security
 
-Service-gator's role is limited to its existing credential scoping for
-agent-initiated API calls (e.g. read access, draft PR creation). It does
-not participate in the push-after-review flow.
+### Hardened path (agent workspace reads)
 
-## Open Questions
+The agent controls its workspace's `.git/config` and could craft
+entries to achieve code execution as root. `git_cmd()` neutralizes
+this via environment-based config overrides (which take precedence
+over `.git/config`):
 
-1. **Upstream opencode changes?** The commit-range diff and review state
-   features are generic enough to propose upstream. Worth a conversation
-   with the opencode maintainers.
+- `core.fsmonitor=false` -- prevents RCE via `git status`/`git diff`
+- `core.hooksPath=/dev/null` -- disables all git hooks
+- `credential.helper=""` -- prevents credential helper RCE
+- `protocol.ext.allow=never` -- blocks `ext::` transport commands
+- `protocol.file.allow=never` -- blocks local path traversal
+- `diff.external=""` -- prevents external diff program execution
+- `GIT_TERMINAL_PROMPT=0` -- prevents interactive prompts
 
-2. **Review granularity**: Per-commit, per-range, or per-file? Starting
-   with commit ranges (like PR review) seems right.
+Long-term, read-only operations should migrate to
+[gix](https://github.com/GitoxideLabs/gitoxide) (pure-Rust) to
+eliminate config-based execution risk by construction.
 
-3. **Agent notification**: When the human rejects/requests-changes, how
-   does the agent learn? For Option A, the primary path is opencode's
-   existing inline comment flow (clicking a change sends file+line context
-   to the agent). The open question is whether that's sufficient for batch
-   rejections (rejecting a whole range with a top-level comment), or whether
-   we also need to inject a message into the opencode session directly.
+### Trusted path (main workspace)
 
-4. **Multi-pod dashboard**: The control plane already knows about all pods.
-   A summary view ("Pod A: 3 commits pending review, Pod B: approved,
-   ready to sync") is straightforward to add.
+The main workspace `.git/config` is set up by our clone scripts;
+the agent has no write access. Only `safe.directory=*` is needed.
+
+### Why `git fetch` from the agent workspace is safe
+
+Git is content-addressed. When pod-api fetches from the agent
+workspace via the local filesystem path, git verifies every object
+matches its SHA hash. The local transport reads objects directly
+without processing the source repo's `.git/config` or hooks.
+
+### Credential isolation
+
+- Agent container: no GH_TOKEN, no push credentials, no git auth
+- Pod-api: has GH_TOKEN, owns all git push operations
+- Service-gator: has GH_TOKEN for GitHub API only, no git operations
+
+## Current State
+
+The `GitReviewTab` component exists and provides read-only review:
+commit log, per-file diffs, SSE auto-refresh. All read endpoints
+work via hardened `run_git()` against the agent workspace.
+
+What does **not** work today:
+
+- `POST /git/fetch-agent` runs in the wrong context. Always fails.
+- `POST /git/push` has no credentials. Always fails.
+- No git hook hardening on the read path.
+- No push UI (no buttons, no approval gate).
+- `git_push_local` in service-gator is fragile and being removed.
+
+## API Endpoints
+
+All served by pod-api (port 8090).
+
+### Read (agent workspace, hardened)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/git/log` | GET | Commit log with `base`/`head` range params |
+| `/git/diff-range` | GET | Per-file diffs with before/after content |
+| `/git/status` | GET | Porcelain status + current branch name |
+| `/git/events` | GET | SSE stream of ref changes (debounced 200ms) |
+
+### Write (main workspace, trusted)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/git/fetch-agent` | POST | Fetch agent commits into main workspace |
+| `/git/push` | POST | Push branch to origin |
+| `/git/create-branch` | POST | Fetch agent commits + push as branch |
+
+### MCP tools (exposed to agent)
+
+| Tool | Description |
+|------|-------------|
+| `create_or_update_branch` | Fetch + push branch. Agent calls this, then service-gator to create a draft PR. |
+
+## Implementation Plan
+
+### Pod-api / pod.rs
+
+1. `git_cmd()` hardening for agent workspace reads.
+2. `git_cmd_trusted()` for main workspace operations.
+3. `--main-workspace` CLI arg and `AppState` field.
+4. Fix `POST /git/fetch-agent` to use main workspace.
+5. Fix `POST /git/push` to use main workspace.
+6. Add `POST /git/create-branch` (fetch + push branch).
+7. Add `branch` field to `GET /git/status`.
+8. Auto-fetch in `GitWatcher` on ref changes.
+9. Mount main workspace `:rw`, add `DAC_OVERRIDE`.
+10. Pass GH_TOKEN to pod-api.
+11. MCP tool `create_or_update_branch`.
+
+### Service-gator
+
+1. Remove `git_push_local`.
+2. Keep GitHub API tools (`create_draft_pr`, etc.).
+
+### Frontend (git-review-tab.tsx)
+
+1. Fetch button with toast feedback.
+2. Viewed-files tracking via accordion open/change.
+3. "Approve & Push" gated on all-files-viewed.
+4. Signed-off-by checkbox.
+5. `data-component`/`data-action` test attributes.
+
+### Integration tests
+
+1. Agent commits appear in `/git/log`.
+2. `/git/diff-range` returns correct diffs.
+3. `POST /git/fetch-agent` fetches into main workspace.
+4. `POST /git/create-branch` pushes branch to origin.
+
+## Future Work
+
+- Signoff backend: `POST /git/push` accepts `signoff: bool`.
+- Merge step: fetch + merge before push.
+- Server-side review enforcement (currently client-side only).
+- Workspace agent: move push ops to a daemon in the workspace
+  container to avoid UID/gitconfig issues long-term.
 
 ## References
 
-- [forgejo-integration.md](./forgejo-integration.md) — full Forgejo spec
-- [opencode-webui-fork.md](./opencode-webui-fork.md) — vendored opencode SPA architecture and phases
+- [integration-web.md](./integration-web.md) -- web UI integration testing plan
+- [forgejo-integration.md](./forgejo-integration.md) -- full Forgejo spec (deferred)
+- [opencode-webui-fork.md](./opencode-webui-fork.md) -- vendored opencode SPA architecture
