@@ -13,6 +13,7 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 | [nono](https://nono.sh/) | Apache-2.0 | Yes | OS-level sandboxing (Landlock/Seatbelt), agent-agnostic |
 | [OpenHands](https://github.com/All-Hands-AI/OpenHands) | MIT | Yes | Self-hostable, Docker-based |
 | [Ambient Code](https://github.com/ambient-code/platform) | MIT | Yes | Kubernetes-native, self-hosted |
+| [paude](https://github.com/bbrowning/paude) | MIT | Yes | Podman + OpenShift backends, agent-agnostic |
 | [Kortex](https://github.com/kortex-hub/kortex) | Apache-2.0 | Yes | Desktop GUI, AI + container/K8s management, Goose integration |
 | [Gastown](https://github.com/steveyegge/gastown) | MIT | Yes | Multi-agent orchestration, no sandboxing |
 | [krunai](https://github.com/slp/krunai) | Apache-2.0 | Yes | MicroVM, but not container oriented |
@@ -73,6 +74,24 @@ The devaipod project would like to align more with Ambient Code. A few things:
 - [Podman support](https://github.com/ambient-code/platform/issues/431)
 - [Image needs to be pluggable](https://github.com/ambient-code/platform/pull/364)
 - It's possible to run locally with [minikube](https://minikube.sigs.k8s.io/) or [minc](https://github.com/minc-org/minc) in theory, but this adds some friction
+
+### paude
+
+Following is Assisted-by: OpenCode (Opus 4.5)
+
+[paude](https://github.com/bbrowning/paude) is a Python CLI that runs AI coding agents (Claude Code, Cursor CLI, Gemini CLI) inside secure containers. MIT licensed. It has a pluggable backend architecture with both Podman and OpenShift implementations, making it the closest existing project to what devaipod is trying to do with Kubernetes support.
+
+The OpenShift backend is particularly interesting as prior art for devaipod's [Kubernetes plans](../todo/kubernetes.md). paude's approach:
+
+- Uses `oc` CLI (subprocess) rather than a native Kubernetes client library. devaipod plans to use kube-rs instead, avoiding subprocess overhead and output parsing.
+- Creates StatefulSets (not bare Pods) for workspace lifecycle, with scale-to-zero for stop/start. devaipod's pod model maps more naturally to bare Pods since each workspace is a multi-container pod with a specific lifecycle.
+- Uses `oc exec` stdin/stdout tunneling with git's `ext::` protocol for code sync -- the agent makes commits inside the pod, and `git pull` tunnels through `oc exec`. This sidesteps the port-forward fragility problem entirely. devaipod should consider this pattern for Model 3 (hybrid local/remote).
+- Credentials go into a tmpfs `emptyDir` volume (RAM-only, never persisted), synced via `oc cp`. This is a stronger security posture than writing credentials to a PVC.
+- Network egress filtering uses a squid proxy container for Podman and Kubernetes NetworkPolicy for OpenShift, similar in spirit to how devaipod isolates agent network access via service-gator -- though service-gator operates at the API level rather than the network level.
+
+Key differences from devaipod: paude is agent-agnostic (wraps Claude Code, Cursor, Gemini CLI) while devaipod integrates deeply with OpenCode. paude has no devcontainer.json support and uses a single container per session rather than devaipod's multi-container pod (workspace + agent + gator + api). paude has no credential scoping equivalent to service-gator -- network-level filtering is a blunter instrument than API-level scoping.
+
+The git-over-exec-tunnel pattern is worth stealing for devaipod's hybrid model. And paude's tmpfs credential storage is a good security practice that devaipod should adopt when running in Kubernetes.
 
 ### Kortex
 
