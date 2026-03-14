@@ -266,8 +266,9 @@ build-integration-web no_cache="":
 # Run Playwright-based web integration tests (pod switcher, git review, etc.)
 # Builds the main devaipod image + the Playwright runner image, then runs
 # browser-driven tests inside a container with podman socket access.
+# Pass a filter pattern to run a subset: just test-integration-web "done button"
 [group('container')]
-test-integration-web image=default_test_image: container-build build-integration-web
+test-integration-web filter="" image=default_test_image: container-build build-integration-web
     #!/usr/bin/env bash
     set -euo pipefail
     # Reuse the same socket-finding logic as test-integration
@@ -316,7 +317,7 @@ test-integration-web image=default_test_image: container-build build-integration
     else
         HOST_SOCKET="/run/podman/podman.sock"
     fi
-    echo "Running Playwright web integration tests..."
+    echo "Running Playwright web integration tests (filter='{{filter}}')..."
     PRIV_FLAG="--privileged"
     if ! podman run --rm --privileged alpine true 2>/dev/null; then
         PRIV_FLAG="--security-opt label=disable"
@@ -330,6 +331,7 @@ test-integration-web image=default_test_image: container-build build-integration
         -e DEVAIPOD_CONTAINER_IMAGE={{ CONTAINER_IMAGE }}:latest \
         -e DEVAIPOD_INSTANCE=integration-test \
         -e DEVAIPOD_MOCK_AGENT=1 \
+        -e PLAYWRIGHT_GREP="{{filter}}" \
         {{ CONTAINER_IMAGE }}-integration-web:latest
 
 # Smoke-test the container image

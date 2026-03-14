@@ -6,6 +6,7 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 10_000 },
   retries: process.env.CI ? 2 : 0,
+  grep: process.env.PLAYWRIGHT_GREP ? new RegExp(process.env.PLAYWRIGHT_GREP) : undefined,
   reporter: [["html", { open: "never", outputFolder: "playwright-report" }], ["line"]],
   use: {
     baseURL: process.env.DEVAIPOD_BASE_URL || "http://localhost:8080",

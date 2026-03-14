@@ -220,8 +220,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/podman-remote /usr/bin/podman \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# The devaipod binary (for creating/managing pods)
+# The devaipod binary + SPA assets (needed for serving the web UI)
 COPY --from=build /usr/bin/devaipod /usr/bin/devaipod
+COPY --from=opencode-web /build/packages/app/dist /usr/share/devaipod/opencode
+COPY --from=mdbook /src/docs/book /usr/share/devaipod/docs
 
 # Playwright test harness
 COPY --from=src /src/e2e-devaipod/ /opt/e2e-devaipod/
