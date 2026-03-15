@@ -234,10 +234,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     }
 
     async function openPod(fullName: string) {
-      const shortName = fullName.replace(/^devaipod-/, "")
-      // Navigate to the SPA agent page; the agent page discovers the
-      // iframe URL itself via the opencode-info API.
-      window.location.href = `/agent/${encodeURIComponent(shortName)}`
+      window.location.href = `/agent/${encodeURIComponent(fullName)}`
     }
 
     async function startPod(fullName: string) {

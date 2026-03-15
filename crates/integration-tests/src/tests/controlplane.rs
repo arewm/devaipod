@@ -98,8 +98,7 @@ pub(crate) fn find_running_pod(fixture: &WebFixture, token: &str) -> Result<Opti
         }
         let status = pod.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status.eq_ignore_ascii_case("running") {
-            let short = name.strip_prefix("devaipod-").unwrap_or(name);
-            return Ok(Some(short.to_string()));
+            return Ok(Some(name.to_string()));
         }
     }
     Ok(None)
