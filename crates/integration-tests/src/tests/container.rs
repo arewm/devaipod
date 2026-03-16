@@ -1938,3 +1938,78 @@ fn test_forward_ports_published() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_forward_ports_published);
+
+/// Verify that rebuild reads devcontainer.json from the workspace volume
+/// rather than cloning the remote. Modifying devcontainer.json inside the
+/// workspace (adding forwardPorts) should be reflected after rebuild.
+fn test_rebuild_reads_workspace_devcontainer() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = unique_test_name("test-rebuild-dc");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create pod (initially no forwardPorts)
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    // Port 9877 should NOT be published yet
+    assert!(
+        get_published_port(&pod_name, 9877).is_err(),
+        "Port 9877 should not be published before rebuild"
+    );
+
+    // Wait for the workspace container to have the cloned repo ready
+    let workspace_container = format!("{}-workspace", pod_name);
+    let sh = shell()?;
+    let dc_path = "/workspaces/test-repo/.devcontainer/devcontainer.json";
+    wait_for_file_content(
+        &sh,
+        &workspace_container,
+        dc_path,
+        "image",
+        Duration::from_secs(30),
+    )
+    .context("devcontainer.json should appear in workspace")?;
+
+    // Modify devcontainer.json inside the workspace container to add forwardPorts
+    let image = std::env::var("DEVAIPOD_TEST_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/bootc-dev/devenv-debian:latest".to_string());
+    let new_dc = format!(
+        r#"{{"name": "integration-test", "image": "{}", "forwardPorts": [9877]}}"#,
+        image
+    );
+    let write_script = format!("printf '%s' '{}' > {}", new_dc, dc_path);
+    let write_output = Command::new("podman")
+        .args(["exec", &workspace_container, "sh", "-c", &write_script])
+        .output()
+        .context("Failed to write updated devcontainer.json")?;
+    assert!(
+        write_output.status.success(),
+        "Failed to write devcontainer.json: {}",
+        String::from_utf8_lossy(&write_output.stderr)
+    );
+
+    // Rebuild the pod
+    let rebuild_output = run_devaipod(&["rebuild", short_name(&pod_name)])?;
+    if !rebuild_output.success() {
+        bail!("devaipod rebuild failed: {}", rebuild_output.combined());
+    }
+
+    // Port 9877 should now be published (rebuild picked up forwardPorts from workspace)
+    let host_port = get_published_port(&pod_name, 9877)
+        .context("After rebuild, forwardPorts port 9877 should be published")?;
+    assert!(
+        host_port > 0,
+        "Port 9877 should be mapped to a non-zero host port after rebuild, got {}",
+        host_port
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_rebuild_reads_workspace_devcontainer);

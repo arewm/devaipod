@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::secrets::DevcontainerSecretDecl;
 
@@ -653,6 +653,79 @@ pub fn parse_jsonc(content: &str) -> Result<DevcontainerConfig> {
     }
 
     Ok(config)
+}
+
+/// State extracted from a workspace volume for rebuilds.
+///
+/// Produced by `devaipod internals output-devcontainer-state` and consumed
+/// by `cmd_rebuild` to avoid cloning the remote repo.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    /// Raw devcontainer.json content (JSONC), if found.
+    pub devcontainer_json: Option<String>,
+    /// Default branch name from git.
+    pub default_branch: String,
+}
+
+/// Read workspace state from a project directory.
+///
+/// Finds devcontainer.json using the standard search order and determines
+/// the git default branch.  Designed to run inside an init container
+/// with the workspace volume mounted.
+pub fn read_workspace_state(project_path: &Path) -> WorkspaceInfo {
+    let devcontainer_json = try_find_devcontainer_json(project_path).and_then(|path| {
+        std::fs::read_to_string(&path)
+            .map_err(|e| {
+                eprintln!("Warning: failed to read {}: {}", path.display(), e);
+                e
+            })
+            .ok()
+    });
+
+    let default_branch = detect_default_branch(project_path);
+
+    WorkspaceInfo {
+        devcontainer_json,
+        default_branch,
+    }
+}
+
+/// Determine the default branch for a git repo.
+///
+/// Prefers `refs/remotes/origin/HEAD` (the remote default), falls back to
+/// the current `HEAD`, and finally to `"main"`.
+fn detect_default_branch(project_path: &Path) -> String {
+    // Try remote HEAD first
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .current_dir(project_path)
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            let refname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+                return branch.to_string();
+            }
+        }
+    }
+
+    // Fall back to local HEAD
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(project_path)
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !branch.is_empty() && branch != "HEAD" {
+                return branch;
+            }
+        }
+    }
+
+    "main".to_string()
 }
 
 #[cfg(test)]

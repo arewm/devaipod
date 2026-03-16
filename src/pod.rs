@@ -286,7 +286,7 @@ pub(crate) async fn detect_self_image_id() -> Option<String> {
 ///
 /// Returns the image name if we can detect it, otherwise falls back to
 /// `DEVAIPOD_IMAGE_FALLBACK`.
-fn detect_self_image() -> String {
+pub(crate) fn detect_self_image() -> String {
     // Explicit override — used by integration tests to point at the
     // locally-built image instead of the published registry image.
     if let Ok(image) = std::env::var("DEVAIPOD_CONTAINER_IMAGE") {
