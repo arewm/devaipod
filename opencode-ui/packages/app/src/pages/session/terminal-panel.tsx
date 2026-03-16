@@ -1,4 +1,4 @@
-import { For, Show, createMemo, createSignal } from "solid-js"
+import { For, Show, createEffect, createMemo, createSignal, untrack } from "solid-js"
 import { Tabs } from "@opencode-ai/ui/tabs"
 import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
 import { IconButton } from "@opencode-ai/ui/icon-button"
@@ -166,9 +166,13 @@ export function TerminalPanel(props: {
     const wsAll = createMemo(() => wt.all())
 
     // Auto-create the first workspace terminal when none exist.
-    if (wsAll().length === 0) {
-      wt.new()
-    }
+    // Use createEffect so the side-effect runs outside the render path and
+    // only triggers once (wsAll() becoming non-empty stops it from re-firing).
+    createEffect(() => {
+      if (wsAll().length === 0) {
+        untrack(() => wt.new())
+      }
+    })
 
     return (
       <div class="flex flex-col h-full">
@@ -308,8 +312,21 @@ export function TerminalPanel(props: {
             </div>
           }
         >
-          <Show when={hasWorkspace() && terminalType() === "workspace"} fallback={<AgentTerminals />}>
-            <WorkspaceTerminalsView />
+          <div
+            style={{
+              display: !hasWorkspace() || terminalType() === "agent" ? "contents" : "none",
+            }}
+          >
+            <AgentTerminals />
+          </div>
+          <Show when={hasWorkspace()}>
+            <div
+              style={{
+                display: terminalType() === "workspace" ? "contents" : "none",
+              }}
+            >
+              <WorkspaceTerminalsView />
+            </div>
           </Show>
         </Show>
       </div>
