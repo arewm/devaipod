@@ -1006,9 +1006,8 @@ fn test_web_container_opencode_info_endpoint() -> Result<()> {
             if let Some(name) = pod.get("Name").and_then(|n| n.as_str()) {
                 if name.starts_with("devaipod-") {
                     // Found a devaipod pod, test the opencode-info endpoint
-                    let short_name = name.strip_prefix("devaipod-").unwrap_or(name);
                     let (info_status, info_body) = fixture.curl_in_container(
-                        &format!("/api/devaipod/pods/{}/opencode-info", short_name),
+                        &format!("/api/devaipod/pods/{}/opencode-info", name),
                         Some(&token),
                     )?;
 
@@ -1112,12 +1111,11 @@ fn test_web_container_opencode_connectivity() -> Result<()> {
             continue;
         }
 
-        let short_name = name.strip_prefix("devaipod-").unwrap_or(name);
         tracing::info!("Found running devaipod pod: {}", name);
 
         // Get opencode-info for this pod
         let (info_status, info_body) = fixture.curl_in_container(
-            &format!("/api/devaipod/pods/{}/opencode-info", short_name),
+            &format!("/api/devaipod/pods/{}/opencode-info", name),
             Some(&token),
         )?;
 

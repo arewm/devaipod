@@ -30,7 +30,7 @@ function AgentView() {
     const n = params.name
     return n.startsWith("devaipod-") ? n : `devaipod-${n}`
   }
-  const shortName = () => params.name.replace(/^devaipod-/, "")
+  const shortName = () => fullName().replace(/^devaipod-/, "")
 
   // -- Iframe source discovery ----------------------------------------------
 
@@ -103,23 +103,20 @@ function AgentView() {
   function goPrev() {
     const idx = currentIdx()
     if (idx > 0) {
-      const short = runningPods()[idx - 1].Name.replace(/^devaipod-/, "")
-      navigate(`/agent/${encodeURIComponent(short)}`)
+      navigate(`/agent/${encodeURIComponent(runningPods()[idx - 1].Name)}`)
     }
   }
 
   function goNext() {
     const idx = currentIdx()
     if (idx >= 0 && idx < runningPods().length - 1) {
-      const short = runningPods()[idx + 1].Name.replace(/^devaipod-/, "")
-      navigate(`/agent/${encodeURIComponent(short)}`)
+      navigate(`/agent/${encodeURIComponent(runningPods()[idx + 1].Name)}`)
     }
   }
 
   function switchToPod(podName: string) {
-    const short = podName.replace(/^devaipod-/, "")
     setDropdownOpen(false)
-    navigate(`/agent/${encodeURIComponent(short)}`)
+    navigate(`/agent/${encodeURIComponent(podName)}`)
   }
 
   // Close dropdown on outside click

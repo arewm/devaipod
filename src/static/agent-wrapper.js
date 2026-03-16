@@ -113,8 +113,7 @@
   }
 
   function navigateToPod(name) {
-    var short = name.replace(/^devaipod-/, "");
-    window.location.href = "/_devaipod/agent/" + encodeURIComponent(short) + "/";
+    window.location.href = "/_devaipod/agent/" + encodeURIComponent(name) + "/";
   }
 
   prevBtn.addEventListener("click", async function () {
