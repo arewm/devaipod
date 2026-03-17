@@ -2,6 +2,7 @@ import { createSignal, createEffect, createMemo, onCleanup, onMount, Show, For }
 import { useParams, useNavigate, A } from "@solidjs/router"
 import { DevaipodProvider, useDevaipod } from "@/context/devaipod"
 import { apiFetch } from "@/utils/devaipod-api"
+import { base64Encode } from "@opencode-ai/util/encode"
 
 // ---------------------------------------------------------------------------
 // Page wrapper — provides context (standalone, outside the OpenCode stack)
@@ -52,8 +53,8 @@ function AgentView() {
           url.hostname = window.location.hostname
           let src = url.toString()
           if (info.latest_session) {
-            const dir = btoa(info.latest_session.directory)
-            src = `${url.origin}/${encodeURIComponent(dir)}/session/${encodeURIComponent(info.latest_session.id)}`
+            const dir = base64Encode(info.latest_session.directory)
+            src = `${url.origin}/${dir}/session/${encodeURIComponent(info.latest_session.id)}`
           }
           setIframeSrc(src)
         }
