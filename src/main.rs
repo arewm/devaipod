@@ -1642,16 +1642,54 @@ struct CreateResult {
     pod_name: String,
 }
 
-/// Normalize source string: fix common URL typos (e.g. https;// -> https://)
-/// so that git URLs are correctly dispatched to clone rather than local path.
-fn normalize_source(source: &str) -> std::borrow::Cow<'_, str> {
+/// Known git hosting providers whose bare hostnames should get `https://` prepended.
+const KNOWN_GIT_HOSTS: &[&str] = &[
+    "github.com",
+    "gitlab.com",
+    "codeberg.org",
+    "bitbucket.org",
+    "sr.ht",
+    "gitea.com",
+];
+
+/// Normalize source string so that git URLs are correctly dispatched to clone
+/// rather than treated as a local path.
+///
+/// Handles:
+/// - Typos: `https;//` → `https://`
+/// - Bare hostnames: `github.com/owner/repo` → `https://github.com/owner/repo`
+/// - SSH URLs: `git@github.com:owner/repo.git` → `https://github.com/owner/repo`
+///
+/// `extra_hosts` allows user-configured hostnames (from `[git] extra_hosts`)
+/// to be recognized alongside the built-in list.
+fn normalize_source<'s>(source: &'s str, extra_hosts: &[String]) -> std::borrow::Cow<'s, str> {
+    // Fix semicolon typos in scheme
     if let Some(rest) = source.strip_prefix("https;//") {
-        std::borrow::Cow::Owned(format!("https://{rest}"))
-    } else if let Some(rest) = source.strip_prefix("http;//") {
-        std::borrow::Cow::Owned(format!("http://{rest}"))
-    } else {
-        std::borrow::Cow::Borrowed(source)
+        return std::borrow::Cow::Owned(format!("https://{rest}"));
     }
+    if let Some(rest) = source.strip_prefix("http;//") {
+        return std::borrow::Cow::Owned(format!("http://{rest}"));
+    }
+
+    // Convert SSH URLs (git@host:owner/repo.git) to HTTPS
+    if let Some(rest) = source.strip_prefix("git@") {
+        // git@github.com:owner/repo.git -> github.com/owner/repo
+        if let Some((host, path)) = rest.split_once(':') {
+            let path = path.trim_end_matches(".git");
+            return std::borrow::Cow::Owned(format!("https://{host}/{path}"));
+        }
+    }
+
+    // Prepend https:// for bare known-host URLs (e.g. github.com/owner/repo)
+    if !source.contains("://") {
+        let is_known = KNOWN_GIT_HOSTS.iter().any(|h| source.starts_with(h))
+            || extra_hosts.iter().any(|h| source.starts_with(h.as_str()));
+        if is_known {
+            return std::borrow::Cow::Owned(format!("https://{source}"));
+        }
+    }
+
+    std::borrow::Cow::Borrowed(source)
 }
 
 /// Create a copy of the config with CLI --mcp servers merged in
@@ -1685,7 +1723,7 @@ async fn create_workspace(
     source: &str,
     opts: &CreateOptions,
 ) -> Result<CreateResult> {
-    let source = normalize_source(source);
+    let source = normalize_source(source, &config.git.extra_hosts);
     let source = source.as_ref();
 
     // Merge CLI --mcp servers into config if any were provided.
@@ -6265,5 +6303,178 @@ mod tests {
         // Leading hyphens stripped, middle hyphens preserved
         assert_eq!(sanitize_name("-my-project"), "my-project");
         assert_eq!(sanitize_name("--my-project"), "my-project");
+    }
+
+    #[test]
+    fn test_normalize_source_bare_github_url() {
+        let no_extra: &[String] = &[];
+        assert_eq!(
+            normalize_source("github.com/owner/repo", no_extra).as_ref(),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_source("gitlab.com/group/project", no_extra).as_ref(),
+            "https://gitlab.com/group/project"
+        );
+        assert_eq!(
+            normalize_source("codeberg.org/user/repo", no_extra).as_ref(),
+            "https://codeberg.org/user/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_source_ssh_url() {
+        let no_extra: &[String] = &[];
+        assert_eq!(
+            normalize_source("git@github.com:owner/repo.git", no_extra).as_ref(),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_source("git@gitlab.com:group/project.git", no_extra).as_ref(),
+            "https://gitlab.com/group/project"
+        );
+        // Without .git suffix
+        assert_eq!(
+            normalize_source("git@github.com:owner/repo", no_extra).as_ref(),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_source_already_valid() {
+        let no_extra: &[String] = &[];
+        // Already-valid URLs should pass through unchanged
+        assert_eq!(
+            normalize_source("https://github.com/owner/repo", no_extra).as_ref(),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_source("http://example.com/repo", no_extra).as_ref(),
+            "http://example.com/repo"
+        );
+        // Local paths should not be modified
+        assert_eq!(
+            normalize_source("/tmp/myrepo", no_extra).as_ref(),
+            "/tmp/myrepo"
+        );
+        assert_eq!(normalize_source("./myrepo", no_extra).as_ref(), "./myrepo");
+    }
+
+    #[test]
+    fn test_normalize_source_typo_fix() {
+        let no_extra: &[String] = &[];
+        assert_eq!(
+            normalize_source("https;//github.com/owner/repo", no_extra).as_ref(),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_source_extra_hosts() {
+        let extra = vec![
+            "forgejo.example.com".to_string(),
+            "gitea.corp.internal".to_string(),
+        ];
+        assert_eq!(
+            normalize_source("forgejo.example.com/user/repo", &extra).as_ref(),
+            "https://forgejo.example.com/user/repo"
+        );
+        assert_eq!(
+            normalize_source("gitea.corp.internal/team/project", &extra).as_ref(),
+            "https://gitea.corp.internal/team/project"
+        );
+        // Unknown hosts still pass through
+        assert_eq!(
+            normalize_source("unknown.host/foo", &extra).as_ref(),
+            "unknown.host/foo"
+        );
+        // Built-in hosts still work alongside extra hosts
+        assert_eq!(
+            normalize_source("github.com/owner/repo", &extra).as_ref(),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    /// Data-driven edge-case tests for normalize_source.
+    ///
+    /// Each entry is (input, extra_hosts, expected_output).
+    #[test]
+    fn test_normalize_source_edge_cases() {
+        let no_extra: &[String] = &[];
+        let cases: &[(&str, &[String], &str)] = &[
+            // SSH URL for an unknown host (git@ is a clear signal)
+            (
+                "git@gitea.private.corp:team/project.git",
+                no_extra,
+                "https://gitea.private.corp/team/project",
+            ),
+            // SSH URL without .git suffix on unknown host
+            (
+                "git@my.internal:org/repo",
+                no_extra,
+                "https://my.internal/org/repo",
+            ),
+            // Bare hostname with port (not a known host, passes through)
+            (
+                "gitea.local:3000/owner/repo",
+                no_extra,
+                "gitea.local:3000/owner/repo",
+            ),
+            // Empty extra_hosts behaves like no extra hosts
+            ("unknown.host/foo", no_extra, "unknown.host/foo"),
+            // http;// typo fix (not just https)
+            (
+                "http;//example.com/repo",
+                no_extra,
+                "http://example.com/repo",
+            ),
+            // Bare known host with no path (e.g. just "github.com")
+            ("github.com", no_extra, "https://github.com"),
+            // sr.ht style URL with tilde user
+            ("sr.ht/~user/repo", no_extra, "https://sr.ht/~user/repo"),
+            // bitbucket bare URL
+            (
+                "bitbucket.org/team/project",
+                no_extra,
+                "https://bitbucket.org/team/project",
+            ),
+            // gitea.com bare URL
+            (
+                "gitea.com/owner/repo",
+                no_extra,
+                "https://gitea.com/owner/repo",
+            ),
+            // Relative path (.) should not be modified
+            (".", no_extra, "."),
+            // Plain word (not a host) should not be modified
+            ("myproject", no_extra, "myproject"),
+        ];
+
+        for (input, extra, expected) in cases {
+            assert_eq!(
+                normalize_source(input, extra).as_ref(),
+                *expected,
+                "normalize_source({:?}, ...) failed",
+                input,
+            );
+        }
+    }
+
+    /// Verify that extra_hosts from config are used in bare-host matching.
+    #[test]
+    fn test_normalize_source_extra_hosts_with_port() {
+        // A host with a port in extra_hosts should match bare URLs that
+        // start with that host:port prefix.
+        let extra = vec!["gitea.local:3000".to_string()];
+        assert_eq!(
+            normalize_source("gitea.local:3000/owner/repo", &extra).as_ref(),
+            "https://gitea.local:3000/owner/repo",
+        );
+        // Without the extra_hosts entry, it passes through unchanged
+        let no_extra: &[String] = &[];
+        assert_eq!(
+            normalize_source("gitea.local:3000/owner/repo", no_extra).as_ref(),
+            "gitea.local:3000/owner/repo",
+        );
     }
 }
