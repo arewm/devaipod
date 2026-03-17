@@ -94,6 +94,27 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         const [providerID, modelID] = sync.data.config.model.split("/")
         const key = { providerID, modelID }
         if (isModelValid(key)) return key
+
+        // Fuzzy match: if the configured model has a @variant suffix (e.g.
+        // claude-sonnet-4@default) that doesn't exist as a model key, try
+        // matching by base name against the provider's actual model IDs.
+        // The provider may report a dated variant like claude-sonnet-4@20250514
+        // instead of the @default alias used in config.
+        const atIndex = modelID.indexOf("@")
+        if (atIndex > 0) {
+          const baseName = modelID.substring(0, atIndex)
+          const provider = providers.all().find((x) => x.id === providerID)
+          if (provider && connected().has(providerID)) {
+            // Prefer an exact base-name match first, then any model sharing
+            // the same base (e.g. claude-sonnet-4@20250514).
+            const candidate =
+              provider.models[baseName] ??
+              Object.values(provider.models).find((m) => m.id.startsWith(baseName + "@"))
+            if (candidate) {
+              return { providerID, modelID: candidate.id }
+            }
+          }
+        }
       }
 
       const resolveRecent = () => {
