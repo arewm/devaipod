@@ -1642,16 +1642,51 @@ struct CreateResult {
     pod_name: String,
 }
 
-/// Normalize source string: fix common URL typos (e.g. https;// -> https://)
-/// so that git URLs are correctly dispatched to clone rather than local path.
+/// Known git hosting providers whose bare hostnames should get `https://` prepended.
+const KNOWN_GIT_HOSTS: &[&str] = &[
+    "github.com",
+    "gitlab.com",
+    "codeberg.org",
+    "bitbucket.org",
+    "sr.ht",
+    "gitea.com",
+];
+
+/// Normalize source string so that git URLs are correctly dispatched to clone
+/// rather than treated as a local path.
+///
+/// Handles:
+/// - Typos: `https;//` → `https://`
+/// - Bare hostnames: `github.com/owner/repo` → `https://github.com/owner/repo`
+/// - SSH URLs: `git@github.com:owner/repo.git` → `https://github.com/owner/repo`
 fn normalize_source(source: &str) -> std::borrow::Cow<'_, str> {
+    // Fix semicolon typos in scheme
     if let Some(rest) = source.strip_prefix("https;//") {
-        std::borrow::Cow::Owned(format!("https://{rest}"))
-    } else if let Some(rest) = source.strip_prefix("http;//") {
-        std::borrow::Cow::Owned(format!("http://{rest}"))
-    } else {
-        std::borrow::Cow::Borrowed(source)
+        return std::borrow::Cow::Owned(format!("https://{rest}"));
     }
+    if let Some(rest) = source.strip_prefix("http;//") {
+        return std::borrow::Cow::Owned(format!("http://{rest}"));
+    }
+
+    // Convert SSH URLs (git@host:owner/repo.git) to HTTPS
+    if let Some(rest) = source.strip_prefix("git@") {
+        // git@github.com:owner/repo.git -> github.com/owner/repo
+        if let Some((host, path)) = rest.split_once(':') {
+            let path = path.trim_end_matches(".git");
+            return std::borrow::Cow::Owned(format!("https://{host}/{path}"));
+        }
+    }
+
+    // Prepend https:// for bare known-host URLs (e.g. github.com/owner/repo)
+    if !source.contains("://") {
+        for host in KNOWN_GIT_HOSTS {
+            if source.starts_with(host) {
+                return std::borrow::Cow::Owned(format!("https://{source}"));
+            }
+        }
+    }
+
+    std::borrow::Cow::Borrowed(source)
 }
 
 /// Create a copy of the config with CLI --mcp servers merged in
@@ -6265,5 +6300,62 @@ mod tests {
         // Leading hyphens stripped, middle hyphens preserved
         assert_eq!(sanitize_name("-my-project"), "my-project");
         assert_eq!(sanitize_name("--my-project"), "my-project");
+    }
+
+    #[test]
+    fn test_normalize_source_bare_github_url() {
+        assert_eq!(
+            normalize_source("github.com/owner/repo").as_ref(),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_source("gitlab.com/group/project").as_ref(),
+            "https://gitlab.com/group/project"
+        );
+        assert_eq!(
+            normalize_source("codeberg.org/user/repo").as_ref(),
+            "https://codeberg.org/user/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_source_ssh_url() {
+        assert_eq!(
+            normalize_source("git@github.com:owner/repo.git").as_ref(),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_source("git@gitlab.com:group/project.git").as_ref(),
+            "https://gitlab.com/group/project"
+        );
+        // Without .git suffix
+        assert_eq!(
+            normalize_source("git@github.com:owner/repo").as_ref(),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_source_already_valid() {
+        // Already-valid URLs should pass through unchanged
+        assert_eq!(
+            normalize_source("https://github.com/owner/repo").as_ref(),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(
+            normalize_source("http://example.com/repo").as_ref(),
+            "http://example.com/repo"
+        );
+        // Local paths should not be modified
+        assert_eq!(normalize_source("/tmp/myrepo").as_ref(), "/tmp/myrepo");
+        assert_eq!(normalize_source("./myrepo").as_ref(), "./myrepo");
+    }
+
+    #[test]
+    fn test_normalize_source_typo_fix() {
+        assert_eq!(
+            normalize_source("https;//github.com/owner/repo").as_ref(),
+            "https://github.com/owner/repo"
+        );
     }
 }
