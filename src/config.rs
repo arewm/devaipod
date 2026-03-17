@@ -94,6 +94,28 @@ pub struct Config {
     /// a devcontainer.json but still need nested container support.
     #[serde(default, rename = "container-nesting")]
     pub container_nesting: bool,
+
+    /// Git-related configuration
+    #[serde(default)]
+    pub git: GitConfig,
+}
+
+/// Git-related configuration
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct GitConfig {
+    /// Additional git hosting provider hostnames for bare-URL normalization.
+    ///
+    /// Bare hostnames like `github.com/owner/repo` are automatically prepended
+    /// with `https://`. The built-in list covers major public forges (GitHub,
+    /// GitLab, Codeberg, etc.); use this to add private instances:
+    ///
+    /// ```toml
+    /// [git]
+    /// extra_hosts = ["forgejo.example.com", "gitea.corp.internal"]
+    /// ```
+    #[serde(default)]
+    pub extra_hosts: Vec<String>,
 }
 
 /// Configuration for binding paths from host home to container home
@@ -2308,5 +2330,41 @@ X-Custom = "value"
             Some(&"Bearer abc123".to_string())
         );
         assert_eq!(entry.headers.get("X-Custom"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_git_config_default() {
+        let config = GitConfig::default();
+        assert!(config.extra_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_git_config_deserialization() {
+        let toml = r#"
+[git]
+extra_hosts = ["forgejo.example.com", "gitea.corp.internal"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.git.extra_hosts.len(), 2);
+        assert_eq!(config.git.extra_hosts[0], "forgejo.example.com");
+        assert_eq!(config.git.extra_hosts[1], "gitea.corp.internal");
+    }
+
+    #[test]
+    fn test_git_config_empty_extra_hosts() {
+        let toml = r#"
+[git]
+extra_hosts = []
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.git.extra_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_git_config_absent_defaults_empty() {
+        // When [git] section is absent entirely, extra_hosts defaults to empty
+        let toml = "";
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.git.extra_hosts.is_empty());
     }
 }
