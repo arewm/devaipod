@@ -17,6 +17,7 @@ export const settingsSoundsErrorsSelector = '[data-action="settings-sounds-error
 export const settingsSoundsErrorsEnabledSelector = '[data-action="settings-sounds-errors-enabled"]'
 export const settingsUpdatesStartupSelector = '[data-action="settings-updates-startup"]'
 export const settingsReleaseNotesSelector = '[data-action="settings-release-notes"]'
+export const settingsPermissionsYoloSelector = '[data-action="settings-permissions-yolo"]'
 
 export const sidebarNavSelector = '[data-component="sidebar-nav-desktop"]'
 

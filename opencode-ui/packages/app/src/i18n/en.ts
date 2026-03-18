@@ -730,8 +730,15 @@ export const dict = {
 
   "settings.permissions.title": "Permissions",
   "settings.permissions.description": "Control what tools the server can use by default.",
+  "settings.permissions.section.yolo": "YOLO Mode",
+  "settings.permissions.yolo.title": "Allow all tools",
+  "settings.permissions.yolo.description": "Temporarily grant full tool access. Disabling restores your previous permission settings.",
   "settings.permissions.section.tools": "Tools",
   "settings.permissions.toast.updateFailed.title": "Failed to update permissions",
+  "settings.permissions.toast.yoloEnabled.title": "YOLO mode enabled",
+  "settings.permissions.toast.yoloEnabled.description": "All tools are now allowed without prompts.",
+  "settings.permissions.toast.yoloDisabled.title": "YOLO mode disabled",
+  "settings.permissions.toast.yoloDisabled.description": "Previous permission settings have been restored.",
 
   "settings.permissions.action.allow": "Allow",
   "settings.permissions.action.ask": "Ask",

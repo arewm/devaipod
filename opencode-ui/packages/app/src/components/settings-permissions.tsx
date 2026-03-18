@@ -1,8 +1,11 @@
 import { Select } from "@opencode-ai/ui/select"
+import { Switch } from "@opencode-ai/ui/switch"
 import { showToast } from "@opencode-ai/ui/toast"
-import { Component, For, createMemo, type JSX } from "solid-js"
+import { Component, For, createEffect, createMemo, type JSX } from "solid-js"
+import { createStore } from "solid-js/store"
 import { useGlobalSync } from "@/context/global-sync"
 import { useLanguage } from "@/context/language"
+import { Persist, persisted } from "@/utils/persist"
 
 type PermissionAction = "allow" | "ask" | "deny"
 
@@ -107,7 +110,58 @@ const ITEMS = [
 
 const VALID_ACTIONS = new Set<PermissionAction>(["allow", "ask", "deny"])
 
-function toMap(value: unknown): PermissionMap {
+// All tool IDs that the UI manages. Used to build complete permission maps for
+// YOLO enable/disable so that mergeDeep (which can only add/overwrite, not
+// remove keys) properly overwrites any previously-set per-tool values.
+export const ALL_TOOL_IDS = ITEMS.map((item) => item.id)
+
+/**
+ * Builds the permission map to write when enabling YOLO mode.
+ * Every known tool is explicitly set to "allow" AND the wildcard "*" is set to
+ * "allow". The wildcard is required to cover any tools not in ALL_TOOL_IDS
+ * (e.g. tools added in future opencode versions). Without it, unknown tools
+ * would fall back to opencode's built-in default ("ask"), which is not YOLO.
+ */
+export function buildYoloPermissionMap(): PermissionMap {
+  const map: PermissionMap = { "*": "allow" }
+  for (const id of ALL_TOOL_IDS) map[id] = "allow"
+  return map
+}
+
+/**
+ * Builds the permission map to write when disabling YOLO mode, given the
+ * previously saved permission config. Every key written by buildYoloPermissionMap
+ * is explicitly overwritten so that mergeDeep removes all YOLO values.
+ *
+ * Only tools that were explicitly set in the saved config are written back —
+ * tools with no saved value are omitted so that opencode's built-in defaults
+ * apply naturally. The wildcard "*" is only written if it was in the saved
+ * config, since writing "*": "allow" unconditionally would override all
+ * per-tool restrictions at evaluation time.
+ *
+ * If the saved config is empty (e.g. the user started with a bare "*": "allow"
+ * pod and the createEffect stripped the wildcard), the result is an empty-ish
+ * map: every YOLO key is overwritten with the opencode default, and the user
+ * lands on system defaults (typically "ask" for each tool).
+ */
+export function buildRestorePermissionMap(saved: unknown): PermissionMap {
+  const savedMap = toMap(saved)
+  const savedWildcard = getRuleDefault(savedMap["*"])
+  const map: PermissionMap = {}
+  for (const id of ALL_TOOL_IDS) {
+    const savedValue = getRuleDefault(savedMap[id]) ?? savedWildcard
+    // Every key must be present to overwrite the YOLO "allow" via mergeDeep.
+    // If the tool had no saved value, use "ask" (opencode's built-in default).
+    map[id] = savedValue ?? "ask"
+  }
+  // Only restore the wildcard if it was explicitly in the saved config.
+  if (savedWildcard !== undefined) {
+    map["*"] = savedWildcard
+  }
+  return map
+}
+
+export function toMap(value: unknown): PermissionMap {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as PermissionMap
 
   const action = getAction(value)
@@ -116,12 +170,12 @@ function toMap(value: unknown): PermissionMap {
   return {}
 }
 
-function getAction(value: unknown): PermissionAction | undefined {
+export function getAction(value: unknown): PermissionAction | undefined {
   if (typeof value === "string" && VALID_ACTIONS.has(value as PermissionAction)) return value as PermissionAction
   return
 }
 
-function getRuleDefault(value: unknown): PermissionAction | undefined {
+export function getRuleDefault(value: unknown): PermissionAction | undefined {
   const action = getAction(value)
   if (action) return action
 
@@ -130,9 +184,42 @@ function getRuleDefault(value: unknown): PermissionAction | undefined {
   return getAction((value as Record<string, unknown>)["*"])
 }
 
+/**
+ * Returns true if the given permission config represents "allow all" (YOLO mode).
+ *
+ * Requires "*": "allow" to be present — this is the invariant that covers
+ * unknown tools (those not in ALL_TOOL_IDS). A config with only explicit
+ * per-tool "allow" entries is not YOLO because future/unknown tools would fall
+ * back to opencode's default ("ask") rather than being allowed.
+ */
+export function isYoloPermission(permission: unknown): boolean {
+  const map = toMap(permission)
+
+  // Wildcard must be "allow" — this is what protects unknown tools.
+  const wildcard = getRuleDefault(map["*"])
+  if (wildcard !== "allow") return false
+
+  // No known tool may have an explicit restriction that overrides the wildcard.
+  for (const id of ALL_TOOL_IDS) {
+    const action = getRuleDefault(map[id])
+    if (action && action !== "allow") return false
+  }
+
+  return true
+}
+
 export const SettingsPermissions: Component = () => {
   const globalSync = useGlobalSync()
   const language = useLanguage()
+
+  // Persisted store for saved pre-YOLO permissions, scoped globally (pod-level).
+  const [yoloStore, setYoloStore] = persisted(
+    Persist.global("permissions.yolo", ["permissions.yolo.v1"]),
+    createStore({
+      // The serialized pre-YOLO permission config. null means YOLO is not active.
+      savedPermission: null as unknown,
+    }),
+  )
 
   const actions = createMemo(
     (): Array<{ value: PermissionAction; label: string }> =>
@@ -144,6 +231,30 @@ export const SettingsPermissions: Component = () => {
 
   const permission = createMemo(() => {
     return toMap(globalSync.data.config.permission)
+  })
+
+  const yoloActive = createMemo(() => {
+    return yoloStore.savedPermission !== null && isYoloPermission(globalSync.data.config.permission)
+  })
+
+  // If the config has "*": "allow" at load time (e.g. set via OPENCODE_PERMISSION
+  // or opencode.json), automatically activate YOLO mode. This normalises the
+  // wildcard into explicit per-tool entries and records the pre-YOLO state so
+  // the user can disable it cleanly. The savedPermission guard makes this
+  // idempotent — it only fires when YOLO is not already active.
+  createEffect(() => {
+    const perm = globalSync.data.config.permission
+    if (yoloStore.savedPermission !== null) return
+    if (!isYoloPermission(perm)) return
+    // Save the config without the wildcard as the restore point.
+    const savedMap = toMap(perm)
+    const withoutWildcard: PermissionMap = {}
+    for (const [key, value] of Object.entries(savedMap)) {
+      if (key !== "*") withoutWildcard[key] = value
+    }
+    setYoloStore("savedPermission", withoutWildcard)
+    // Write the normalised YOLO map so "*" is removed from the server config.
+    void globalSync.updateConfig({ permission: buildYoloPermissionMap() })
   })
 
   const actionFor = (id: string): PermissionAction => {
@@ -175,6 +286,53 @@ export const SettingsPermissions: Component = () => {
     globalSync.updateConfig({ permission: { [id]: nextValue } }).catch(rollback)
   }
 
+  const enableYolo = async () => {
+    const current = globalSync.data.config.permission
+    // Save current permission before enabling YOLO.
+    setYoloStore("savedPermission", current ?? {})
+
+    const rollback = (err: unknown) => {
+      setYoloStore("savedPermission", null)
+      const message = err instanceof Error ? err.message : String(err)
+      showToast({ title: language.t("settings.permissions.toast.updateFailed.title"), description: message })
+    }
+
+    await globalSync.updateConfig({ permission: buildYoloPermissionMap() }).catch(rollback)
+
+    showToast({
+      variant: "success",
+      icon: "circle-check",
+      title: language.t("settings.permissions.toast.yoloEnabled.title"),
+      description: language.t("settings.permissions.toast.yoloEnabled.description"),
+    })
+  }
+
+  const disableYolo = async () => {
+    const saved = yoloStore.savedPermission
+    // Clear saved state before restoring so even on error we exit YOLO mode.
+    setYoloStore("savedPermission", null)
+
+    const rollback = (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err)
+      showToast({ title: language.t("settings.permissions.toast.updateFailed.title"), description: message })
+    }
+
+    await globalSync.updateConfig({ permission: buildRestorePermissionMap(saved) }).catch(rollback)
+
+    showToast({
+      title: language.t("settings.permissions.toast.yoloDisabled.title"),
+      description: language.t("settings.permissions.toast.yoloDisabled.description"),
+    })
+  }
+
+  const toggleYolo = (checked: boolean) => {
+    if (checked) {
+      void enableYolo()
+    } else {
+      void disableYolo()
+    }
+  }
+
   return (
     <div class="flex flex-col h-full overflow-y-auto no-scrollbar">
       <div class="sticky top-0 z-10 bg-[linear-gradient(to_bottom,var(--surface-raised-stronger-non-alpha)_calc(100%_-_24px),transparent)]">
@@ -186,6 +344,20 @@ export const SettingsPermissions: Component = () => {
 
       <div class="flex flex-col gap-6 px-4 py-6 sm:p-8 sm:pt-6 max-w-[720px]">
         <div class="flex flex-col gap-2">
+          <h3 class="text-14-medium text-text-strong">{language.t("settings.permissions.section.yolo")}</h3>
+          <div class="border border-border-weak-base rounded-lg overflow-hidden">
+            <SettingsRow
+              title={language.t("settings.permissions.yolo.title")}
+              description={language.t("settings.permissions.yolo.description")}
+            >
+              <div data-action="settings-permissions-yolo">
+                <Switch checked={yoloActive()} onChange={toggleYolo} />
+              </div>
+            </SettingsRow>
+          </div>
+        </div>
+
+        <div class="flex flex-col gap-2" classList={{ "opacity-50 pointer-events-none": yoloActive() }}>
           <h3 class="text-14-medium text-text-strong">{language.t("settings.permissions.section.tools")}</h3>
           <div class="border border-border-weak-base rounded-lg overflow-hidden">
             <For each={ITEMS}>
@@ -197,6 +369,7 @@ export const SettingsPermissions: Component = () => {
                     value={(o) => o.value}
                     label={(o) => o.label}
                     onSelect={(option) => option && setPermission(item.id, option.value)}
+                    disabled={yoloActive()}
                     variant="secondary"
                     size="small"
                     triggerVariant="settings"
