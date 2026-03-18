@@ -712,6 +712,16 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
             <span class="text-text-weak">Created: </span>
             <span class="text-text-secondary-base">{formatDate(props.pod.Created)}</span>
           </div>
+          <Show when={props.pod.ForwardedPorts && props.pod.ForwardedPorts.length > 0}>
+            <div>
+              <span class="text-text-weak">Ports: </span>
+              <span class="text-text-secondary-base">
+                {props.pod.ForwardedPorts!.map(
+                  (p) => `${p.hostPort}→${p.containerPort}`
+                ).join(", ")}
+              </span>
+            </div>
+          </Show>
         </div>
 
         {/* Agent status line */}
