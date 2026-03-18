@@ -60,7 +60,14 @@ fn mcp_state_token_path() -> std::path::PathBuf {
     std::path::PathBuf::from(dir).join(MCP_STATE_TOKEN_FILENAME)
 }
 
-const DEVAIPOD_AUTH_COOKIE: &str = "DEVAIPOD_AUTH";
+/// Base name for the auth cookie. The actual cookie name includes the port
+/// to avoid collisions when running multiple instances on the same host
+/// (e.g. `DEVAIPOD_AUTH_8080`).  HTTP cookies have no port attribute, so
+/// embedding the port in the name is the standard workaround.
+const DEVAIPOD_AUTH_COOKIE_BASE: &str = "DEVAIPOD_AUTH";
+
+/// Cookie Max-Age: 1 week (604800 seconds).
+const COOKIE_MAX_AGE_SECS: u32 = 604_800;
 
 /// Extract a raw cookie value by name from the request headers.
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -240,6 +247,18 @@ pub(crate) struct AppState {
     self_image_id: Option<String>,
     /// Cached pod list maintained by the background event watcher.
     pod_cache: PodCache,
+    /// Port-scoped auth cookie name (e.g. `DEVAIPOD_AUTH_8080`).
+    auth_cookie_name: String,
+}
+
+impl AppState {
+    /// Format a Set-Cookie header value for the auth cookie.
+    fn auth_cookie_header(&self) -> String {
+        format!(
+            "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+            self.auth_cookie_name, self.token, COOKIE_MAX_AGE_SECS
+        )
+    }
 }
 
 /// Query parameters for token authentication
@@ -251,9 +270,13 @@ struct TokenQuery {
 /// Authentication middleware
 ///
 /// Validates requests by checking (in order):
-/// 1. `DEVAIPOD_AUTH` cookie (set by the login endpoint)
+/// 1. Port-scoped `DEVAIPOD_AUTH_<port>` cookie (set by the login endpoint)
 /// 2. `Authorization: Bearer ...` header
 /// 3. `?token=...` query parameter
+///
+/// When cookie-based auth succeeds, the cookie is re-issued with a fresh
+/// `Max-Age` so the expiry slides forward on every request. This keeps the
+/// session alive as long as the browser is actively using the UI.
 ///
 /// Returns 401 Unauthorized if none is present or valid.
 async fn auth_middleware(
@@ -264,9 +287,17 @@ async fn auth_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Check auth cookie (primary method — set by /_devaipod/login)
-    if let Some(token) = cookie_value(&headers, DEVAIPOD_AUTH_COOKIE) {
+    if let Some(token) = cookie_value(&headers, &state.auth_cookie_name) {
         if token == state.token {
-            return Ok(next.run(request).await);
+            let mut response = next.run(request).await;
+            // Refresh the cookie expiry on every authenticated request.
+            // Use `append` (not `insert`) to preserve any Set-Cookie headers
+            // from proxied upstream responses.
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                state.auth_cookie_header().parse().unwrap(),
+            );
+            return Ok(response);
         }
     }
 
@@ -1234,16 +1265,22 @@ async fn login(State(state): State<Arc<AppState>>, Query(query): Query<TokenQuer
             .body(Body::from("Invalid or missing token"))
             .unwrap();
     }
-    let cookie = format!(
-        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400",
-        DEVAIPOD_AUTH_COOKIE, state.token
-    );
     Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, "/pods")
-        .header(header::SET_COOKIE, cookie)
+        .header(header::SET_COOKIE, state.auth_cookie_header())
         .body(Body::empty())
         .unwrap()
+}
+
+/// No-op handler for token refresh.
+///
+/// The actual cookie renewal happens in `auth_middleware`, which re-issues
+/// the cookie on every authenticated request. This endpoint exists solely
+/// so the frontend has a dedicated URL to call on a periodic timer (every
+/// 4 hours) to ensure the cookie doesn't expire during long idle periods.
+async fn token_refresh() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 /// Serve the opencode SPA for top-level pages (e.g. /pods).
@@ -2685,7 +2722,15 @@ pub(crate) fn build_app(
     self_image_id: Option<String>,
 ) -> Router {
     let pod_cache: PodCache = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-    build_app_with_cache(token, mcp_token, socket_path, self_image_id, pod_cache)
+    // Default to port 8080 when not specified (unit tests, etc.)
+    build_app_with_cache(
+        token,
+        mcp_token,
+        socket_path,
+        self_image_id,
+        pod_cache,
+        8080,
+    )
 }
 
 /// Build the web app router with a pre-existing pod cache.
@@ -2698,6 +2743,7 @@ fn build_app_with_cache(
     socket_path: Option<PathBuf>,
     self_image_id: Option<String>,
     pod_cache: PodCache,
+    port: u16,
 ) -> Router {
     let state = Arc::new(AppState {
         token: token.clone(),
@@ -2706,6 +2752,7 @@ fn build_app_with_cache(
         launches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         self_image_id,
         pod_cache,
+        auth_cookie_name: format!("{}_{}", DEVAIPOD_AUTH_COOKIE_BASE, port),
     });
 
     // Build the API router with authentication
@@ -2745,6 +2792,11 @@ fn build_app_with_cache(
             "/devaipod/pods/{name}/completion-status",
             get(get_pod_completion_status).put(update_pod_completion_status),
         )
+        // Lightweight endpoint for frontend cookie refresh (every 4h).
+        // The auth_middleware already re-issues the cookie on every
+        // authenticated request, so this handler is a no-op — its only
+        // purpose is to give the frontend a dedicated URL to hit.
+        .route("/devaipod/token-refresh", post(token_refresh))
         .route("/devaipod/prune", post(prune_done_pods))
         .route("/devaipod/pods/enrichment", get(pod_enrichment))
         // Unified pod list: pods + agent status + enrichment in one response
@@ -2847,6 +2899,7 @@ pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Resu
         socket_path,
         self_image_id,
         pod_cache,
+        port,
     );
 
     // Bind to [::] which accepts both IPv4 and IPv6 connections via dual-stack
