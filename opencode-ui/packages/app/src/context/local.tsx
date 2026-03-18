@@ -6,7 +6,7 @@ import { useSync } from "./sync"
 import { base64Encode } from "@opencode-ai/util/encode"
 import { useProviders } from "@/hooks/use-providers"
 import { useModels } from "@/context/models"
-import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
+import { cycleModelVariant, fuzzyMatchModelID, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
 
 export type ModelKey = { providerID: string; modelID: string }
 
@@ -94,6 +94,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         const [providerID, modelID] = sync.data.config.model.split("/")
         const key = { providerID, modelID }
         if (isModelValid(key)) return key
+
+        // Fuzzy match: the provider may report a dated variant
+        // (claude-sonnet-4@20250514) instead of the @default alias in config.
+        const provider = providers.all().find((x) => x.id === providerID)
+        if (provider && connected().has(providerID)) {
+          const match = fuzzyMatchModelID(modelID, Object.keys(provider.models))
+          if (match) return { providerID, modelID: match }
+        }
       }
 
       const resolveRecent = () => {

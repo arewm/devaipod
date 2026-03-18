@@ -94,6 +94,22 @@ The resolution order is:
 You can also specify `--image` per-invocation or set `default-image` in the config,
 but these only set the image without any lifecycle commands or customizations.
 
+## Git Hosting Providers
+
+devaipod recognizes bare hostnames like `github.com/owner/repo` and
+automatically prepends `https://`. The built-in list covers GitHub, GitLab,
+Codeberg, Bitbucket, sr.ht, and Gitea. For private instances, add them via
+the `[git]` section:
+
+```toml
+[git]
+extra_hosts = ["forgejo.example.com", "gitea.corp.internal"]
+```
+
+This lets you run `devaipod up forgejo.example.com/team/project` without
+typing the full URL. SSH URLs (`git@host:owner/repo.git`) are also
+automatically converted to HTTPS regardless of this setting.
+
 ## Per-Project Configuration
 
 Projects use standard `devcontainer.json` with optional devaipod customizations:

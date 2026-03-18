@@ -34,6 +34,27 @@ export function resolveModelVariant(input: VariantInput) {
   return undefined
 }
 
+/**
+ * Fuzzy-match a configured model ID against a provider's model map.
+ *
+ * When config specifies e.g. `claude-sonnet-4@default` but the provider
+ * only has `claude-sonnet-4@20250514`, this strips the `@variant` suffix
+ * and matches by base name. Returns the actual model ID or undefined.
+ */
+export function fuzzyMatchModelID(configuredModelID: string, availableModelIDs: string[]): string | undefined {
+  // Exact match
+  if (availableModelIDs.includes(configuredModelID)) return configuredModelID
+
+  const atIndex = configuredModelID.indexOf("@")
+  if (atIndex <= 0) return undefined
+
+  const baseName = configuredModelID.substring(0, atIndex)
+  // Exact base name (no variant suffix at all)
+  if (availableModelIDs.includes(baseName)) return baseName
+  // Any model sharing the same base
+  return availableModelIDs.find((id) => id.startsWith(baseName + "@"))
+}
+
 export function cycleModelVariant(input: VariantInput) {
   if (input.variants.length === 0) return undefined
   if (input.selected && input.variants.includes(input.selected)) {

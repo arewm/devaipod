@@ -559,6 +559,7 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
   const [collapsed, setCollapsed] = createSignal(false)
   const [showSettings, setShowSettings] = createSignal(false)
   const [actionError, setActionError] = createSignal("")
+  const [taskExpanded, setTaskExpanded] = createSignal(false)
 
   const shortName = () => props.pod.Name.replace("devaipod-", "")
   const isAdvisor = () => shortName() === "advisor"
@@ -697,9 +698,20 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
           <Show when={taskLabel()}>
             <div>
               <span class="text-text-weak">Task: </span>
-              <span class="text-text-secondary-base">
-                {taskLabel().length > 100 ? taskLabel().substring(0, 100) + "..." : taskLabel()}
-              </span>
+              <Show when={taskLabel().length > 100} fallback={
+                <span class="text-text-secondary-base">{taskLabel()}</span>
+              }>
+                <span class="text-text-secondary-base whitespace-pre-wrap">
+                  {taskExpanded() ? taskLabel() : taskLabel().substring(0, 100) + "..."}
+                </span>
+                <button
+                  type="button"
+                  class="ml-1 text-text-weak hover:text-text-secondary-base text-11-regular cursor-pointer"
+                  onClick={() => setTaskExpanded((v) => !v)}
+                >
+                  {taskExpanded() ? "less" : "more"}
+                </button>
+              </Show>
             </div>
           </Show>
           <Show when={mode()}>
