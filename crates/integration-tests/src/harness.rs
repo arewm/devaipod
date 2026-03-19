@@ -230,6 +230,7 @@ impl DevaipodHarness {
                 }
             }
 
+            #[allow(clippy::disallowed_methods)] // Intentional: poll interval
             std::thread::sleep(Duration::from_secs(2));
         }
     }
@@ -297,6 +298,7 @@ fn wait_for_health(port: u16, timeout: Duration) -> Result<()> {
                 return Ok(());
             }
         }
+        #[allow(clippy::disallowed_methods)] // Intentional: poll interval
         std::thread::sleep(Duration::from_millis(200));
     }
     bail!(

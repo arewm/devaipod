@@ -31,3 +31,6 @@ xshell = "0.2"
 [lints.rust]
 unsafe_code = "allow"  # Required for linkme
 missing_docs = "allow"  # Test code
+
+[lints.clippy]
+disallowed_methods = "deny"

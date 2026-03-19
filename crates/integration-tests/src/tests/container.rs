@@ -598,8 +598,8 @@ fn test_workspace_container_has_repo() -> Result<()> {
 
     let workspace_container = format!("{}-workspace", pod_name);
 
-    // Give containers a moment to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&workspace_container, Duration::from_secs(30))?;
 
     let sh = shell()?;
 
@@ -735,8 +735,8 @@ fn test_logs_command() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Give containers a moment to produce logs
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
 
     // Get logs (should not error even if empty) - use short name for CLI
     let logs_output = run_devaipod(&["logs", short_name(&pod_name)])?;
@@ -763,8 +763,8 @@ fn test_exec_runs_command() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Give containers a moment to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
 
     // Run a command via exec (defaults to agent container)
     let exec_output = run_devaipod(&["exec", short_name(&pod_name), "--", "echo", "hello"])?;
@@ -1035,8 +1035,8 @@ fn test_agent_device_passthrough() -> Result<()> {
     let agent_container = format!("{}-agent", pod_name);
     let workspace_container = format!("{}-workspace", pod_name);
 
-    // Give containers time to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&workspace_container, Duration::from_secs(30))?;
 
     // Verify workspace has /dev/kvm
     let workspace_kvm = cmd!(sh, "podman exec {workspace_container} test -e /dev/kvm")
@@ -1222,8 +1222,8 @@ fn test_agent_has_separate_workspace() -> Result<()> {
     let workspace_container = format!("{}-workspace", pod_name);
     let agent_container = format!("{}-agent", pod_name);
 
-    // Give containers time to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&workspace_container, Duration::from_secs(30))?;
 
     // Create a unique marker file in the workspace container
     let workspace_marker = "workspace-unique-marker-12345";
@@ -1320,8 +1320,8 @@ fn test_agent_cannot_write_to_main_workspace() -> Result<()> {
     let sh = shell()?;
     let agent_container = format!("{}-agent", pod_name);
 
-    // Give containers time to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
 
     // First verify the mount point exists and is accessible for reading
     let read_check = cmd!(
@@ -1396,8 +1396,8 @@ fn test_agent_workspace_shares_git_objects() -> Result<()> {
     let sh = shell()?;
     let agent_container = format!("{}-agent", pod_name);
 
-    // Give containers time to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
 
     // Check that the alternates file exists in the agent's git repo
     let alternates_check = cmd!(
@@ -1529,8 +1529,8 @@ fn test_gator_can_access_agent_workspace() -> Result<()> {
     let sh = shell()?;
     let gator_container = format!("{}-gator", pod_name);
 
-    // Give containers time to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for gator container to be ready
+    crate::wait_for_container_running(&gator_container, Duration::from_secs(30))?;
 
     // Verify gator can read from /workspaces
     let ws_check = cmd!(sh, "podman exec {gator_container} ls /workspaces")
@@ -1597,8 +1597,8 @@ fn test_gator_can_resolve_git_alternates() -> Result<()> {
     let sh = shell()?;
     let gator_container = format!("{}-gator", pod_name);
 
-    // Give containers time to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for gator container to be ready
+    crate::wait_for_container_running(&gator_container, Duration::from_secs(30))?;
 
     // Verify gator has /mnt/main-workspace mounted
     let main_ws_check = cmd!(sh, "podman exec {gator_container} ls /mnt/main-workspace")
@@ -1697,8 +1697,8 @@ fn test_gator_scopes_configuration() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Give containers time to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
 
     // 1. Verify pod has service-gator label with scope config
     let labels_str = podman_pod_inspect(&pod_name, "{{json .Labels}}")?;
