@@ -490,3 +490,127 @@ fn test_harness_pod_switcher_multi_pod() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_harness_pod_switcher_multi_pod);
+
+/// Verify that the pod state cache preserves completion_status and last_active_ts
+/// after a pod is stopped.
+///
+/// Uses the DevaipodHarness (host-mode web server) to create a pod, set
+/// completion status to "done", stop it, and verify the cached state survives.
+fn test_harness_pod_state_cache_survives_stop() -> Result<()> {
+    let mut harness = DevaipodHarness::start()?;
+    let repo = TestRepo::new()?;
+
+    let pod_name = crate::unique_test_name("cache-stop");
+    let short = crate::short_name(&pod_name);
+
+    harness.create_pod(repo.repo_path.to_str().unwrap(), short)?;
+
+    // Wait for completion-status endpoint to be reachable through the proxy.
+    // The pod-api sidecar needs time to become healthy after pod creation.
+    let cs_path = format!("/api/devaipod/pods/{short}/completion-status");
+    let cs_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (status, _) = harness.get(&cs_path)?;
+        if status == 200 {
+            break;
+        }
+        if std::time::Instant::now() > cs_deadline {
+            color_eyre::eyre::bail!(
+                "completion-status endpoint not reachable within 60s (last status: {status})"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    // Set completion status to "done"
+    let (status, body) = harness.put(&cs_path, r#"{"status":"done"}"#)?;
+    assert_eq!(status, 200, "PUT completion-status failed: {body}");
+
+    // Verify unified list shows completion_status while running
+    let (status, body) = harness.get("/api/devaipod/pods")?;
+    assert_eq!(status, 200);
+    let pods: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    let our_pod = pods
+        .iter()
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(&pod_name));
+    assert!(our_pod.is_some(), "Pod {pod_name} should be in the list");
+    let pod_json = our_pod.unwrap();
+
+    if let Some(agent) = pod_json.get("agent_status") {
+        assert_eq!(
+            agent.get("completion_status").and_then(|v| v.as_str()),
+            Some("done"),
+            "Running pod should show completion_status 'done'"
+        );
+    }
+
+    // Now stop the pod
+    tracing::info!("Stopping pod {pod_name}...");
+    let stop = std::process::Command::new("podman")
+        .args(["pod", "stop", "--", &pod_name])
+        .output()?;
+    assert!(
+        stop.status.success(),
+        "podman pod stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    // Poll until the control plane reports the pod as non-Running
+    let stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut pod_json;
+    loop {
+        let (status, body) = harness.get("/api/devaipod/pods")?;
+        assert_eq!(status, 200);
+        let pods: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+        let our_pod = pods
+            .iter()
+            .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(&pod_name));
+        assert!(
+            our_pod.is_some(),
+            "Stopped pod {pod_name} should still be in the list"
+        );
+        pod_json = our_pod.unwrap().clone();
+        let pod_status = pod_json
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        if !pod_status.eq_ignore_ascii_case("running") {
+            break;
+        }
+        if std::time::Instant::now() > stop_deadline {
+            color_eyre::eyre::bail!(
+                "Pod {pod_name} still Running 30s after stop (status: {pod_status})"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    // completion_status should be preserved from cache
+    let agent_status = pod_json.get("agent_status");
+    assert!(
+        agent_status.is_some(),
+        "Stopped pod should have agent_status from cache: {pod_json}"
+    );
+    assert_eq!(
+        agent_status
+            .unwrap()
+            .get("completion_status")
+            .and_then(|v| v.as_str()),
+        Some("done"),
+        "Cached completion_status should survive pod stop: {pod_json}"
+    );
+
+    // Activity should be "Stopped" for a stopped pod
+    assert_eq!(
+        agent_status
+            .unwrap()
+            .get("activity")
+            .and_then(|v| v.as_str()),
+        Some("Stopped"),
+        "Stopped pod activity should be 'Stopped': {pod_json}"
+    );
+
+    tracing::info!("Pod state cache test passed for pod '{pod_name}'");
+    Ok(())
+}
+podman_integration_test!(test_harness_pod_state_cache_survives_stop);

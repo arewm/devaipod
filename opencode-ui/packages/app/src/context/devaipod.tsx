@@ -20,6 +20,7 @@ interface RawUnifiedPod {
   labels?: Record<string, string>
   containers?: Array<{ Names: string; Status: string }>
   agent_status?: AgentStatus
+  last_active_ts?: number
   needs_update: boolean
   forwarded_ports?: ForwardedPort[]
 }
@@ -31,6 +32,8 @@ export interface PodInfo {
   Labels?: Record<string, string>
   Containers?: Array<{ Names: string; Status: string }>
   ForwardedPorts?: Array<{ containerPort: number; hostPort: number }>
+  /** Last time the agent was active (unix ms), from server cache. */
+  LastActiveTs?: number
 }
 
 export interface AgentStatus {
@@ -40,6 +43,7 @@ export interface AgentStatus {
   session_count?: number
   completion_status?: "active" | "done"
   title?: string
+  last_message_ts?: number
 }
 
 export interface LaunchState {
@@ -103,41 +107,7 @@ const PODMAN_PODS = "/api/podman/v5.0.0/libpod/pods"
 const POD_POLL_MS = 5_000
 const LAUNCH_POLL_MS = 3_000
 const PROPOSAL_POLL_MS = 10_000
-const LAST_OPENED_KEY = "devaipod-last-opened"
 
-// ---------------------------------------------------------------------------
-// Last-opened tracking (localStorage)
-// ---------------------------------------------------------------------------
-
-function getLastOpenedMap(): Record<string, number> {
-  try {
-    const raw = localStorage.getItem(LAST_OPENED_KEY)
-    if (!raw) return {}
-    return JSON.parse(raw) as Record<string, number>
-  } catch {
-    return {}
-  }
-}
-
-function setLastOpenedMap(map: Record<string, number>) {
-  try {
-    localStorage.setItem(LAST_OPENED_KEY, JSON.stringify(map))
-  } catch {
-    // localStorage full or unavailable; silently ignore
-  }
-}
-
-/** Record that a pod was opened right now. */
-export function recordPodOpened(podName: string) {
-  const map = getLastOpenedMap()
-  map[podName] = Date.now()
-  setLastOpenedMap(map)
-}
-
-/** Get the "last opened" timestamp for a pod, or undefined if never opened. */
-export function getLastOpened(podName: string): number | undefined {
-  return getLastOpenedMap()[podName]
-}
 
 // ---------------------------------------------------------------------------
 // Frecency sort & time sections
@@ -160,17 +130,16 @@ export function timeSection(ts: number, now: number): TimeSection {
   return "Older"
 }
 
-/** Get the effective timestamp for sorting: last-opened if available, else Created. */
+/** Get the effective timestamp for sorting: last_active_ts if available, else Created. */
 export function effectiveTimestamp(pod: PodInfo): number {
-  const opened = getLastOpened(pod.Name)
-  if (opened !== undefined) return opened
+  if (pod.LastActiveTs !== undefined) return pod.LastActiveTs
   const t = new Date(pod.Created).getTime()
   return Number.isNaN(t) ? 0 : t
 }
 
 /**
  * Sort pods by frecency: advisor first, then running before stopped,
- * then by last-opened (or created) descending within each group.
+ * then by last-active (or created) descending within each group.
  */
 export function frecencySortPods(pods: PodInfo[]): PodInfo[] {
   return [...pods].sort((a, b) => {
@@ -227,6 +196,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
             containerPort: fp.container_port,
             hostPort: fp.host_port,
           })),
+          LastActiveTs: p.last_active_ts,
         }))
         // Extract agent status and enrichment from the same response
         const agentMap: Record<string, AgentStatus> = {}
@@ -330,7 +300,6 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     }
 
     async function openPod(fullName: string) {
-      recordPodOpened(fullName)
       window.location.href = `/agent/${encodeURIComponent(fullName)}`
     }
 
