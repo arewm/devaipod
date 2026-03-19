@@ -201,10 +201,11 @@ want in my opinion: Landlock was supposed to primarily used by apps to sandbox *
 
 ### NVIDIA OpenShell
 
-(This section is Assisted-by: OpenCode (Claude Opus 4.6) research, only superficial human review)
+(This section is Assisted-by: OpenCode (Claude Opus 4.6) research, but has been refined and edited)
 
-[NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) is an open-source runtime for executing AI agents in sandboxed environments. Apache-2.0 licensed, written primarily in Rust with a Python CLI. It provides a gateway/sandbox architecture where a K3s Kubernetes cluster runs inside a single Docker container, and each sandbox is an isolated environment with kernel-level enforcement (Landlock for filesystem, seccomp for syscalls, network namespace isolation with an HTTP CONNECT proxy for egress filtering).
+On [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) there's a lot of overlap. One obvious thing here is that it does a pretty wild thing in running k3s inside docker (which would probably also work with podman), whereas devaipod leans into the native support for podman pods. However there are also clear advantages to k3s-in-container, among them it makes it much easier to have symmetric support for a real remote Kuberentes cluster.
 
+I think service-gator as MCP is a stonger/better solution than the generic REST proxy. We're coming at these things from a very similar space, but a key thing here with service-gator is that the tokens are not accessible to the agent at all.
 OpenShell is the closest project to devaipod in goals: both sandbox AI agents with fine-grained controls rather than just filesystem isolation. Key similarities and differences:
 
 - **Sandboxing approach**: OpenShell uses Landlock (kernel LSM) for filesystem restrictions plus seccomp for syscall filtering, layered inside Docker containers. devaipod uses OCI containers via podman with rootless execution. The author of devaipod thinks LandLock was not intended for what OpenShell or nono.sh are doing with it and it's mostly unnecessary.
@@ -214,9 +215,15 @@ OpenShell is the closest project to devaipod in goals: both sandbox AI agents wi
 - **Agent support**: OpenShell is agent-agnostic — it wraps Claude Code, OpenCode, Codex, OpenClaw, and Ollama. devaipod integrates deeply with OpenCode at the moment, but supporting other agent types is a possibility.
 - **Inference routing**: OpenShell has a built-in privacy router that intercepts LLM API calls and can redirect them to local or self-hosted backends, stripping/replacing credentials. devaipod has no equivalent — inference routing is handled by the agent's own configuration.
 - **devcontainer.json**: devaipod uses the devcontainer.json standard for defining the agent environment. OpenShell uses community sandbox images and supports BYOC (bring your own container) but has no devcontainer.json integration.
+- **git support**: Devaipod aims to have strong, native support for git, but I don't see this in OpenShell
 - **Platform**: OpenShell requires Docker. devaipod uses podman (but could also pretty easily use docker). It is also a goal to support targeting Kubernetes.
 
-The projects share the same fundamental insight that sandboxing AI agents requires more than filesystem isolation — you need network egress control, credential scoping, and defense-in-depth. OpenShell's inference routing and GPU support are capabilities devaipod lacks. devaipod's service-gator credential scoping is stronger than OpenShell's provider model for the services it covers, and devaipod's podman-native approach avoids the Docker/K3s dependency.
+The projects share the same fundamental insight that sandboxing AI agents requires more than filesystem isolation — you need network egress control, credential scoping, and defense-in-depth.
+
+In a nutshell, I am considering:
+
+- Rebasing devaipod on OpenShell
+- Trying to contribute service-gator to that project
 
 ## Why devaipod?
 
