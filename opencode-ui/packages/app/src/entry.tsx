@@ -5,12 +5,13 @@ import { Platform, PlatformProvider } from "@/context/platform"
 import { dict as en } from "@/i18n/en"
 import { dict as zh } from "@/i18n/zh"
 import { handleNotificationClick } from "@/utils/notification-click"
-import { initDevaipodErrorReporting } from "@/utils/devaipod-api"
+import { initDevaipodErrorReporting, startTokenRefreshTimer } from "@/utils/devaipod-api"
 import pkg from "../package.json"
 
 // Each pod runs on its own origin (different port), so localStorage is
 // naturally isolated — no explicit scoping needed.
 initDevaipodErrorReporting()
+startTokenRefreshTimer()
 
 const DEFAULT_SERVER_URL_KEY = "opencode.settings.dat:defaultServerUrl"
 

@@ -85,4 +85,24 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   return undefined as T
 }
 
+/** Interval for auth cookie refresh: 4 hours in milliseconds. */
+const TOKEN_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000
 
+let refreshTimerId: ReturnType<typeof setInterval> | undefined
+
+/**
+ * Start a periodic timer that refreshes the auth cookie.
+ *
+ * The server sets the cookie with a 1-week Max-Age and re-issues it on every
+ * authenticated API request. This timer is a safety net: if the user leaves the
+ * page idle for hours, a lightweight POST to /api/devaipod/token-refresh keeps
+ * the cookie alive. Call this once during app initialization.
+ */
+export function startTokenRefreshTimer(): void {
+  if (refreshTimerId !== undefined) clearInterval(refreshTimerId)
+  refreshTimerId = setInterval(() => {
+    apiFetch("/api/devaipod/token-refresh", { method: "POST" }).catch(() => {
+      /* best-effort: if the server is down the cookie will expire naturally */
+    })
+  }, TOKEN_REFRESH_INTERVAL_MS)
+}

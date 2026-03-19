@@ -8,6 +8,11 @@ import { apiFetch } from "@/utils/devaipod-api"
 // ---------------------------------------------------------------------------
 
 /** Pod info from the unified /api/devaipod/pods endpoint (server-side naming). */
+interface ForwardedPort {
+  container_port: number
+  host_port: number
+}
+
 interface RawUnifiedPod {
   name: string
   status: string
@@ -16,6 +21,7 @@ interface RawUnifiedPod {
   containers?: Array<{ Names: string; Status: string }>
   agent_status?: AgentStatus
   needs_update: boolean
+  forwarded_ports?: ForwardedPort[]
 }
 
 export interface PodInfo {
@@ -24,6 +30,7 @@ export interface PodInfo {
   Created: string
   Labels?: Record<string, string>
   Containers?: Array<{ Names: string; Status: string }>
+  ForwardedPorts?: Array<{ containerPort: number; hostPort: number }>
 }
 
 export interface AgentStatus {
@@ -131,6 +138,10 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
           Created: p.created,
           Labels: p.labels,
           Containers: p.containers,
+          ForwardedPorts: p.forwarded_ports?.map((fp) => ({
+            containerPort: fp.container_port,
+            hostPort: fp.host_port,
+          })),
         }))
         // Extract agent status and enrichment from the same response
         const agentMap: Record<string, AgentStatus> = {}

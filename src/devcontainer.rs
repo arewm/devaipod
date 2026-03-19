@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::secrets::DevcontainerSecretDecl;
 
@@ -471,6 +471,85 @@ impl DevcontainerConfig {
         passthrough
     }
 
+    /// Parse `forwardPorts` entries into podman `-p` port specs.
+    ///
+    /// Supports two formats from the devcontainer spec:
+    /// - Integer: `3000` → `"0.0.0.0::3000"` (random host port)
+    /// - String `"hostPort:containerPort"`: `"8080:3000"` → `"0.0.0.0:8080:3000"`
+    ///
+    /// Invalid entries are logged and skipped.
+    pub fn publish_port_specs(&self) -> Vec<String> {
+        let mut specs = Vec::new();
+        for entry in &self.forward_ports {
+            match entry {
+                serde_json::Value::Number(n) => {
+                    if let Some(port) = n.as_u64() {
+                        if port > 0 && port <= 65535 {
+                            specs.push(format!("0.0.0.0::{}", port));
+                        } else {
+                            tracing::warn!("forwardPorts: port {} out of range, skipping", port);
+                        }
+                    } else {
+                        tracing::warn!("forwardPorts: invalid number {:?}, skipping", n);
+                    }
+                }
+                serde_json::Value::String(s) => {
+                    // Expected format: "hostPort:containerPort"
+                    // We also handle plain port number as string: "3000"
+                    let parts: Vec<&str> = s.split(':').collect();
+                    match parts.len() {
+                        1 => {
+                            // Plain port number as string
+                            match parts[0].parse::<u16>() {
+                                Ok(port) if port > 0 => {
+                                    specs.push(format!("0.0.0.0::{}", port));
+                                }
+                                Ok(0) => {
+                                    tracing::warn!("forwardPorts: port 0 is invalid, skipping");
+                                }
+                                _ => {
+                                    tracing::warn!(
+                                        "forwardPorts: could not parse '{}' as port, skipping",
+                                        s
+                                    );
+                                }
+                            }
+                        }
+                        2 => {
+                            // "hostPort:containerPort" (we only handle numeric forms)
+                            let host_port = parts[0].parse::<u16>();
+                            let container_port = parts[1].parse::<u16>();
+                            match (host_port, container_port) {
+                                (Ok(_), Ok(0)) => {
+                                    tracing::warn!(
+                                        "forwardPorts: container port 0 is invalid in '{}', skipping",
+                                        s
+                                    );
+                                }
+                                (Ok(hp), Ok(cp)) => {
+                                    specs.push(format!("0.0.0.0:{}:{}", hp, cp));
+                                }
+                                _ => {
+                                    tracing::warn!(
+                                        "forwardPorts: could not parse '{}' as host:container port mapping, skipping",
+                                        s
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            tracing::warn!("forwardPorts: unexpected format '{}', skipping", s);
+                        }
+                    }
+                }
+                other => {
+                    tracing::warn!("forwardPorts: unexpected entry type {:?}, skipping", other);
+                }
+            }
+        }
+        specs
+    }
+
     /// Get (env_var_name, secret_name) pairs for devcontainer.json secrets.
     ///
     /// For devcontainer.json, the convention is that the secret key is used as
@@ -574,6 +653,79 @@ pub fn parse_jsonc(content: &str) -> Result<DevcontainerConfig> {
     }
 
     Ok(config)
+}
+
+/// State extracted from a workspace volume for rebuilds.
+///
+/// Produced by `devaipod internals output-devcontainer-state` and consumed
+/// by `cmd_rebuild` to avoid cloning the remote repo.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    /// Raw devcontainer.json content (JSONC), if found.
+    pub devcontainer_json: Option<String>,
+    /// Default branch name from git.
+    pub default_branch: String,
+}
+
+/// Read workspace state from a project directory.
+///
+/// Finds devcontainer.json using the standard search order and determines
+/// the git default branch.  Designed to run inside an init container
+/// with the workspace volume mounted.
+pub fn read_workspace_state(project_path: &Path) -> WorkspaceInfo {
+    let devcontainer_json = try_find_devcontainer_json(project_path).and_then(|path| {
+        std::fs::read_to_string(&path)
+            .map_err(|e| {
+                eprintln!("Warning: failed to read {}: {}", path.display(), e);
+                e
+            })
+            .ok()
+    });
+
+    let default_branch = detect_default_branch(project_path);
+
+    WorkspaceInfo {
+        devcontainer_json,
+        default_branch,
+    }
+}
+
+/// Determine the default branch for a git repo.
+///
+/// Prefers `refs/remotes/origin/HEAD` (the remote default), falls back to
+/// the current `HEAD`, and finally to `"main"`.
+fn detect_default_branch(project_path: &Path) -> String {
+    // Try remote HEAD first
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .current_dir(project_path)
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            let refname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+                return branch.to_string();
+            }
+        }
+    }
+
+    // Fall back to local HEAD
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(project_path)
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !branch.is_empty() && branch != "HEAD" {
+                return branch;
+            }
+        }
+    }
+
+    "main".to_string()
 }
 
 #[cfg(test)]
@@ -1019,5 +1171,73 @@ mod tests {
         let config = DevcontainerConfig::default();
         let secret_mounts = config.devcontainer_secret_mounts();
         assert!(secret_mounts.is_empty());
+    }
+
+    #[test]
+    fn test_publish_port_specs_integers() {
+        let config = DevcontainerConfig {
+            forward_ports: vec![serde_json::json!(3000), serde_json::json!(8080)],
+            ..Default::default()
+        };
+        let specs = config.publish_port_specs();
+        assert_eq!(specs, vec!["0.0.0.0::3000", "0.0.0.0::8080"]);
+    }
+
+    #[test]
+    fn test_publish_port_specs_strings() {
+        let config = DevcontainerConfig {
+            forward_ports: vec![serde_json::json!("3000"), serde_json::json!("8080:3000")],
+            ..Default::default()
+        };
+        let specs = config.publish_port_specs();
+        assert_eq!(specs, vec!["0.0.0.0::3000", "0.0.0.0:8080:3000"]);
+    }
+
+    #[test]
+    fn test_publish_port_specs_mixed() {
+        let config = DevcontainerConfig {
+            forward_ports: vec![
+                serde_json::json!(3000),
+                serde_json::json!("9090:8080"),
+                serde_json::json!("invalid"),
+                serde_json::json!(99999), // out of range
+                serde_json::json!(true),  // wrong type
+            ],
+            ..Default::default()
+        };
+        let specs = config.publish_port_specs();
+        assert_eq!(specs, vec!["0.0.0.0::3000", "0.0.0.0:9090:8080"]);
+    }
+
+    #[test]
+    fn test_publish_port_specs_empty() {
+        let config = DevcontainerConfig::default();
+        let specs = config.publish_port_specs();
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn test_publish_port_specs_rejects_zero() {
+        let config = DevcontainerConfig {
+            forward_ports: vec![
+                serde_json::json!(0),                     // integer 0
+                serde_json::json!("0"),                   // string "0"
+                serde_json::json!("0:3000"),              // host port 0 is ok (means random)
+                serde_json::json!("8080:0"),              // container port 0 is invalid
+                serde_json::json!("127.0.0.1:8080:3000"), // 3 parts, unsupported
+            ],
+            ..Default::default()
+        };
+        let specs = config.publish_port_specs();
+        // Only "0:3000" should pass (host port 0 = random assignment by podman)
+        assert_eq!(specs, vec!["0.0.0.0:0:3000"]);
+    }
+
+    #[test]
+    fn test_parse_forward_ports_from_json() {
+        let json = r#"{"image": "test", "forwardPorts": [3000, "8080:3000"]}"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let specs = config.publish_port_specs();
+        assert_eq!(specs, vec!["0.0.0.0::3000", "0.0.0.0:8080:3000"]);
     }
 }

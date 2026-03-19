@@ -971,6 +971,13 @@ enum HostCommand {
         #[command(subcommand)]
         action: HelperCommand,
     },
+
+    /// Internal plumbing commands used by the control plane
+    #[command(hide = true)]
+    Internals {
+        #[command(subcommand)]
+        action: InternalsCommand,
+    },
 }
 
 /// Actions for interacting with the opencode agent
@@ -1134,6 +1141,22 @@ enum HelperCommand {
     },
 }
 
+/// Internal plumbing commands used by the control plane.
+///
+/// These are not user-facing; they exist so the control plane can run
+/// our own binary inside an init container to extract data from volumes.
+#[derive(Debug, Parser)]
+enum InternalsCommand {
+    /// Read devcontainer.json and git state from a workspace directory.
+    ///
+    /// Outputs a JSON object with `devcontainer_json` (nullable string)
+    /// and `default_branch` (string) on stdout.
+    OutputDevcontainerState {
+        /// Path to the project root (e.g. /workspaces/myrepo)
+        path: std::path::PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Only emit ANSI color codes when stderr is a real terminal.
@@ -1194,6 +1217,7 @@ fn command_requires_config(cmd: &HostCommand) -> bool {
             | HostCommand::Completions { .. }
             | HostCommand::PodApi(_)
             | HostCommand::MockOpencode { .. }
+            | HostCommand::Internals { .. }
     )
 }
 
@@ -1205,6 +1229,7 @@ fn command_allowed_on_host(cmd: &HostCommand) -> bool {
             | HostCommand::Completions { .. }
             | HostCommand::PodApi(_)
             | HostCommand::MockOpencode { .. }
+            | HostCommand::Internals { .. }
     )
 }
 
@@ -1477,6 +1502,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             name,
         } => cmd_advisor(&config, task.as_deref(), status, proposals, name.as_deref()).await,
         HostCommand::Helper { action } => run_helper_async(action).await,
+        HostCommand::Internals { action } => run_internals(action),
     }
 }
 
@@ -1509,6 +1535,17 @@ fn run_helper(cmd: HelperCommand) -> Result<()> {
     tokio::runtime::Runtime::new()
         .context("Failed to create tokio runtime")?
         .block_on(run_helper_async(cmd))
+}
+
+fn run_internals(cmd: InternalsCommand) -> Result<()> {
+    match cmd {
+        InternalsCommand::OutputDevcontainerState { path } => {
+            let info = devcontainer::read_workspace_state(&path);
+            serde_json::to_writer(std::io::stdout(), &info)
+                .context("Failed to write workspace info JSON")?;
+            Ok(())
+        }
+    }
 }
 
 /// Which lifecycle commands to run
@@ -4755,103 +4792,86 @@ async fn cmd_rebuild(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Stop the pod first
-    tracing::info!("Stopping containers...");
-    let stop_output = podman_command()
-        .args(["pod", "stop", "--", pod_name])
-        .output()
-        .context("Failed to stop pod")?;
+    // Start podman service early — we need it to read config from the
+    // workspace volume before tearing down the pod.
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
 
-    if !stop_output.status.success() {
-        tracing::debug!(
-            "Pod stop returned non-zero (may already be stopped): {}",
-            String::from_utf8_lossy(&stop_output.stderr).trim()
+    // Read devcontainer.json from the existing workspace volume rather
+    // than cloning the remote again.  This picks up any config changes
+    // the agent (or user) made inside the workspace.
+    let volume_name = format!("{}-workspace", pod_name);
+    let repo_name = git::extract_repo_name(&remote_url).unwrap_or_else(|| "workspace".to_string());
+    let self_image = pod::detect_self_image();
+
+    let workspace_dir = format!("/workspaces/{}", repo_name);
+
+    tracing::info!("Reading devcontainer configuration from workspace volume...");
+    let (exit_code, raw_output) = podman
+        .run_init_container_with_output(
+            &self_image,
+            &volume_name,
+            "/workspaces",
+            &[
+                "devaipod",
+                "internals",
+                "output-devcontainer-state",
+                &workspace_dir,
+            ],
+            &[],
+        )
+        .await
+        .context("Failed to read config from workspace volume")?;
+
+    if exit_code != 0 {
+        tracing::warn!(
+            "Init container exited with code {} while reading workspace config",
+            exit_code
         );
     }
 
-    // Remove the pod but keep volumes
-    tracing::info!("Removing containers (keeping volumes)...");
-    let rm_output = podman_command()
-        .args(["pod", "rm", "--force", "--", pod_name])
-        .output()
-        .context("Failed to remove pod")?;
+    let ws_info: devcontainer::WorkspaceInfo = serde_json::from_str(&raw_output)
+        .context("Failed to parse workspace info JSON from init container")?;
+    let default_branch = ws_info.default_branch;
 
-    if !rm_output.status.success() {
-        let stderr = String::from_utf8_lossy(&rm_output.stderr);
-        bail!("Failed to remove pod: {}", stderr.trim());
-    }
-
-    // Clone the repo to get the latest devcontainer.json
-    tracing::info!("Fetching latest devcontainer configuration...");
+    // Write the devcontainer.json to a tempdir so DevaipodPod::create can
+    // use find_devcontainer_json() for image resolution (Dockerfile builds).
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_path = temp_dir.path();
 
-    let clone_output = tokio::process::Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            &remote_url,
-            temp_path.to_str().unwrap(),
-        ])
-        .output()
-        .await
-        .context("Failed to clone repository")?;
-
-    if !clone_output.status.success() {
-        let stderr = String::from_utf8_lossy(&clone_output.stderr);
-        bail!("Failed to clone repository: {}", stderr);
-    }
-
-    // Load devcontainer.json: repo > dotfiles fallback > image override > default-image
-    let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
-    let (devcontainer_config, dotfiles_image) = if let Some(ref path) = devcontainer_json_path {
-        (devcontainer::load(path)?, None)
-    } else if let Some(ref dotfiles) = config.dotfiles {
-        // Try dotfiles repo as fallback
-        let gh_token = git::get_github_token_with_secret(config);
-        match clone_dotfiles_for_devcontainer(&dotfiles.url, gh_token.as_deref()).await {
-            Ok(Some((dc_config, _temp_dir))) => {
-                tracing::info!("Using devcontainer.json from dotfiles ({})", dotfiles.url);
-                let img = dc_config.image.clone();
-                (dc_config, img)
+    let (devcontainer_config, dotfiles_image) =
+        if let Some(ref dc_content) = ws_info.devcontainer_json {
+            let dc_dir = temp_path.join(".devcontainer");
+            std::fs::create_dir_all(&dc_dir)?;
+            std::fs::write(dc_dir.join("devcontainer.json"), dc_content)?;
+            (devcontainer::load(&dc_dir.join("devcontainer.json"))?, None)
+        } else if let Some(ref dotfiles) = config.dotfiles {
+            // Try dotfiles repo as fallback
+            let gh_token = git::get_github_token_with_secret(config);
+            match clone_dotfiles_for_devcontainer(&dotfiles.url, gh_token.as_deref()).await {
+                Ok(Some((dc_config, _temp_dir))) => {
+                    tracing::info!("Using devcontainer.json from dotfiles ({})", dotfiles.url);
+                    let img = dc_config.image.clone();
+                    (dc_config, img)
+                }
+                _ => (devcontainer::DevcontainerConfig::default(), None),
             }
-            _ => (devcontainer::DevcontainerConfig::default(), None),
-        }
-    } else if image_override.is_some() {
-        tracing::info!("No devcontainer.json found, using defaults with image override");
-        (devcontainer::DevcontainerConfig::default(), None)
-    } else if let Some(ref default_image) = config.default_image {
-        tracing::info!(
-            "No devcontainer.json found, using default-image from config: {}",
-            default_image
-        );
-        (devcontainer::DevcontainerConfig::default(), None)
-    } else {
-        bail!(
-            "No devcontainer.json found in repository.\n\
+        } else if image_override.is_some() {
+            tracing::info!("No devcontainer.json found, using defaults with image override");
+            (devcontainer::DevcontainerConfig::default(), None)
+        } else if let Some(ref default_image) = config.default_image {
+            tracing::info!(
+                "No devcontainer.json found, using default-image from config: {}",
+                default_image
+            );
+            (devcontainer::DevcontainerConfig::default(), None)
+        } else {
+            bail!(
+                "No devcontainer.json found in workspace.\n\
              Use --image to specify a container image or set default-image in config."
-        );
-    };
-
-    // Get the default branch name from the cloned repo
-    let branch_output = tokio::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(temp_path)
-        .output()
-        .await
-        .context("Failed to get default branch")?;
-
-    let default_branch = if branch_output.status.success() {
-        String::from_utf8_lossy(&branch_output.stdout)
-            .trim()
-            .to_string()
-    } else {
-        "main".to_string()
-    };
-
-    // Extract repo name from URL
-    let repo_name = git::extract_repo_name(&remote_url).unwrap_or_else(|| "workspace".to_string());
+            );
+        };
 
     // Detect if the user has a fork of the repository
     let fork_url = if let Some(repo_ref) = forge::parse_repo_url(&remote_url) {
@@ -4875,10 +4895,30 @@ async fn cmd_rebuild(
     };
     let source = pod::WorkspaceSource::RemoteRepo(remote_info);
 
-    // Start podman service
-    let podman = podman::PodmanService::spawn()
-        .await
-        .context("Failed to start podman service")?;
+    // Now stop and remove the pod (volumes are preserved)
+    tracing::info!("Stopping containers...");
+    let stop_output = podman_command()
+        .args(["pod", "stop", "--", pod_name])
+        .output()
+        .context("Failed to stop pod")?;
+
+    if !stop_output.status.success() {
+        tracing::debug!(
+            "Pod stop returned non-zero (may already be stopped): {}",
+            String::from_utf8_lossy(&stop_output.stderr).trim()
+        );
+    }
+
+    tracing::info!("Removing containers (keeping volumes)...");
+    let rm_output = podman_command()
+        .args(["pod", "rm", "--force", "--", pod_name])
+        .output()
+        .context("Failed to remove pod")?;
+
+    if !rm_output.status.success() {
+        let stderr = String::from_utf8_lossy(&rm_output.stderr);
+        bail!("Failed to remove pod: {}", stderr.trim());
+    }
 
     let enable_gator = config.service_gator.is_enabled();
 
