@@ -289,6 +289,7 @@ function LaunchForm(props: { onClose: () => void }) {
   const [readOnly, setReadOnly] = createSignal(true)
   const [devcontainerJson, setDevcontainerJson] = createSignal("")
   const [useDefaultDevcontainer, setUseDefaultDevcontainer] = createSignal(false)
+  const [autoApprove, setAutoApprove] = createSignal(true)
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
 
@@ -331,6 +332,7 @@ function LaunchForm(props: { onClose: () => void }) {
       const dcj = devcontainerJson().trim()
       if (dcj) params.devcontainer_json = dcj
       if (useDefaultDevcontainer()) params.use_default_devcontainer = true
+      if (!autoApprove()) params.no_auto_approve = true
 
       await ctx.launchWorkspace(params)
       props.onClose()
@@ -386,6 +388,13 @@ function LaunchForm(props: { onClose: () => void }) {
                 onChange={setUseDefaultDevcontainer}
               >
                 Use default devcontainer (from dotfiles repo instead of project's)
+              </Checkbox>
+
+              <Checkbox
+                checked={autoApprove()}
+                onChange={setAutoApprove}
+              >
+                Auto-approve tool permissions (agent runs autonomously without prompts)
               </Checkbox>
 
               <div>

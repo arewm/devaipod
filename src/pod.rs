@@ -424,6 +424,7 @@ impl DevaipodPod {
         task: Option<&str>,
         enable_orchestration: bool,
         worker_gator_mode: WorkerGatorMode,
+        auto_approve: bool,
     ) -> Result<Self> {
         // Note: container_home is resolved after we determine the image, since
         // we need to query the image for the user if devcontainer doesn't specify one
@@ -955,6 +956,7 @@ impl DevaipodPod {
             &agent_home_volume,
             worker_workspace_volume_name.as_deref(),
             global_config,
+            auto_approve,
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -2353,6 +2355,7 @@ exec sleep infinity
         agent_home_volume: &str,
         worker_workspace_volume: Option<&str>,
         global_config: &crate::config::Config,
+        auto_approve: bool,
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
         let agent_home = AGENT_HOME_PATH.to_string();
@@ -2404,6 +2407,17 @@ exec sleep infinity
 
         // Add env vars from global config (allowlist + explicit vars)
         env.extend(global_config.env.collect());
+
+        // Auto-approve all tool permissions by default so the agent runs
+        // autonomously without interactive prompts. This matches the behavior
+        // users expect in a headless pod environment. Pass --no-auto-approve
+        // to disable this.
+        if auto_approve {
+            env.insert(
+                "OPENCODE_PERMISSION".to_string(),
+                r#"{"*":"allow"}"#.to_string(),
+            );
+        }
 
         // No bind mounts - we clone the repo into the container instead
         // This avoids UID mapping issues with rootless podman
@@ -3262,6 +3276,7 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
+            true, // auto_approve
         );
 
         // Volume mounts: agent workspace, main workspace (readonly), and agent home
@@ -3295,6 +3310,43 @@ mod tests {
 
         // Verify HOME is NOT overridden (it comes from passwd entry for devenv user)
         assert_eq!(container_config.env.get("HOME"), None);
+
+        // With auto_approve=true, OPENCODE_PERMISSION should be set
+        assert_eq!(
+            container_config.env.get("OPENCODE_PERMISSION").unwrap(),
+            r#"{"*":"allow"}"#,
+        );
+    }
+
+    #[test]
+    fn test_agent_container_config_auto_approve_disabled() {
+        // When auto_approve is false, OPENCODE_PERMISSION should not be set
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false,                  // enable_gator
+            false,                  // enable_orchestration
+            "test-main-workspace",  // main workspace (read-only reference)
+            "test-agent-workspace", // agent's own workspace clone
+            "test-agent-home",
+            None, // worker_workspace_volume (no orchestration)
+            &global_config,
+            false, // auto_approve disabled
+        );
+
+        assert!(
+            container_config.env.get("OPENCODE_PERMISSION").is_none(),
+            "OPENCODE_PERMISSION should not be set when auto_approve is false"
+        );
     }
 
     #[test]
@@ -3319,6 +3371,7 @@ mod tests {
             "test-agent-home",
             Some("test-worker-workspace"), // worker_workspace_volume
             &global_config,
+            true, // auto_approve
         );
 
         // With orchestration enabled, should have 4 volume mounts:
@@ -3379,6 +3432,7 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
+            true, // auto_approve
         );
 
         // No bind mounts - we clone the repo into the container instead
@@ -3415,6 +3469,7 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
+            true, // auto_approve
         );
 
         // Verify file_secrets are included for agent container
@@ -3835,6 +3890,7 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
+            true, // auto_approve
         );
 
         // Agent should have no secrets
@@ -4497,6 +4553,7 @@ mod tests {
             "test-agent-home-vol",
             None, // worker_workspace_volume
             &global_config,
+            true, // auto_approve
         );
 
         // Should have devcontainer secrets (LLM keys go to agent)

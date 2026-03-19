@@ -399,6 +399,13 @@ struct UpOptions {
     /// settings (nested containers, lifecycle commands, etc.) always apply.
     #[arg(long)]
     use_default_devcontainer: bool,
+    /// Disable auto-approve of tool permissions
+    ///
+    /// By default, the agent container has all tool permissions set to "allow"
+    /// so it runs autonomously. Use this flag to disable that and require
+    /// interactive approval for tool usage.
+    #[arg(long)]
+    no_auto_approve: bool,
 }
 
 /// Internal options for workspace creation (like `podman create` vs `podman run`)
@@ -430,6 +437,8 @@ struct CreateOptions {
     devcontainer_json: Option<String>,
     /// Use the devcontainer.json from dotfiles instead of the project's
     use_default_devcontainer: bool,
+    /// Whether to auto-approve all tool permissions (default: true)
+    auto_approve: bool,
 }
 
 impl CreateOptions {
@@ -448,6 +457,7 @@ impl CreateOptions {
             mcp_servers: opts.mcp_servers.clone(),
             devcontainer_json: opts.devcontainer_json.clone(),
             use_default_devcontainer: opts.use_default_devcontainer,
+            auto_approve: !opts.no_auto_approve,
         }
     }
 }
@@ -784,6 +794,13 @@ enum HostCommand {
         /// Use the devcontainer.json from your dotfiles repo instead of the project's
         #[arg(long)]
         use_default_devcontainer: bool,
+        /// Disable auto-approve of tool permissions
+        ///
+        /// By default, the agent container has all tool permissions set to "allow"
+        /// so it runs autonomously. Use this flag to disable that and require
+        /// interactive approval for tool usage.
+        #[arg(long)]
+        no_auto_approve: bool,
     },
     /// Generate shell completions
     ///
@@ -1376,6 +1393,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             mcp_servers,
             devcontainer_json,
             use_default_devcontainer,
+            no_auto_approve,
         } => {
             let source = resolve_source(source.as_deref(), &config)?;
 
@@ -1451,6 +1469,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 &mcp_servers,
                 devcontainer_json.as_deref(),
                 use_default_devcontainer,
+                !no_auto_approve,
             )
             .await?;
 
@@ -2138,6 +2157,7 @@ async fn create_workspace_from_local(
         opts.task.as_deref(),
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
+        opts.auto_approve,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -2328,6 +2348,7 @@ async fn create_workspace_from_remote(
         opts.task.as_deref(),
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
+        opts.auto_approve,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -2494,6 +2515,7 @@ async fn create_workspace_from_pr(
         opts.task.as_deref(),
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
+        opts.auto_approve,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -2567,6 +2589,7 @@ async fn cmd_run(
     mcp_servers: &[String],
     devcontainer_json: Option<&str>,
     use_default_devcontainer: bool,
+    auto_approve: bool,
 ) -> Result<String> {
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
@@ -2581,6 +2604,7 @@ async fn cmd_run(
         mcp_servers: mcp_servers.to_vec(),
         devcontainer_json: devcontainer_json.map(|s| s.to_string()),
         use_default_devcontainer,
+        auto_approve,
     };
 
     // Create the workspace - no SSH by default (async execution)
@@ -3540,6 +3564,7 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
         &[],   // no CLI mcp_servers — entry is already in the config
         None,  // no devcontainer override
         false, // don't override project devcontainer
+        true,  // auto_approve
     )
     .await?;
 
@@ -4957,6 +4982,7 @@ async fn cmd_rebuild(
         None, // task - agent home volume persists with original task
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
+        true, // auto_approve: rebuilds keep default behavior
     )
     .await
     .context("Failed to recreate pod")?;
