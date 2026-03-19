@@ -87,9 +87,11 @@ function AgentView() {
     ctx.refresh()
   }
 
-  // Immediately fetch pod list so arrows & status are available without
-  // waiting for the first poll interval.
-  onMount(() => ctx.refresh())
+  // Immediately fetch pod list so arrows & status are available
+  // without waiting for the first poll interval.
+  onMount(() => {
+    ctx.refresh()
+  })
 
   // -- Pod switcher ---------------------------------------------------------
 

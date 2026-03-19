@@ -50,14 +50,126 @@ const MCP_TOKEN_SECRET_PATH: &str = "/run/secrets/devaipod-mcp-token";
 /// Filename for the MCP auth token inside the state directory.
 const MCP_STATE_TOKEN_FILENAME: &str = "mcp-token";
 
-fn state_token_path() -> std::path::PathBuf {
+/// Filename for the pod state cache inside the state directory.
+const POD_STATE_CACHE_FILENAME: &str = "pod-state-cache.json";
+
+fn state_dir_path() -> std::path::PathBuf {
     let dir = std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
-    std::path::PathBuf::from(dir).join(STATE_TOKEN_FILENAME)
+    std::path::PathBuf::from(dir)
+}
+
+fn state_token_path() -> std::path::PathBuf {
+    state_dir_path().join(STATE_TOKEN_FILENAME)
+}
+
+/// Get the path to the current devaipod binary for spawning subcommands.
+///
+/// Uses `current_exe()` so subcommand spawning works both in-container
+/// (where `devaipod` is on PATH) and in host/test mode (where it may be
+/// at an arbitrary path like `target/debug/devaipod`).
+fn self_exe() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "devaipod".to_string())
 }
 
 fn mcp_state_token_path() -> std::path::PathBuf {
-    let dir = std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
-    std::path::PathBuf::from(dir).join(MCP_STATE_TOKEN_FILENAME)
+    state_dir_path().join(MCP_STATE_TOKEN_FILENAME)
+}
+
+fn pod_state_cache_path() -> std::path::PathBuf {
+    state_dir_path().join(POD_STATE_CACHE_FILENAME)
+}
+
+/// Cached pod state persisted to disk so that metadata survives pod stops.
+///
+/// Populated from running pods' agent status responses and used as fallback
+/// when pods are stopped and the pod-api sidecar is unreachable.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+struct CachedPodState {
+    /// Last time the agent was active (from last_message_ts, unix ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_active_ts: Option<i64>,
+    /// Completion status: "active" or "done".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_status: Option<String>,
+    /// Human-readable session title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Last known agent activity: "Working", "Idle", "Stopped".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity: Option<String>,
+}
+
+type PodStateCache = Arc<tokio::sync::RwLock<HashMap<String, CachedPodState>>>;
+
+/// Load the pod state cache from disk. Returns an empty map if the file
+/// doesn't exist or is corrupt.
+fn load_pod_state_cache() -> HashMap<String, CachedPodState> {
+    let path = pod_state_cache_path();
+    match std::fs::read_to_string(&path) {
+        Ok(data) => match serde_json::from_str(&data) {
+            Ok(map) => {
+                tracing::debug!("Loaded pod state cache from {}", path.display());
+                map
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to parse pod state cache at {}: {e}; starting fresh",
+                    path.display()
+                );
+                HashMap::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => {
+            tracing::debug!(
+                "Failed to read pod state cache at {}: {e}; starting fresh",
+                path.display()
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// Persist the pod state cache to disk asynchronously.
+///
+/// Uses write-to-temp + rename for atomicity.
+async fn save_pod_state_cache(cache: &PodStateCache) {
+    let path = pod_state_cache_path();
+    let data = {
+        let map = cache.read().await;
+        match serde_json::to_string_pretty(&*map) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Failed to serialize pod state cache: {e}");
+                return;
+            }
+        }
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if !parent.exists() {
+        tracing::debug!(
+            "Pod state cache directory {} does not exist; skipping save",
+            parent.display()
+        );
+        return;
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = tokio::fs::write(&tmp, &data).await {
+        tracing::warn!("Failed to write pod state cache to {}: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+        tracing::warn!(
+            "Failed to rename pod state cache {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        );
+    }
 }
 
 /// Base name for the auth cookie. The actual cookie name includes the port
@@ -249,6 +361,9 @@ pub(crate) struct AppState {
     pod_cache: PodCache,
     /// Port-scoped auth cookie name (e.g. `DEVAIPOD_AUTH_8080`).
     auth_cookie_name: String,
+    /// Cached pod state (activity, completion, title, last_active_ts) persisted
+    /// to disk so that metadata survives pod stops.
+    pod_state_cache: PodStateCache,
 }
 
 impl AppState {
@@ -1393,7 +1508,7 @@ async fn run_workspace(
         .unwrap_or(&pod_name)
         .to_string();
 
-    let mut cmd = tokio::process::Command::new("devaipod");
+    let mut cmd = tokio::process::Command::new(self_exe());
     cmd.arg("run");
 
     // Add source if provided
@@ -1559,7 +1674,7 @@ async fn launch_advisor(
             if state == "running" {
                 // Advisor already running — if task provided, send it
                 if let Some(ref task) = req.task {
-                    let mut cmd = tokio::process::Command::new("devaipod");
+                    let mut cmd = tokio::process::Command::new(self_exe());
                     cmd.args(["opencode", "advisor", "send", task]);
                     let _ = cmd.output().await;
                 }
@@ -1595,7 +1710,7 @@ async fn launch_advisor(
     // This reuses the CLI command which handles dotfiles fallback,
     // image selection, and MCP setup internally. We pass --no-attach
     // (via an env var) so it doesn't block trying to attach.
-    let mut cmd = tokio::process::Command::new("devaipod");
+    let mut cmd = tokio::process::Command::new(self_exe());
     cmd.arg("advisor");
     // Prevent the advisor command from trying to attach to the pod
     // (which would block the web handler indefinitely). Setting
@@ -1718,7 +1833,7 @@ async fn recreate_workspace(
 
     tracing::info!("Recreating workspace: {}", pod_name);
 
-    let output = tokio::process::Command::new("devaipod")
+    let output = tokio::process::Command::new(self_exe())
         .arg("rebuild")
         .arg(&pod_name)
         .output()
@@ -1798,6 +1913,10 @@ struct UnifiedPodInfo {
     /// Agent status from pod-api sidecar (None if pod is not running or unreachable)
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_status: Option<AgentStatusResponse>,
+    /// Last time the agent was active (unix timestamp in milliseconds).
+    /// Available for both running pods (live) and stopped pods (from cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_active_ts: Option<i64>,
     /// Whether the pod's sidecar image is outdated
     needs_update: bool,
     /// Forwarded ports from devcontainer.json `forwardPorts`
@@ -1918,6 +2037,11 @@ async fn fetch_podman_pods(socket_path: &std::path::Path) -> Vec<PodmanPodJson> 
 /// concurrently fetches agent status from each running pod's pod-api sidecar.
 /// The cache is populated at startup and updated whenever podman container
 /// events fire, so this handler never hits the podman socket directly.
+///
+/// For running pods, the pod state cache is updated with fresh data from the
+/// agent status response. For stopped pods, cached state is used to populate
+/// `agent_status` and `last_active_ts` so that titles, completion status, and
+/// frecency timestamps survive across pod stops.
 async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<UnifiedPodInfo>> {
     let cached_pods = state.pod_cache.read().await.clone();
 
@@ -1949,30 +2073,88 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
                 (None, vec![])
             };
 
-            UnifiedPodInfo {
-                name: pod.name,
-                status: pod.status,
-                created: pod.created,
-                labels: pod.labels,
-                containers: pod.containers,
-                agent_status,
-                needs_update: pod.needs_update,
-                forwarded_ports,
-            }
+            (pod, agent_status, forwarded_ports)
         });
 
         tasks.push(task);
     }
 
     let mut result = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        if let Ok(info) = task.await {
-            result.push(info);
+    let mut cache_changed = false;
+
+    {
+        let mut psc = state.pod_state_cache.write().await;
+
+        for task in tasks {
+            let Ok((pod, agent_status, forwarded_ports)) = task.await else {
+                continue;
+            };
+
+            let is_running = pod.status.eq_ignore_ascii_case("running");
+            let (final_agent_status, last_active_ts) = if is_running {
+                if let Some(status) = agent_status {
+                    // Update the cache with fresh data from the running pod
+                    let ts = status.last_message_ts;
+                    let new_cached = CachedPodState {
+                        last_active_ts: ts,
+                        completion_status: status.completion_status.clone(),
+                        title: status.title.clone(),
+                        activity: Some(status.activity.clone()),
+                    };
+                    let old = psc.insert(pod.name.clone(), new_cached.clone());
+                    if old.as_ref() != Some(&new_cached) {
+                        cache_changed = true;
+                    }
+                    (Some(status), ts)
+                } else {
+                    // Running but pod-api unreachable; use cached last_active_ts
+                    let ts = psc.get(&pod.name).and_then(|c| c.last_active_ts);
+                    (agent_status, ts)
+                }
+            } else {
+                // Stopped pod: construct synthetic agent_status from cache
+                match psc.get(&pod.name) {
+                    Some(cached) => {
+                        let synthetic = AgentStatusResponse {
+                            // Always report "Stopped" for non-running pods,
+                            // regardless of what was cached.
+                            activity: "Stopped".to_string(),
+                            status_line: None,
+                            current_tool: None,
+                            recent_output: vec![],
+                            last_message_ts: cached.last_active_ts,
+                            session_count: 0,
+                            completion_status: cached.completion_status.clone(),
+                            title: cached.title.clone(),
+                        };
+                        (Some(synthetic), cached.last_active_ts)
+                    }
+                    None => (None, None),
+                }
+            };
+
+            result.push(UnifiedPodInfo {
+                name: pod.name,
+                status: pod.status,
+                created: pod.created,
+                labels: pod.labels,
+                containers: pod.containers,
+                agent_status: final_agent_status,
+                last_active_ts,
+                needs_update: pod.needs_update,
+                forwarded_ports,
+            });
         }
     }
 
-    // The cache is already sorted, but agent_status fetch is concurrent
-    // and the spawn order is preserved, so no re-sort needed.
+    // Persist the cache in the background if anything changed
+    if cache_changed {
+        let cache = state.pod_state_cache.clone();
+        tokio::spawn(async move {
+            save_pod_state_cache(&cache).await;
+        });
+    }
+
     Json(result)
 }
 
@@ -2048,11 +2230,13 @@ async fn compute_enrichment_map(
 /// Refresh the pod cache: fetch pods from podman + enrichment, store the result.
 ///
 /// This is called once at startup and again whenever a relevant podman event
-/// fires. It replaces the entire cache atomically.
+/// fires. It replaces the entire cache atomically. Also prunes stale entries
+/// from the pod state cache (pods that no longer exist).
 async fn refresh_pod_cache(
     socket_path: &std::path::Path,
     self_image_id: Option<&str>,
     cache: &PodCache,
+    pod_state_cache: Option<&PodStateCache>,
 ) {
     let enrichment_future = async {
         let docker = bollard::Docker::connect_with_unix(
@@ -2109,9 +2293,24 @@ async fn refresh_pod_cache(
         b.created.cmp(&a.created)
     });
 
+    let pod_names: std::collections::HashSet<String> =
+        pods.iter().map(|p| p.name.clone()).collect();
     let count = pods.len();
     *cache.write().await = pods;
     tracing::debug!("Pod cache refreshed: {} pods", count);
+
+    // Prune pod state cache entries for pods that no longer exist
+    if let Some(psc) = pod_state_cache {
+        let mut psc_guard = psc.write().await;
+        let before = psc_guard.len();
+        psc_guard.retain(|name, _| pod_names.contains(name));
+        let pruned = before - psc_guard.len();
+        drop(psc_guard);
+        if pruned > 0 {
+            tracing::debug!("Pruned {} stale pod state cache entries", pruned);
+            save_pod_state_cache(psc).await;
+        }
+    }
 }
 
 /// Spawn a background task that watches podman events and refreshes the pod cache.
@@ -2121,7 +2320,12 @@ async fn refresh_pod_cache(
 /// cache refresh (rather than incremental updates, which would be fragile).
 ///
 /// If the event stream disconnects, the watcher reconnects after a short delay.
-fn spawn_pod_event_watcher(socket_path: PathBuf, self_image_id: Option<String>, cache: PodCache) {
+fn spawn_pod_event_watcher(
+    socket_path: PathBuf,
+    self_image_id: Option<String>,
+    cache: PodCache,
+    pod_state_cache: PodStateCache,
+) {
     tokio::spawn(async move {
         loop {
             let docker = match bollard::Docker::connect_with_unix(
@@ -2201,6 +2405,7 @@ fn spawn_pod_event_watcher(socket_path: PathBuf, self_image_id: Option<String>, 
                             &socket_path,
                             self_image_id.as_deref(),
                             &cache,
+                            Some(&pod_state_cache),
                         ).await;
                     }
                 }
@@ -2729,6 +2934,7 @@ pub(crate) fn build_app(
     self_image_id: Option<String>,
 ) -> Router {
     let pod_cache: PodCache = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let pod_state_cache: PodStateCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     // Default to port 8080 when not specified (unit tests, etc.)
     build_app_with_cache(
         token,
@@ -2736,6 +2942,7 @@ pub(crate) fn build_app(
         socket_path,
         self_image_id,
         pod_cache,
+        pod_state_cache,
         8080,
     )
 }
@@ -2750,6 +2957,7 @@ fn build_app_with_cache(
     socket_path: Option<PathBuf>,
     self_image_id: Option<String>,
     pod_cache: PodCache,
+    pod_state_cache: PodStateCache,
     port: u16,
 ) -> Router {
     let state = Arc::new(AppState {
@@ -2759,6 +2967,7 @@ fn build_app_with_cache(
         launches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         self_image_id,
         pod_cache,
+        pod_state_cache,
         auth_cookie_name: format!("{}_{}", DEVAIPOD_AUTH_COOKIE_BASE, port),
     });
 
@@ -2892,12 +3101,24 @@ pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Resu
     // accepting requests. The same Arc is given to both the router and the
     // background event watcher.
     let pod_cache: PodCache = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let pod_state_cache: PodStateCache = Arc::new(tokio::sync::RwLock::new(load_pod_state_cache()));
 
     if let Some(ref sp) = socket_path {
-        refresh_pod_cache(sp, self_image_id.as_deref(), &pod_cache).await;
+        refresh_pod_cache(
+            sp,
+            self_image_id.as_deref(),
+            &pod_cache,
+            Some(&pod_state_cache),
+        )
+        .await;
         tracing::info!("Initial pod cache populated");
 
-        spawn_pod_event_watcher(sp.clone(), self_image_id.clone(), pod_cache.clone());
+        spawn_pod_event_watcher(
+            sp.clone(),
+            self_image_id.clone(),
+            pod_cache.clone(),
+            pod_state_cache.clone(),
+        );
     }
 
     let app = build_app_with_cache(
@@ -2906,6 +3127,7 @@ pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Resu
         socket_path,
         self_image_id,
         pod_cache,
+        pod_state_cache,
         port,
     );
 
@@ -3630,5 +3852,88 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "MCP token must not grant access to gator-scopes"
         );
+    }
+
+    #[test]
+    fn test_cached_pod_state_roundtrip() {
+        let state = CachedPodState {
+            last_active_ts: Some(1700000000000),
+            completion_status: Some("done".to_string()),
+            title: Some("Fix the widget".to_string()),
+            activity: Some("Idle".to_string()),
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: CachedPodState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, deserialized);
+    }
+
+    #[test]
+    fn test_cached_pod_state_empty_fields() {
+        let state = CachedPodState::default();
+        let json = serde_json::to_string(&state).unwrap();
+        // All fields have skip_serializing_if, so default should produce "{}"
+        assert_eq!(json, "{}");
+        let deserialized: CachedPodState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, deserialized);
+    }
+
+    #[test]
+    fn test_cached_pod_state_partial_fields() {
+        // Only some fields set — mirrors a pod that has a title but no
+        // last_message_ts yet.
+        let state = CachedPodState {
+            title: Some("My task".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: CachedPodState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, deserialized);
+        assert!(deserialized.last_active_ts.is_none());
+        assert!(deserialized.completion_status.is_none());
+    }
+
+    #[test]
+    fn test_pod_state_cache_map_roundtrip() {
+        let mut map = HashMap::new();
+        map.insert(
+            "devaipod-foo-abc123".to_string(),
+            CachedPodState {
+                last_active_ts: Some(1700000000000),
+                completion_status: Some("active".to_string()),
+                title: Some("Working on foo".to_string()),
+                activity: Some("Working".to_string()),
+            },
+        );
+        map.insert(
+            "devaipod-bar-def456".to_string(),
+            CachedPodState {
+                last_active_ts: Some(1699999000000),
+                completion_status: Some("done".to_string()),
+                title: None,
+                activity: Some("Stopped".to_string()),
+            },
+        );
+
+        let json = serde_json::to_string(&map).unwrap();
+        let deserialized: HashMap<String, CachedPodState> = serde_json::from_str(&json).unwrap();
+        assert_eq!(map, deserialized);
+    }
+
+    #[test]
+    fn test_pod_state_cache_corrupt_json() {
+        // Corrupt JSON should deserialize to nothing (load function returns
+        // empty map). Test the pattern used in load_pod_state_cache.
+        let corrupt = "not valid json {{{";
+        let result: Result<HashMap<String, CachedPodState>, _> = serde_json::from_str(corrupt);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pod_state_cache_ignores_unknown_fields() {
+        // Forward-compatible: extra fields in the JSON should be ignored
+        let json = r#"{"devaipod-x":{"last_active_ts":42,"unknown_field":"ok"}}"#;
+        let map: HashMap<String, CachedPodState> = serde_json::from_str(json).unwrap();
+        assert_eq!(map["devaipod-x"].last_active_ts, Some(42));
     }
 }

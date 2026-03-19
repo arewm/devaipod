@@ -20,6 +20,7 @@ interface RawUnifiedPod {
   labels?: Record<string, string>
   containers?: Array<{ Names: string; Status: string }>
   agent_status?: AgentStatus
+  last_active_ts?: number
   needs_update: boolean
   forwarded_ports?: ForwardedPort[]
 }
@@ -31,6 +32,8 @@ export interface PodInfo {
   Labels?: Record<string, string>
   Containers?: Array<{ Names: string; Status: string }>
   ForwardedPorts?: Array<{ containerPort: number; hostPort: number }>
+  /** Last time the agent was active (unix ms), from server cache. */
+  LastActiveTs?: number
 }
 
 export interface AgentStatus {
@@ -40,6 +43,7 @@ export interface AgentStatus {
   session_count?: number
   completion_status?: "active" | "done"
   title?: string
+  last_message_ts?: number
 }
 
 export interface LaunchState {
@@ -105,6 +109,56 @@ const POD_POLL_MS = 5_000
 const LAUNCH_POLL_MS = 3_000
 const PROPOSAL_POLL_MS = 10_000
 
+
+// ---------------------------------------------------------------------------
+// Frecency sort & time sections
+// ---------------------------------------------------------------------------
+
+export type TimeSection = "Active Today" | "This Week" | "This Month" | "Older"
+
+const MS_DAY = 86_400_000
+const MS_WEEK = 7 * MS_DAY
+const MS_MONTH = 30 * MS_DAY
+
+/** Classify a timestamp into a time section relative to now. */
+export function timeSection(ts: number, now: number): TimeSection {
+  const d = new Date(now)
+  const startOfToday = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  if (ts >= startOfToday) return "Active Today"
+  const age = now - ts
+  if (age < MS_WEEK) return "This Week"
+  if (age < MS_MONTH) return "This Month"
+  return "Older"
+}
+
+/** Get the effective timestamp for sorting: last_active_ts if available, else Created. */
+export function effectiveTimestamp(pod: PodInfo): number {
+  if (pod.LastActiveTs !== undefined) return pod.LastActiveTs
+  const t = new Date(pod.Created).getTime()
+  return Number.isNaN(t) ? 0 : t
+}
+
+/**
+ * Sort pods by frecency: advisor first, then running before stopped,
+ * then by last-active (or created) descending within each group.
+ */
+export function frecencySortPods(pods: PodInfo[]): PodInfo[] {
+  return [...pods].sort((a, b) => {
+    // Advisor always first
+    const aAdvisor = a.Name === "devaipod-advisor" ? 1 : 0
+    const bAdvisor = b.Name === "devaipod-advisor" ? 1 : 0
+    if (aAdvisor !== bAdvisor) return bAdvisor - aAdvisor
+
+    // Running before stopped
+    const aRunning = (a.Status ?? "").toLowerCase() === "running" ? 1 : 0
+    const bRunning = (b.Status ?? "").toLowerCase() === "running" ? 1 : 0
+    if (aRunning !== bRunning) return bRunning - aRunning
+
+    // Within same status group: sort by effective timestamp descending
+    return effectiveTimestamp(b) - effectiveTimestamp(a)
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
@@ -143,6 +197,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
             containerPort: fp.container_port,
             hostPort: fp.host_port,
           })),
+          LastActiveTs: p.last_active_ts,
         }))
         // Extract agent status and enrichment from the same response
         const agentMap: Record<string, AgentStatus> = {}
