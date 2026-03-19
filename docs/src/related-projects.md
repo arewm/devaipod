@@ -17,6 +17,7 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 | [paude](https://github.com/bbrowning/paude) | MIT | Yes | Podman + OpenShift backends, agent-agnostic |
 | [Kortex](https://github.com/kortex-hub/kortex) | Apache-2.0 | Yes | Desktop GUI, AI + container/K8s management, Goose integration |
 | [Gastown](https://github.com/steveyegge/gastown) | MIT | Yes | Multi-agent orchestration, no sandboxing |
+| [gjoll](https://github.com/ondrejbudai/gjoll) | Apache-2.0 | Yes | Cloud VM sandboxes via OpenTofu, credential-injecting reverse proxy |
 | [krunai](https://github.com/slp/krunai) | Apache-2.0 | Yes | MicroVM, but not container oriented |
 | [Auto-Claude](https://github.com/AndyMik90/Auto-Claude) | AGPL-3.0 | Yes | Desktop app, no sandboxing |
 | [Continue](https://github.com/continuedev/continue) | Apache-2.0 | Partial | CLI is local; "Mission Control" cloud is proprietary |
@@ -224,6 +225,43 @@ In a nutshell, I am considering:
 
 - Rebasing devaipod on OpenShell
 - Trying to contribute service-gator to that project
+
+### gjoll
+
+(This section is Assisted-by: OpenCode (Claude Opus 4.6), based on source code analysis of the gjoll repository)
+
+[gjoll](https://github.com/ondrejbudai/gjoll) is a Go CLI tool that provisions cloud VM sandboxes for coding agents using standard OpenTofu `.tf` files. Apache-2.0 licensed, experimental. The design philosophy is radical simplicity: gjoll injects three variables into your `.tf` file (`gjoll_ssh_pubkey`, `gjoll_name`, `gjoll_instance_state`), runs `tofu apply`, and gets out of the way. It supports any cloud provider that has an OpenTofu provider (AWS, Proxmox, libvirt/QEMU, etc.).
+
+The architecture is interesting because it solves similar problems to devaipod but makes fundamentally different trade-offs — full VMs instead of containers, SSH-based git transport instead of forge integration, and HTTP reverse proxies instead of MCP-based credential scoping.
+
+(Note from devaipod author: Nothing wrong with provisioning classic mutable VMs, but I think containers are architecturally the right choice;
+ where VM isolation on top of containerization is desired, there's tons of tools for that)
+
+**Git workflow** — gjoll has a dedicated git sync mechanism via `gjoll push` and `gjoll pull`. `push` initializes a repo on the VM with `receive.denyCurrentBranch=updateInstead`, sets the remote HEAD to match the local branch via `git symbolic-ref`, and pushes over SSH (`GIT_SSH_COMMAND=ssh -F <config>`). The working tree on the VM updates immediately — no separate checkout step. `pull` fetches back from the VM and creates a local branch named `gjoll-<name>` (hyphens, not slashes, to avoid breaking tools like lazygit).
+
+(devaipod author: This is much less heavyweight than devaipod's choice to have a git clone per pod, and has clear advantages. Similar to paude in that respect.)
+
+The workflow is: push code to VM → agent works → pull changes back → human creates PR locally.
+
+By contrast, devaipod's service-gator provides the agent with scoped forge access, and we plan to invest in having a good review process inside the UI, and also allow some autonomous updates.
+
+**Credential gating** — this is gjoll's most distinctive feature and the area of strongest overlap with devaipod's goals. The `gjoll proxy` command runs local HTTP reverse proxies on the host that inject authentication headers, with SSH reverse tunnels (`-R`) making them reachable on the VM as `localhost:<port>`. Credentials never leave the host machine.
+
+Three auth modes are supported: `gcp` (GCP Application Default Credentials via `google.DefaultTokenSource()`, with automatic token refresh), `api-key` (static key read from a local file, injected as `x-api-key` header), and no-auth passthrough. The proxy binds to `127.0.0.1:0` only — not network-reachable. Token fetch failures surface as 502 errors rather than forwarding unauthenticated requests.
+
+However, the proxy provides **full, unscoped access** to the upstream API. Any request to `http://localhost:<port>/any/path` is forwarded with credentials attached. There is no URL path filtering, no HTTP method restrictions, no rate limiting, and no audit logging beyond error messages. A misbehaving agent can make any API call the credential allows.
+
+There is **no support for GitHub tokens** — the proxy is designed for LLM API access (Vertex AI, Anthropic), not forge operations. To give a sandboxed agent GitHub access, you'd need to either extend the proxy with a new auth mode for Bearer tokens and add path-level scoping, or copy the token to the VM directly (their `ubuntu-claude.tf` example shows a commented-out `copy_files` approach for this, though the newer `ubuntu-claude-vertex.tf` example explicitly avoids it in favor of proxying).
+
+The contrast with service-gator is architectural: gjoll gives the agent a **raw HTTP pipe** with credentials injected (network-level proxy), while service-gator gives the agent **semantic tools** with per-operation permission checks (MCP-level scoping). You can tell service-gator "this agent can create draft PRs on `owner/repo` but cannot force-push or delete branches." gjoll's proxy has no equivalent — it's all-or-nothing per API target.
+
+The proxy model is well-suited for LLM API access where you *want* the agent to make arbitrary API calls to the model provider. service-gator is better for forge operations where you want to constrain what the agent can do. The two approaches are complementary rather than competing.
+
+**Other notable differences from devaipod**:
+
+- **Isolation unit**: Full cloud VMs (via OpenTofu) vs. OCI containers (via podman). VMs provide stronger isolation but are heavier — gjoll requires cloud infrastructure or local libvirt/QEMU, while devaipod runs with just podman.
+- **Environment definition**: Raw `.tf` files vs. devcontainer.json. gjoll is maximally flexible but requires HCL knowledge; devaipod uses the standard devcontainer spec.
+- **SSH security**: Per-sandbox ed25519 keypairs with `IdentitiesOnly yes` and `IdentityAgent none` (no agent forwarding). But `StrictHostKeyChecking no` for ephemeral VMs — pragmatic but means no MITM protection.
 
 ## Why devaipod?
 
