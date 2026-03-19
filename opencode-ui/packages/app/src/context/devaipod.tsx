@@ -103,6 +103,91 @@ const PODMAN_PODS = "/api/podman/v5.0.0/libpod/pods"
 const POD_POLL_MS = 5_000
 const LAUNCH_POLL_MS = 3_000
 const PROPOSAL_POLL_MS = 10_000
+const LAST_OPENED_KEY = "devaipod-last-opened"
+
+// ---------------------------------------------------------------------------
+// Last-opened tracking (localStorage)
+// ---------------------------------------------------------------------------
+
+function getLastOpenedMap(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(LAST_OPENED_KEY)
+    if (!raw) return {}
+    return JSON.parse(raw) as Record<string, number>
+  } catch {
+    return {}
+  }
+}
+
+function setLastOpenedMap(map: Record<string, number>) {
+  try {
+    localStorage.setItem(LAST_OPENED_KEY, JSON.stringify(map))
+  } catch {
+    // localStorage full or unavailable; silently ignore
+  }
+}
+
+/** Record that a pod was opened right now. */
+export function recordPodOpened(podName: string) {
+  const map = getLastOpenedMap()
+  map[podName] = Date.now()
+  setLastOpenedMap(map)
+}
+
+/** Get the "last opened" timestamp for a pod, or undefined if never opened. */
+export function getLastOpened(podName: string): number | undefined {
+  return getLastOpenedMap()[podName]
+}
+
+// ---------------------------------------------------------------------------
+// Frecency sort & time sections
+// ---------------------------------------------------------------------------
+
+export type TimeSection = "Active Today" | "This Week" | "This Month" | "Older"
+
+const MS_DAY = 86_400_000
+const MS_WEEK = 7 * MS_DAY
+const MS_MONTH = 30 * MS_DAY
+
+/** Classify a timestamp into a time section relative to now. */
+export function timeSection(ts: number, now: number): TimeSection {
+  const d = new Date(now)
+  const startOfToday = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  if (ts >= startOfToday) return "Active Today"
+  const age = now - ts
+  if (age < MS_WEEK) return "This Week"
+  if (age < MS_MONTH) return "This Month"
+  return "Older"
+}
+
+/** Get the effective timestamp for sorting: last-opened if available, else Created. */
+export function effectiveTimestamp(pod: PodInfo): number {
+  const opened = getLastOpened(pod.Name)
+  if (opened !== undefined) return opened
+  const t = new Date(pod.Created).getTime()
+  return Number.isNaN(t) ? 0 : t
+}
+
+/**
+ * Sort pods by frecency: advisor first, then running before stopped,
+ * then by last-opened (or created) descending within each group.
+ */
+export function frecencySortPods(pods: PodInfo[]): PodInfo[] {
+  return [...pods].sort((a, b) => {
+    // Advisor always first
+    const aAdvisor = a.Name === "devaipod-advisor" ? 1 : 0
+    const bAdvisor = b.Name === "devaipod-advisor" ? 1 : 0
+    if (aAdvisor !== bAdvisor) return bAdvisor - aAdvisor
+
+    // Running before stopped
+    const aRunning = (a.Status ?? "").toLowerCase() === "running" ? 1 : 0
+    const bRunning = (b.Status ?? "").toLowerCase() === "running" ? 1 : 0
+    if (aRunning !== bRunning) return bRunning - aRunning
+
+    // Within same status group: sort by effective timestamp descending
+    return effectiveTimestamp(b) - effectiveTimestamp(a)
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Context
@@ -245,6 +330,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     }
 
     async function openPod(fullName: string) {
+      recordPodOpened(fullName)
       window.location.href = `/agent/${encodeURIComponent(fullName)}`
     }
 

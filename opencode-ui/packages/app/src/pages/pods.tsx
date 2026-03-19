@@ -27,6 +27,10 @@ import {
   type LaunchWorkspaceParams,
   type GatorScopeConfig,
   type GatorScopesResponse,
+  frecencySortPods,
+  effectiveTimestamp,
+  timeSection,
+  type TimeSection,
 } from "@/context/devaipod"
 
 // ---------------------------------------------------------------------------
@@ -47,12 +51,180 @@ export default function PodsPage() {
 
 type PodFilter = "all" | "running" | "stopped" | "done"
 
+// ---------------------------------------------------------------------------
+// Search query parser
+// ---------------------------------------------------------------------------
+
+interface ParsedQuery {
+  repo?: string
+  task?: string
+  status?: PodFilter
+  freeText: string[]
+}
+
+function parseSearchQuery(raw: string): ParsedQuery {
+  const result: ParsedQuery = { freeText: [] }
+  // Match structured terms: key:"quoted value" or key:value
+  const regex = /(\w+):(?:"([^"]*)"|([\S]+))/g
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  // Collect positions of structured matches to extract free text from gaps
+  const gaps: string[] = []
+  // eslint-disable-next-line no-cond-assign
+  while ((match = regex.exec(raw)) !== null) {
+    if (match.index > lastIndex) {
+      gaps.push(raw.slice(lastIndex, match.index))
+    }
+    lastIndex = match.index + match[0].length
+
+    const key = match[1].toLowerCase()
+    const value = match[2] ?? match[3]
+
+    if (key === "repo") result.repo = value
+    else if (key === "task") result.task = value
+    else if (key === "status") {
+      const v = value.toLowerCase()
+      if (v === "running" || v === "stopped" || v === "done") result.status = v
+    }
+  }
+
+  if (lastIndex < raw.length) {
+    gaps.push(raw.slice(lastIndex))
+  }
+
+  const freeText = gaps.join(" ").trim()
+  if (freeText) {
+    result.freeText = freeText.toLowerCase().split(/\s+/).filter(Boolean)
+  }
+
+  return result
+}
+
+function podMatchesQuery(
+  pod: PodInfo,
+  query: ParsedQuery,
+  isDone: boolean,
+  isRunning: boolean,
+  agentTitle?: string,
+): boolean {
+  const labels = pod.Labels ?? {}
+  const repo = labels["io.devaipod.repo"] ?? ""
+  const task = labels["io.devaipod.task"] ?? ""
+  const title = agentTitle || labels["io.devaipod.title"] || ""
+  const shortName = pod.Name.replace("devaipod-", "")
+
+  if (query.repo && !repo.toLowerCase().includes(query.repo.toLowerCase())) return false
+  if (query.task && !task.toLowerCase().includes(query.task.toLowerCase())) return false
+
+  if (query.status) {
+    if (query.status === "done" && !isDone) return false
+    if (query.status === "running" && (!isRunning || isDone)) return false
+    if (query.status === "stopped" && (isRunning || isDone)) return false
+  }
+
+  for (const term of query.freeText) {
+    const haystack = `${shortName} ${repo} ${task} ${title} ${pod.Name}`.toLowerCase()
+    if (!haystack.includes(term)) return false
+  }
+
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Time section divider
+// ---------------------------------------------------------------------------
+
+const TIME_SECTION_ORDER: TimeSection[] = ["Active Today", "This Week", "This Month", "Older"]
+
+function SectionDivider(props: { label: TimeSection }) {
+  return (
+    <div class="flex items-center gap-3 my-2">
+      <hr class="flex-1 border-t border-border-base" />
+      <span class="text-11-regular text-text-weak shrink-0">{props.label}</span>
+      <hr class="flex-1 border-t border-border-base" />
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Main content
+// ---------------------------------------------------------------------------
+
 function PodsPageContent() {
   const ctx = useDevaipod()
 
   const [showForm, setShowForm] = createSignal(false)
   const [focusedIdx, setFocusedIdx] = createSignal(-1)
-  const [filter, setFilter] = createSignal<PodFilter>("all")
+  const [searchText, setSearchText] = createSignal("")
+
+  // Derive completion status for a pod from agent status
+  const podCompletionStatus = (podName: string) =>
+    ctx.agentStatus[podName]?.completion_status ?? "active"
+
+  const isPodRunning = (pod: PodInfo) =>
+    (pod.Status ?? "").toLowerCase() === "running"
+
+  const isPodDone = (podName: string) =>
+    podCompletionStatus(podName) === "done"
+
+  // Frecency-sorted, then filtered pods
+  const filteredPods = createMemo(() => {
+    const sorted = frecencySortPods(ctx.pods)
+    const raw = searchText().trim()
+    if (!raw) return sorted
+
+    const query = parseSearchQuery(raw)
+    return sorted.filter((p) =>
+      podMatchesQuery(p, query, isPodDone(p.Name), isPodRunning(p), ctx.agentStatus[p.Name]?.title)
+    )
+  })
+
+  // Group filtered pods into time sections
+  const sectionedPods = createMemo(() => {
+    const pods = filteredPods()
+    const now = Date.now()
+    const sections: { section: TimeSection; pods: PodInfo[] }[] = []
+    const buckets = new Map<TimeSection, PodInfo[]>()
+
+    for (const pod of pods) {
+      const ts = effectiveTimestamp(pod)
+      const sec = timeSection(ts, now)
+      let list = buckets.get(sec)
+      if (!list) {
+        list = []
+        buckets.set(sec, list)
+      }
+      list.push(pod)
+    }
+
+    for (const sec of TIME_SECTION_ORDER) {
+      const list = buckets.get(sec)
+      if (list && list.length > 0) {
+        sections.push({ section: sec, pods: list })
+      }
+    }
+
+    return sections
+  })
+
+  // Whether to show section dividers (only if more than one section)
+  const showDividers = createMemo(() => sectionedPods().length > 1)
+
+  // Filter counts for the filter chips
+  const filterCounts = createMemo(() => {
+    const pods = ctx.pods
+    let running = 0, stopped = 0, done = 0
+    for (const p of pods) {
+      if (isPodDone(p.Name)) done++
+      else if (isPodRunning(p)) running++
+      else stopped++
+    }
+    return { all: pods.length, running, stopped, done }
+  })
+
+  // Alias for keyboard navigation
+  const flatPodList = filteredPods
 
   // Keyboard shortcuts
   onMount(() => {
@@ -73,7 +245,7 @@ function PodsPageContent() {
       }
 
       if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !isInput) {
-        const total = filteredPods().length
+        const total = flatPodList().length
         if (total === 0) return
         e.preventDefault()
         setFocusedIdx((prev) => {
@@ -84,7 +256,7 @@ function PodsPageContent() {
 
       if (e.key === "Enter" && !isInput) {
         const idx = focusedIdx()
-        const cards = filteredPods()
+        const cards = flatPodList()
         if (idx >= 0 && idx < cards.length) {
           e.preventDefault()
           const card = cards[idx]
@@ -101,40 +273,6 @@ function PodsPageContent() {
     onCleanup(() => document.removeEventListener("keydown", handler))
   })
 
-  // Derive completion status for a pod from agent status
-  const podCompletionStatus = (podName: string) =>
-    ctx.agentStatus[podName]?.completion_status ?? "active"
-
-  const isPodRunning = (pod: PodInfo) =>
-    (pod.Status ?? "").toLowerCase() === "running"
-
-  const isPodDone = (podName: string) =>
-    podCompletionStatus(podName) === "done"
-
-  // Filter counts for the filter bar
-  const filterCounts = createMemo(() => {
-    const pods = ctx.pods
-    let running = 0, stopped = 0, done = 0
-    for (const p of pods) {
-      if (isPodDone(p.Name)) done++
-      else if (isPodRunning(p)) running++
-      else stopped++
-    }
-    return { all: pods.length, running, stopped, done }
-  })
-
-  // Filtered pod list
-  const filteredPods = createMemo(() => {
-    const f = filter()
-    if (f === "all") return ctx.pods
-    return ctx.pods.filter((p) => {
-      if (f === "done") return isPodDone(p.Name)
-      if (f === "running") return isPodRunning(p) && !isPodDone(p.Name)
-      // "stopped"
-      return !isPodRunning(p) && !isPodDone(p.Name)
-    })
-  })
-
   const existingPodNames = createMemo(() => new Set(ctx.pods.map((p) => p.Name)))
 
   const connectionDotClass = createMemo(() => {
@@ -148,6 +286,35 @@ function PodsPageContent() {
     const names = existingPodNames()
     return Object.entries(ctx.launches).filter(([podName]) => !names.has(podName))
   })
+
+  // Quick filter chip handler — inserts/replaces status: prefix in search
+  function applyStatusFilter(status: PodFilter) {
+    const current = searchText()
+    // Remove any existing status: term
+    const withoutStatus = current.replace(/\bstatus:\S+/g, "").trim()
+    if (status === "all") {
+      setSearchText(withoutStatus)
+    } else {
+      setSearchText(withoutStatus ? `${withoutStatus} status:${status}` : `status:${status}`)
+    }
+  }
+
+  // Track which status filter chip is active based on search text
+  const activeStatusFilter = createMemo((): PodFilter => {
+    const query = parseSearchQuery(searchText())
+    return query.status ?? "all"
+  })
+
+  // Compute a flat index offset for each section so we can map
+  // section-local indexes to the flat focused index
+  function flatIndexOffset(sectionIdx: number): number {
+    let offset = 0
+    const sections = sectionedPods()
+    for (let i = 0; i < sectionIdx; i++) {
+      offset += sections[i].pods.length
+    }
+    return offset
+  }
 
   return (
     <div class="h-full overflow-y-auto">
@@ -197,28 +364,37 @@ function PodsPageContent() {
         </Show>
       </div>
 
-      {/* Filter bar */}
+      {/* Search bar and filter chips */}
       <Show when={ctx.pods.length > 0}>
-        <div class="flex gap-1 mb-4">
-          <For each={["all", "running", "stopped", "done"] as PodFilter[]}>
-            {(f) => {
-              const count = () => filterCounts()[f]
-              return (
-                <button
-                  type="button"
-                  class="px-2.5 py-1 rounded text-12-regular transition-colors cursor-pointer"
-                  classList={{
-                    "bg-fill-element-active text-text-strong": filter() === f,
-                    "text-text-weak hover:text-text-secondary-base hover:bg-fill-element-base": filter() !== f,
-                  }}
-                  onClick={() => setFilter(f)}
-                >
-                  {f.charAt(0).toUpperCase() + f.slice(1)}
-                  <span class="ml-1 opacity-60">{count()}</span>
-                </button>
-              )
-            }}
-          </For>
+        <div class="mb-4 flex flex-col gap-2">
+          <input
+            type="text"
+            placeholder="Search pods... (repo:name, task:text, status:running)"
+            class="w-full text-12-regular bg-background-base border border-border-base rounded px-3 py-2 text-text-strong placeholder:text-text-weak focus:outline-none focus:border-border-active-base"
+            value={searchText()}
+            onInput={(e) => setSearchText(e.currentTarget.value)}
+          />
+          <div class="flex gap-1">
+            <For each={["all", "running", "stopped", "done"] as PodFilter[]}>
+              {(f) => {
+                const count = () => filterCounts()[f]
+                return (
+                  <button
+                    type="button"
+                    class="px-2.5 py-1 rounded text-12-regular transition-colors cursor-pointer"
+                    classList={{
+                      "bg-fill-element-active text-text-strong": activeStatusFilter() === f,
+                      "text-text-weak hover:text-text-secondary-base hover:bg-fill-element-base": activeStatusFilter() !== f,
+                    }}
+                    onClick={() => applyStatusFilter(f)}
+                  >
+                    {f.charAt(0).toUpperCase() + f.slice(1)}
+                    <span class="ml-1 opacity-60">{count()}</span>
+                  </button>
+                )
+              }}
+            </For>
+          </div>
         </div>
       </Show>
 
@@ -251,19 +427,33 @@ function PodsPageContent() {
           when={filteredPods().length > 0}
           fallback={
             <div class="flex flex-col items-center justify-center py-8 text-text-weak">
-              <p class="text-12-regular">No {filter()} workspaces</p>
+              <p class="text-12-regular">
+                {searchText().trim() ? "No matching workspaces" : "No workspaces"}
+              </p>
             </div>
           }
         >
           <div class="flex flex-col gap-3">
-            <For each={filteredPods()}>
-              {(pod, index) => (
-                <PodCard
-                  pod={pod}
-                  focused={focusedIdx() === index()}
-                  onFocus={() => setFocusedIdx(index())}
-                />
-              )}
+            <For each={sectionedPods()}>
+              {(section, sectionIdx) => {
+                const offset = () => flatIndexOffset(sectionIdx())
+                return (
+                  <>
+                    <Show when={showDividers()}>
+                      <SectionDivider label={section.section} />
+                    </Show>
+                    <For each={section.pods}>
+                      {(pod, podIdx) => (
+                        <PodCard
+                          pod={pod}
+                          focused={focusedIdx() === offset() + podIdx()}
+                          onFocus={() => setFocusedIdx(offset() + podIdx())}
+                        />
+                      )}
+                    </For>
+                  </>
+                )
+              }}
             </For>
           </div>
         </Show>

@@ -1,6 +1,6 @@
 import { createSignal, createEffect, createMemo, onCleanup, onMount, Show, For } from "solid-js"
 import { useParams, useNavigate, A } from "@solidjs/router"
-import { DevaipodProvider, useDevaipod } from "@/context/devaipod"
+import { DevaipodProvider, useDevaipod, recordPodOpened } from "@/context/devaipod"
 import { apiFetch } from "@/utils/devaipod-api"
 import { base64Encode } from "@opencode-ai/util/encode"
 
@@ -87,9 +87,13 @@ function AgentView() {
     ctx.refresh()
   }
 
-  // Immediately fetch pod list so arrows & status are available without
-  // waiting for the first poll interval.
-  onMount(() => ctx.refresh())
+  // Record that this pod was opened (handles direct URL navigation)
+  // and immediately fetch pod list so arrows & status are available
+  // without waiting for the first poll interval.
+  onMount(() => {
+    recordPodOpened(fullName())
+    ctx.refresh()
+  })
 
   // -- Pod switcher ---------------------------------------------------------
 
