@@ -17,6 +17,7 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 | [paude](https://github.com/bbrowning/paude) | MIT | Yes | Podman + OpenShift backends, agent-agnostic |
 | [Kortex](https://github.com/kortex-hub/kortex) | Apache-2.0 | Yes | Desktop GUI, AI + container/K8s management, Goose integration |
 | [Gastown](https://github.com/steveyegge/gastown) | MIT | Yes | Multi-agent orchestration, no sandboxing |
+| [Gyre](https://github.com/jsell-rh/gyre/) | No license | Yes | Built-in forge + agent orchestration platform |
 | [gjoll](https://github.com/ondrejbudai/gjoll) | Apache-2.0 | Yes | Cloud VM sandboxes via OpenTofu, credential-injecting reverse proxy |
 | [krunai](https://github.com/slp/krunai) | Apache-2.0 | Yes | MicroVM, but not container oriented |
 | [Auto-Claude](https://github.com/AndyMik90/Auto-Claude) | AGPL-3.0 | Yes | Desktop app, no sandboxing |
@@ -119,6 +120,24 @@ Key differences from devaipod:
 - **AI manages infrastructure**: Kortex uses AI to help manage containers/K8s; devaipod uses containers to sandbox AI that writes code.
 
 The projects could be complementary: Kortex could manage the container/K8s infrastructure that devaipod pods run on. More concretely, Kortex's MCP integration means it could consume service-gator as a tool provider, which would add the credential scoping that Kortex currently lacks for its Goose integration.
+
+### Gyre
+
+(This section is Assisted-by: OpenCode (Claude Opus 4.6) research, but was human reviewed)
+
+[Gyre](https://github.com/jsell-rh/gyre/) is an autonomous software development platform built in Rust and Svelte. The repository has no LICENSE file, though the Cargo.toml says MIT. That should probably be expanded.
+
+Gyre provides its own built-in git forge (Smart HTTP transport), merge queue, agent orchestrator, and identity provider. Agents are single-purpose, spawned via API, given a git worktree and scoped bearer token, and torn down after completing their task. External repos can be pull-mirrored into Gyre, but all agent work happens inside Gyre's forge.
+
+Key points for comparison with devaipod:
+
+- **No devcontainer.json**. Agent environments use a "compute target" abstraction (local processes, Docker/Podman, SSH, Kubernetes), though current implementation spawns local OS processes. Nix flake for the project's own development.
+- **No per-agent container sandboxing**. The Gyre server can run in a container (Dockerfile) or NixOS VM, but agents spawned by it are local processes with git worktree + scoped token isolation. The specs describe container/K8s compute targets and eBPF audit, but these appear unfinished.
+- **No outbound forge flow**. Repos can be one-way mirrored *into* Gyre, but there is no documented mechanism for pushing agent work back out as a GitHub PR. devaipod + service-gator is designed for exactly this -- agents opening scoped PRs on existing forges.
+- **Supply chain security** is ambitious: `gyre-stack.lock` pins agent configuration (AGENTS.md hash, MCP servers, model ID), and pushes with non-matching stacks are rejected. Three attestation levels from "raw git push" to "Gyre-managed runtime with eBPF + SPIFFE."
+
+cgwalters: One possible intersection here: the "local forge" mode could be an optional thing devaipod runs or configurable alongside it. I actually investigated forgejo for this purpose in the past.
+It also seems like gyre could learn to reuse the devcontainer backend logic from devaipod?
 
 ### Auto-Claude
 
