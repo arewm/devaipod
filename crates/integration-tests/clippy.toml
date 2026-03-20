@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "Use poll_until() or wait_for_container_running() instead of bare sleep. If you need a sleep inside a polling loop, add #[allow(clippy::disallowed_methods)]." },
+]

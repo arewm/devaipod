@@ -177,15 +177,8 @@ fn test_ssh_config_created_on_pod_up() -> Result<()> {
     // The config file uses the full pod name with prefix
     let config_file = ssh_guard.config_file(&pod_name);
 
-    // Give a moment for the file to be written
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Verify config file was created in our tempdir
-    assert!(
-        config_file.exists(),
-        "SSH config file should exist at {}",
-        config_file.display()
-    );
+    // Wait for the SSH config file to appear
+    crate::wait_for_file(&config_file, Duration::from_secs(10))?;
 
     let content = std::fs::read_to_string(&config_file)?;
 
@@ -233,15 +226,8 @@ fn test_ssh_config_removed_on_pod_delete() -> Result<()> {
     // The config file uses the full pod name
     let config_file = ssh_guard.config_file(&pod_name);
 
-    // Give a moment for the file to be written
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Verify config was created
-    assert!(
-        config_file.exists(),
-        "SSH config should exist after pod creation at {}",
-        config_file.display()
-    );
+    // Wait for the SSH config file to appear
+    crate::wait_for_file(&config_file, Duration::from_secs(10))?;
 
     // Delete the pod (don't add to guard since we're deleting manually)
     let delete_output = run_devaipod_in_with_env(
@@ -283,8 +269,8 @@ fn test_ssh_server_starts_on_exec_stdio() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Give containers time to start
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
 
     // Start exec --stdio without a command - this starts the SSH server
     // Use binary path directly since we're spawning a child process that needs host mode
@@ -580,8 +566,8 @@ fn test_exec_stdio_multiple_commands() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Give containers time to start
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
 
     // Test 1: pwd command
     let pwd_output = run_devaipod(&["exec", "-W", "--stdio", short_name(&pod_name), "--", "pwd"])?;
@@ -651,8 +637,8 @@ fn test_exec_stdio_agent_container() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Give containers time to start
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait for workspace container to be ready
+    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
 
     // Default exec --stdio goes to agent container
     let output = run_devaipod(&[

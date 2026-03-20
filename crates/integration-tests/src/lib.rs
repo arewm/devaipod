@@ -235,6 +235,68 @@ macro_rules! readonly_test {
     };
 }
 
+/// Poll a condition with a timeout. Returns Ok(()) if the condition
+/// returns Ok(true) before the deadline, or the last error/timeout.
+pub fn poll_until<F>(
+    description: &str,
+    timeout: std::time::Duration,
+    interval: std::time::Duration,
+    mut condition: F,
+) -> color_eyre::Result<()>
+where
+    F: FnMut() -> color_eyre::Result<bool>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match condition() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                if std::time::Instant::now() > deadline {
+                    return Err(e.wrap_err(format!("Timed out: {description}")));
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            color_eyre::eyre::bail!("Timed out after {timeout:?}: {description}");
+        }
+        #[allow(clippy::disallowed_methods)] // Intentional: poll interval
+        std::thread::sleep(interval);
+    }
+}
+
+/// Poll until a container is running.
+pub fn wait_for_container_running(
+    container_name: &str,
+    timeout: std::time::Duration,
+) -> color_eyre::Result<()> {
+    poll_until(
+        &format!("container '{container_name}' running"),
+        timeout,
+        std::time::Duration::from_secs(1),
+        || {
+            let output = std::process::Command::new("podman")
+                .args(["inspect", "--format", "{{.State.Status}}", container_name])
+                .output()?;
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(status == "running")
+        },
+    )
+}
+
+/// Poll until a file exists on the host filesystem.
+pub fn wait_for_file(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> color_eyre::Result<()> {
+    poll_until(
+        &format!("file '{}' exists", path.display()),
+        timeout,
+        std::time::Duration::from_millis(100),
+        || Ok(path.exists()),
+    )
+}
+
 /// Environment variable name for overriding SSH config directory.
 const SSH_CONFIG_DIR_ENV: &str = "DEVAIPOD_SSH_CONFIG_DIR";
 
@@ -411,6 +473,7 @@ impl SharedFixture {
                     status
                 );
             }
+            #[allow(clippy::disallowed_methods)] // Intentional: poll interval
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
 
