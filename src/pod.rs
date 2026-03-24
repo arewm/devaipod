@@ -957,9 +957,19 @@ impl DevaipodPod {
             // Framework has a known default image (e.g. goose has ghcr.io/block/goose:latest)
             framework_default.to_string()
         } else {
-            // Fall back to the workspace devcontainer image (opencode is embedded there)
-            image.clone()
-        };
+             // Fall back to the workspace devcontainer image (opencode is embedded there).
+             // Note: for claude-code, this image almost certainly does NOT have `claude`
+             // installed. Warn the user so they know they need to set [agent] image.
+             if matches!(agent_framework, crate::config::AgentFramework::ClaudeCode) {
+                 tracing::warn!(
+                     "No [agent] image configured for claude-code framework. \
+                      Falling back to the workspace devcontainer image, which likely does not \
+                      have `claude` installed. Set `image` in [agent] to a custom image with \
+                      claude-code available."
+                 );
+             }
+             image.clone()
+         };
 
         // Ensure the agent image is available if it differs from the workspace image.
         // Use pull-if-missing semantics (ensure_image with ImageSource::Image) rather
@@ -2475,10 +2485,11 @@ if [ -n "${{DEVAIPOD_CLAUDE_MCP_JSON}}" ]; then
     printf '%s\n' "${{DEVAIPOD_CLAUDE_MCP_JSON}}" > "$MCP_CONFIG_FILE"
 fi
 
-# Auto-approve flag (--dangerously-skip-permissions) when YOLO mode is enabled
-EXTRA_FLAGS=""
+# Auto-approve flag (--dangerously-skip-permissions) when YOLO mode is enabled.
+# Use an array to avoid word-splitting issues with unquoted flag strings.
+EXTRA_FLAGS=()
 if [ -n "${{DEVAIPOD_AUTO_APPROVE}}" ]; then
-    EXTRA_FLAGS="--dangerously-skip-permissions"
+    EXTRA_FLAGS=(--dangerously-skip-permissions)
 fi
 
 # Read task from the devaipod task file (written by signal_agent_ready).
@@ -2488,16 +2499,17 @@ fi
 TASK_FILE="{home}/.config/devaipod/task.md"
 if [ -f "$TASK_FILE" ]; then
     if [ -f "$MCP_CONFIG_FILE" ]; then
-        exec claude -p "$(cat "$TASK_FILE")" $EXTRA_FLAGS --mcp-config "$MCP_CONFIG_FILE"
+        exec claude -p "$(cat "$TASK_FILE")" "${{EXTRA_FLAGS[@]}}" --mcp-config "$MCP_CONFIG_FILE"
     else
-        exec claude -p "$(cat "$TASK_FILE")" $EXTRA_FLAGS
+        exec claude -p "$(cat "$TASK_FILE")" "${{EXTRA_FLAGS[@]}}"
     fi
 else
-    # No task: start claude in interactive mode
+    # No task: start claude in interactive mode (requires a TTY; only useful in
+    # dev/debug scenarios — in production devaipod always writes a task file).
     if [ -f "$MCP_CONFIG_FILE" ]; then
-        exec claude $EXTRA_FLAGS --mcp-config "$MCP_CONFIG_FILE"
+        exec claude "${{EXTRA_FLAGS[@]}}" --mcp-config "$MCP_CONFIG_FILE"
     else
-        exec claude $EXTRA_FLAGS
+        exec claude "${{EXTRA_FLAGS[@]}}"
     fi
 fi"#,
                     home = AGENT_HOME_PATH,
