@@ -137,7 +137,7 @@ fn extract_repo_from_url(url: &str) -> Option<String> {
 const DEV_PASSTHROUGH_PATHS: &[&str] = &["/dev/fuse", "/dev/net/tun", "/dev/kvm"];
 
 use crate::config::{Config, DotfilesConfig, WorkerGatorMode};
-use crate::devcontainer::DevcontainerConfig;
+use crate::devcontainer::{DevcontainerConfig, ImageSource};
 use crate::podman::{ContainerConfig, PodmanService};
 
 /// Add devices from devcontainer runArgs (e.g. --device=/dev/kvm).
@@ -379,6 +379,8 @@ pub struct DevaipodPod {
     pub branch: Option<String>,
     /// Whether forwardPorts were configured in devcontainer.json
     pub has_forwarded_ports: bool,
+    /// Agent framework running in the agent container
+    pub agent_framework: crate::config::AgentFramework,
 }
 
 impl DevaipodPod {
@@ -959,10 +961,17 @@ impl DevaipodPod {
             image.clone()
         };
 
-        // Ensure the agent image is available if it differs from the workspace image
+        // Ensure the agent image is available if it differs from the workspace image.
+        // Use pull-if-missing semantics (ensure_image with ImageSource::Image) rather
+        // than unconditional pull (ensure_gator_image) so repeated invocations are fast.
         if agent_image != image {
             podman
-                .ensure_gator_image(&agent_image)
+                .ensure_image(
+                    &ImageSource::Image(agent_image.clone()),
+                    &agent_image,
+                    false,
+                    None,
+                )
                 .await
                 .with_context(|| format!("Failed to pull agent image: {}", agent_image))?;
         }
@@ -1125,6 +1134,7 @@ impl DevaipodPod {
             repo_url: source.upstream_url(),
             branch: source.branch_name(),
             has_forwarded_ports,
+            agent_framework: global_config.agent.framework.clone(),
         })
     }
 
@@ -1806,12 +1816,15 @@ chmod 644 '{config_path}'
         let task_file_path = format!("{}/{}", AGENT_HOME_PATH, task_file);
         let config_file_path = format!("{}/{}", AGENT_HOME_PATH, config_file);
 
-        // Write the task markdown file
+        // Write the task markdown file (all frameworks read from this path).
+        // Use a deliberately obscure heredoc delimiter to reduce collision risk with
+        // task content. The exec API does not support stdin, so heredoc is the
+        // most practical approach here; use a UUID-like token as the sentinel.
         tracing::debug!("Writing task to agent container...");
         let task_script = format!(
-            r#"mkdir -p {agent_home}/.config/opencode && cat > '{agent_home}/{task_file}' << 'TASK_EOF'
+            r#"mkdir -p {agent_home}/.config/opencode && cat > '{agent_home}/{task_file}' << 'DEVAIPOD_TASK_EOF_a7f3b9c2d1e4'
 {task_content}
-TASK_EOF"#,
+DEVAIPOD_TASK_EOF_a7f3b9c2d1e4"#,
             agent_home = AGENT_HOME_PATH,
             task_file = task_file,
             task_content = task_content,
@@ -1829,71 +1842,75 @@ TASK_EOF"#,
             bail!("Failed to write task file (exit code {})", exit_code);
         }
 
-        // Read existing opencode.json from container (if it exists)
-        let (exit_code, stdout, _stderr) = podman
-            .exec_output(&self.agent_container, &["cat", &config_file_path])
-            .await
-            .context("Failed to read opencode config")?;
+        // Only write opencode.json for the opencode framework; other frameworks
+        // (goose, claude-code) manage their own config via env vars / startup script.
+        if self.agent_framework == crate::config::AgentFramework::Opencode {
+            // Read existing opencode.json from container (if it exists)
+            let (exit_code, stdout, _stderr) = podman
+                .exec_output(&self.agent_container, &["cat", &config_file_path])
+                .await
+                .context("Failed to read opencode config")?;
 
-        // Parse existing config or create new one
-        // Use jsonc-parser to handle JSONC (comments, trailing commas)
-        let mut config: serde_json::Value = if exit_code == 0 && !stdout.is_empty() {
-            let content = String::from_utf8_lossy(&stdout);
-            match jsonc_parser::parse_to_serde_value(&content, &Default::default()) {
-                Ok(Some(value)) => value,
-                Ok(None) | Err(_) => {
-                    tracing::debug!("Could not parse existing opencode.json, creating new one");
-                    serde_json::json!({"$schema": "https://opencode.ai/config.json"})
+            // Parse existing config or create new one
+            // Use jsonc-parser to handle JSONC (comments, trailing commas)
+            let mut config: serde_json::Value = if exit_code == 0 && !stdout.is_empty() {
+                let content = String::from_utf8_lossy(&stdout);
+                match jsonc_parser::parse_to_serde_value(&content, &Default::default()) {
+                    Ok(Some(value)) => value,
+                    Ok(None) | Err(_) => {
+                        tracing::debug!("Could not parse existing opencode.json, creating new one");
+                        serde_json::json!({"$schema": "https://opencode.ai/config.json"})
+                    }
+                }
+            } else {
+                serde_json::json!({"$schema": "https://opencode.ai/config.json"})
+            };
+
+            // Merge task into instructions array
+            let instructions = config.as_object_mut().and_then(|obj| {
+                obj.entry("instructions")
+                    .or_insert(serde_json::json!([]))
+                    .as_array_mut()
+            });
+            if let Some(arr) = instructions {
+                let task_path_value = serde_json::Value::String(task_file_path.clone());
+                if !arr.contains(&task_path_value) {
+                    arr.push(task_path_value);
                 }
             }
-        } else {
-            serde_json::json!({"$schema": "https://opencode.ai/config.json"})
-        };
 
-        // Merge task into instructions array
-        let instructions = config.as_object_mut().and_then(|obj| {
-            obj.entry("instructions")
-                .or_insert(serde_json::json!([]))
-                .as_array_mut()
-        });
-        if let Some(arr) = instructions {
-            let task_path_value = serde_json::Value::String(task_file_path.clone());
-            if !arr.contains(&task_path_value) {
-                arr.push(task_path_value);
+            // Disable opencode's built-in git snapshotting — we use the real git
+            // history via the agent/workspace remote setup instead.
+            if let Some(obj) = config.as_object_mut() {
+                obj.insert("snapshot".to_string(), serde_json::json!(false));
             }
-        }
 
-        // Disable opencode's built-in git snapshotting — we use the real git
-        // history via the agent/workspace remote setup instead.
-        if let Some(obj) = config.as_object_mut() {
-            obj.insert("snapshot".to_string(), serde_json::json!(false));
-        }
-
-        // Write merged config back to container
-        let config_json = serde_json::to_string_pretty(&config).unwrap_or_else(|_| {
-            format!(
-                r#"{{"$schema": "https://opencode.ai/config.json", "instructions": ["{}"]}}"#,
-                task_file_path
-            )
-        });
-        let config_script = format!(
-            r#"cat > '{}' << 'CONFIG_EOF'
+            // Write merged config back to container
+            let config_json = serde_json::to_string_pretty(&config).unwrap_or_else(|_| {
+                format!(
+                    r#"{{"$schema": "https://opencode.ai/config.json", "instructions": ["{}"]}}"#,
+                    task_file_path
+                )
+            });
+            let config_script = format!(
+                r#"cat > '{}' << 'CONFIG_EOF'
 {}
 CONFIG_EOF"#,
-            config_file_path, config_json
-        );
-        let exit_code = podman
-            .exec_quiet(
-                &self.agent_container,
-                &["/bin/sh", "-c", &config_script],
-                None,
-                None,
-            )
-            .await
-            .context("Failed to write opencode config")?;
+                config_file_path, config_json
+            );
+            let exit_code = podman
+                .exec_quiet(
+                    &self.agent_container,
+                    &["/bin/sh", "-c", &config_script],
+                    None,
+                    None,
+                )
+                .await
+                .context("Failed to write opencode config")?;
 
-        if exit_code != 0 {
-            bail!("Failed to write opencode config (exit code {})", exit_code);
+            if exit_code != 0 {
+                bail!("Failed to write opencode config (exit code {})", exit_code);
+            }
         }
         tracing::debug!("Task written to agent container");
 
@@ -2454,24 +2471,26 @@ if [ -n "${{DEVAIPOD_CLAUDE_MCP_JSON}}" ]; then
 fi
 
 # Auto-approve flag (--dangerously-skip-permissions) when YOLO mode is enabled
-AUTO_APPROVE_FLAG=""
+EXTRA_FLAGS=""
 if [ -n "${{DEVAIPOD_AUTO_APPROVE}}" ]; then
-    AUTO_APPROVE_FLAG="--dangerously-skip-permissions"
-fi
-
-# MCP config flag
-MCP_FLAG=""
-if [ -f "$MCP_CONFIG_FILE" ]; then
-    MCP_FLAG="--mcp-config $MCP_CONFIG_FILE"
+    EXTRA_FLAGS="--dangerously-skip-permissions"
 fi
 
 # Read task from the devaipod task file (written by signal_agent_ready)
 TASK_FILE="{home}/.config/opencode/devaipod-task.md"
 if [ -f "$TASK_FILE" ]; then
-    exec claude -p "$(cat "$TASK_FILE")" $AUTO_APPROVE_FLAG $MCP_FLAG
+    if [ -f "$MCP_CONFIG_FILE" ]; then
+        exec claude -p "$(cat "$TASK_FILE")" $EXTRA_FLAGS --mcp-config "$MCP_CONFIG_FILE"
+    else
+        exec claude -p "$(cat "$TASK_FILE")" $EXTRA_FLAGS
+    fi
 else
     # No task: start claude in interactive mode
-    exec claude $AUTO_APPROVE_FLAG $MCP_FLAG
+    if [ -f "$MCP_CONFIG_FILE" ]; then
+        exec claude $EXTRA_FLAGS --mcp-config "$MCP_CONFIG_FILE"
+    else
+        exec claude $EXTRA_FLAGS
+    fi
 fi"#,
                     home = AGENT_HOME_PATH,
                     state = AGENT_STATE_PATH,
@@ -2727,7 +2746,7 @@ fi"#,
                     yaml.push_str("extensions:\n");
                     for (name, url) in &mcp_entries {
                         yaml.push_str(&format!(
-                            "  {name}:\n    enabled: true\n    type: remote_mcp\n    url: {url}\n    name: {name}\n"
+                            "  {name}:\n    enabled: true\n    type: streamable_http\n    name: {name}\n    description: \"\"\n    uri: {url}\n    timeout: 300\n"
                         ));
                     }
                 }
@@ -2747,7 +2766,7 @@ fi"#,
                         servers.insert(
                             name.clone(),
                             serde_json::json!({
-                                "type": "sse",
+                                "type": "http",
                                 "url": url
                             }),
                         );
@@ -5129,8 +5148,8 @@ mod tests {
             "Goose MCP YAML should include service-gator"
         );
         assert!(
-            yaml.contains("remote_mcp"),
-            "Goose MCP YAML should use remote_mcp type"
+            yaml.contains("streamable_http"),
+            "Goose MCP YAML should use streamable_http type"
         );
         assert!(
             yaml.contains(&format!("localhost:{}", GATOR_PORT)),
@@ -5187,8 +5206,8 @@ mod tests {
         );
         assert_eq!(
             json["mcpServers"]["service-gator"]["type"],
-            "sse",
-            "Claude MCP server type should be sse"
+            "http",
+            "Claude MCP server type should be http"
         );
     }
 }
