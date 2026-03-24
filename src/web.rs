@@ -1285,6 +1285,10 @@ async fn agent_ui_root(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
+        // Required so the cross-origin opencode iframe (allow="clipboard-write")
+        // can access navigator.clipboard.  Without this header browsers ignore
+        // the allow attribute on cross-origin iframes.
+        .header("Permissions-Policy", "clipboard-read=*, clipboard-write=*")
         .body(Body::from(agent_iframe_wrapper(&name, &base_url)))
         .unwrap())
 }
@@ -1302,6 +1306,9 @@ async fn serve_opencode_index() -> Result<Response, StatusCode> {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
+        // Same clipboard policy as agent_ui_root — the SPA also embeds the
+        // opencode iframe and needs to delegate clipboard access to it.
+        .header("Permissions-Policy", "clipboard-read=*, clipboard-write=*")
         .body(Body::from(content))
         .unwrap())
 }
