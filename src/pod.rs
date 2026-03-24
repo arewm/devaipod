@@ -1801,7 +1801,9 @@ chmod 644 '{config_path}'
         task: &str,
         enable_gator: bool,
     ) -> Result<()> {
-        let task_file = ".config/opencode/devaipod-task.md";
+        // Framework-neutral task file location: not tied to the opencode config directory.
+        // All frameworks (opencode, goose, claude-code) read from this path.
+        let task_file = ".config/devaipod/task.md";
         let config_file = ".config/opencode/opencode.json";
 
         // Generate the complete system prompt using the prompt module
@@ -1822,7 +1824,7 @@ chmod 644 '{config_path}'
         // most practical approach here; use a UUID-like token as the sentinel.
         tracing::debug!("Writing task to agent container...");
         let task_script = format!(
-            r#"mkdir -p {agent_home}/.config/opencode && cat > '{agent_home}/{task_file}' << 'DEVAIPOD_TASK_EOF_a7f3b9c2d1e4'
+            r#"mkdir -p {agent_home}/.config/devaipod && cat > '{agent_home}/{task_file}' << 'DEVAIPOD_TASK_EOF_a7f3b9c2d1e4'
 {task_content}
 DEVAIPOD_TASK_EOF_a7f3b9c2d1e4"#,
             agent_home = AGENT_HOME_PATH,
@@ -1893,9 +1895,9 @@ DEVAIPOD_TASK_EOF_a7f3b9c2d1e4"#,
                 )
             });
             let config_script = format!(
-                r#"cat > '{}' << 'CONFIG_EOF'
+                r#"cat > '{}' << 'DEVAIPOD_CONFIG_EOF_b8e2f1d4c7a3'
 {}
-CONFIG_EOF"#,
+DEVAIPOD_CONFIG_EOF_b8e2f1d4c7a3"#,
                 config_file_path, config_json
             );
             let exit_code = podman
@@ -1919,7 +1921,7 @@ CONFIG_EOF"#,
         // at startup and will overwrite the task file with this worker-specific version
         // that omits orchestration instructions (the worker is the leaf executor).
         if self.enable_orchestration {
-            let worker_task_file = ".config/opencode/devaipod-task-worker.md";
+            let worker_task_file = ".config/devaipod/task-worker.md";
             let worker_task_content = crate::prompt::generate_worker_prompt(
                 task,
                 enable_gator,
@@ -1927,9 +1929,9 @@ CONFIG_EOF"#,
                 self.branch.as_deref(),
             );
             let worker_task_script = format!(
-                r#"cat > '{agent_home}/{worker_task_file}' << 'TASK_EOF'
+                r#"cat > '{agent_home}/{worker_task_file}' << 'DEVAIPOD_TASK_EOF_a7f3b9c2d1e4'
 {worker_task_content}
-TASK_EOF"#,
+DEVAIPOD_TASK_EOF_a7f3b9c2d1e4"#,
                 agent_home = AGENT_HOME_PATH,
                 worker_task_file = worker_task_file,
                 worker_task_content = worker_task_content,
@@ -2442,8 +2444,11 @@ if [ -n "${{DEVAIPOD_GOOSE_MCP_YAML}}" ]; then
     printf '%s\n' "${{DEVAIPOD_GOOSE_MCP_YAML}}" > {home}/.config/goose/config.yaml
 fi
 
-# Read task from the devaipod task file (written by signal_agent_ready)
-TASK_FILE="{home}/.config/opencode/devaipod-task.md"
+# Read task from the devaipod task file (written by signal_agent_ready).
+# Security note: TASK=$(cat file) does not cause re-evaluation of the file
+# contents — the shell stores the output as a plain string. When "$TASK" is
+# passed to goose, no further shell expansion occurs on the content.
+TASK_FILE="{home}/.config/devaipod/task.md"
 if [ -f "$TASK_FILE" ]; then
     TASK=$(cat "$TASK_FILE")
     exec goose run --text "$TASK"
@@ -2476,8 +2481,11 @@ if [ -n "${{DEVAIPOD_AUTO_APPROVE}}" ]; then
     EXTRA_FLAGS="--dangerously-skip-permissions"
 fi
 
-# Read task from the devaipod task file (written by signal_agent_ready)
-TASK_FILE="{home}/.config/opencode/devaipod-task.md"
+# Read task from the devaipod task file (written by signal_agent_ready).
+# Security note: $(cat "$TASK_FILE") inside double quotes does not cause
+# re-evaluation of the file contents — the shell passes the string verbatim
+# as an argument to claude. No shell metacharacters in the task are executed.
+TASK_FILE="{home}/.config/devaipod/task.md"
 if [ -f "$TASK_FILE" ]; then
     if [ -f "$MCP_CONFIG_FILE" ]; then
         exec claude -p "$(cat "$TASK_FILE")" $EXTRA_FLAGS --mcp-config "$MCP_CONFIG_FILE"
@@ -2612,6 +2620,17 @@ fi"#,
             }
         }
 
+        // Warn if orchestration is requested for a non-opencode framework.
+        // Orchestration uses opencode-specific mechanisms (devaipod-workerctl,
+        // OPENCODE_WORKER_URL) that other frameworks do not understand.
+        if enable_orchestration && *agent_framework != crate::config::AgentFramework::Opencode {
+            tracing::warn!(
+                "Orchestration mode is designed for the opencode framework. \
+                 The {} framework may not support devaipod-workerctl communication with the worker.",
+                agent_framework
+            );
+        }
+
         // No bind mounts - we clone the repo into the container instead
         // This avoids UID mapping issues with rootless podman
         let mounts = vec![];
@@ -2740,7 +2759,9 @@ fi"#,
                 // somehow unset by a dotfiles postStart script.
                 let mut yaml = String::new();
                 if auto_approve {
-                    yaml.push_str("GOOSE_MODE: auto\n");
+                    // goose_mode is the snake_case config file key; the env var is GOOSE_MODE
+                    // (uppercase). These are separate lookup paths in goose's config system.
+                    yaml.push_str("goose_mode: auto\n");
                 }
                 if !mcp_entries.is_empty() {
                     yaml.push_str("extensions:\n");
@@ -3266,9 +3287,10 @@ fi
 
 # Use worker-specific task file if available (omits orchestration instructions
 # since the worker is the leaf executor, not an orchestrator)
-if [ -f /mnt/agent-home/.config/opencode/devaipod-task-worker.md ]; then
-    cp /mnt/agent-home/.config/opencode/devaipod-task-worker.md \
-       {home}/.config/opencode/devaipod-task.md
+mkdir -p {home}/.config/devaipod
+if [ -f /mnt/agent-home/.config/devaipod/task-worker.md ]; then
+    cp /mnt/agent-home/.config/devaipod/task-worker.md \
+       {home}/.config/devaipod/task.md
 fi
 
 # Copy git identity
@@ -4945,8 +4967,8 @@ mod tests {
             "Goose script should write MCP config from env var"
         );
         assert!(
-            script.contains("devaipod-task.md"),
-            "Goose script should read task from devaipod task file"
+            script.contains(".config/devaipod/task.md"),
+            "Goose script should read task from framework-neutral devaipod task file"
         );
         assert!(
             script.contains(AGENT_STATE_PATH),
@@ -4979,8 +5001,8 @@ mod tests {
             "Claude-code script should write MCP config from env var"
         );
         assert!(
-            script.contains("devaipod-task.md"),
-            "Claude-code script should read task from devaipod task file"
+            script.contains(".config/devaipod/task.md"),
+            "Claude-code script should read task from framework-neutral devaipod task file"
         );
         assert!(
             script.contains(AGENT_STATE_PATH),
@@ -5028,11 +5050,12 @@ mod tests {
             container_config.env.get("OPENCODE_PERMISSION").is_none(),
             "Goose should not set OPENCODE_PERMISSION"
         );
-        // The GOOSE_MODE should also appear in the MCP YAML (for sandbox-authoritative config)
+        // The goose_mode key should appear in the MCP YAML (for sandbox-authoritative config).
+        // Note: goose_mode is the snake_case config file key; GOOSE_MODE is the env var.
         let yaml = container_config.env.get("DEVAIPOD_GOOSE_MCP_YAML");
         assert!(
-            yaml.map(|y| y.contains("GOOSE_MODE: auto")).unwrap_or(false),
-            "GOOSE_MCP_YAML should include GOOSE_MODE: auto when auto_approve is true"
+            yaml.map(|y| y.contains("goose_mode: auto")).unwrap_or(false),
+            "GOOSE_MCP_YAML should include goose_mode: auto (snake_case config key) when auto_approve is true"
         );
     }
 

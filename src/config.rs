@@ -930,6 +930,16 @@ pub enum AgentFramework {
     ClaudeCode,
 }
 
+impl std::fmt::Display for AgentFramework {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentFramework::Opencode => write!(f, "opencode"),
+            AgentFramework::Goose => write!(f, "goose"),
+            AgentFramework::ClaudeCode => write!(f, "claude-code"),
+        }
+    }
+}
+
 impl AgentFramework {
     /// Return the default container image for this framework, if known.
     ///
