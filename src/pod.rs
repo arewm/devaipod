@@ -1072,10 +1072,49 @@ impl DevaipodPod {
             None
         };
 
+        // Create user-defined extra containers (from [[extra-containers]] in config)
+        let mut extra_container_count = 0;
+        for extra in &global_config.extra_containers {
+            let extra_container_name = format!("{}-extra-{}", pod_name, extra.name);
+
+            // Pull the image if it is not already present locally.
+            // We use ensure_image (ImageSource::Image path) which checks locally first.
+            use crate::devcontainer::ImageSource;
+            podman
+                .ensure_image(
+                    &ImageSource::Image(extra.image.clone()),
+                    &extra.image,
+                    false,
+                    None,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to ensure image '{}' for extra container '{}'",
+                        extra.image, extra.name
+                    )
+                })?;
+
+            let extra_config = Self::extra_container_config(extra);
+            podman
+                .create_container(&extra_container_name, &extra.image, pod_name, extra_config)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to create extra container '{}'",
+                        extra_container_name
+                    )
+                })?;
+
+            tracing::debug!("Created extra container '{}'", extra_container_name);
+            extra_container_count += 1;
+        }
+
         let container_count = 2
             + if gator_container.is_some() { 1 } else { 0 }
             + if api_container.is_some() { 1 } else { 0 }
-            + if worker_container.is_some() { 1 } else { 0 };
+            + if worker_container.is_some() { 1 } else { 0 }
+            + extra_container_count;
         tracing::debug!(
             "Created pod '{}' with {} containers",
             pod_name,
@@ -3126,6 +3165,36 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
         }
     }
 
+    /// Build a ContainerConfig for a user-defined extra container.
+    ///
+    /// Extra containers run in the pod network namespace with the mounts, env
+    /// vars, and labels configured by the user. They receive no special
+    /// treatment from devaipod: no YOLO mode injection, no MCP wiring, no
+    /// workspace volumes unless explicitly configured in `mounts`.
+    fn extra_container_config(
+        extra: &crate::config::ExtraContainerConfig,
+    ) -> crate::podman::ContainerConfig {
+        use crate::podman::MountConfig;
+
+        let mounts = extra
+            .mounts
+            .iter()
+            .map(|m| MountConfig {
+                source: m.host_path.clone(),
+                target: m.container_path.clone(),
+                readonly: m.read_only,
+            })
+            .collect();
+
+        crate::podman::ContainerConfig {
+            mounts,
+            env: extra.env.clone(),
+            command: extra.command.clone(),
+            labels: extra.labels.clone(),
+            ..Default::default()
+        }
+    }
+
     /// Resolve the container home directory based on the effective user
     ///
     /// Most devcontainer images use a non-root user like "vscode" or "devenv"
@@ -4689,5 +4758,129 @@ mod tests {
             .filter(|(env_var, _)| env_var == "GH_TOKEN")
             .count();
         assert_eq!(gh_token_count, 1);
+    }
+
+    // =========================================================================
+    // Extra container tests
+    // =========================================================================
+
+    #[test]
+    fn test_extra_container_config_minimal() {
+        use crate::config::ExtraContainerConfig;
+        let extra = ExtraContainerConfig {
+            name: "goose".to_string(),
+            image: "ghcr.io/block/goose-cli:latest".to_string(),
+            command: None,
+            env: Default::default(),
+            mounts: vec![],
+            labels: Default::default(),
+        };
+
+        let config = DevaipodPod::extra_container_config(&extra);
+
+        assert!(config.mounts.is_empty());
+        assert!(config.env.is_empty());
+        assert!(config.command.is_none());
+        assert!(config.labels.is_empty());
+        // Extra containers use default (non-restricted) security settings —
+        // the user is in control of what they run.
+        assert!(!config.drop_all_caps);
+        assert!(!config.no_new_privileges);
+    }
+
+    #[test]
+    fn test_extra_container_config_with_command_and_env() {
+        use crate::config::ExtraContainerConfig;
+        let mut env = std::collections::HashMap::new();
+        env.insert("GOOSE_DEBUG".to_string(), "1".to_string());
+        env.insert("OPENAI_API_KEY".to_string(), "sk-test".to_string());
+
+        let extra = ExtraContainerConfig {
+            name: "goose".to_string(),
+            image: "ghcr.io/block/goose-cli:latest".to_string(),
+            command: Some(vec!["goose".to_string(), "session".to_string()]),
+            env,
+            mounts: vec![],
+            labels: Default::default(),
+        };
+
+        let config = DevaipodPod::extra_container_config(&extra);
+
+        assert_eq!(
+            config.command,
+            Some(vec!["goose".to_string(), "session".to_string()])
+        );
+        assert_eq!(config.env.get("GOOSE_DEBUG"), Some(&"1".to_string()));
+        assert_eq!(
+            config.env.get("OPENAI_API_KEY"),
+            Some(&"sk-test".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extra_container_config_with_mounts() {
+        use crate::config::{ExtraContainerConfig, ExtraMountConfig};
+        let extra = ExtraContainerConfig {
+            name: "goose".to_string(),
+            image: "ghcr.io/block/goose-cli:latest".to_string(),
+            command: None,
+            env: Default::default(),
+            mounts: vec![
+                ExtraMountConfig {
+                    host_path: "/home/user/.config/goose".to_string(),
+                    container_path: "/root/.config/goose".to_string(),
+                    read_only: true,
+                },
+                ExtraMountConfig {
+                    host_path: "/tmp/workdir".to_string(),
+                    container_path: "/workdir".to_string(),
+                    read_only: false,
+                },
+            ],
+            labels: Default::default(),
+        };
+
+        let config = DevaipodPod::extra_container_config(&extra);
+
+        assert_eq!(config.mounts.len(), 2);
+        assert_eq!(config.mounts[0].source, "/home/user/.config/goose");
+        assert_eq!(config.mounts[0].target, "/root/.config/goose");
+        assert!(config.mounts[0].readonly);
+        assert_eq!(config.mounts[1].source, "/tmp/workdir");
+        assert_eq!(config.mounts[1].target, "/workdir");
+        assert!(!config.mounts[1].readonly);
+    }
+
+    #[test]
+    fn test_extra_container_config_with_labels() {
+        use crate::config::ExtraContainerConfig;
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("app.type".to_string(), "ai-agent".to_string());
+        labels.insert("managed-by".to_string(), "devaipod".to_string());
+
+        let extra = ExtraContainerConfig {
+            name: "goose".to_string(),
+            image: "ghcr.io/block/goose-cli:latest".to_string(),
+            command: None,
+            env: Default::default(),
+            mounts: vec![],
+            labels,
+        };
+
+        let config = DevaipodPod::extra_container_config(&extra);
+
+        assert_eq!(config.labels.get("app.type"), Some(&"ai-agent".to_string()));
+        assert_eq!(
+            config.labels.get("managed-by"),
+            Some(&"devaipod".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extra_container_naming_convention() {
+        // Verify the naming pattern <pod>-extra-<name> is consistent
+        let pod_name = "devaipod-myproject";
+        let container_name = format!("{}-extra-{}", pod_name, "goose");
+        assert_eq!(container_name, "devaipod-myproject-extra-goose");
     }
 }

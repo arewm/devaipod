@@ -98,6 +98,35 @@ pub struct Config {
     /// Git-related configuration
     #[serde(default)]
     pub git: GitConfig,
+
+    /// Extra containers to inject into the pod alongside workspace/agent/gator/api.
+    ///
+    /// Each entry defines an additional container that is created with the pod
+    /// and started alongside the core containers. All containers in a pod share
+    /// the same network namespace (localhost communication).
+    ///
+    /// Extra containers do NOT automatically receive workspace volumes, agent home
+    /// volumes, YOLO mode, or MCP configuration — that is the user's responsibility.
+    /// This is intentional: generic injection means devaipod does not know what is
+    /// running inside the extra container.
+    ///
+    /// Example configuration:
+    /// ```toml
+    /// [[extra-containers]]
+    /// name = "goose"
+    /// image = "ghcr.io/block/goose-cli:latest"
+    /// command = ["goose", "session", "start"]
+    ///
+    /// [extra-containers.env]
+    /// OPENAI_API_KEY = "sk-..."
+    ///
+    /// [[extra-containers.mounts]]
+    /// host_path = "/home/user/.config/goose"
+    /// container_path = "/root/.config/goose"
+    /// read_only = true
+    /// ```
+    #[serde(default, rename = "extra-containers")]
+    pub extra_containers: Vec<ExtraContainerConfig>,
 }
 
 /// Git-related configuration
@@ -116,6 +145,56 @@ pub struct GitConfig {
     /// ```
     #[serde(default)]
     pub extra_hosts: Vec<String>,
+}
+
+// =============================================================================
+// Extra container configuration
+// =============================================================================
+
+/// A host-path or named-volume bind mount for an extra container
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExtraMountConfig {
+    /// Host path or named volume to mount (supports absolute paths and named volumes)
+    pub host_path: String,
+    /// Path inside the container to mount at
+    pub container_path: String,
+    /// Mount as read-only (default: false)
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Configuration for a user-defined extra container injected into the pod
+///
+/// Extra containers run alongside workspace/agent/gator/api in the same pod
+/// and therefore share the pod's network namespace (localhost communication).
+///
+/// **Important caveats:**
+/// - Workspace volumes and agent home volumes are NOT automatically mounted —
+///   you must configure explicit mounts if needed.
+/// - YOLO mode (`OPENCODE_PERMISSION`) is NOT injected — add it to `env` if needed.
+/// - MCP configuration is NOT injected — configure it yourself in the container.
+/// - Containers are named `<pod-name>-extra-<name>` (e.g., `devaipod-myproject-extra-goose`).
+/// - The container image is pulled if not already present locally.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExtraContainerConfig {
+    /// Unique name for this container within the pod (used in `<pod>-extra-<name>`)
+    pub name: String,
+    /// Container image to run (e.g., "ghcr.io/block/goose-cli:latest")
+    pub image: String,
+    /// Command to run in the container (overrides image CMD)
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// Environment variables to set
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Volume/bind mounts for the container
+    #[serde(default)]
+    pub mounts: Vec<ExtraMountConfig>,
+    /// Labels to attach to the container
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 /// Configuration for binding paths from host home to container home
@@ -2366,5 +2445,152 @@ extra_hosts = []
         let toml = "";
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.git.extra_hosts.is_empty());
+    }
+
+    // =========================================================================
+    // Extra container configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_extra_containers_default_empty() {
+        let toml = "";
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.extra_containers.is_empty());
+    }
+
+    #[test]
+    fn test_parse_single_extra_container_minimal() {
+        let toml = r#"
+[[extra-containers]]
+name = "goose"
+image = "ghcr.io/block/goose-cli:latest"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.extra_containers.len(), 1);
+
+        let c = &config.extra_containers[0];
+        assert_eq!(c.name, "goose");
+        assert_eq!(c.image, "ghcr.io/block/goose-cli:latest");
+        assert!(c.command.is_none());
+        assert!(c.env.is_empty());
+        assert!(c.mounts.is_empty());
+        assert!(c.labels.is_empty());
+    }
+
+    #[test]
+    fn test_parse_extra_container_full() {
+        let toml = r#"
+[[extra-containers]]
+name = "goose"
+image = "ghcr.io/block/goose-cli:latest"
+command = ["goose", "session", "start"]
+
+[extra-containers.env]
+OPENAI_API_KEY = "sk-test"
+GOOSE_DEBUG = "1"
+
+[[extra-containers.mounts]]
+host_path = "/home/user/.config/goose"
+container_path = "/root/.config/goose"
+read_only = true
+
+[[extra-containers.mounts]]
+host_path = "/tmp/workdir"
+container_path = "/workdir"
+
+[extra-containers.labels]
+"app.type" = "ai-agent"
+"managed-by" = "devaipod"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.extra_containers.len(), 1);
+
+        let c = &config.extra_containers[0];
+        assert_eq!(c.name, "goose");
+        assert_eq!(c.image, "ghcr.io/block/goose-cli:latest");
+        assert_eq!(
+            c.command,
+            Some(vec![
+                "goose".to_string(),
+                "session".to_string(),
+                "start".to_string()
+            ])
+        );
+
+        // Env vars
+        assert_eq!(c.env.get("OPENAI_API_KEY"), Some(&"sk-test".to_string()));
+        assert_eq!(c.env.get("GOOSE_DEBUG"), Some(&"1".to_string()));
+
+        // Mounts
+        assert_eq!(c.mounts.len(), 2);
+        assert_eq!(c.mounts[0].host_path, "/home/user/.config/goose");
+        assert_eq!(c.mounts[0].container_path, "/root/.config/goose");
+        assert!(c.mounts[0].read_only);
+        assert_eq!(c.mounts[1].host_path, "/tmp/workdir");
+        assert_eq!(c.mounts[1].container_path, "/workdir");
+        assert!(!c.mounts[1].read_only);
+
+        // Labels
+        assert_eq!(c.labels.get("app.type"), Some(&"ai-agent".to_string()));
+        assert_eq!(c.labels.get("managed-by"), Some(&"devaipod".to_string()));
+    }
+
+    #[test]
+    fn test_parse_multiple_extra_containers() {
+        let toml = r#"
+[[extra-containers]]
+name = "goose"
+image = "ghcr.io/block/goose-cli:latest"
+
+[[extra-containers]]
+name = "custom-mcp"
+image = "myregistry.example.com/custom-mcp:v1"
+command = ["custom-mcp", "--port", "9000"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.extra_containers.len(), 2);
+
+        assert_eq!(config.extra_containers[0].name, "goose");
+        assert_eq!(config.extra_containers[1].name, "custom-mcp");
+        assert_eq!(
+            config.extra_containers[1].command,
+            Some(vec![
+                "custom-mcp".to_string(),
+                "--port".to_string(),
+                "9000".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_extra_container_unknown_field_rejected() {
+        // deny_unknown_fields should cause this to fail
+        let toml = r#"
+[[extra-containers]]
+name = "goose"
+image = "ghcr.io/block/goose-cli:latest"
+unknown_field = "should fail"
+"#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "Unknown fields in ExtraContainerConfig should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_extra_mount_read_only_default_false() {
+        let toml = r#"
+[[extra-containers]]
+name = "test"
+image = "alpine:latest"
+
+[[extra-containers.mounts]]
+host_path = "/tmp/foo"
+container_path = "/foo"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let mount = &config.extra_containers[0].mounts[0];
+        assert!(!mount.read_only, "read_only should default to false");
     }
 }
