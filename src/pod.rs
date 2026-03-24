@@ -943,6 +943,30 @@ impl DevaipodPod {
             (None, None)
         };
 
+        // Determine the agent container image: use framework-specific default or workspace image.
+        // For opencode (the default), we reuse the workspace devcontainer image since opencode
+        // is embedded in it. For other frameworks, use the framework's default image or the
+        // user-configured override from [agent] image.
+        let agent_framework = &global_config.agent.framework;
+        let agent_image = if let Some(ref override_img) = global_config.agent.image {
+            // User explicitly set [agent] image — always use it
+            override_img.clone()
+        } else if let Some(framework_default) = agent_framework.default_image() {
+            // Framework has a known default image (e.g. goose has ghcr.io/block/goose:latest)
+            framework_default.to_string()
+        } else {
+            // Fall back to the workspace devcontainer image (opencode is embedded there)
+            image.clone()
+        };
+
+        // Ensure the agent image is available if it differs from the workspace image
+        if agent_image != image {
+            podman
+                .ensure_gator_image(&agent_image)
+                .await
+                .with_context(|| format!("Failed to pull agent image: {}", agent_image))?;
+        }
+
         let agent_config = Self::agent_container_config(
             project_path,
             &workspace_folder,
@@ -957,9 +981,10 @@ impl DevaipodPod {
             worker_workspace_volume_name.as_deref(),
             global_config,
             auto_approve,
+            agent_framework,
         );
         podman
-            .create_container(&agent_container, &image, pod_name, agent_config)
+            .create_container(&agent_container, &agent_image, pod_name, agent_config)
             .await
             .with_context(|| format!("Failed to create agent container: {}", agent_container))?;
 
@@ -2323,9 +2348,141 @@ exec sleep infinity
         }
     }
 
+    /// Build the startup script for the agent container based on the agent framework.
+    ///
+    /// Each framework has a different launch command and setup requirements:
+    /// - opencode: runs as a persistent HTTP server (`opencode serve`)
+    /// - goose: runs one task per invocation (`goose run --text "..."`)
+    /// - claude-code: runs one task per invocation (`claude -p "..."`)
+    ///
+    /// The script waits for the devaipod state file before starting (to ensure
+    /// the workspace and dotfiles are set up first) and handles the mock agent
+    /// mode used in integration tests (opencode only).
+    fn build_agent_startup_script(framework: &crate::config::AgentFramework) -> String {
+        match framework {
+            crate::config::AgentFramework::Opencode => {
+                format!(
+                    r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
+
+# Wait for devaipod to finish setup (dotfiles, task config) before starting
+# opencode.  The state file lives on the container overlay so it persists
+# across stop/start but is absent after a container rebuild.
+while [ ! -f {state} ]; do
+    sleep 0.1
+done
+
+# Mock mode: run inline mock server instead of the real opencode server.
+# Used by integration tests to avoid needing a real AI provider.
+# Uses Python3 (available in all devcontainer images) so no extra binary
+# is required in the agent container.
+if [ -n "${{DEVAIPOD_MOCK_AGENT}}" ]; then
+    exec python3 -u -c "
+import json, http.server, socketserver
+
+SESSION = json.dumps([dict(id='mock-001',slug='mock',projectID='p',directory='/workspaces/test',title='Mock',version='1.0.0',time=dict(created=1700000000000,updated=1700000100000))])
+MESSAGE = json.dumps([dict(info=dict(role='assistant',time=dict(created=1700000001000,completed=1700000002000),finish='stop'),parts=[dict(type='text',text='Ready.')])])
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith('/session') and '/message' in self.path:
+            body = MESSAGE
+        elif self.path.startswith('/session'):
+            body = SESSION
+        else:
+            self.send_error(404); return
+        self.send_response(200)
+        self.send_header('Content-Type','application/json')
+        self.end_headers()
+        self.wfile.write(body.encode())
+    def log_message(self, *a): pass
+
+print('Mock opencode on port {opencode_port}', flush=True)
+socketserver.TCPServer(('0.0.0.0',{opencode_port}),H).serve_forever()
+"
+fi
+
+# Run opencode serve, bound to 0.0.0.0 so it's accessible from the published port
+exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
+                    home = AGENT_HOME_PATH,
+                    state = AGENT_STATE_PATH,
+                    opencode_port = OPENCODE_PORT
+                )
+            }
+            crate::config::AgentFramework::Goose => {
+                format!(
+                    r#"mkdir -p {home}/.config/goose {home}/.local/share {home}/.local/bin {home}/.cache
+
+# Wait for devaipod to finish setup (dotfiles, task config) before starting.
+while [ ! -f {state} ]; do
+    sleep 0.1
+done
+
+# Write devaipod-managed goose config (YAML format).
+# This file is ALWAYS written by devaipod to ensure the sandbox controls YOLO
+# mode and MCP connections — not the user's dotfiles. Any dotfiles-provided
+# goose config.yaml is superseded by this file.
+if [ -n "${{DEVAIPOD_GOOSE_MCP_YAML}}" ]; then
+    printf '%s\n' "${{DEVAIPOD_GOOSE_MCP_YAML}}" > {home}/.config/goose/config.yaml
+fi
+
+# Read task from the devaipod task file (written by signal_agent_ready)
+TASK_FILE="{home}/.config/opencode/devaipod-task.md"
+if [ -f "$TASK_FILE" ]; then
+    TASK=$(cat "$TASK_FILE")
+    exec goose run --text "$TASK"
+else
+    # No task: start goose in interactive session mode
+    exec goose session
+fi"#,
+                    home = AGENT_HOME_PATH,
+                    state = AGENT_STATE_PATH,
+                )
+            }
+            crate::config::AgentFramework::ClaudeCode => {
+                format!(
+                    r#"mkdir -p {home}/.claude {home}/.local/share {home}/.local/bin {home}/.cache
+
+# Wait for devaipod to finish setup (dotfiles, task config) before starting.
+while [ ! -f {state} ]; do
+    sleep 0.1
+done
+
+# Write claude-code MCP config if provided (JSON format)
+MCP_CONFIG_FILE="{home}/.claude/mcp.json"
+if [ -n "${{DEVAIPOD_CLAUDE_MCP_JSON}}" ]; then
+    printf '%s\n' "${{DEVAIPOD_CLAUDE_MCP_JSON}}" > "$MCP_CONFIG_FILE"
+fi
+
+# Auto-approve flag (--dangerously-skip-permissions) when YOLO mode is enabled
+AUTO_APPROVE_FLAG=""
+if [ -n "${{DEVAIPOD_AUTO_APPROVE}}" ]; then
+    AUTO_APPROVE_FLAG="--dangerously-skip-permissions"
+fi
+
+# MCP config flag
+MCP_FLAG=""
+if [ -f "$MCP_CONFIG_FILE" ]; then
+    MCP_FLAG="--mcp-config $MCP_CONFIG_FILE"
+fi
+
+# Read task from the devaipod task file (written by signal_agent_ready)
+TASK_FILE="{home}/.config/opencode/devaipod-task.md"
+if [ -f "$TASK_FILE" ]; then
+    exec claude -p "$(cat "$TASK_FILE")" $AUTO_APPROVE_FLAG $MCP_FLAG
+else
+    # No task: start claude in interactive mode
+    exec claude $AUTO_APPROVE_FLAG $MCP_FLAG
+fi"#,
+                    home = AGENT_HOME_PATH,
+                    state = AGENT_STATE_PATH,
+                )
+            }
+        }
+    }
+
     /// Create container config for the agent container
     ///
-    /// The agent runs `opencode serve` with credential isolation:
+    /// The agent runs the configured framework (opencode by default) with credential isolation:
     /// - Receives LLM API keys but NOT trusted credentials (GH_TOKEN, etc.)
     /// - Uses a separate home directory volume
     /// - Has the same Linux capabilities as workspace (for nested container support)
@@ -2336,8 +2493,7 @@ exec sleep infinity
     /// If `devcontainer_config` is provided, env vars from its `customizations.devaipod.env_allowlist`
     /// will be forwarded to the agent.
     ///
-    /// If `enable_gator` is true, OPENCODE_CONFIG_CONTENT is set with MCP config
-    /// to connect opencode to the service-gator container (no auth needed).
+    /// If `enable_gator` is true, MCP config is injected for the agent to connect to service-gator.
     ///
     /// If `enable_orchestration` is true and `worker_workspace_volume` is provided,
     /// the worker's workspace is mounted read-only at `/mnt/worker-workspace`.
@@ -2356,6 +2512,7 @@ exec sleep infinity
         worker_workspace_volume: Option<&str>,
         global_config: &crate::config::Config,
         auto_approve: bool,
+        agent_framework: &crate::config::AgentFramework,
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
         let agent_home = AGENT_HOME_PATH.to_string();
@@ -2412,11 +2569,28 @@ exec sleep infinity
         // autonomously without interactive prompts. This matches the behavior
         // users expect in a headless pod environment. Pass --no-auto-approve
         // to disable this.
+        //
+        // Each framework uses a different mechanism for YOLO/auto-approve:
+        // - opencode: OPENCODE_PERMISSION env var with wildcard allow
+        // - goose: GOOSE_MODE=auto env var
+        // - claude-code: --dangerously-skip-permissions CLI flag (handled in startup script)
         if auto_approve {
-            env.insert(
-                "OPENCODE_PERMISSION".to_string(),
-                r#"{"*":"allow"}"#.to_string(),
-            );
+            match agent_framework {
+                crate::config::AgentFramework::Opencode => {
+                    env.insert(
+                        "OPENCODE_PERMISSION".to_string(),
+                        r#"{"*":"allow"}"#.to_string(),
+                    );
+                }
+                crate::config::AgentFramework::Goose => {
+                    env.insert("GOOSE_MODE".to_string(), "auto".to_string());
+                }
+                crate::config::AgentFramework::ClaudeCode => {
+                    // --dangerously-skip-permissions is passed in the startup script
+                    // when auto_approve is true; we signal this via an env var.
+                    env.insert("DEVAIPOD_AUTO_APPROVE".to_string(), "1".to_string());
+                }
+            }
         }
 
         // No bind mounts - we clone the repo into the container instead
@@ -2492,41 +2666,99 @@ exec sleep infinity
             }
         }
 
-        // Build MCP config combining service-gator and any additional MCP servers
-        let mut mcp_servers = serde_json::Map::new();
-
+        // Collect MCP server entries (service-gator + any extras from config)
+        let mut mcp_entries: Vec<(String, String)> = Vec::new();
         if enable_gator {
-            mcp_servers.insert(
+            mcp_entries.push((
                 "service-gator".to_string(),
-                serde_json::json!({
-                    "type": "remote",
-                    "url": format!("http://localhost:{}/mcp", GATOR_PORT),
-                    "enabled": true
-                }),
-            );
+                format!("http://localhost:{}/mcp", GATOR_PORT),
+            ));
         }
-
-        // Add any additional MCP servers from config
         for (name, entry) in global_config.mcp.enabled_servers() {
-            let mut server_json = serde_json::json!({
-                "type": "remote",
-                "url": entry.url,
-                "enabled": true
-            });
-            if !entry.headers.is_empty() {
-                server_json["headers"] = serde_json::json!(entry.headers);
-            }
-            mcp_servers.insert(name.to_string(), server_json);
+            mcp_entries.push((name.to_string(), entry.url.clone()));
         }
 
-        if !mcp_servers.is_empty() {
-            let mcp_config = serde_json::json!({
-                "mcp": mcp_servers
-            });
-            env.insert(
-                "OPENCODE_CONFIG_CONTENT".to_string(),
-                mcp_config.to_string(),
-            );
+        // Inject MCP config in the format appropriate for the agent framework.
+        // opencode: OPENCODE_CONFIG_CONTENT env var (JSON)
+        // goose: DEVAIPOD_GOOSE_MCP_YAML env var (YAML written to disk by startup script)
+        // claude-code: DEVAIPOD_CLAUDE_MCP_JSON env var (JSON written to disk by startup script)
+        match agent_framework {
+            crate::config::AgentFramework::Opencode => {
+                let mut mcp_servers = serde_json::Map::new();
+                for (name, url) in &mcp_entries {
+                    mcp_servers.insert(
+                        name.clone(),
+                        serde_json::json!({
+                            "type": "remote",
+                            "url": url,
+                            "enabled": true
+                        }),
+                    );
+                    // Propagate headers for non-gator servers
+                    if let Some(entry) = global_config.mcp.servers.get(name.as_str()) {
+                        if !entry.headers.is_empty() {
+                            if let Some(obj) = mcp_servers.get_mut(name) {
+                                obj["headers"] = serde_json::json!(entry.headers);
+                            }
+                        }
+                    }
+                }
+                if !mcp_servers.is_empty() {
+                    let mcp_config = serde_json::json!({ "mcp": mcp_servers });
+                    env.insert(
+                        "OPENCODE_CONFIG_CONTENT".to_string(),
+                        mcp_config.to_string(),
+                    );
+                }
+            }
+            crate::config::AgentFramework::Goose => {
+                // Goose uses a YAML config file (~/.config/goose/config.yaml).
+                // We always generate this config and write it in the startup script.
+                // Critically, we ALWAYS include goose_mode here when auto_approve is
+                // set — this ensures the sandbox controls YOLO behavior, not dotfiles.
+                // The env var GOOSE_MODE=auto already takes precedence over config, but
+                // writing it to the config file too ensures consistency if the env is
+                // somehow unset by a dotfiles postStart script.
+                let mut yaml = String::new();
+                if auto_approve {
+                    yaml.push_str("GOOSE_MODE: auto\n");
+                }
+                if !mcp_entries.is_empty() {
+                    yaml.push_str("extensions:\n");
+                    for (name, url) in &mcp_entries {
+                        yaml.push_str(&format!(
+                            "  {name}:\n    enabled: true\n    type: remote_mcp\n    url: {url}\n    name: {name}\n"
+                        ));
+                    }
+                }
+                // Always pass the config content (even if just goose_mode) so the
+                // startup script writes an authoritative config file.
+                if !yaml.is_empty() {
+                    env.insert("DEVAIPOD_GOOSE_MCP_YAML".to_string(), yaml);
+                }
+            }
+            crate::config::AgentFramework::ClaudeCode => {
+                // Claude Code uses a JSON MCP config file passed via --mcp-config.
+                // We generate the JSON here and pass it via env var; the startup
+                // script writes it to disk before launching claude.
+                if !mcp_entries.is_empty() {
+                    let mut servers = serde_json::Map::new();
+                    for (name, url) in &mcp_entries {
+                        servers.insert(
+                            name.clone(),
+                            serde_json::json!({
+                                "type": "sse",
+                                "url": url
+                            }),
+                        );
+                    }
+                    let mcp_json = serde_json::json!({ "mcpServers": servers });
+                    env.insert(
+                        "DEVAIPOD_CLAUDE_MCP_JSON".to_string(),
+                        mcp_json.to_string(),
+                    );
+                }
+            }
         }
 
         // When orchestration is enabled, set OPENCODE_WORKER_URL so the task owner
@@ -2552,52 +2784,7 @@ exec sleep infinity
         // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
         let file_secrets = global_config.trusted_env.file_secret_mounts();
 
-        let startup_script = format!(
-            r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
-
-# Wait for devaipod to finish setup (dotfiles, task config) before starting
-# opencode.  The state file lives on the container overlay so it persists
-# across stop/start but is absent after a container rebuild.
-while [ ! -f {state} ]; do
-    sleep 0.1
-done
-
-# Mock mode: run inline mock server instead of the real opencode server.
-# Used by integration tests to avoid needing a real AI provider.
-# Uses Python3 (available in all devcontainer images) so no extra binary
-# is required in the agent container.
-if [ -n "${{DEVAIPOD_MOCK_AGENT}}" ]; then
-    exec python3 -u -c "
-import json, http.server, socketserver
-
-SESSION = json.dumps([dict(id='mock-001',slug='mock',projectID='p',directory='/workspaces/test',title='Mock',version='1.0.0',time=dict(created=1700000000000,updated=1700000100000))])
-MESSAGE = json.dumps([dict(info=dict(role='assistant',time=dict(created=1700000001000,completed=1700000002000),finish='stop'),parts=[dict(type='text',text='Ready.')])])
-
-class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.startswith('/session') and '/message' in self.path:
-            body = MESSAGE
-        elif self.path.startswith('/session'):
-            body = SESSION
-        else:
-            self.send_error(404); return
-        self.send_response(200)
-        self.send_header('Content-Type','application/json')
-        self.end_headers()
-        self.wfile.write(body.encode())
-    def log_message(self, *a): pass
-
-print('Mock opencode on port {opencode_port}', flush=True)
-socketserver.TCPServer(('0.0.0.0',{opencode_port}),H).serve_forever()
-"
-fi
-
-# Run opencode serve, bound to 0.0.0.0 so it's accessible from the published port
-exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
-            home = AGENT_HOME_PATH,
-            state = AGENT_STATE_PATH,
-            opencode_port = OPENCODE_PORT
-        );
+        let startup_script = Self::build_agent_startup_script(agent_framework);
 
         ContainerConfig {
             mounts,
@@ -3277,6 +3464,7 @@ mod tests {
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             true, // auto_approve
+            &crate::config::AgentFramework::Opencode,
         );
 
         // Volume mounts: agent workspace, main workspace (readonly), and agent home
@@ -3341,6 +3529,7 @@ mod tests {
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             false, // auto_approve disabled
+            &crate::config::AgentFramework::Opencode,
         );
 
         assert!(
@@ -3372,6 +3561,7 @@ mod tests {
             Some("test-worker-workspace"), // worker_workspace_volume
             &global_config,
             true, // auto_approve
+            &crate::config::AgentFramework::Opencode,
         );
 
         // With orchestration enabled, should have 4 volume mounts:
@@ -3433,6 +3623,7 @@ mod tests {
             None, // worker_workspace_volume
             &global_config,
             true, // auto_approve
+            &crate::config::AgentFramework::Opencode,
         );
 
         // No bind mounts - we clone the repo into the container instead
@@ -3470,6 +3661,7 @@ mod tests {
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             true, // auto_approve
+            &crate::config::AgentFramework::Opencode,
         );
 
         // Verify file_secrets are included for agent container
@@ -3891,6 +4083,7 @@ mod tests {
             None, // worker_workspace_volume
             &global_config,
             true, // auto_approve
+            &crate::config::AgentFramework::Opencode,
         );
 
         // Agent should have no secrets
@@ -4554,6 +4747,7 @@ mod tests {
             None, // worker_workspace_volume
             &global_config,
             true, // auto_approve
+            &crate::config::AgentFramework::Opencode,
         );
 
         // Should have devcontainer secrets (LLM keys go to agent)
@@ -4689,5 +4883,312 @@ mod tests {
             .filter(|(env_var, _)| env_var == "GH_TOKEN")
             .count();
         assert_eq!(gh_token_count, 1);
+    }
+
+    // =========================================================================
+    // Agent framework startup script tests
+    // =========================================================================
+
+    #[test]
+    fn test_opencode_startup_script() {
+        let script = DevaipodPod::build_agent_startup_script(&crate::config::AgentFramework::Opencode);
+        assert!(
+            script.contains("opencode serve"),
+            "Opencode script should start opencode serve"
+        );
+        assert!(
+            script.contains(&format!("--port {}", OPENCODE_PORT)),
+            "Opencode script should use the correct port"
+        );
+        assert!(
+            script.contains("DEVAIPOD_MOCK_AGENT"),
+            "Opencode script should handle mock mode for tests"
+        );
+        assert!(
+            script.contains(AGENT_STATE_PATH),
+            "Opencode script should wait for state file"
+        );
+    }
+
+    #[test]
+    fn test_goose_startup_script() {
+        let script = DevaipodPod::build_agent_startup_script(&crate::config::AgentFramework::Goose);
+        assert!(
+            script.contains("goose run"),
+            "Goose script should invoke goose run for tasks"
+        );
+        assert!(
+            script.contains("goose session"),
+            "Goose script should fall back to interactive session mode"
+        );
+        assert!(
+            script.contains("DEVAIPOD_GOOSE_MCP_YAML"),
+            "Goose script should write MCP config from env var"
+        );
+        assert!(
+            script.contains("devaipod-task.md"),
+            "Goose script should read task from devaipod task file"
+        );
+        assert!(
+            script.contains(AGENT_STATE_PATH),
+            "Goose script should wait for state file"
+        );
+        // Critically: must not invoke the opencode binary
+        assert!(
+            !script.contains("opencode serve"),
+            "Goose script should not invoke opencode serve"
+        );
+    }
+
+    #[test]
+    fn test_claude_code_startup_script() {
+        let script = DevaipodPod::build_agent_startup_script(&crate::config::AgentFramework::ClaudeCode);
+        assert!(
+            script.contains("claude"),
+            "Claude-code script should invoke claude"
+        );
+        assert!(
+            script.contains("--dangerously-skip-permissions"),
+            "Claude-code script should support YOLO mode"
+        );
+        assert!(
+            script.contains("DEVAIPOD_AUTO_APPROVE"),
+            "Claude-code script should check auto-approve env var"
+        );
+        assert!(
+            script.contains("DEVAIPOD_CLAUDE_MCP_JSON"),
+            "Claude-code script should write MCP config from env var"
+        );
+        assert!(
+            script.contains("devaipod-task.md"),
+            "Claude-code script should read task from devaipod task file"
+        );
+        assert!(
+            script.contains(AGENT_STATE_PATH),
+            "Claude-code script should wait for state file"
+        );
+        // Critically: must not invoke the opencode binary
+        assert!(
+            !script.contains("opencode serve"),
+            "Claude-code script should not invoke opencode serve"
+        );
+    }
+
+    #[test]
+    fn test_goose_yolo_env_var_set_when_auto_approve() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/devenv";
+        let global_config = crate::config::Config::default();
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false, // enable_gator
+            false, // enable_orchestration
+            "test-main-workspace",
+            "test-agent-workspace",
+            "test-agent-home",
+            None,
+            &global_config,
+            true, // auto_approve
+            &crate::config::AgentFramework::Goose,
+        );
+
+        assert_eq!(
+            container_config.env.get("GOOSE_MODE"),
+            Some(&"auto".to_string()),
+            "Goose should have GOOSE_MODE=auto when auto_approve is true"
+        );
+        // Goose should NOT use opencode's YOLO mechanism
+        assert!(
+            container_config.env.get("OPENCODE_PERMISSION").is_none(),
+            "Goose should not set OPENCODE_PERMISSION"
+        );
+        // The GOOSE_MODE should also appear in the MCP YAML (for sandbox-authoritative config)
+        let yaml = container_config.env.get("DEVAIPOD_GOOSE_MCP_YAML");
+        assert!(
+            yaml.map(|y| y.contains("GOOSE_MODE: auto")).unwrap_or(false),
+            "GOOSE_MCP_YAML should include GOOSE_MODE: auto when auto_approve is true"
+        );
+    }
+
+    #[test]
+    fn test_goose_yolo_not_set_when_auto_approve_disabled() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/devenv";
+        let global_config = crate::config::Config::default();
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false, // enable_gator
+            false, // enable_orchestration
+            "test-main-workspace",
+            "test-agent-workspace",
+            "test-agent-home",
+            None,
+            &global_config,
+            false, // auto_approve disabled
+            &crate::config::AgentFramework::Goose,
+        );
+
+        assert!(
+            container_config.env.get("GOOSE_MODE").is_none(),
+            "Goose should NOT have GOOSE_MODE when auto_approve is false"
+        );
+    }
+
+    #[test]
+    fn test_claude_code_auto_approve_env_var() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/devenv";
+        let global_config = crate::config::Config::default();
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false, // enable_gator
+            false, // enable_orchestration
+            "test-main-workspace",
+            "test-agent-workspace",
+            "test-agent-home",
+            None,
+            &global_config,
+            true, // auto_approve
+            &crate::config::AgentFramework::ClaudeCode,
+        );
+
+        assert_eq!(
+            container_config.env.get("DEVAIPOD_AUTO_APPROVE"),
+            Some(&"1".to_string()),
+            "Claude-code should have DEVAIPOD_AUTO_APPROVE=1 when auto_approve is true"
+        );
+        // Claude-code should NOT use opencode's or goose's YOLO mechanism
+        assert!(
+            container_config.env.get("OPENCODE_PERMISSION").is_none(),
+            "Claude-code should not set OPENCODE_PERMISSION"
+        );
+        assert!(
+            container_config.env.get("GOOSE_MODE").is_none(),
+            "Claude-code should not set GOOSE_MODE"
+        );
+    }
+
+    #[test]
+    fn test_goose_mcp_config_uses_yaml_format() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/devenv";
+        let global_config = crate::config::Config::default();
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            true,  // enable_gator
+            false, // enable_orchestration
+            "test-main-workspace",
+            "test-agent-workspace",
+            "test-agent-home",
+            None,
+            &global_config,
+            true, // auto_approve
+            &crate::config::AgentFramework::Goose,
+        );
+
+        // Goose should use YAML MCP config, not opencode's JSON format
+        assert!(
+            container_config.env.contains_key("DEVAIPOD_GOOSE_MCP_YAML"),
+            "Goose should use DEVAIPOD_GOOSE_MCP_YAML for MCP config"
+        );
+        assert!(
+            !container_config.env.contains_key("OPENCODE_CONFIG_CONTENT"),
+            "Goose should not use OPENCODE_CONFIG_CONTENT"
+        );
+        let yaml = container_config.env.get("DEVAIPOD_GOOSE_MCP_YAML").unwrap();
+        assert!(
+            yaml.contains("service-gator"),
+            "Goose MCP YAML should include service-gator"
+        );
+        assert!(
+            yaml.contains("remote_mcp"),
+            "Goose MCP YAML should use remote_mcp type"
+        );
+        assert!(
+            yaml.contains(&format!("localhost:{}", GATOR_PORT)),
+            "Goose MCP YAML should reference gator port"
+        );
+    }
+
+    #[test]
+    fn test_claude_code_mcp_config_uses_json_format() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/devenv";
+        let global_config = crate::config::Config::default();
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            true,  // enable_gator
+            false, // enable_orchestration
+            "test-main-workspace",
+            "test-agent-workspace",
+            "test-agent-home",
+            None,
+            &global_config,
+            true, // auto_approve
+            &crate::config::AgentFramework::ClaudeCode,
+        );
+
+        // Claude-code should use JSON MCP config, not opencode's or goose's format
+        assert!(
+            container_config.env.contains_key("DEVAIPOD_CLAUDE_MCP_JSON"),
+            "Claude-code should use DEVAIPOD_CLAUDE_MCP_JSON for MCP config"
+        );
+        assert!(
+            !container_config.env.contains_key("OPENCODE_CONFIG_CONTENT"),
+            "Claude-code should not use OPENCODE_CONFIG_CONTENT"
+        );
+        assert!(
+            !container_config.env.contains_key("DEVAIPOD_GOOSE_MCP_YAML"),
+            "Claude-code should not use DEVAIPOD_GOOSE_MCP_YAML"
+        );
+        let json_str = container_config
+            .env
+            .get("DEVAIPOD_CLAUDE_MCP_JSON")
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert!(
+            json["mcpServers"]["service-gator"].is_object(),
+            "Claude MCP JSON should have service-gator in mcpServers"
+        );
+        assert_eq!(
+            json["mcpServers"]["service-gator"]["type"],
+            "sse",
+            "Claude MCP server type should be sse"
+        );
     }
 }

@@ -98,6 +98,13 @@ pub struct Config {
     /// Git-related configuration
     #[serde(default)]
     pub git: GitConfig,
+
+    /// Agent framework configuration
+    ///
+    /// Controls which AI agent framework runs in the agent container.
+    /// Defaults to opencode, which is embedded in the devaipod container image.
+    #[serde(default)]
+    pub agent: AgentConfig,
 }
 
 /// Git-related configuration
@@ -895,6 +902,96 @@ impl McpServersConfig {
         }
         Ok(())
     }
+}
+
+// =============================================================================
+// Agent framework configuration
+// =============================================================================
+
+/// Which AI agent framework to run in the agent container
+///
+/// Each framework has different mechanisms for receiving tasks, configuring MCP
+/// servers, and enabling autonomous (YOLO) mode.
+///
+/// The default is `opencode`, which is embedded in the devaipod container image
+/// and requires no additional configuration.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentFramework {
+    /// OpenCode (default) — embedded in the devaipod image, runs as a persistent
+    /// server (`opencode serve`) that accepts sessions via HTTP API.
+    #[default]
+    Opencode,
+    /// Goose by Block — a Python/Go CLI agent that runs tasks non-interactively
+    /// via `goose run --text "..."`. Requires a separate image with goose installed.
+    Goose,
+    /// Claude Code by Anthropic — a CLI agent that runs tasks non-interactively
+    /// via `claude -p "..."`. Requires a separate image with claude-code installed.
+    ClaudeCode,
+}
+
+impl AgentFramework {
+    /// Return the default container image for this framework, if known.
+    ///
+    /// Returns `None` for frameworks where no canonical public image is available
+    /// (the user must specify one via `[agent] image`).
+    pub fn default_image(&self) -> Option<&'static str> {
+        match self {
+            // OpenCode is embedded in the devaipod image; no separate image needed.
+            AgentFramework::Opencode => None,
+            // Block's official goose image
+            AgentFramework::Goose => Some("ghcr.io/block/goose:latest"),
+            // No official headless image for claude-code yet
+            AgentFramework::ClaudeCode => None,
+        }
+    }
+
+    /// Whether this framework runs as a persistent server (vs. a one-shot process).
+    ///
+    /// OpenCode runs as a long-lived HTTP server that multiple sessions can connect to.
+    /// Other frameworks typically run one task per process invocation.
+    ///
+    /// This affects UX: server-mode frameworks support `devaipod attach` for interactive
+    /// supervision, while one-shot frameworks complete their task and exit.
+    #[allow(dead_code)] // Used in future UX improvements for non-server frameworks
+    pub fn is_server_mode(&self) -> bool {
+        matches!(self, AgentFramework::Opencode)
+    }
+}
+
+/// Agent framework configuration
+///
+/// Controls which AI agent framework runs in the agent container and how it
+/// is configured. This is an advanced option; the default (opencode) requires
+/// no configuration.
+///
+/// Example for goose:
+/// ```toml
+/// [agent]
+/// framework = "goose"
+/// image = "ghcr.io/block/goose:latest"
+/// ```
+///
+/// Example for claude-code (image must be user-supplied):
+/// ```toml
+/// [agent]
+/// framework = "claude-code"
+/// image = "my-registry/claude-code-devenv:latest"
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AgentConfig {
+    /// Which agent framework to use (default: "opencode")
+    #[serde(default)]
+    pub framework: AgentFramework,
+
+    /// Override the container image for the agent.
+    ///
+    /// When not set, the workspace devcontainer image is used for opencode.
+    /// For other frameworks, each has a `default_image()` (see `AgentFramework`),
+    /// but you can override it here.
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 /// Get the XDG config directory
@@ -2366,5 +2463,109 @@ extra_hosts = []
         let toml = "";
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.git.extra_hosts.is_empty());
+    }
+
+    // =========================================================================
+    // Agent framework configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_agent_config_defaults_to_opencode() {
+        let toml = "";
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.framework, AgentFramework::Opencode);
+        assert!(config.agent.image.is_none());
+    }
+
+    #[test]
+    fn test_agent_config_explicit_opencode() {
+        let toml = r#"
+[agent]
+framework = "opencode"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.framework, AgentFramework::Opencode);
+        assert!(config.agent.image.is_none());
+    }
+
+    #[test]
+    fn test_agent_config_goose_with_default_image() {
+        let toml = r#"
+[agent]
+framework = "goose"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.framework, AgentFramework::Goose);
+        // No explicit image — uses framework default
+        assert!(config.agent.image.is_none());
+        // Framework default image is the block goose image
+        assert_eq!(
+            config.agent.framework.default_image(),
+            Some("ghcr.io/block/goose:latest")
+        );
+    }
+
+    #[test]
+    fn test_agent_config_goose_with_custom_image() {
+        let toml = r#"
+[agent]
+framework = "goose"
+image = "my-registry/goose:custom"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.framework, AgentFramework::Goose);
+        assert_eq!(
+            config.agent.image,
+            Some("my-registry/goose:custom".to_string())
+        );
+    }
+
+    #[test]
+    fn test_agent_config_claude_code() {
+        let toml = r#"
+[agent]
+framework = "claude-code"
+image = "my-registry/claude-devenv:latest"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.framework, AgentFramework::ClaudeCode);
+        assert_eq!(
+            config.agent.image,
+            Some("my-registry/claude-devenv:latest".to_string())
+        );
+        // No official default image for claude-code
+        assert!(config.agent.framework.default_image().is_none());
+    }
+
+    #[test]
+    fn test_agent_framework_server_mode() {
+        // Only opencode is a persistent server
+        assert!(AgentFramework::Opencode.is_server_mode());
+        assert!(!AgentFramework::Goose.is_server_mode());
+        assert!(!AgentFramework::ClaudeCode.is_server_mode());
+    }
+
+    #[test]
+    fn test_agent_framework_default_images() {
+        assert!(AgentFramework::Opencode.default_image().is_none());
+        assert_eq!(
+            AgentFramework::Goose.default_image(),
+            Some("ghcr.io/block/goose:latest")
+        );
+        assert!(AgentFramework::ClaudeCode.default_image().is_none());
+    }
+
+    #[test]
+    fn test_agent_config_unknown_framework_fails() {
+        // Unknown framework values should fail to parse cleanly
+        let toml = r#"
+[agent]
+framework = "nonexistent-framework"
+"#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "Unknown framework values should fail to parse"
+        );
     }
 }
