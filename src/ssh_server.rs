@@ -223,12 +223,12 @@ impl russh::server::Handler for SshHandler {
         _pix_height: u32,
         _session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        if let Some(state) = self.channels.get_mut(&channel) {
-            if let Some(pty) = &mut state.pty {
-                pty.cols = col_width;
-                pty.rows = row_height;
-                // TODO: Send SIGWINCH to the process if running with PTY
-            }
+        if let Some(state) = self.channels.get_mut(&channel)
+            && let Some(pty) = &mut state.pty
+        {
+            pty.cols = col_width;
+            pty.rows = row_height;
+            // TODO: Send SIGWINCH to the process if running with PTY
         }
         std::future::ready(Ok(()))
     }
@@ -555,8 +555,7 @@ async fn run_sftp(
     input_rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     // Try multiple sftp-server paths (Debian/Ubuntu vs RHEL/Fedora)
-    let sftp_command =
-        "for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server; do [ -x $p ] && exec $p -e; done; echo 'sftp-server not found' >&2; exit 1";
+    let sftp_command = "for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server; do [ -x $p ] && exec $p -e; done; echo 'sftp-server not found' >&2; exit 1";
     run_podman_exec(
         handle,
         channel,

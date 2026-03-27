@@ -7,12 +7,12 @@
 //! uses `--image` to override the devcontainer, which is the flow that
 //! was failing with "Failed to clone into workspace volume (exit code 125)".
 
-use color_eyre::eyre::bail;
 use color_eyre::Result;
+use color_eyre::eyre::bail;
 
 use crate::{
-    integration_test, podman_integration_test, run_devaipod, run_devaipod_in, short_name,
-    unique_test_name, PodGuard, TestRepo,
+    PodGuard, TestRepo, integration_test, podman_integration_test, run_devaipod, run_devaipod_in,
+    short_name, unique_test_name,
 };
 
 // =============================================================================

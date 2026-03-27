@@ -1,11 +1,11 @@
 [workspace]
 members = [".", "crates/integration-tests"]
-resolver = "2"
+resolver = "3"
 
 [package]
 name = "devaipod"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Sandboxed AI coding agents in reproducible dev environments"
 repository = "https://github.com/cgwalters/devaipod"
 readme = "README.md"

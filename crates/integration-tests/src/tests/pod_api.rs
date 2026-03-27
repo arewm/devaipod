@@ -4,8 +4,8 @@
 //! process, then exercise the HTTP API via actual TCP connections. No
 //! podman or containers required — just two localhost processes.
 
-use color_eyre::eyre::Context;
 use color_eyre::Result;
+use color_eyre::eyre::Context;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};

@@ -3,7 +3,7 @@
 //! This module provides abstractions for working with git hosting platforms,
 //! including parsing PR/MR URLs and fetching metadata.
 
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Supported git forge types

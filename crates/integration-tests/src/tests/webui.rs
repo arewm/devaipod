@@ -42,12 +42,12 @@
 //!
 //! All tests share a single `WebFixture` container to reduce resource contention.
 
-use color_eyre::eyre::bail;
 use color_eyre::Result;
+use color_eyre::eyre::bail;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 use crate::container_integration_test;
 use crate::shell;
@@ -1046,7 +1046,8 @@ fn test_web_container_opencode_info_endpoint() -> Result<()> {
                         // URL should be a direct localhost URL (token is not included)
                         let url = info.get("url").unwrap().as_str().unwrap_or("");
                         assert!(
-                            url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:"),
+                            url.starts_with("http://127.0.0.1:")
+                                || url.starts_with("http://localhost:"),
                             "URL should start with 'http://127.0.0.1:' or 'http://localhost:', got: {}",
                             url
                         );

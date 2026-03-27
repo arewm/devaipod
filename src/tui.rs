@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::models::ContainerSummary;
-use bollard::Docker;
 use color_eyre::eyre::{Context, Result};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -19,16 +19,16 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use futures_util::StreamExt;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, TableState, Wrap};
-use ratatui::Terminal;
 use tokio::time::interval;
 
 /// State file name for persistent TUI/instance state
@@ -96,10 +96,10 @@ fn save_state(state: &TuiStateCache) {
 
     // Write atomically via temp file
     let tmp_path = path.with_extension("tmp");
-    if let Ok(contents) = serde_json::to_string_pretty(state) {
-        if std::fs::write(&tmp_path, contents).is_ok() {
-            let _ = std::fs::rename(&tmp_path, &path);
-        }
+    if let Ok(contents) = serde_json::to_string_pretty(state)
+        && std::fs::write(&tmp_path, contents).is_ok()
+    {
+        let _ = std::fs::rename(&tmp_path, &path);
     }
 }
 
@@ -134,7 +134,7 @@ fn build_cache(instances: &[InstanceInfo]) -> TuiStateCache {
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
 
-use crate::{get_instance_id, INSTANCE_LABEL_KEY};
+use crate::{INSTANCE_LABEL_KEY, get_instance_id};
 
 /// Check whether a container's labels match the current instance filter.
 fn labels_match_instance(labels: Option<&HashMap<String, String>>) -> bool {
@@ -852,20 +852,19 @@ async fn fetch_git_state(
             .ok();
 
         let dirs: Vec<String> = if let Some(exec) = ls_exec {
-            if let Ok(StartExecResults::Attached { mut output, .. }) =
-                docker.start_exec(&exec.id, None).await
-            {
-                let mut stdout = String::new();
-                while let Ok(Some(msg)) = output.try_next().await {
-                    stdout.push_str(&msg.to_string());
+            match docker.start_exec(&exec.id, None).await {
+                Ok(StartExecResults::Attached { mut output, .. }) => {
+                    let mut stdout = String::new();
+                    while let Ok(Some(msg)) = output.try_next().await {
+                        stdout.push_str(&msg.to_string());
+                    }
+                    stdout
+                        .lines()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect()
                 }
-                stdout
-                    .lines()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect()
-            } else {
-                vec![]
+                _ => vec![],
             }
         } else {
             vec![]
@@ -1051,7 +1050,7 @@ fn derive_agent_state_from_messages(messages: &[serde_json::Value]) -> AgentStat
             return AgentState {
                 activity: AgentActivity::Unknown,
                 ..Default::default()
-            }
+            };
         }
     };
 
@@ -1661,10 +1660,10 @@ fn spawn_git_refresh(
         }
 
         // Rate-limit: skip if we refreshed this instance recently
-        if let Some(last_refresh) = instance.last_git_refresh {
-            if now.duration_since(last_refresh) < GIT_REFRESH_RATE_LIMIT {
-                continue;
-            }
+        if let Some(last_refresh) = instance.last_git_refresh
+            && now.duration_since(last_refresh) < GIT_REFRESH_RATE_LIMIT
+        {
+            continue;
         }
 
         let docker = docker.clone();
@@ -1713,16 +1712,16 @@ fn spawn_agent_refresh(instances: &[InstanceInfo], tx: mpsc::Sender<AgentStateUp
         }
 
         // Need both port and password to query the API
-        let (Some(api_port), Some(ref api_password)) = (instance.api_port, &instance.api_password)
+        let (Some(api_port), Some(api_password)) = (instance.api_port, &instance.api_password)
         else {
             continue;
         };
 
         // Rate-limit: skip if we refreshed this instance recently
-        if let Some(last_refresh) = instance.last_agent_refresh {
-            if now.duration_since(last_refresh) < AGENT_REFRESH_RATE_LIMIT {
-                continue;
-            }
+        if let Some(last_refresh) = instance.last_agent_refresh
+            && now.duration_since(last_refresh) < AGENT_REFRESH_RATE_LIMIT
+        {
+            continue;
         }
 
         let tx = tx.clone();
@@ -1801,29 +1800,35 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                 spawn_agent_refresh(&app.instances, agent_tx.clone());
             }
             _ = refresh_interval.tick() => {
-                if let Err(e) = app.refresh_instances().await {
-                    app.status_message = Some(format!("Refresh error: {}", e));
-                } else {
-                    // Spawn background git refresh after instance refresh
-                    spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                    // Also refresh agent state
-                    spawn_agent_refresh(&app.instances, agent_tx.clone());
+                match app.refresh_instances().await {
+                    Err(e) => {
+                        app.status_message = Some(format!("Refresh error: {}", e));
+                    }
+                    Ok(()) => {
+                        // Spawn background git refresh after instance refresh
+                        spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                        // Also refresh agent state
+                        spawn_agent_refresh(&app.instances, agent_tx.clone());
+                    }
                 }
             }
             // Async event stream - truly non-blocking
             maybe_event = event_stream.next() => {
-                if let Some(Ok(event)) = maybe_event {
-                    if let Some(action) = handle_event(&mut app, event) {
+                if let Some(Ok(event)) = maybe_event
+                    && let Some(action) = handle_event(&mut app, event) {
                         match action {
                             Action::Quit => return Ok(()),
                             Action::Refresh => {
                                 app.status_message = Some("Refreshing...".to_string());
-                                if let Err(e) = app.refresh_instances().await {
-                                    app.status_message = Some(format!("Refresh error: {}", e));
-                                } else {
-                                    spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                    spawn_agent_refresh(&app.instances, agent_tx.clone());
-                                    app.status_message = Some("Refreshed".to_string());
+                                match app.refresh_instances().await {
+                                    Err(e) => {
+                                        app.status_message = Some(format!("Refresh error: {}", e));
+                                    }
+                                    Ok(()) => {
+                                        spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
+                                        spawn_agent_refresh(&app.instances, agent_tx.clone());
+                                        app.status_message = Some("Refreshed".to_string());
+                                    }
                                 }
                             }
                             Action::Attach(name) => {
@@ -2005,7 +2010,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             }
                         }
                     }
-                }
             }
         }
     }

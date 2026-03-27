@@ -13,13 +13,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Path, Query, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use base64::prelude::*;
 use color_eyre::eyre::{Context, Result};
@@ -402,36 +402,34 @@ async fn auth_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Check auth cookie (primary method — set by /_devaipod/login)
-    if let Some(token) = cookie_value(&headers, &state.auth_cookie_name) {
-        if token == state.token {
-            let mut response = next.run(request).await;
-            // Refresh the cookie expiry on every authenticated request.
-            // Use `append` (not `insert`) to preserve any Set-Cookie headers
-            // from proxied upstream responses.
-            response.headers_mut().append(
-                header::SET_COOKIE,
-                state.auth_cookie_header().parse().unwrap(),
-            );
-            return Ok(response);
-        }
+    if let Some(token) = cookie_value(&headers, &state.auth_cookie_name)
+        && token == state.token
+    {
+        let mut response = next.run(request).await;
+        // Refresh the cookie expiry on every authenticated request.
+        // Use `append` (not `insert`) to preserve any Set-Cookie headers
+        // from proxied upstream responses.
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            state.auth_cookie_header().parse().unwrap(),
+        );
+        return Ok(response);
     }
 
     // Check Authorization header
-    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if token == state.token {
-                    return Ok(next.run(request).await);
-                }
-            }
-        }
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION)
+        && let Ok(auth_str) = auth_header.to_str()
+        && let Some(token) = auth_str.strip_prefix("Bearer ")
+        && token == state.token
+    {
+        return Ok(next.run(request).await);
     }
 
     // Check query parameter (legacy / one-off use)
-    if let Some(ref token) = query.token {
-        if token == &state.token {
-            return Ok(next.run(request).await);
-        }
+    if let Some(ref token) = query.token
+        && token == &state.token
+    {
+        return Ok(next.run(request).await);
     }
 
     Err(StatusCode::UNAUTHORIZED)
@@ -448,14 +446,12 @@ async fn mcp_auth_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if token == state.mcp_token {
-                    return Ok(next.run(request).await);
-                }
-            }
-        }
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION)
+        && let Ok(auth_str) = auth_header.to_str()
+        && let Some(token) = auth_str.strip_prefix("Bearer ")
+        && token == state.mcp_token
+    {
+        return Ok(next.run(request).await);
     }
     Err(StatusCode::UNAUTHORIZED)
 }
@@ -1666,42 +1662,42 @@ async fn launch_advisor(
         ])
         .output();
 
-    if let Ok(output) = check {
-        if output.status.success() {
-            let state = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_lowercase();
-            if state == "running" {
-                // Advisor already running — if task provided, send it
-                if let Some(ref task) = req.task {
-                    let mut cmd = tokio::process::Command::new(self_exe());
-                    cmd.args(["opencode", "advisor", "send", task]);
-                    let _ = cmd.output().await;
-                }
+    if let Ok(output) = check
+        && output.status.success()
+    {
+        let state = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_lowercase();
+        if state == "running" {
+            // Advisor already running — if task provided, send it
+            if let Some(ref task) = req.task {
+                let mut cmd = tokio::process::Command::new(self_exe());
+                cmd.args(["opencode", "advisor", "send", task]);
+                let _ = cmd.output().await;
+            }
+            return Ok(Json(RunResponse {
+                success: true,
+                workspace: "advisor".to_string(),
+                message: "Advisor is already running".to_string(),
+                status: None,
+                pod_name: None,
+            }));
+        } else {
+            // Advisor exists but stopped — start it
+            let start = tokio::process::Command::new("podman")
+                .args(["pod", "start", "devaipod-advisor"])
+                .output()
+                .await;
+            if let Ok(o) = start
+                && o.status.success()
+            {
                 return Ok(Json(RunResponse {
                     success: true,
                     workspace: "advisor".to_string(),
-                    message: "Advisor is already running".to_string(),
+                    message: "Advisor pod started".to_string(),
                     status: None,
                     pod_name: None,
                 }));
-            } else {
-                // Advisor exists but stopped — start it
-                let start = tokio::process::Command::new("podman")
-                    .args(["pod", "start", "devaipod-advisor"])
-                    .output()
-                    .await;
-                if let Ok(o) = start {
-                    if o.status.success() {
-                        return Ok(Json(RunResponse {
-                            success: true,
-                            workspace: "advisor".to_string(),
-                            message: "Advisor pod started".to_string(),
-                            status: None,
-                            pod_name: None,
-                        }));
-                    }
-                }
             }
         }
     }
@@ -2828,12 +2824,11 @@ async fn prune_done_pods() -> Result<Json<PruneResponse>, StatusCode> {
         if let Some(names) = &container.names {
             for name in names {
                 let name = name.trim_start_matches('/');
-                if let Some(pod_name) = name.strip_suffix("-agent") {
-                    if pod_name.starts_with("devaipod-")
-                        && !pod_names.contains(&pod_name.to_string())
-                    {
-                        pod_names.push(pod_name.to_string());
-                    }
+                if let Some(pod_name) = name.strip_suffix("-agent")
+                    && pod_name.starts_with("devaipod-")
+                    && !pod_names.contains(&pod_name.to_string())
+                {
+                    pod_names.push(pod_name.to_string());
                 }
             }
         }

@@ -10,10 +10,10 @@
 
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{Context, Result, bail};
 
 use crate::forge::PullRequestInfo;
-use crate::git::{GitRepoInfo, RemoteRepoInfo, REMOTE_AGENT, REMOTE_WORKER, REMOTE_WORKSPACE};
+use crate::git::{GitRepoInfo, REMOTE_AGENT, REMOTE_WORKER, REMOTE_WORKSPACE, RemoteRepoInfo};
 
 /// Source for workspace content - local git repo, remote URL, or PR/MR
 #[derive(Debug, Clone)]
@@ -302,13 +302,13 @@ pub(crate) fn detect_self_image() -> String {
             cmd.args(["--url", &format!("unix://{}", socket.display())]);
         }
         cmd.args(["inspect", "devaipod", "--format", "{{.ImageName}}"]);
-        if let Ok(output) = cmd.output() {
-            if output.status.success() {
-                let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !image.is_empty() {
-                    tracing::debug!("Detected devaipod self-image: {image}");
-                    return image;
-                }
+        if let Ok(output) = cmd.output()
+            && output.status.success()
+        {
+            let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !image.is_empty() {
+                tracing::debug!("Detected devaipod self-image: {image}");
+                return image;
             }
         }
         tracing::debug!(
@@ -586,11 +586,11 @@ impl DevaipodPod {
         ));
 
         // Add service-gator config as a label (CLI args format)
-        if let Some(sg_config) = service_gator_config {
-            if sg_config.is_enabled() {
-                let cli_args = crate::service_gator::config_to_cli_args(sg_config);
-                labels.push(("io.devaipod.service-gator".to_string(), cli_args.join(" ")));
-            }
+        if let Some(sg_config) = service_gator_config
+            && sg_config.is_enabled()
+        {
+            let cli_args = crate::service_gator::config_to_cli_args(sg_config);
+            labels.push(("io.devaipod.service-gator".to_string(), cli_args.join(" ")));
         }
 
         // Generate random password for opencode API authentication
@@ -2132,10 +2132,10 @@ fi
 
         // Second pass: resolve values that contain variable references
         for (key, value) in env.iter_mut() {
-            if value.contains("${") {
-                if let Some(resolved) = resolve_env_value(value, key) {
-                    *value = resolved;
-                }
+            if value.contains("${")
+                && let Some(resolved) = resolve_env_value(value, key)
+            {
+                *value = resolved;
             }
         }
 
@@ -2210,7 +2210,8 @@ fi
             if trusted_env_vars.contains(&env_var) {
                 tracing::warn!(
                     "Ignoring devcontainer secret '{}' for env var '{}' - shadowed by trusted secret",
-                    secret_name, env_var
+                    secret_name,
+                    env_var
                 );
             } else {
                 secrets.push((env_var, secret_name));
@@ -2384,10 +2385,10 @@ exec sleep infinity
         // 3. Vars from global config env.allowlist and env.vars
         for (key, value) in std::env::vars() {
             // Handle DEVAIPOD_AGENT_* prefix: strip and forward
-            if let Some(stripped) = key.strip_prefix("DEVAIPOD_AGENT_") {
-                if !stripped.is_empty() {
-                    env.insert(stripped.to_string(), value);
-                }
+            if let Some(stripped) = key.strip_prefix("DEVAIPOD_AGENT_")
+                && !stripped.is_empty()
+            {
+                env.insert(stripped.to_string(), value);
             }
         }
 
@@ -2482,13 +2483,13 @@ exec sleep infinity
         const GCLOUD_ADC_PATH: &str = ".config/gcloud/application_default_credentials.json";
         if bind_home.paths.iter().any(|p| p == GCLOUD_ADC_PATH) {
             // Check if the file actually exists on the host
-            if let Some(host_home) = get_host_home() {
-                if host_home.join(GCLOUD_ADC_PATH).exists() {
-                    env.insert(
-                        "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
-                        format!("{}/{}", agent_home, GCLOUD_ADC_PATH),
-                    );
-                }
+            if let Some(host_home) = get_host_home()
+                && host_home.join(GCLOUD_ADC_PATH).exists()
+            {
+                env.insert(
+                    "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                    format!("{}/{}", agent_home, GCLOUD_ADC_PATH),
+                );
             }
         }
 
@@ -2639,13 +2640,11 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
                 ];
                 // When orchestration is enabled, mount worker's workspace read-only
                 // so the task owner can access worker's commits via git
-                if enable_orchestration {
-                    if let Some(worker_vol) = worker_workspace_volume {
-                        mounts.push((
-                            worker_vol.to_string(),
-                            "/mnt/worker-workspace:ro".to_string(),
-                        ));
-                    }
+                if enable_orchestration && let Some(worker_vol) = worker_workspace_volume {
+                    mounts.push((
+                        worker_vol.to_string(),
+                        "/mnt/worker-workspace:ro".to_string(),
+                    ));
                 }
                 mounts
             },
@@ -2895,10 +2894,10 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
 
         // Forward env vars to the worker container (same pattern as agent)
         for (key, value) in std::env::vars() {
-            if let Some(stripped) = key.strip_prefix("DEVAIPOD_AGENT_") {
-                if !stripped.is_empty() {
-                    env.insert(stripped.to_string(), value);
-                }
+            if let Some(stripped) = key.strip_prefix("DEVAIPOD_AGENT_")
+                && !stripped.is_empty()
+            {
+                env.insert(stripped.to_string(), value);
             }
         }
 
@@ -2974,15 +2973,14 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
 
         // Handle gcloud ADC path (same as agent)
         const GCLOUD_ADC_PATH: &str = ".config/gcloud/application_default_credentials.json";
-        if bind_home.paths.iter().any(|p| p == GCLOUD_ADC_PATH) {
-            if let Some(host_home) = get_host_home() {
-                if host_home.join(GCLOUD_ADC_PATH).exists() {
-                    env.insert(
-                        "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
-                        format!("{}/{}", worker_home, GCLOUD_ADC_PATH),
-                    );
-                }
-            }
+        if bind_home.paths.iter().any(|p| p == GCLOUD_ADC_PATH)
+            && let Some(host_home) = get_host_home()
+            && host_home.join(GCLOUD_ADC_PATH).exists()
+        {
+            env.insert(
+                "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                format!("{}/{}", worker_home, GCLOUD_ADC_PATH),
+            );
         }
 
         // Build MCP config combining service-gator and any additional MCP servers
@@ -3510,9 +3508,10 @@ mod tests {
         assert_eq!(cmd[0], "--mcp-server");
         assert!(cmd.iter().any(|s| s.contains(&GATOR_PORT.to_string())));
         assert!(cmd.contains(&"--scope-file".to_string()));
-        assert!(cmd
-            .iter()
-            .any(|s| s.contains(crate::service_gator::GATOR_CONFIG_PATH)));
+        assert!(
+            cmd.iter()
+                .any(|s| s.contains(crate::service_gator::GATOR_CONFIG_PATH))
+        );
 
         // Verify security restrictions
         assert!(container_config.drop_all_caps);
@@ -3600,12 +3599,16 @@ mod tests {
 
         // Verify secrets are listed for mounting as (env_var, secret_name) tuples
         assert_eq!(container_config.secrets.len(), 2);
-        assert!(container_config
-            .secrets
-            .contains(&("GH_TOKEN".to_string(), "gh_token".to_string())));
-        assert!(container_config
-            .secrets
-            .contains(&("GITLAB_TOKEN".to_string(), "gitlab_token".to_string())));
+        assert!(
+            container_config
+                .secrets
+                .contains(&("GH_TOKEN".to_string(), "gh_token".to_string()))
+        );
+        assert!(
+            container_config
+                .secrets
+                .contains(&("GITLAB_TOKEN".to_string(), "gitlab_token".to_string()))
+        );
 
         // No *_FILE env vars with the new type=env approach
         assert!(!container_config.env.contains_key("GH_TOKEN_FILE"));
@@ -3639,9 +3642,11 @@ mod tests {
 
         // Verify secret is listed as (env_var, secret_name) tuple
         assert_eq!(container_config.secrets.len(), 1);
-        assert!(container_config
-            .secrets
-            .contains(&("GH_TOKEN".to_string(), "gh_token".to_string())));
+        assert!(
+            container_config
+                .secrets
+                .contains(&("GH_TOKEN".to_string(), "gh_token".to_string()))
+        );
 
         // No *_FILE env var with type=env approach
         assert!(!container_config.env.contains_key("GH_TOKEN_FILE"));
@@ -3858,12 +3863,16 @@ mod tests {
 
         // Verify secrets are included for workspace container
         assert_eq!(container_config.secrets.len(), 2);
-        assert!(container_config
-            .secrets
-            .contains(&("GH_TOKEN".to_string(), "gh_token".to_string())));
-        assert!(container_config
-            .secrets
-            .contains(&("GITLAB_TOKEN".to_string(), "gitlab_token".to_string())));
+        assert!(
+            container_config
+                .secrets
+                .contains(&("GH_TOKEN".to_string(), "gh_token".to_string()))
+        );
+        assert!(
+            container_config
+                .secrets
+                .contains(&("GITLAB_TOKEN".to_string(), "gitlab_token".to_string()))
+        );
     }
 
     #[test]
@@ -4517,9 +4526,11 @@ mod tests {
             "ANTHROPIC_API_KEY".to_string(),
             "ANTHROPIC_API_KEY".to_string()
         )));
-        assert!(container_config
-            .secrets
-            .contains(&("OPENAI_API_KEY".to_string(), "OPENAI_API_KEY".to_string())));
+        assert!(
+            container_config
+                .secrets
+                .contains(&("OPENAI_API_KEY".to_string(), "OPENAI_API_KEY".to_string()))
+        );
     }
 
     #[test]
@@ -4562,9 +4573,11 @@ mod tests {
             "ANTHROPIC_API_KEY".to_string(),
             "ANTHROPIC_API_KEY".to_string()
         )));
-        assert!(container_config
-            .secrets
-            .contains(&("OPENAI_API_KEY".to_string(), "OPENAI_API_KEY".to_string())));
+        assert!(
+            container_config
+                .secrets
+                .contains(&("OPENAI_API_KEY".to_string(), "OPENAI_API_KEY".to_string()))
+        );
     }
 
     #[test]
@@ -4622,9 +4635,11 @@ mod tests {
 
         // Should have both trusted and devcontainer secrets
         assert_eq!(container_config.secrets.len(), 2);
-        assert!(container_config
-            .secrets
-            .contains(&("GH_TOKEN".to_string(), "gh_token".to_string())));
+        assert!(
+            container_config
+                .secrets
+                .contains(&("GH_TOKEN".to_string(), "gh_token".to_string()))
+        );
         assert!(container_config.secrets.contains(&(
             "ANTHROPIC_API_KEY".to_string(),
             "ANTHROPIC_API_KEY".to_string()
@@ -4672,9 +4687,11 @@ mod tests {
         assert_eq!(container_config.secrets.len(), 2);
 
         // Verify trusted GH_TOKEN is present (not the devcontainer one)
-        assert!(container_config
-            .secrets
-            .contains(&("GH_TOKEN".to_string(), "gh_token_trusted".to_string())));
+        assert!(
+            container_config
+                .secrets
+                .contains(&("GH_TOKEN".to_string(), "gh_token_trusted".to_string()))
+        );
 
         // Verify devcontainer ANTHROPIC_API_KEY is present
         assert!(container_config.secrets.contains(&(

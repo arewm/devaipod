@@ -14,21 +14,21 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::prelude::*;
-use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
 use bollard::Docker;
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
 use color_eyre::eyre::{Context, Result};
 use futures_util::{SinkExt, Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -261,10 +261,10 @@ impl GitWatcher {
 
         // Watch .git/FETCH_HEAD if it exists (created on first fetch).
         let fetch_head = git_dir.join("FETCH_HEAD");
-        if fetch_head.exists() {
-            if let Err(e) = watcher.watch(&fetch_head, RecursiveMode::NonRecursive) {
-                tracing::debug!("FETCH_HEAD watch skipped (non-critical): {e}");
-            }
+        if fetch_head.exists()
+            && let Err(e) = watcher.watch(&fetch_head, RecursiveMode::NonRecursive)
+        {
+            tracing::debug!("FETCH_HEAD watch skipped (non-critical): {e}");
         }
 
         tracing::info!("GitWatcher started for {}", workspace.display());
@@ -467,21 +467,21 @@ async fn git_log(
     State(state): State<AppState>,
     Query(params): Query<GitLogQuery>,
 ) -> Result<Json<GitLogResponse>, (StatusCode, String)> {
-    if let Some(ref base) = params.base {
-        if !is_valid_git_ref(base) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Invalid git ref for 'base': {base}"),
-            ));
-        }
+    if let Some(ref base) = params.base
+        && !is_valid_git_ref(base)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid git ref for 'base': {base}"),
+        ));
     }
-    if let Some(ref head) = params.head {
-        if !is_valid_git_ref(head) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Invalid git ref for 'head': {head}"),
-            ));
-        }
+    if let Some(ref head) = params.head
+        && !is_valid_git_ref(head)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid git ref for 'head': {head}"),
+        ));
     }
 
     // Build the format arg and range specification.
@@ -979,10 +979,10 @@ async fn cleanup_stale_pty_sessions(sessions: &mut HashMap<String, PtySession>) 
     let mut to_remove = Vec::new();
     for (id, session) in sessions.iter() {
         let output = session.output.lock().await;
-        if let Some(exited_at) = output.exited_at {
-            if now.duration_since(exited_at) > EXITED_SESSION_TTL {
-                to_remove.push(id.clone());
-            }
+        if let Some(exited_at) = output.exited_at
+            && now.duration_since(exited_at) > EXITED_SESSION_TTL
+        {
+            to_remove.push(id.clone());
         }
     }
     for id in &to_remove {
@@ -1377,17 +1377,16 @@ async fn handle_ws(
     }
 
     // Replay buffered output from the requested cursor.
-    if let Some(replay) = replay_bytes {
-        if !replay.is_empty()
-            && ws_tx
-                .send(Message::Text(
-                    String::from_utf8_lossy(&replay).into_owned().into(),
-                ))
-                .await
-                .is_err()
-        {
-            return;
-        }
+    if let Some(replay) = replay_bytes
+        && !replay.is_empty()
+        && ws_tx
+            .send(Message::Text(
+                String::from_utf8_lossy(&replay).into_owned().into(),
+            ))
+            .await
+            .is_err()
+    {
+        return;
     }
 
     // Bridge: PTY output → WebSocket, WebSocket input → PTY stdin.

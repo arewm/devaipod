@@ -47,9 +47,9 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use color_eyre::eyre::{eyre, Context, Result};
+use color_eyre::eyre::{Context, Result, eyre};
 use libtest_mimic::{Arguments, Trial};
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 /// Guard that kills the podman system service when dropped.
 ///
@@ -71,9 +71,9 @@ impl Drop for PodmanServiceGuard {
 
 // Re-export from lib for test registration
 pub(crate) use integration_tests::{
-    container_integration_test, integration_test, podman_integration_test, poll_until,
-    readonly_test, wait_for_container_running, wait_for_file, SharedFixture, INTEGRATION_TESTS,
-    READONLY_INTEGRATION_TESTS,
+    INTEGRATION_TESTS, READONLY_INTEGRATION_TESTS, SharedFixture, container_integration_test,
+    integration_test, podman_integration_test, poll_until, readonly_test,
+    wait_for_container_running, wait_for_file,
 };
 
 mod tests;
@@ -211,8 +211,10 @@ fn ensure_podman_socket() -> Option<PodmanServiceGuard> {
                 i * 100,
             );
             // Set DOCKER_HOST so all child processes (devaipod, podman CLI) find it.
-            // Safe: called from main() before any threads are spawned.
-            std::env::set_var("DOCKER_HOST", format!("unix://{}", socket_path.display()));
+            // SAFETY: called from main() before any threads are spawned.
+            unsafe {
+                std::env::set_var("DOCKER_HOST", format!("unix://{}", socket_path.display()))
+            };
             return Some(PodmanServiceGuard { child });
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -247,8 +249,8 @@ fn setup_synthetic_config() -> tempfile::TempDir {
     )
     .expect("write synthetic config");
 
-    // Safe: called from main() before threads are spawned.
-    std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
+    // SAFETY: called from main() before threads are spawned.
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", config_dir.path()) };
     eprintln!("Using synthetic config at {}", config_path.display());
 
     config_dir

@@ -5,7 +5,7 @@
 
 use color_eyre::Result;
 
-use crate::{integration_test, run_devaipod, run_devaipod_in, shell, TestRepo};
+use crate::{TestRepo, integration_test, run_devaipod, run_devaipod_in, shell};
 
 fn test_dry_run_shows_config() -> Result<()> {
     let repo = TestRepo::new()?;

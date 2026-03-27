@@ -6,15 +6,15 @@
 //! - Readonly tests: Use the shared fixture, only query pod state
 //! - Mutating tests: Create/delete their own pods
 
-use color_eyre::eyre::{bail, Context};
 use color_eyre::Result;
+use color_eyre::eyre::{Context, bail};
 use std::process::Command;
 use std::time::{Duration, Instant};
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 use crate::{
-    podman_integration_test, readonly_test, run_devaipod, run_devaipod_in, shell, short_name,
-    unique_test_name, PodGuard, SharedFixture, TestRepo,
+    PodGuard, SharedFixture, TestRepo, podman_integration_test, readonly_test, run_devaipod,
+    run_devaipod_in, shell, short_name, unique_test_name,
 };
 
 /// Host to use when connecting to pod-published ports from the test runner.

@@ -40,7 +40,7 @@ pub const REMOTE_WORKER: &str = "worker";
 /// In worker container: points to task owner's workspace git
 pub const REMOTE_OWNER: &str = "owner";
 
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{Context, Result, bail};
 
 /// Get a GitHub token from the environment (checks GH_TOKEN and GITHUB_TOKEN)
 pub fn get_github_token() -> Option<String> {
@@ -65,10 +65,10 @@ pub fn get_github_token_with_secret(config: &crate::config::Config) -> Option<St
 
     // Then check for a GH_TOKEN secret in the trusted config
     for (env_var, secret_name) in config.trusted_env.secret_mounts() {
-        if env_var == "GH_TOKEN" || env_var == "GITHUB_TOKEN" {
-            if let Some(token) = read_podman_secret(&secret_name) {
-                return Some(token);
-            }
+        if (env_var == "GH_TOKEN" || env_var == "GITHUB_TOKEN")
+            && let Some(token) = read_podman_secret(&secret_name)
+        {
+            return Some(token);
         }
     }
 
@@ -868,10 +868,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let result = detect_git_info(temp.path());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Not a git repository"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Not a git repository")
+        );
     }
 
     #[test]
