@@ -6,7 +6,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use color_eyre::eyre::{bail, Result};
+use color_eyre::eyre::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{GhRepoPermission, ServiceGatorConfig};
@@ -413,7 +413,7 @@ pub fn mint_token(
     expires_in: Option<u64>,
     subject: Option<&str>,
 ) -> Result<String> {
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
 
     let now = now_unix();
     let exp = now + expires_in.unwrap_or(DEFAULT_TOKEN_EXPIRES_IN);
@@ -446,7 +446,7 @@ pub fn mint_token_from_scopes(
     expires_in: Option<u64>,
     subject: Option<&str>,
 ) -> Result<String> {
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
 
     let now = now_unix();
     let exp = now + expires_in.unwrap_or(DEFAULT_TOKEN_EXPIRES_IN);
@@ -798,7 +798,7 @@ mod tests {
         assert_eq!(token.split('.').count(), 3);
 
         // Verify we can decode it
-        use jsonwebtoken::{decode, DecodingKey, Validation};
+        use jsonwebtoken::{DecodingKey, Validation, decode};
         let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.validate_exp = false; // Don't validate exp for test
         validation.required_spec_claims.clear();

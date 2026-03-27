@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::secrets::DevcontainerSecretDecl;
@@ -365,10 +365,10 @@ impl DevcontainerConfig {
                 }
             } else if arg == "--device" {
                 // Format: --device /dev/foo
-                if let Some(value) = iter.next() {
-                    if !value.starts_with('-') {
-                        devices.push(value.to_string());
-                    }
+                if let Some(value) = iter.next()
+                    && !value.starts_with('-')
+                {
+                    devices.push(value.to_string());
                 }
             }
         }
@@ -391,10 +391,10 @@ impl DevcontainerConfig {
                 }
             } else if arg == "--security-opt" {
                 // Format: --security-opt value
-                if let Some(value) = iter.next() {
-                    if !value.starts_with('-') {
-                        opts.push(value.to_string());
-                    }
+                if let Some(value) = iter.next()
+                    && !value.starts_with('-')
+                {
+                    opts.push(value.to_string());
                 }
             }
         }
@@ -417,10 +417,10 @@ impl DevcontainerConfig {
                 }
             } else if arg == "--cap-add" {
                 // Format: --cap-add VALUE
-                if let Some(value) = iter.next() {
-                    if !value.starts_with('-') {
-                        caps.push(value.to_string());
-                    }
+                if let Some(value) = iter.next()
+                    && !value.starts_with('-')
+                {
+                    caps.push(value.to_string());
                 }
             }
         }
@@ -460,12 +460,12 @@ impl DevcontainerConfig {
             passthrough.push(arg.clone());
             // If this looks like a flag with a space-separated value, include the value too
             // (i.e., starts with -- and next arg doesn't start with --)
-            if arg.starts_with("--") && !arg.contains('=') {
-                if let Some(next) = iter.peek() {
-                    if !next.starts_with("--") {
-                        passthrough.push(iter.next().unwrap().clone());
-                    }
-                }
+            if arg.starts_with("--")
+                && !arg.contains('=')
+                && let Some(next) = iter.peek()
+                && !next.starts_with("--")
+            {
+                passthrough.push(iter.next().unwrap().clone());
             }
         }
         passthrough
@@ -590,15 +590,15 @@ pub fn try_find_devcontainer_json(project_path: &Path) -> Option<PathBuf> {
 
     // Check for subdirectories in .devcontainer
     let devcontainer_dir = project_path.join(".devcontainer");
-    if devcontainer_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&devcontainer_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let nested = path.join("devcontainer.json");
-                    if nested.exists() {
-                        return Some(nested);
-                    }
+    if devcontainer_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&devcontainer_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let nested = path.join("devcontainer.json");
+                if nested.exists() {
+                    return Some(nested);
                 }
             }
         }
@@ -701,12 +701,11 @@ fn detect_default_branch(project_path: &Path) -> String {
         .current_dir(project_path)
         .stderr(std::process::Stdio::null())
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let refname = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
-                return branch.to_string();
-            }
+        let refname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+            return branch.to_string();
         }
     }
 
@@ -716,12 +715,11 @@ fn detect_default_branch(project_path: &Path) -> String {
         .current_dir(project_path)
         .stderr(std::process::Stdio::null())
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !branch.is_empty() && branch != "HEAD" {
-                return branch;
-            }
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !branch.is_empty() && branch != "HEAD" {
+            return branch;
         }
     }
 
@@ -747,9 +745,11 @@ mod tests {
             config.image,
             Some("mcr.microsoft.com/devcontainers/rust:1".to_string())
         );
-        assert!(config
-            .features
-            .contains_key("ghcr.io/devcontainers/features/node:1"));
+        assert!(
+            config
+                .features
+                .contains_key("ghcr.io/devcontainers/features/node:1")
+        );
         assert!(matches!(
             config.post_create_command,
             Some(Command::String(_))
@@ -1039,10 +1039,12 @@ mod tests {
         let json = r#"{"build": {"dockerfile": "Dockerfile"}}"#;
         let result = super::parse_jsonc(json);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("build context paths cannot be resolved"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("build context paths cannot be resolved")
+        );
     }
 
     #[test]

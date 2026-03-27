@@ -7,8 +7,8 @@
 //! On drop the harness kills the web server process and removes any
 //! pods that were registered via [`DevaipodHarness::track_pod`].
 
-use color_eyre::eyre::{bail, Context, ContextCompat};
 use color_eyre::Result;
+use color_eyre::eyre::{Context, ContextCompat, bail};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -213,20 +213,19 @@ impl DevaipodHarness {
                 bail!("Pod '{full_name}' did not become Running within 120s");
             }
 
-            if let Ok((200, body)) = self.get("/api/devaipod/pods") {
-                if let Ok(pods) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
-                    if let Some(pod) = pods.iter().find(|p| {
-                        p.get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|n| n == full_name)
-                            .unwrap_or(false)
-                    }) {
-                        let status = pod.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                        if status.eq_ignore_ascii_case("running") {
-                            tracing::info!("Pod '{full_name}' is Running");
-                            return Ok(());
-                        }
-                    }
+            if let Ok((200, body)) = self.get("/api/devaipod/pods")
+                && let Ok(pods) = serde_json::from_str::<Vec<serde_json::Value>>(&body)
+                && let Some(pod) = pods.iter().find(|p| {
+                    p.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| n == full_name)
+                        .unwrap_or(false)
+                })
+            {
+                let status = pod.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                if status.eq_ignore_ascii_case("running") {
+                    tracing::info!("Pod '{full_name}' is Running");
+                    return Ok(());
                 }
             }
 
@@ -293,10 +292,10 @@ fn extract_token_from_line(line: &str) -> Option<String> {
 fn wait_for_health(port: u16, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if let Ok((status, _)) = http_request_raw("GET", port, "/_devaipod/health", None, None) {
-            if status == 200 {
-                return Ok(());
-            }
+        if let Ok((status, _)) = http_request_raw("GET", port, "/_devaipod/health", None, None)
+            && status == 200
+        {
+            return Ok(());
         }
         #[allow(clippy::disallowed_methods)] // Intentional: poll interval
         std::thread::sleep(Duration::from_millis(200));

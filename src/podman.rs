@@ -13,14 +13,14 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use bollard::Docker;
 use bollard::container::{
     LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
     WaitContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::BuildImageOptions;
-use bollard::Docker;
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{Context, Result, bail};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -58,20 +58,20 @@ const PODMAN_SOCKET_ENV: &str = "DEVAIPOD_PODMAN_SOCKET";
 /// 6. `$XDG_RUNTIME_DIR/podman/podman.sock` (host rootless fallback, warns)
 pub fn get_container_socket() -> Result<PathBuf> {
     // 1. DOCKER_HOST - the standard env var honored by Docker, Podman, and all major tools
-    if let Ok(docker_host) = std::env::var("DOCKER_HOST") {
-        if let Some(path) = parse_docker_host(&docker_host) {
-            let path = PathBuf::from(path);
-            if path.exists() {
-                tracing::debug!("Using {} (from DOCKER_HOST)", path.display());
-                return Ok(path);
-            }
-            tracing::warn!(
-                "DOCKER_HOST points to {} but socket does not exist",
-                path.display()
-            );
+    if let Ok(docker_host) = std::env::var("DOCKER_HOST")
+        && let Some(path) = parse_docker_host(&docker_host)
+    {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            tracing::debug!("Using {} (from DOCKER_HOST)", path.display());
+            return Ok(path);
         }
-        // If DOCKER_HOST was set but we couldn't use it, fall through to other probes
+        tracing::warn!(
+            "DOCKER_HOST points to {} but socket does not exist",
+            path.display()
+        );
     }
+    // If DOCKER_HOST was set but we couldn't use it, fall through to other probes
 
     // 2. DEVAIPOD_PODMAN_SOCKET - deprecated, mapped to DOCKER_HOST equivalent
     if let Ok(path_str) = std::env::var(PODMAN_SOCKET_ENV) {
@@ -716,12 +716,11 @@ impl PodmanService {
             .context("Failed to inspect image")?;
 
         // The user is in config.user
-        if let Some(config) = info.config {
-            if let Some(user) = config.user {
-                if !user.is_empty() {
-                    return Ok(Some(user));
-                }
-            }
+        if let Some(config) = info.config
+            && let Some(user) = config.user
+            && !user.is_empty()
+        {
+            return Ok(Some(user));
         }
         Ok(None)
     }
@@ -1253,7 +1252,7 @@ impl PodmanService {
         for (env_var, secret_name) in &config.file_secrets {
             args.push("--secret".to_string());
             args.push(secret_name.to_string()); // mounts at /run/secrets/{secret_name}
-                                                // Set env var to point to the mounted file
+            // Set env var to point to the mounted file
             args.push("-e".to_string());
             args.push(format!("{}=/run/secrets/{}", env_var, secret_name));
         }
@@ -1373,14 +1372,17 @@ impl PodmanService {
         };
         let mut stream = self.client.wait_container(name, Some(options));
         // The stream returns one result when the container exits
-        if let Some(result) = stream.next().await {
-            let wait_response =
-                result.with_context(|| format!("Failed to wait for container {}", name))?;
-            let exit_code = wait_response.status_code;
-            tracing::debug!("Container {} exited with code {}", name, exit_code);
-            Ok(exit_code)
-        } else {
-            color_eyre::eyre::bail!("Wait stream ended without result for container {}", name);
+        match stream.next().await {
+            Some(result) => {
+                let wait_response =
+                    result.with_context(|| format!("Failed to wait for container {}", name))?;
+                let exit_code = wait_response.status_code;
+                tracing::debug!("Container {} exited with code {}", name, exit_code);
+                Ok(exit_code)
+            }
+            None => {
+                color_eyre::eyre::bail!("Wait stream ended without result for container {}", name);
+            }
         }
     }
 

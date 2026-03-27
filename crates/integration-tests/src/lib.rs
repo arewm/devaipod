@@ -340,7 +340,7 @@ impl SharedFixture {
 
     /// Create a new shared fixture (internal)
     fn create() -> color_eyre::Result<Self> {
-        use color_eyre::eyre::{bail, Context};
+        use color_eyre::eyre::{Context, bail};
         use std::process::Command;
 
         tracing::info!("Creating shared integration test fixture");

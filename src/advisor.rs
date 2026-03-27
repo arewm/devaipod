@@ -155,7 +155,7 @@ fn generate_proposal_id() -> String {
 // Pod introspection — shell out to podman CLI
 // ---------------------------------------------------------------------------
 
-use crate::{get_instance_id, INSTANCE_LABEL_KEY};
+use crate::{INSTANCE_LABEL_KEY, get_instance_id};
 
 /// List all devaipod pods with basic status info.
 ///

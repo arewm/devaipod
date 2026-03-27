@@ -165,11 +165,19 @@ impl EnvConfig {
     /// 1. Variables from allowlist (looked up in current environment)
     /// 2. Variables from vars (explicit values, take precedence over allowlist)
     pub fn collect(&self) -> HashMap<String, String> {
+        self.collect_with(|key| std::env::var(key).ok())
+    }
+
+    /// Collect environment variables using a custom lookup function.
+    ///
+    /// Like [`collect`](Self::collect), but uses the provided function
+    /// to resolve allowlist entries instead of the process environment.
+    fn collect_with(&self, env_lookup: impl Fn(&str) -> Option<String>) -> HashMap<String, String> {
         let mut result = HashMap::new();
 
-        // First, add env vars from allowlist (looked up from current environment)
+        // First, add env vars from allowlist (looked up via env_lookup)
         for key in &self.allowlist {
-            if let Ok(value) = std::env::var(key) {
+            if let Some(value) = env_lookup(key) {
                 result.insert(key.clone(), value);
             }
         }
@@ -229,6 +237,15 @@ impl TrustedEnvConfig {
     /// Collect environment variables for trusted containers.
     pub fn collect(&self) -> HashMap<String, String> {
         self.env.collect()
+    }
+
+    /// Collect environment variables using a custom lookup function.
+    ///
+    /// Like [`collect`](Self::collect), but uses the provided function
+    /// to resolve allowlist entries instead of the process environment.
+    #[cfg(test)]
+    fn collect_with(&self, env_lookup: impl Fn(&str) -> Option<String>) -> HashMap<String, String> {
+        self.env.collect_with(env_lookup)
     }
 
     /// Get (env_var_name, secret_name) pairs for podman secret mounting with type=env.
@@ -1754,15 +1771,19 @@ allowlist = ["GOOGLE_CLOUD_PROJECT", "SSH_AUTH_SOCK", "VERTEX_LOCATION"]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.env.allowlist.len(), 3);
-        assert!(config
-            .env
-            .allowlist
-            .contains(&"GOOGLE_CLOUD_PROJECT".to_string()));
+        assert!(
+            config
+                .env
+                .allowlist
+                .contains(&"GOOGLE_CLOUD_PROJECT".to_string())
+        );
         assert!(config.env.allowlist.contains(&"SSH_AUTH_SOCK".to_string()));
-        assert!(config
-            .env
-            .allowlist
-            .contains(&"VERTEX_LOCATION".to_string()));
+        assert!(
+            config
+                .env
+                .allowlist
+                .contains(&"VERTEX_LOCATION".to_string())
+        );
     }
 
     #[test]
@@ -1809,23 +1830,20 @@ EDITOR = "vim"
 
     #[test]
     fn test_env_config_vars_override_allowlist() {
-        // Set an env var that's in the allowlist
-        std::env::set_var("TEST_OVERRIDE_VAR", "from_env");
-
         let mut env = EnvConfig::default();
         env.allowlist.push("TEST_OVERRIDE_VAR".to_string());
-        // Explicit vars should override
+        // Explicit vars should override allowlist-resolved values
         env.vars
             .insert("TEST_OVERRIDE_VAR".to_string(), "from_config".to_string());
 
-        let collected = env.collect();
+        let collected = env.collect_with(|key| match key {
+            "TEST_OVERRIDE_VAR" => Some("from_env".to_string()),
+            _ => None,
+        });
         assert_eq!(
             collected.get("TEST_OVERRIDE_VAR"),
             Some(&"from_config".to_string())
         );
-
-        // Cleanup
-        std::env::remove_var("TEST_OVERRIDE_VAR");
     }
 
     #[test]
@@ -1859,21 +1877,27 @@ allowlist = ["GH_TOKEN", "GITLAB_TOKEN", "JIRA_API_TOKEN"]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.trusted_env.env.allowlist.len(), 3);
-        assert!(config
-            .trusted_env
-            .env
-            .allowlist
-            .contains(&"GH_TOKEN".to_string()));
-        assert!(config
-            .trusted_env
-            .env
-            .allowlist
-            .contains(&"GITLAB_TOKEN".to_string()));
-        assert!(config
-            .trusted_env
-            .env
-            .allowlist
-            .contains(&"JIRA_API_TOKEN".to_string()));
+        assert!(
+            config
+                .trusted_env
+                .env
+                .allowlist
+                .contains(&"GH_TOKEN".to_string())
+        );
+        assert!(
+            config
+                .trusted_env
+                .env
+                .allowlist
+                .contains(&"GITLAB_TOKEN".to_string())
+        );
+        assert!(
+            config
+                .trusted_env
+                .env
+                .allowlist
+                .contains(&"JIRA_API_TOKEN".to_string())
+        );
     }
 
     #[test]
@@ -1911,19 +1935,23 @@ JIRA_API_TOKEN = "from_config"
 
         // Regular env
         assert_eq!(config.env.allowlist.len(), 1);
-        assert!(config
-            .env
-            .allowlist
-            .contains(&"GOOGLE_CLOUD_PROJECT".to_string()));
+        assert!(
+            config
+                .env
+                .allowlist
+                .contains(&"GOOGLE_CLOUD_PROJECT".to_string())
+        );
         assert_eq!(config.env.vars.len(), 1);
 
         // Trusted env - separate from regular
         assert_eq!(config.trusted_env.env.allowlist.len(), 2);
-        assert!(config
-            .trusted_env
-            .env
-            .allowlist
-            .contains(&"GH_TOKEN".to_string()));
+        assert!(
+            config
+                .trusted_env
+                .env
+                .allowlist
+                .contains(&"GH_TOKEN".to_string())
+        );
         assert_eq!(config.trusted_env.env.vars.len(), 1);
         assert_eq!(
             config.trusted_env.env.vars.get("JIRA_API_TOKEN"),
@@ -1933,8 +1961,6 @@ JIRA_API_TOKEN = "from_config"
 
     #[test]
     fn test_trusted_env_collect() {
-        std::env::set_var("TEST_TRUSTED_VAR", "trusted_value");
-
         let mut trusted = TrustedEnvConfig::default();
         trusted.env.allowlist.push("TEST_TRUSTED_VAR".to_string());
         trusted
@@ -1942,14 +1968,15 @@ JIRA_API_TOKEN = "from_config"
             .vars
             .insert("EXPLICIT_VAR".to_string(), "explicit".to_string());
 
-        let collected = trusted.collect();
+        let collected = trusted.collect_with(|key| match key {
+            "TEST_TRUSTED_VAR" => Some("trusted_value".to_string()),
+            _ => None,
+        });
         assert_eq!(
             collected.get("TEST_TRUSTED_VAR"),
             Some(&"trusted_value".to_string())
         );
         assert_eq!(collected.get("EXPLICIT_VAR"), Some(&"explicit".to_string()));
-
-        std::env::remove_var("TEST_TRUSTED_VAR");
     }
 
     // =========================================================================
@@ -1972,14 +1999,18 @@ secrets = ["GH_TOKEN=gh_token", "GITLAB_TOKEN=gitlab_token"]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.trusted_env.secrets.len(), 2);
-        assert!(config
-            .trusted_env
-            .secrets
-            .contains(&"GH_TOKEN=gh_token".to_string()));
-        assert!(config
-            .trusted_env
-            .secrets
-            .contains(&"GITLAB_TOKEN=gitlab_token".to_string()));
+        assert!(
+            config
+                .trusted_env
+                .secrets
+                .contains(&"GH_TOKEN=gh_token".to_string())
+        );
+        assert!(
+            config
+                .trusted_env
+                .secrets
+                .contains(&"GITLAB_TOKEN=gitlab_token".to_string())
+        );
     }
 
     #[test]
@@ -2040,11 +2071,13 @@ secrets = ["GH_TOKEN=gh_token"]
 
         // Env allowlist
         assert_eq!(config.trusted_env.env.allowlist.len(), 1);
-        assert!(config
-            .trusted_env
-            .env
-            .allowlist
-            .contains(&"JIRA_API_TOKEN".to_string()));
+        assert!(
+            config
+                .trusted_env
+                .env
+                .allowlist
+                .contains(&"JIRA_API_TOKEN".to_string())
+        );
 
         // Explicit vars
         assert_eq!(config.trusted_env.env.vars.len(), 1);
@@ -2055,10 +2088,12 @@ secrets = ["GH_TOKEN=gh_token"]
 
         // Secrets (now a Vec of strings)
         assert_eq!(config.trusted_env.secrets.len(), 1);
-        assert!(config
-            .trusted_env
-            .secrets
-            .contains(&"GH_TOKEN=gh_token".to_string()));
+        assert!(
+            config
+                .trusted_env
+                .secrets
+                .contains(&"GH_TOKEN=gh_token".to_string())
+        );
     }
 
     // =========================================================================
@@ -2080,10 +2115,12 @@ file_secrets = ["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc"]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.trusted_env.file_secrets.len(), 1);
-        assert!(config
-            .trusted_env
-            .file_secrets
-            .contains(&"GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string()));
+        assert!(
+            config
+                .trusted_env
+                .file_secrets
+                .contains(&"GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string())
+        );
     }
 
     #[test]
@@ -2126,9 +2163,11 @@ file_secrets = ["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc"]
         let mounts = trusted.file_secret_mounts();
         // Only the 2 valid entries should be returned
         assert_eq!(mounts.len(), 2);
-        assert!(mounts
-            .iter()
-            .any(|(env, _)| env == "GOOGLE_APPLICATION_CREDENTIALS"));
+        assert!(
+            mounts
+                .iter()
+                .any(|(env, _)| env == "GOOGLE_APPLICATION_CREDENTIALS")
+        );
         assert!(mounts.iter().any(|(env, _)| env == "VALID_TWO"));
     }
 
@@ -2146,9 +2185,11 @@ file_secrets = ["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc"]
         assert_eq!(config.trusted_env.secrets.len(), 1);
         let secret_mounts = config.trusted_env.secret_mounts();
         assert_eq!(secret_mounts.len(), 1);
-        assert!(secret_mounts
-            .iter()
-            .any(|(env, secret)| env == "GH_TOKEN" && secret == "gh_token"));
+        assert!(
+            secret_mounts
+                .iter()
+                .any(|(env, secret)| env == "GH_TOKEN" && secret == "gh_token")
+        );
 
         // File secrets
         assert_eq!(config.trusted_env.file_secrets.len(), 1);
@@ -2279,15 +2320,21 @@ enabled = true
     #[test]
     fn test_mcp_merge_cli_servers_invalid() {
         let mut config = McpServersConfig::default();
-        assert!(config
-            .merge_cli_servers(&["no-equals-sign".to_string()])
-            .is_err());
-        assert!(config
-            .merge_cli_servers(&["=http://empty-name".to_string()])
-            .is_err());
-        assert!(config
-            .merge_cli_servers(&["empty-url=".to_string()])
-            .is_err());
+        assert!(
+            config
+                .merge_cli_servers(&["no-equals-sign".to_string()])
+                .is_err()
+        );
+        assert!(
+            config
+                .merge_cli_servers(&["=http://empty-name".to_string()])
+                .is_err()
+        );
+        assert!(
+            config
+                .merge_cli_servers(&["empty-url=".to_string()])
+                .is_err()
+        );
     }
 
     #[test]

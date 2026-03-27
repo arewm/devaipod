@@ -11,8 +11,8 @@ use color_eyre::Result;
 use xshell::cmd;
 
 use crate::{
-    integration_test, podman_integration_test, run_devaipod_in, shell, short_name,
-    unique_test_name, PodGuard, TestRepo,
+    PodGuard, TestRepo, integration_test, podman_integration_test, run_devaipod_in, shell,
+    short_name, unique_test_name,
 };
 
 // =============================================================================

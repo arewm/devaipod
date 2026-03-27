@@ -10,7 +10,7 @@
 use color_eyre::Result;
 use integration_tests::harness::DevaipodHarness;
 
-use crate::{container_integration_test, podman_integration_test, TestRepo};
+use crate::{TestRepo, container_integration_test, podman_integration_test};
 
 use super::WebFixture;
 

@@ -9,8 +9,8 @@
 //! Note: These tests use a temporary directory for SSH configs via
 //! `DEVAIPOD_SSH_CONFIG_DIR` to avoid mutating the user's real `~/.ssh/config.d`.
 
-use color_eyre::eyre::bail;
 use color_eyre::Result;
+use color_eyre::eyre::bail;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -18,9 +18,9 @@ use std::time::Duration;
 use xshell::cmd;
 
 use crate::{
-    get_devaipod_binary_path, podman_integration_test, readonly_test, run_devaipod,
-    run_devaipod_in_with_env, run_devaipod_with_env, shell, short_name, unique_test_name, PodGuard,
-    SharedFixture, TestRepo,
+    PodGuard, SharedFixture, TestRepo, get_devaipod_binary_path, podman_integration_test,
+    readonly_test, run_devaipod, run_devaipod_in_with_env, run_devaipod_with_env, shell,
+    short_name, unique_test_name,
 };
 
 /// Environment variable name for overriding SSH config directory.
@@ -313,12 +313,13 @@ fn test_ssh_server_starts_on_exec_stdio() -> Result<()> {
     let status = child.wait();
 
     // If we got no banner, check stderr for socket/config failure and skip if so
-    let stderr_output = if let Some(mut s) = child.stderr.take() {
-        let mut out = String::new();
-        let _ = s.read_to_string(&mut out);
-        out
-    } else {
-        String::new()
+    let stderr_output = match child.stderr.take() {
+        Some(mut s) => {
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out);
+            out
+        }
+        None => String::new(),
     };
     if !banner.starts_with("SSH-2.0-") {
         if stderr_output.contains("No container socket")

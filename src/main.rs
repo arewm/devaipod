@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use clap::{Args, CommandFactory, Parser};
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{Context, Result, bail};
 
 #[allow(dead_code)] // MCP server will use these in a follow-up
 mod advisor;
@@ -1314,7 +1314,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
             worker,
         } => {
             if !std::io::stdin().is_terminal() {
-                bail!("attach requires an interactive terminal. For non-interactive use, consider using the OpenCode API directly.");
+                bail!(
+                    "attach requires an interactive terminal. For non-interactive use, consider using the OpenCode API directly."
+                );
             }
             let pod_name = resolve_workspace(workspace.as_deref(), latest)?;
             let target = if worker {
@@ -1807,16 +1809,16 @@ async fn create_workspace(
     };
 
     // Auto-create SSH config entry if enabled (default: true)
-    if config.ssh.auto_config {
-        if let Some(config_path) = write_ssh_config(&result.pod_name) {
-            tracing::info!("Created SSH config: {}", config_path.display());
-            // Warn if Include directive is missing (skip in container mode where
-            // the config is exported via /run/devaipod-ssh bind mount)
-            if !is_using_container_ssh_export() && !ssh_config_has_include() {
-                tracing::warn!(
-                    "Add 'Include ~/.ssh/config.d/*' to the top of ~/.ssh/config for SSH integration"
-                );
-            }
+    if config.ssh.auto_config
+        && let Some(config_path) = write_ssh_config(&result.pod_name)
+    {
+        tracing::info!("Created SSH config: {}", config_path.display());
+        // Warn if Include directive is missing (skip in container mode where
+        // the config is exported via /run/devaipod-ssh bind mount)
+        if !is_using_container_ssh_export() && !ssh_config_has_include() {
+            tracing::warn!(
+                "Add 'Include ~/.ssh/config.d/*' to the top of ~/.ssh/config for SSH integration"
+            );
         }
     }
 
@@ -1852,10 +1854,10 @@ async fn resolve_devcontainer_config(
     }
 
     // 2. Check the project source (unless user requested the dotfiles devcontainer)
-    if !opts.use_default_devcontainer {
-        if let Some(ref path) = devcontainer::try_find_devcontainer_json(project_path) {
-            return Ok((devcontainer::load(path)?, opts.image.clone()));
-        }
+    if !opts.use_default_devcontainer
+        && let Some(ref path) = devcontainer::try_find_devcontainer_json(project_path)
+    {
+        return Ok((devcontainer::load(path)?, opts.image.clone()));
     }
 
     // 3. Check the dotfiles repository for a devcontainer.json
@@ -2017,16 +2019,12 @@ async fn create_workspace_from_local(
     }
 
     // Detect if the user has a fork of the repository and add it as a remote
-    if let Some(ref remote_url) = git_info.remote_url {
-        if let Some(repo_ref) = forge::parse_repo_url(remote_url) {
-            if repo_ref.forge_type == forge::ForgeType::GitHub {
-                if let Some(fork_info) =
-                    forge::fetch_github_user_fork(&repo_ref, Some(config)).await
-                {
-                    git_info.fork_url = Some(fork_info.clone_url);
-                }
-            }
-        }
+    if let Some(ref remote_url) = git_info.remote_url
+        && let Some(repo_ref) = forge::parse_repo_url(remote_url)
+        && repo_ref.forge_type == forge::ForgeType::GitHub
+        && let Some(fork_info) = forge::fetch_github_user_fork(&repo_ref, Some(config)).await
+    {
+        git_info.fork_url = Some(fork_info.clone_url);
     }
 
     let (devcontainer_config, effective_image) = resolve_devcontainer_config(
@@ -2937,19 +2935,19 @@ async fn cmd_title(pod_name: &str, new_title: Option<&str>) -> Result<()> {
                     .send()
                     .await;
 
-                if let Ok(resp) = resp {
-                    if resp.status().is_success() {
-                        #[derive(serde::Deserialize)]
-                        struct TitleResp {
-                            title: Option<String>,
+                if let Ok(resp) = resp
+                    && resp.status().is_success()
+                {
+                    #[derive(serde::Deserialize)]
+                    struct TitleResp {
+                        title: Option<String>,
+                    }
+                    if let Ok(t) = resp.json::<TitleResp>().await {
+                        match t.title {
+                            Some(title) => println!("{title}"),
+                            None => println!("(no title set)"),
                         }
-                        if let Ok(t) = resp.json::<TitleResp>().await {
-                            match t.title {
-                                Some(title) => println!("{title}"),
-                                None => println!("(no title set)"),
-                            }
-                            return Ok(());
-                        }
+                        return Ok(());
                     }
                 }
             }
@@ -3143,7 +3141,9 @@ async fn cmd_controlplane(serve: bool, _port: u16, list: bool, json: bool) -> Re
         eprintln!("Control plane HTTP server mode is not yet implemented.");
         eprintln!();
         eprintln!("This feature is planned for a future release. See:");
-        eprintln!("  https://github.com/cgwalters/devaipod/blob/main/docs/todo/opencode-web-enhancements.md");
+        eprintln!(
+            "  https://github.com/cgwalters/devaipod/blob/main/docs/todo/opencode-web-enhancements.md"
+        );
         eprintln!();
         eprintln!(
             "For now, use 'devaipod web' or 'devaipod list' and 'devaipod attach' to manage pods."
@@ -5752,10 +5752,10 @@ fn cmd_opencode_send(
         // Extract and print the text response
         if let Some(parts) = response.get("parts").and_then(|p| p.as_array()) {
             for part in parts {
-                if let Some("text") = part.get("type").and_then(|t| t.as_str()) {
-                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        println!("{}", text);
-                    }
+                if let Some("text") = part.get("type").and_then(|t| t.as_str())
+                    && let Some(text) = part.get("text").and_then(|t| t.as_str())
+                {
+                    println!("{}", text);
                 }
             }
         }
@@ -5840,27 +5840,23 @@ fn extract_pod_ports(pod_json: &serde_json::Value) -> Vec<String> {
     let mut ports = Vec::new();
 
     // Ports are typically in InfraConfig.PortBindings
-    if let Some(infra) = pod_json.get("InfraConfig") {
-        if let Some(bindings) = infra.get("PortBindings") {
-            if let Some(obj) = bindings.as_object() {
-                for (container_port, host_bindings) in obj {
-                    if let Some(arr) = host_bindings.as_array() {
-                        for binding in arr {
-                            let host_ip = binding
-                                .get("HostIp")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("0.0.0.0");
-                            let host_port = binding
-                                .get("HostPort")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if !host_port.is_empty() {
-                                ports.push(format!(
-                                    "{}:{} -> {}",
-                                    host_ip, host_port, container_port
-                                ));
-                            }
-                        }
+    if let Some(infra) = pod_json.get("InfraConfig")
+        && let Some(bindings) = infra.get("PortBindings")
+        && let Some(obj) = bindings.as_object()
+    {
+        for (container_port, host_bindings) in obj {
+            if let Some(arr) = host_bindings.as_array() {
+                for binding in arr {
+                    let host_ip = binding
+                        .get("HostIp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0.0.0.0");
+                    let host_port = binding
+                        .get("HostPort")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !host_port.is_empty() {
+                        ports.push(format!("{}:{} -> {}", host_ip, host_port, container_port));
                     }
                 }
             }
@@ -6052,15 +6048,13 @@ fn configure_subuid() -> Result<()> {
     if let Some(line) = current_subuid
         .lines()
         .find(|l| l.starts_with(&format!("{}:", user)))
+        && let Some(start_str) = line.split(':').nth(1)
+        && let Ok(start) = start_str.parse::<u64>()
+        && start > 0
+        && start < max_uid
     {
-        if let Some(start_str) = line.split(':').nth(1) {
-            if let Ok(start) = start_str.parse::<u64>() {
-                if start > 0 && start < max_uid {
-                    tracing::debug!("subuid already configured correctly for {}", user);
-                    return Ok(());
-                }
-            }
-        }
+        tracing::debug!("subuid already configured correctly for {}", user);
+        return Ok(());
     }
 
     // Reconfigure for constrained namespace
