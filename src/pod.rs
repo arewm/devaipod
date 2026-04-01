@@ -166,6 +166,7 @@ fn nested_container_security(devices: &mut Vec<String>) -> (bool, Vec<String>, V
         vec!["SYS_ADMIN".to_string(), "NET_ADMIN".to_string()],
         vec![
             "unmask=/proc/*".to_string(),
+            "unmask=/sys/fs/cgroup".to_string(),
             "label=disable".to_string(),
             "seccomp=unconfined".to_string(),
         ],
