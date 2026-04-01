@@ -30,6 +30,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::{RwLock, broadcast};
 use tower::ServiceExt;
+use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 // ---------------------------------------------------------------------------
@@ -2047,12 +2048,23 @@ async fn fallback_handler(State(state): State<AppState>, request: Request) -> Re
             .uri(request.uri().clone())
             .body(Body::empty())
             .unwrap();
-        let resp = ServeDir::new(OPENCODE_UI_PATH)
+        let mut resp = ServeDir::new(OPENCODE_UI_PATH)
             .oneshot(file_req)
             .await
             .unwrap()
             .into_response();
         if resp.status() != StatusCode::NOT_FOUND {
+            // Vite produces content-hashed filenames under /assets/ (e.g.
+            // index-abc123.js) — these are immutable so we can cache
+            // aggressively.  Other static files (favicon, etc.) get a
+            // shorter cache lifetime.
+            let cache_value = if trimmed.starts_with("assets/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "public, max-age=3600"
+            };
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, cache_value.parse().unwrap());
             return resp;
         }
         // File not found in UI dir — fall through to proxy (opencode may serve it)
@@ -2478,6 +2490,7 @@ fn build_router(state: AppState) -> Router {
         .route("/pty/{pty_id}/connect", get(pty_connect))
         // Fallback: static UI files and opencode API proxy
         .fallback(fallback_handler)
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 
