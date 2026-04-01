@@ -28,6 +28,7 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 use tower::ServiceExt;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
@@ -1403,7 +1404,9 @@ async fn serve_spa_page() -> Result<Response, StatusCode> {
 /// Serve /assets/* from the vendored opencode UI directory.
 ///
 /// All `/assets/*` requests come from the opencode SPA, so we always
-/// serve from `OPENCODE_UI_PATH`.
+/// serve from `OPENCODE_UI_PATH`. Vite produces content-hashed filenames
+/// (e.g. `index-abc123.js`) so these files are immutable — we set
+/// aggressive cache headers to avoid re-downloading on every page load.
 async fn serve_root_assets(Path(path): Path<String>) -> Result<Response, StatusCode> {
     let file_path = if path.is_empty() {
         "assets".to_string()
@@ -1415,11 +1418,18 @@ async fn serve_root_assets(Path(path): Path<String>) -> Result<Response, StatusC
         .uri(&uri)
         .body(Body::empty())
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(ServeDir::new(OPENCODE_UI_PATH)
+    let mut resp = ServeDir::new(OPENCODE_UI_PATH)
         .oneshot(request)
         .await
         .unwrap()
-        .into_response())
+        .into_response();
+    if resp.status().is_success() {
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable".parse().unwrap(),
+        );
+    }
+    Ok(resp)
 }
 
 /// Request body for run endpoint
@@ -3072,6 +3082,7 @@ fn build_app_with_cache(
         .fallback(static_or_spa_fallback)
         .layer(middleware::from_fn(request_trace))
         .layer(cors)
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 
