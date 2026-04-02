@@ -172,6 +172,14 @@ fn nested_container_security(devices: &mut Vec<String>) -> (bool, Vec<String>, V
     )
 }
 
+/// Default tmpfs mounts for all containers.
+///
+/// Every container gets `/tmp` as a tmpfs so that ephemeral data stays
+/// in-memory and doesn't bloat the overlay filesystem.
+fn default_tmpfs_mounts() -> Vec<String> {
+    vec!["/tmp".to_string()]
+}
+
 /// Port for the opencode server in the agent container
 pub const OPENCODE_PORT: u16 = 4096;
 
@@ -2319,6 +2327,7 @@ exec sleep infinity
             file_secrets,
             labels: labels.iter().cloned().collect(),
             extra_create_args: config.passthrough_run_args(),
+            tmpfs_mounts: default_tmpfs_mounts(),
             ..Default::default()
         }
     }
@@ -2652,6 +2661,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             secrets,
             file_secrets,
             extra_create_args,
+            tmpfs_mounts: default_tmpfs_mounts(),
             ..Default::default()
         }
     }
@@ -2740,6 +2750,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             no_new_privileges: true,
             secrets,
             file_secrets,
+            tmpfs_mounts: default_tmpfs_mounts(),
             ..Default::default()
         }
     }
@@ -2839,6 +2850,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
                 retries: Some(3),
                 start_period: Some("5s".to_string()),
             }),
+            tmpfs_mounts: default_tmpfs_mounts(),
             ..Default::default()
         }
     }
@@ -3122,6 +3134,7 @@ exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
                     "/mnt/agent-home:ro".to_string(), // Agent's home for LLM credentials
                 ),
             ],
+            tmpfs_mounts: default_tmpfs_mounts(),
             ..Default::default()
         }
     }
