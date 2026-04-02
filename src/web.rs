@@ -644,9 +644,12 @@ async fn fetch_latest_session(pod_api_port: u16) -> Option<LatestSessionInfo> {
 
     let sessions: Vec<serde_json::Value> = resp.json().await.ok()?;
 
-    // Find the session with the most recent updated time
+    // Find the root session (not a subagent) with the most recent updated time.
+    // Subagent sessions have a non-null parentID and should never be navigated
+    // to directly — the chat UI is intended for the parent session.
     sessions
         .iter()
+        .filter(|s| crate::session_is_root(s))
         .filter_map(|s| {
             let id = s.get("id")?.as_str()?;
             let dir = s.get("directory")?.as_str()?;

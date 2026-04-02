@@ -1187,9 +1187,7 @@ async fn fetch_agent_state(api_port: u16, api_password: &str) -> AgentState {
     }
 
     // Find the root session (no parent)
-    let root_session = sessions.iter().find(|s| {
-        s.get("parentID").is_none() || s.get("parentID").map(|p| p.is_null()).unwrap_or(false)
-    });
+    let root_session = sessions.iter().find(|s| crate::session_is_root(s));
 
     let Some(root_session) = root_session else {
         return unknown;

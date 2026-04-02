@@ -31,6 +31,12 @@ mod ssh_server;
 mod tui;
 mod web;
 
+/// Returns `true` if the session JSON object represents a root session
+/// (i.e. not a subagent session). Subagent sessions have a non-null `parentID`.
+pub(crate) fn session_is_root(s: &serde_json::Value) -> bool {
+    matches!(s.get("parentID"), None | Some(serde_json::Value::Null))
+}
+
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
 
@@ -5511,12 +5517,7 @@ fn detect_active_session(pod_name: &str, port: Option<u16>) -> Option<String> {
 
     // Find root sessions (those without a parentID)
     // These are the main task sessions, not subagent sessions
-    let mut root_sessions: Vec<_> = sessions
-        .iter()
-        .filter(|s| {
-            s.get("parentID").is_none() || s.get("parentID") == Some(&serde_json::Value::Null)
-        })
-        .collect();
+    let mut root_sessions: Vec<_> = sessions.iter().filter(|s| session_is_root(s)).collect();
 
     if root_sessions.is_empty() {
         // No root sessions, just use the first session
@@ -5672,10 +5673,12 @@ fn cmd_opencode_session(pod_name: &str, action: SessionAction) -> Result<()> {
             } else {
                 println!("Sessions:");
                 if let Some(arr) = sessions.as_array() {
-                    if arr.is_empty() {
+                    // Only show root sessions (not subagent sessions).
+                    let root_sessions: Vec<_> = arr.iter().filter(|s| session_is_root(s)).collect();
+                    if root_sessions.is_empty() {
                         println!("  (none)");
                     } else {
-                        for session in arr {
+                        for session in &root_sessions {
                             let id = session.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                             let title = session
                                 .get("title")
