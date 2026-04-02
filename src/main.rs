@@ -5672,10 +5672,20 @@ fn cmd_opencode_session(pod_name: &str, action: SessionAction) -> Result<()> {
             } else {
                 println!("Sessions:");
                 if let Some(arr) = sessions.as_array() {
-                    if arr.is_empty() {
+                    // Only show root sessions (not subagent sessions).
+                    let root_sessions: Vec<_> = arr
+                        .iter()
+                        .filter(|s| {
+                            s.get("parentID").is_none()
+                                || s.get("parentID")
+                                    .map(|p| p.is_null())
+                                    .unwrap_or(false)
+                        })
+                        .collect();
+                    if root_sessions.is_empty() {
                         println!("  (none)");
                     } else {
-                        for session in arr {
+                        for session in &root_sessions {
                             let id = session.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                             let title = session
                                 .get("title")
