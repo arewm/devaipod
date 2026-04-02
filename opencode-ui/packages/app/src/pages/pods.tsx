@@ -3,6 +3,7 @@ import {
   createMemo,
   createSignal,
   For,
+  Index,
   Match,
   onCleanup,
   onMount,
@@ -593,26 +594,26 @@ function LaunchForm(props: { onClose: () => void }) {
                   Control AI agent access to external services (e.g. github:org/repo, github:org/*:write)
                 </p>
                 <div class="flex flex-col gap-2">
-                  <For each={scopes()}>
+                  <Index each={scopes()}>
                     {(scope, index) => (
                       <div class="flex gap-2 items-center">
                         <TextField
                           hideLabel
                           label="Scope"
                           placeholder="github:org/repo or github:org/*:write"
-                          value={scope}
-                          onChange={(v) => updateScope(index(), v)}
+                          value={scope()}
+                          onChange={(v) => updateScope(index, v)}
                           class="flex-1"
                         />
                         <IconButton
                           icon="close-small"
                           size="small"
                           variant="ghost"
-                          onClick={() => removeScope(index())}
+                          onClick={() => removeScope(index)}
                         />
                       </div>
                     )}
-                  </For>
+                  </Index>
                 </div>
                 <Button
                   variant="ghost"
