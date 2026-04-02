@@ -653,10 +653,7 @@ async fn fetch_latest_session(pod_api_port: u16) -> Option<LatestSessionInfo> {
     sessions
         .iter()
         .filter(|s| {
-            s.get("parentID").is_none()
-                || s.get("parentID")
-                    .map(|p| p.is_null())
-                    .unwrap_or(false)
+            matches!(s.get("parentID"), None | Some(serde_json::Value::Null))
         })
         .filter_map(|s| {
             let id = s.get("id")?.as_str()?;

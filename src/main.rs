@@ -5514,7 +5514,7 @@ fn detect_active_session(pod_name: &str, port: Option<u16>) -> Option<String> {
     let mut root_sessions: Vec<_> = sessions
         .iter()
         .filter(|s| {
-            s.get("parentID").is_none() || s.get("parentID") == Some(&serde_json::Value::Null)
+            matches!(s.get("parentID"), None | Some(serde_json::Value::Null))
         })
         .collect();
 
@@ -5676,10 +5676,7 @@ fn cmd_opencode_session(pod_name: &str, action: SessionAction) -> Result<()> {
                     let root_sessions: Vec<_> = arr
                         .iter()
                         .filter(|s| {
-                            s.get("parentID").is_none()
-                                || s.get("parentID")
-                                    .map(|p| p.is_null())
-                                    .unwrap_or(false)
+                            matches!(s.get("parentID"), None | Some(serde_json::Value::Null))
                         })
                         .collect();
                     if root_sessions.is_empty() {
