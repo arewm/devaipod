@@ -1548,9 +1548,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
     }
 
     // Find the root session (no parentID or null parentID).
-    let root_session = sessions.iter().find(|s| {
-        matches!(s.get("parentID"), None | Some(serde_json::Value::Null))
-    });
+    let root_session = sessions.iter().find(|s| crate::session_is_root(s));
 
     let session_id = match root_session
         .and_then(|s| s.get("id"))

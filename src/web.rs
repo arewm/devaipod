@@ -652,9 +652,7 @@ async fn fetch_latest_session(pod_api_port: u16) -> Option<LatestSessionInfo> {
     // to directly — the chat UI is intended for the parent session.
     sessions
         .iter()
-        .filter(|s| {
-            matches!(s.get("parentID"), None | Some(serde_json::Value::Null))
-        })
+        .filter(|s| crate::session_is_root(s))
         .filter_map(|s| {
             let id = s.get("id")?.as_str()?;
             let dir = s.get("directory")?.as_str()?;
