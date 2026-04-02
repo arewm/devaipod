@@ -210,9 +210,9 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         }
         batch(() => {
           // Server already sorts (advisor first, running, then by date)
-          setStore("pods", reconcile(pods, { key: "Name", merge: false }))
-          setStore("agentStatus", reconcile(agentMap))
-          setStore("enrichment", reconcile(enrichMap))
+          setStore("pods", reconcile(pods, { key: "Name", merge: true }))
+          setStore("agentStatus", reconcile(agentMap, { merge: true }))
+          setStore("enrichment", reconcile(enrichMap, { merge: true }))
           setStore("connected", true)
           setStore("error", undefined)
         })
@@ -230,7 +230,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       try {
         const launches = await apiFetch<Record<string, LaunchState>>("/api/devaipod/launches")
         const oldLaunches = store.launches
-        setStore("launches", reconcile(launches))
+        setStore("launches", reconcile(launches, { merge: true }))
 
         // Detect transitions that warrant a pod list refresh
         let needRefresh = false
@@ -257,7 +257,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     async function fetchProposals() {
       try {
         const proposals = await apiFetch<Proposal[]>("/api/devaipod/proposals")
-        setStore("proposals", reconcile(proposals.filter((p) => p.status === "pending"), { key: "id", merge: false }))
+        setStore("proposals", reconcile(proposals.filter((p) => p.status === "pending"), { key: "id", merge: true }))
       } catch {
         // Ignore
       }

@@ -463,7 +463,7 @@ async fn run_podman_exec(
                 Ok(0) => break,
                 Ok(n) => {
                     if handle_stdout
-                        .data(channel, buf[..n].to_vec().into())
+                        .data(channel, buf[..n].to_vec())
                         .await
                         .is_err()
                     {
@@ -487,7 +487,7 @@ async fn run_podman_exec(
                 Ok(0) => break,
                 Ok(n) => {
                     if handle_stderr
-                        .extended_data(channel, 1, buf[..n].to_vec().into())
+                        .extended_data(channel, 1, buf[..n].to_vec())
                         .await
                         .is_err()
                     {

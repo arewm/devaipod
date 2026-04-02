@@ -54,7 +54,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "cors", "compression-full"] }
 
 # SSH server for remote development (VSCode/Zed integration)
-russh = { version = "0.57", features = ["aws-lc-rs"] }
+russh = { version = "0.59", features = ["aws-lc-rs"] }
 russh-sftp = "2.1"
 async-stream = "0.3"
 async-trait = "0.1"
