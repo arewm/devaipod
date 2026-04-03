@@ -159,6 +159,16 @@ export function navigatePromptHistory(input: HistoryNavInput): HistoryNavResult 
     }
   }
 
+  if (input.historyIndex === -1 && input.savedPrompt) {
+    return {
+      handled: true,
+      historyIndex: -1,
+      savedPrompt: null,
+      prompt: input.savedPrompt,
+      cursor: "end",
+    }
+  }
+
   return {
     handled: false,
     historyIndex: input.historyIndex,

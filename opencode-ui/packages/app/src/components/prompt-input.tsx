@@ -286,7 +286,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const resetHistoryNavigation = (force = false) => {
     if (!force && (store.historyIndex < 0 || store.applyingHistory)) return
     setStore("historyIndex", -1)
-    setStore("savedPrompt", null)
+    if (force) {
+      setStore("savedPrompt", null)
+    }
   }
 
   const clearEditor = () => {

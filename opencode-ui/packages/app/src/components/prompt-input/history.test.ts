@@ -73,6 +73,51 @@ describe("prompt-input history", () => {
     expect(original[1].selection?.startLine).toBe(1)
   })
 
+  test("navigatePromptHistory down from -1 restores savedPrompt when available", () => {
+    const saved = text("my saved draft")
+    const result = navigatePromptHistory({
+      direction: "down",
+      entries: [text("history entry")],
+      historyIndex: -1,
+      currentPrompt: text("current edited content"),
+      savedPrompt: saved,
+    })
+    expect(result.handled).toBe(true)
+    if (!result.handled) throw new Error("expected handled")
+    expect(result.historyIndex).toBe(-1)
+    expect(result.savedPrompt).toBeNull()
+    expect(result.prompt[0]?.type === "text" ? result.prompt[0].content : "").toBe("my saved draft")
+    expect(result.cursor).toBe("end")
+  })
+
+  test("navigatePromptHistory down from -1 is unhandled without savedPrompt", () => {
+    const result = navigatePromptHistory({
+      direction: "down",
+      entries: [text("history entry")],
+      historyIndex: -1,
+      currentPrompt: text("current content"),
+      savedPrompt: null,
+    })
+    expect(result.handled).toBe(false)
+  })
+
+  test("navigatePromptHistory re-entering history overwrites savedPrompt with current content", () => {
+    // Simulate: user was at historyIndex=0, typed something (reset to -1 with
+    // savedPrompt preserved), then presses up again
+    const result = navigatePromptHistory({
+      direction: "up",
+      entries: [text("history entry")],
+      historyIndex: -1,
+      currentPrompt: text("edited content"),
+      savedPrompt: text("original draft"),
+    })
+    expect(result.handled).toBe(true)
+    if (!result.handled) throw new Error("expected handled")
+    expect(result.historyIndex).toBe(0)
+    // savedPrompt should be the CURRENT content (edited), not the old draft
+    expect(result.savedPrompt![0]?.type === "text" ? result.savedPrompt![0].content : "").toBe("edited content")
+  })
+
   test("canNavigateHistoryAtCursor only allows multiline boundaries", () => {
     const value = "a\nb\nc"
 
