@@ -211,9 +211,14 @@
     }
   }
 
-  // Initial fetch + periodic refresh
+  // Initial fetch, then self-scheduling poll (next poll waits for current to finish)
   fetchPodList();
-  setInterval(fetchPodList, 15000);
+  function schedulePoll() {
+    setTimeout(function () {
+      fetchPodList().finally(schedulePoll);
+    }, 15000);
+  }
+  schedulePoll();
 
   // -- Session title ----------------------------------------------------------
   async function fetchTitle() {

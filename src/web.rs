@@ -764,33 +764,24 @@ async fn get_pod_api_port(pod_name: &str) -> Result<u16, StatusCode> {
         })
 }
 
-/// Get all published port mappings for a pod, excluding infrastructure ports.
+/// Inspect a pod's agent container once and extract both the pod-api host port
+/// and all forwarded ports, avoiding redundant Docker connections and
+/// `inspect_container` calls.
 ///
-/// Returns a list of `ForwardedPort` pairs (container_port, host_port).
-/// The pod-api internal port (8090) is excluded since it's infrastructure.
-async fn get_pod_forwarded_ports(pod_name: &str) -> Vec<ForwardedPort> {
-    use bollard::Docker;
-
-    let socket_path = match get_container_socket() {
-        Ok(p) => p,
-        Err(_) => return vec![],
-    };
-
-    let docker = match Docker::connect_with_unix(
-        &format!("unix://{}", socket_path.display()),
-        120,
-        bollard::API_DEFAULT_VERSION,
-    ) {
-        Ok(d) => d,
-        Err(_) => return vec![],
-    };
-
+/// Returns `(Option<pod_api_host_port>, Vec<ForwardedPort>)`.
+async fn inspect_pod_ports(
+    docker: &bollard::Docker,
+    pod_name: &str,
+) -> (Option<u16>, Vec<ForwardedPort>) {
     let info = match docker
         .inspect_container(&format!("{pod_name}-agent"), None)
         .await
     {
         Ok(i) => i,
-        Err(_) => return vec![],
+        Err(e) => {
+            tracing::debug!("Failed to inspect agent container for {pod_name}: {e}");
+            return (None, vec![]);
+        }
     };
 
     let ports = match info
@@ -799,14 +790,23 @@ async fn get_pod_forwarded_ports(pod_name: &str) -> Vec<ForwardedPort> {
         .and_then(|ns| ns.ports.as_ref())
     {
         Some(p) => p,
-        None => return vec![],
+        None => return (None, vec![]),
     };
 
     let api_port = crate::pod::POD_API_PORT;
-    let mut result = Vec::new();
+    let port_key = format!("{api_port}/tcp");
 
+    // Extract the pod-api host port
+    let pod_api_host_port = ports
+        .get(&port_key)
+        .and_then(|b| b.as_ref())
+        .and_then(|bindings| bindings.first())
+        .and_then(|b| b.host_port.as_ref())
+        .and_then(|p| p.parse::<u16>().ok());
+
+    // Extract all forwarded ports (excluding pod-api infrastructure port)
+    let mut forwarded = Vec::new();
     for (container_port_key, bindings) in ports {
-        // Parse "8080/tcp" format
         let container_port: u16 = match container_port_key
             .split('/')
             .next()
@@ -816,7 +816,6 @@ async fn get_pod_forwarded_ports(pod_name: &str) -> Vec<ForwardedPort> {
             None => continue,
         };
 
-        // Skip the pod-api infrastructure port
         if container_port == api_port {
             continue;
         }
@@ -828,7 +827,7 @@ async fn get_pod_forwarded_ports(pod_name: &str) -> Vec<ForwardedPort> {
                     .as_ref()
                     .and_then(|p| p.parse::<u16>().ok())
                 {
-                    result.push(ForwardedPort {
+                    forwarded.push(ForwardedPort {
                         container_port,
                         host_port,
                     });
@@ -837,7 +836,7 @@ async fn get_pod_forwarded_ports(pod_name: &str) -> Vec<ForwardedPort> {
         }
     }
 
-    result
+    (pod_api_host_port, forwarded)
 }
 
 /// Low-level HTTP proxy: connect to `host:port`, forward `request`,
@@ -2058,6 +2057,27 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
         return Json(vec![]);
     }
 
+    let has_running = cached_pods
+        .iter()
+        .any(|p| p.status.eq_ignore_ascii_case("running"));
+
+    // Create a single shared Docker connection for all pod inspections,
+    // rather than one per pod (which was the previous behaviour).
+    let docker = if has_running {
+        let socket_path = get_container_socket().ok();
+        socket_path.and_then(|sp| {
+            bollard::Docker::connect_with_unix(
+                &format!("unix://{}", sp.display()),
+                120,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .ok()
+        })
+    } else {
+        None
+    };
+    let docker = docker.map(Arc::new);
+
     // Concurrently fetch agent status for running pods
     let host = host_for_pod_services();
     let client = reqwest::Client::builder()
@@ -2072,12 +2092,22 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
         let host = host.clone();
         let client = client.clone();
         let pod_name = pod.name.clone();
+        let docker = docker.clone();
 
         let task = tokio::spawn(async move {
             let (agent_status, forwarded_ports) = if is_running {
-                let status = fetch_agent_status_for_pod(&client, &host, &pod_name).await;
-                let ports = get_pod_forwarded_ports(&pod_name).await;
-                (status, ports)
+                if let Some(ref docker) = docker {
+                    // Single inspect_container call to get both the pod-api
+                    // port and forwarded ports, avoiding redundant work.
+                    let (api_port, ports) = inspect_pod_ports(docker, &pod_name).await;
+                    let status = match api_port {
+                        Some(port) => fetch_agent_status_with_port(&client, &host, port).await,
+                        None => None,
+                    };
+                    (status, ports)
+                } else {
+                    (None, vec![])
+                }
             } else {
                 (None, vec![])
             };
@@ -2167,15 +2197,12 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
     Json(result)
 }
 
-/// Fetch agent status from a pod's pod-api sidecar.
-///
-/// Returns None if the pod-api is unreachable or returns an error.
-async fn fetch_agent_status_for_pod(
+/// Fetch agent status given an already-known pod-api host port.
+async fn fetch_agent_status_with_port(
     client: &reqwest::Client,
     host: &str,
-    pod_name: &str,
+    port: u16,
 ) -> Option<AgentStatusResponse> {
-    let port = get_pod_api_port(pod_name).await.ok()?;
     let resp = client
         .get(format!("http://{}:{}/summary", host, port))
         .send()
