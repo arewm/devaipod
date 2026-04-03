@@ -264,23 +264,47 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     }
 
     // -- Polling setup ------------------------------------------------------
+    // Use self-scheduling setTimeout loops instead of setInterval so the next
+    // poll is only queued after the current one finishes.  This makes request
+    // pileup structurally impossible when the server is slow.
 
-    const podInterval = setInterval(() => {
-      fetchPods()
-    }, POD_POLL_MS)
-    onCleanup(() => clearInterval(podInterval))
+    let disposed = false
+    onCleanup(() => { disposed = true })
 
-    const launchInterval = setInterval(() => {
-      if (Object.keys(store.launches).length > 0) {
-        fetchLaunches()
-      }
-    }, LAUNCH_POLL_MS)
-    onCleanup(() => clearInterval(launchInterval))
+    let podTimer: ReturnType<typeof setTimeout> | undefined
+    function schedulePodPoll() {
+      if (disposed) return
+      podTimer = setTimeout(async () => {
+        await fetchPods()
+        schedulePodPoll()
+      }, POD_POLL_MS)
+    }
+    schedulePodPoll()
+    onCleanup(() => clearTimeout(podTimer))
 
-    const proposalInterval = setInterval(() => {
-      fetchProposals()
-    }, PROPOSAL_POLL_MS)
-    onCleanup(() => clearInterval(proposalInterval))
+    let launchTimer: ReturnType<typeof setTimeout> | undefined
+    function scheduleLaunchPoll() {
+      if (disposed) return
+      launchTimer = setTimeout(async () => {
+        if (Object.keys(store.launches).length > 0) {
+          await fetchLaunches()
+        }
+        scheduleLaunchPoll()
+      }, LAUNCH_POLL_MS)
+    }
+    scheduleLaunchPoll()
+    onCleanup(() => clearTimeout(launchTimer))
+
+    let proposalTimer: ReturnType<typeof setTimeout> | undefined
+    function scheduleProposalPoll() {
+      if (disposed) return
+      proposalTimer = setTimeout(async () => {
+        await fetchProposals()
+        scheduleProposalPoll()
+      }, PROPOSAL_POLL_MS)
+    }
+    scheduleProposalPoll()
+    onCleanup(() => clearTimeout(proposalTimer))
 
     // Initial fetch — the effect tracks only refreshCounter; the async bodies
     // read store state (e.g. store.pods, store.launches) which must NOT be tracked
