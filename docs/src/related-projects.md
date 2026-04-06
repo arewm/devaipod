@@ -6,14 +6,15 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 
 ## Comparison Table
 
-| Project | License | Local-only? | Notes |
-|---------|---------|-------------|-------|
+| Project | License | Self-hostable? | Notes |
+|---------|---------|----------------|-------|
 | **devaipod** | Apache-2.0/MIT | Yes | No cloud services required |
 | [Docker AI Sandboxes](https://docs.docker.com/ai/sandboxes/) | Proprietary | Yes | MicroVM isolation, Docker Desktop required |
 | [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) | Apache-2.0 | Yes | Docker-based sandboxing with gateway control plane, Landlock/seccomp, policy-driven egress |
 | [nono](https://nono.sh/) | Apache-2.0 | Yes | OS-level sandboxing (Landlock/Seatbelt), agent-agnostic |
 | [OpenHands](https://github.com/All-Hands-AI/OpenHands) | MIT | Yes | Self-hostable, Docker-based |
 | [Ambient Code](https://github.com/ambient-code/platform) | MIT | Yes | Kubernetes-native, self-hosted |
+| [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) | Apache-2.0 | Yes | Kubernetes CRD for sandboxed agent pods (k8s-sigs) |
 | [paude](https://github.com/bbrowning/paude) | MIT | Yes | Podman + OpenShift backends, agent-agnostic |
 | [Kortex](https://github.com/kortex-hub/kortex) | Apache-2.0 | Yes | Desktop GUI, AI + container/K8s management, Goose integration |
 | [Gastown](https://github.com/steveyegge/gastown) | MIT | Yes | Multi-agent orchestration, no sandboxing |
@@ -77,6 +78,16 @@ The devaipod project would like to align more with Ambient Code. A few things:
 - [Podman support](https://github.com/ambient-code/platform/issues/431)
 - [Image needs to be pluggable](https://github.com/ambient-code/platform/pull/364)
 - It's possible to run locally with [minikube](https://minikube.sigs.k8s.io/) or [minc](https://github.com/minc-org/minc) in theory, but this adds some friction
+
+### agent-sandbox (kubernetes-sigs)
+
+(This section is Assisted-by: OpenCode (Claude Opus 4.6), based on source code analysis of the agent-sandbox repository)
+
+[agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) is a Kubernetes SIG Apps project (Apache-2.0, Go, `v1alpha1`) that provides a `Sandbox` CRD. Despite the name, it's essentially a "StatefulPod" -- a single Pod + headless Service + optional PVCs with lifecycle management (scheduled shutdown, pause/resume, expiry). Extension CRDs add templates, PVC-style claims, and warm pools for fast allocation. It supports pluggable runtimes (gVisor, Kata) via `runtimeClassName` and has managed NetworkPolicy defaults.
+
+There is no built-in agent framework integration, no git workflow, no credential scoping, and no devcontainer.json support. It's infrastructure plumbing, not an agent execution environment.
+
+devaipod's Kubernetes support could optionally target agent-sandbox as the underlying pod abstraction, with devaipod defining the multi-container layout (workspace + agent + gator + api) and service-gator providing credential scoping that agent-sandbox lacks. The warm pool mechanism is the most interesting piece -- pre-provisioning sandboxes for fast allocation is worth considering.
 
 ### paude
 
