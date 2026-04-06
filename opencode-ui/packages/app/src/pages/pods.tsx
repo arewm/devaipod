@@ -1027,6 +1027,18 @@ function PodCard(props: { pod: PodInfo; focused: boolean; onFocus: () => void })
           </Card>
         </Show>
 
+        {/* Pod diagnostics (e.g. agent binary not found) */}
+        <Show when={props.pod.Diagnostics}>
+          {(diag) => (
+            <div class="mx-4 mb-3 rounded border border-icon-warning-base/30 bg-icon-warning-base/10 p-3">
+              <p class="text-12-regular text-text-primary">{diag().message}</p>
+              <Show when={diag().suggestion}>
+                <p class="text-11-regular text-text-subtle mt-1">{diag().suggestion}</p>
+              </Show>
+            </div>
+          )}
+        </Show>
+
         {/* Devaipod settings inline */}
         <Show when={showSettings()}>
           <DevaipodSettings podName={props.pod.Name} />
