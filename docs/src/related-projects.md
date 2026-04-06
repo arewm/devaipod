@@ -83,23 +83,11 @@ The devaipod project would like to align more with Ambient Code. A few things:
 
 (This section is Assisted-by: OpenCode (Claude Opus 4.6), based on source code analysis of the agent-sandbox repository)
 
-[agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) is a Kubernetes SIG Apps project that provides a `Sandbox` CRD and controller for managing isolated, stateful, singleton workloads -- primarily AI agent runtimes. Apache-2.0 licensed, written in Go. Currently `v1alpha1` with a roadmap targeting Beta/GA in 2026.
+[agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) is a Kubernetes SIG Apps project (Apache-2.0, Go, `v1alpha1`) that provides a `Sandbox` CRD. Despite the name, it's essentially a "StatefulPod" -- a single Pod + headless Service + optional PVCs with lifecycle management (scheduled shutdown, pause/resume, expiry). Extension CRDs add templates, PVC-style claims, and warm pools for fast allocation. It supports pluggable runtimes (gVisor, Kata) via `runtimeClassName` and has managed NetworkPolicy defaults.
 
-The core idea: a `Sandbox` resource maps 1:1 to a Pod + headless Service + optional PVCs, providing a declarative abstraction for "one long-running container with a stable identity and persistent storage." Three extension CRDs add `SandboxTemplate` (reusable configs with managed NetworkPolicy), `SandboxClaim` (PVC-style lifecycle management), and `SandboxWarmPool` (pre-provisioned pools to eliminate cold-start latency). Go and Python client SDKs provide programmatic access (command execution, file I/O) via an HTTP runtime server inside the sandbox pod.
+There is no built-in agent framework integration, no git workflow, no credential scoping, and no devcontainer.json support. It's infrastructure plumbing, not an agent execution environment.
 
-The sandbox isolation model is runtime-agnostic: the CRD exposes Kubernetes' `runtimeClassName` field, so operators can plug in gVisor (syscall interception), Kata Containers (microVMs), or plain runc. The project provides ValidatingAdmissionPolicy examples that enforce security baselines (mandatory gVisor, drop all capabilities, read-only root, etc.). Network isolation uses managed NetworkPolicies that default-deny and block RFC1918, link-local/metadata-server, and IPv6 ULA ranges. `AutomountServiceAccountToken` defaults to `false`.
-
-Key differences from devaipod:
-
-- **Scope**: agent-sandbox is infrastructure plumbing -- a CRD that manages pods. It is not an end-to-end agent execution environment. There is no built-in agent framework integration, no git workflow, no forge integration. Agents interact with sandboxes through HTTP client SDKs rather than running inside a purpose-built multi-container pod.
-- **Credential scoping**: No equivalent to service-gator. Secrets use standard Kubernetes mechanisms (mounted Secrets, ServiceAccounts). There is no per-operation permission scoping -- if an agent gets a GitHub token, it has full access.
-- **devcontainer.json**: Not a first-class concept. One example uses Coder's envbuilder to build a devcontainer inside a Sandbox, but the CRD itself has no devcontainer awareness.
-- **Architecture**: Single container per Sandbox (plus whatever sidecars the user adds manually) vs. devaipod's opinionated multi-container pod (workspace + agent + gator + api). agent-sandbox gives you primitives; devaipod gives you an assembled system.
-- **Target audience**: agent-sandbox targets platform teams building multi-tenant agent infrastructure on Kubernetes. devaipod targets individual developers with zero infrastructure beyond podman.
-
-The most interesting aspect for devaipod is the warm pool mechanism -- pre-provisioning sandboxes and claiming them on demand is a pattern worth considering if devaipod adds Kubernetes support. The `SandboxTemplate` + `SandboxClaim` abstraction is also a clean model for multi-tenant scenarios.
-
-The projects are potentially complementary: agent-sandbox provides the Kubernetes scheduling and lifecycle primitives, while devaipod's pod architecture (multi-container layout, service-gator credential scoping, devcontainer.json support) could define what actually runs inside the sandbox. A `SandboxTemplate` that provisions a devaipod-style multi-container pod with service-gator sidecars would combine the strengths of both.
+devaipod's Kubernetes support could optionally target agent-sandbox as the underlying pod abstraction, with devaipod defining the multi-container layout (workspace + agent + gator + api) and service-gator providing credential scoping that agent-sandbox lacks. The warm pool mechanism is the most interesting piece -- pre-provisioning sandboxes for fast allocation is worth considering.
 
 ### paude
 
