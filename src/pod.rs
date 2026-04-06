@@ -2603,11 +2603,20 @@ socketserver.TCPServer(('0.0.0.0',{opencode_port}),H).serve_forever()
 "
 fi
 
+# Pre-flight: verify the agent binary is available in the container image.
+# Exit with devaipod-specific code 42 if missing, so the backend can surface
+# a diagnostic to the user instead of a generic "exited(127)" message.
+if ! command -v {agent_binary} >/dev/null 2>&1; then
+    echo "devaipod-error: agent-binary-not-found: {agent_binary}" >&2
+    exit 42
+fi
+
 # Run opencode serve, bound to 0.0.0.0 so it's accessible from the published port
-exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
+exec {agent_binary} serve --port {opencode_port} --hostname 0.0.0.0"#,
             home = AGENT_HOME_PATH,
             state = AGENT_STATE_PATH,
-            opencode_port = OPENCODE_PORT
+            opencode_port = OPENCODE_PORT,
+            agent_binary = "opencode"
         );
 
         ContainerConfig {
@@ -3081,10 +3090,17 @@ if [ -f /mnt/agent-home/.gitconfig ]; then
     cp /mnt/agent-home/.gitconfig {home}/.gitconfig
 fi
 
+# Pre-flight: verify the agent binary is available
+if ! command -v {agent_binary} >/dev/null 2>&1; then
+    echo "devaipod-error: agent-binary-not-found: {agent_binary}" >&2
+    exit 42
+fi
+
 # Run opencode serve in foreground
-exec opencode serve --port {opencode_port} --hostname 127.0.0.1"#,
+exec {agent_binary} serve --port {opencode_port} --hostname 127.0.0.1"#,
             home = AGENT_HOME_PATH,
-            opencode_port = WORKER_OPENCODE_PORT // Worker uses a different port to avoid conflict with agent
+            opencode_port = WORKER_OPENCODE_PORT, // Worker uses a different port to avoid conflict with agent
+            agent_binary = "opencode"
         );
 
         ContainerConfig {
@@ -3312,6 +3328,10 @@ mod tests {
         assert_eq!(cmd[1], "-c");
         assert!(cmd[2].contains("opencode serve"));
         assert!(cmd[2].contains(&format!("--port {}", OPENCODE_PORT)));
+        // Pre-flight check for agent binary (uses command -v, exits 42 if missing)
+        assert!(cmd[2].contains("command -v"));
+        assert!(cmd[2].contains("agent-binary-not-found"));
+        assert!(cmd[2].contains("exit 42"));
 
         // Agent has the same security settings as workspace (not restricted)
         // to support nested containers. Security comes from credential isolation.
