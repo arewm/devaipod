@@ -6,8 +6,8 @@ For broader context on the state of agentic AI coding tools, see [Thoughts on ag
 
 ## Comparison Table
 
-| Project | License | Local-only? | Notes |
-|---------|---------|-------------|-------|
+| Project | License | Self-hostable? | Notes |
+|---------|---------|----------------|-------|
 | **devaipod** | Apache-2.0/MIT | Yes | No cloud services required |
 | [Docker AI Sandboxes](https://docs.docker.com/ai/sandboxes/) | Proprietary | Yes | MicroVM isolation, Docker Desktop required |
 | [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) | Apache-2.0 | Yes | Docker-based sandboxing with gateway control plane, Landlock/seccomp, policy-driven egress |
