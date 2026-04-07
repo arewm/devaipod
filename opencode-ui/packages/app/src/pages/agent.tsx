@@ -1,4 +1,4 @@
-import { createSignal, createEffect, createMemo, onCleanup, onMount, Show, For } from "solid-js"
+import { createSignal, createEffect, createMemo, onCleanup, onMount, Show, For, Index } from "solid-js"
 import { useParams, useNavigate, A } from "@solidjs/router"
 import { DevaipodProvider, useDevaipod } from "@/context/devaipod"
 import { apiFetch } from "@/utils/devaipod-api"
@@ -162,6 +162,11 @@ function AgentView() {
     return status.activity
   }
 
+  // -- Forwarded ports for the current pod -----------------------------------
+
+  const currentPod = () => ctx.pods.find((p) => p.Name === fullName())
+  const forwardedPorts = () => currentPod()?.ForwardedPorts ?? []
+
   // Display name for pod trigger button
   const triggerLabel = () => {
     const title = sessionTitle()
@@ -199,6 +204,31 @@ function AgentView() {
         >
           {isDone() ? "Done" : "Mark Done"}
         </button>
+
+        {/* Forwarded ports */}
+        <Show when={forwardedPorts().length > 0}>
+          <div class="flex items-center gap-1.5 text-[13px] text-text-weak ml-2">
+            <span>Ports:</span>
+            <Index each={forwardedPorts()}>
+              {(port, idx) => (
+                <>
+                  <Show when={idx > 0}>
+                    <span class="opacity-40">,</span>
+                  </Show>
+                  <a
+                    href={`http://${window.location.hostname}:${port().hostPort}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="text-text-secondary-base hover:text-text-strong no-underline hover:underline tabular-nums"
+                    title={`Open port ${port().containerPort} (host port ${port().hostPort})`}
+                  >
+                    {port().hostPort}&rarr;{port().containerPort}
+                  </a>
+                </>
+              )}
+            </Index>
+          </div>
+        </Show>
 
         <span class="flex-1" />
 
