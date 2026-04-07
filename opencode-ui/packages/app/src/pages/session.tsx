@@ -40,7 +40,7 @@ import { showToast } from "@opencode-ai/ui/toast"
 import { SessionHeader, SessionContextTab, SortableTab, FileVisual, NewSessionView } from "@/components/session"
 import { navMark, navParams } from "@/utils/perf"
 import { same } from "@/utils/same"
-import { createOpenReviewFile, focusTerminalById, getTabReorderIndex } from "@/pages/session/helpers"
+import { createOpenReviewFile, focusTerminalById, getTabReorderIndex, isStaleSubmittedPrompt } from "@/pages/session/helpers"
 import { createScrollSpy } from "@/pages/session/scroll-spy"
 import { createFileTabListSync } from "@/pages/session/file-tab-scroll"
 import { FileTabContent } from "@/pages/session/file-tabs"
@@ -679,6 +679,37 @@ export default function Page() {
     if (!id) return
     sync.session.sync(id)
   })
+
+  // Clear stale submitted prompts (devaipod iframe workaround).
+  //
+  // In devaipod, switching between pods destroys and recreates the iframe
+  // hosting the OpenCode web UI.  If the user navigates away while the
+  // agent is still processing, the per-session prompt in localStorage may
+  // retain the already-submitted text.  On reload the stale text reappears
+  // in the input box.  Detect and clear it on session mount.
+  {
+    let cleared = false
+    createEffect(() => {
+      if (cleared) return
+      const id = params.id
+      if (!id) return
+      if (!prompt.ready()) return
+
+      const msgs = sync.data.message[id]
+      if (!msgs) return
+
+      if (
+        isStaleSubmittedPrompt({
+          promptParts: prompt.current(),
+          messages: msgs,
+          parts: sync.data.part,
+        })
+      ) {
+        cleared = true
+        prompt.reset()
+      }
+    })
+  }
 
   createEffect(() => {
     if (!view().terminal.opened()) {
