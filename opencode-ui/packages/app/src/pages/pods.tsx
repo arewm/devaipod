@@ -10,6 +10,7 @@ import {
   Show,
   Switch,
 } from "solid-js"
+import { createStore } from "solid-js/store"
 import { Button } from "@opencode-ai/ui/button"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Icon } from "@opencode-ai/ui/icon"
@@ -28,10 +29,12 @@ import {
   type LaunchWorkspaceParams,
   type GatorScopeConfig,
   type GatorScopesResponse,
-  frecencySortPods,
   effectiveTimestamp,
-  timeSection,
-  type TimeSection,
+  type SortBy,
+  type GroupBy,
+  type Density,
+  sortPods,
+  groupPods,
 } from "@/context/devaipod"
 
 // ---------------------------------------------------------------------------
@@ -133,17 +136,251 @@ function podMatchesQuery(
 }
 
 // ---------------------------------------------------------------------------
-// Time section divider
+// View preferences (localStorage persistence)
 // ---------------------------------------------------------------------------
 
-const TIME_SECTION_ORDER: TimeSection[] = ["Active Today", "This Week", "This Month", "Older"]
+interface ViewPrefs {
+  sortBy: SortBy
+  groupBy: GroupBy
+  density: Density
+}
 
-function SectionDivider(props: { label: TimeSection }) {
+const VIEW_PREFS_KEY = "devaipod-view-prefs"
+
+function loadViewPrefs(): ViewPrefs {
+  try {
+    const raw = localStorage.getItem(VIEW_PREFS_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      return {
+        sortBy: (["activity", "repo", "created"] as SortBy[]).includes(parsed.sortBy) ? parsed.sortBy : "activity",
+        groupBy: (["time", "repo", "status", "none"] as GroupBy[]).includes(parsed.groupBy) ? parsed.groupBy : "time",
+        density: (["comfortable", "compact"] as Density[]).includes(parsed.density) ? parsed.density : "comfortable",
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return { sortBy: "activity", groupBy: "time", density: "comfortable" }
+}
+
+function saveViewPrefs(prefs: ViewPrefs) {
+  try {
+    localStorage.setItem(VIEW_PREFS_KEY, JSON.stringify(prefs))
+  } catch {
+    // ignore
+  }
+}
+
+// ---------------------------------------------------------------------------
+// View toolbar (sort / group / density controls)
+// ---------------------------------------------------------------------------
+
+function ViewToolbar(props: {
+  sortBy: SortBy
+  groupBy: GroupBy
+  density: Density
+  onSortChange: (s: SortBy) => void
+  onGroupChange: (g: GroupBy) => void
+  onDensityChange: (d: Density) => void
+}) {
+  const chipClass = (active: boolean) =>
+    active
+      ? "bg-fill-element-active text-text-strong"
+      : "text-text-weak hover:text-text-secondary-base hover:bg-fill-element-base"
+
   return (
-    <div class="flex items-center gap-3 my-2">
-      <hr class="flex-1 border-t border-border-base" />
-      <span class="text-11-regular text-text-weak shrink-0">{props.label}</span>
-      <hr class="flex-1 border-t border-border-base" />
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-2 mb-4">
+      {/* Sort controls */}
+      <div class="flex items-center gap-1">
+        <span class="text-11-regular text-text-weak mr-1">Sort:</span>
+        <For each={[
+          ["activity", "Activity"],
+          ["repo", "Repo"],
+          ["created", "Created"],
+        ] as [SortBy, string][]}>
+          {([value, label]) => (
+            <button
+              type="button"
+              class="px-2 py-0.5 rounded text-11-regular transition-colors cursor-pointer"
+              classList={{ [chipClass(props.sortBy === value)]: true }}
+              onClick={() => props.onSortChange(value)}
+            >
+              {label}
+            </button>
+          )}
+        </For>
+      </div>
+
+      {/* Group controls */}
+      <div class="flex items-center gap-1">
+        <span class="text-11-regular text-text-weak mr-1">Group:</span>
+        <For each={[
+          ["time", "Time"],
+          ["repo", "Repo"],
+          ["status", "Status"],
+          ["none", "None"],
+        ] as [GroupBy, string][]}>
+          {([value, label]) => (
+            <button
+              type="button"
+              class="px-2 py-0.5 rounded text-11-regular transition-colors cursor-pointer"
+              classList={{ [chipClass(props.groupBy === value)]: true }}
+              onClick={() => props.onGroupChange(value)}
+            >
+              {label}
+            </button>
+          )}
+        </For>
+      </div>
+
+      {/* Density toggle */}
+      <div class="flex items-center gap-1 ml-auto">
+        <button
+          type="button"
+          class="px-1.5 py-0.5 rounded text-11-regular transition-colors cursor-pointer"
+          classList={{ [chipClass(props.density === "comfortable")]: true }}
+          onClick={() => props.onDensityChange("comfortable")}
+          title="Comfortable view"
+          aria-label="Comfortable density"
+        >
+          {"\u2630"}
+        </button>
+        <button
+          type="button"
+          class="px-1.5 py-0.5 rounded text-11-regular transition-colors cursor-pointer"
+          classList={{ [chipClass(props.density === "compact")]: true }}
+          onClick={() => props.onDensityChange("compact")}
+          title="Compact view"
+          aria-label="Compact density"
+        >
+          {"\u229E"}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Compact pod card (single-line density)
+// ---------------------------------------------------------------------------
+
+function CompactPodCard(props: {
+  pod: PodInfo
+  focused: boolean
+  onFocus: () => void
+  hideRepo?: boolean
+}) {
+  const ctx = useDevaipod()
+
+  const shortName = () => props.pod.Name.replace("devaipod-", "")
+  const isRunning = () => (props.pod.Status ?? "").toLowerCase() === "running"
+  const labels = () => props.pod.Labels ?? {}
+  const repo = () => labels()["io.devaipod.repo"] ?? ""
+  const agentStatus = () => ctx.agentStatus[props.pod.Name]
+  const title = () => agentStatus()?.title || labels()["io.devaipod.title"] || shortName()
+  const isDone = () => agentStatus()?.completion_status === "done"
+
+  const statusDot = createMemo(() => {
+    if (!isRunning()) return { char: "\u25CC", cls: "text-text-weak" }
+    if (isDone()) return { char: "\u25C6", cls: "text-violet-400" }
+    const activity = agentStatus()?.activity
+    if (activity === "Working") return { char: "\u25CF", cls: "text-icon-success-base" }
+    if (activity === "Idle") return { char: "\u25CB", cls: "text-icon-info-base" }
+    return { char: "\u2026", cls: "text-text-weak" }
+  })
+
+  const activityText = createMemo(() => {
+    if (!isRunning()) return ""
+    const s = agentStatus()
+    if (!s) return ""
+    if (s.current_tool) return `\u2192 ${s.current_tool}`
+    if (s.status_line) return s.status_line
+    return ""
+  })
+
+  const relativeTime = createMemo(() => {
+    const ts = effectiveTimestamp(props.pod)
+    if (!ts) return ""
+    const diff = Date.now() - ts
+    if (diff < 0 || diff < 60_000) return "just now"
+    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
+    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
+    return `${Math.floor(diff / 86_400_000)}d ago`
+  })
+
+  const repoShort = createMemo(() => {
+    const r = repo()
+    if (!r) return ""
+    const parts = r.split("/")
+    return parts[parts.length - 1]
+  })
+
+  let rowRef: HTMLDivElement | undefined
+
+  createEffect(() => {
+    if (props.focused && rowRef) {
+      rowRef.focus({ preventScroll: true })
+    }
+  })
+
+  return (
+    <div
+      ref={rowRef}
+      tabIndex={0}
+      onFocus={props.onFocus}
+      class="flex items-center gap-2 px-3 py-2 rounded border border-border-base bg-background-base transition-colors cursor-pointer hover:bg-fill-element-base"
+      classList={{
+        "ring-2 ring-border-active-base": props.focused,
+        "opacity-50": !isRunning() && !isDone(),
+        "opacity-70": isDone(),
+      }}
+      onClick={() => {
+        if (isRunning()) {
+          ctx.openPod(props.pod.Name).catch(alertError)
+        } else {
+          ctx.startPod(props.pod.Name).catch(alertError)
+        }
+      }}
+    >
+      <span class="text-14-medium shrink-0" classList={{ [statusDot().cls]: true }}>
+        {statusDot().char}
+      </span>
+
+      <span class="text-12-regular text-text-strong truncate min-w-0 flex-1" title={title()}>
+        {title()}
+      </span>
+
+      <Show when={!props.hideRepo && repoShort()}>
+        <span class="text-10-regular text-text-weak bg-fill-element-base px-1.5 py-0.5 rounded shrink-0 max-w-[120px] truncate">
+          {repoShort()}
+        </span>
+      </Show>
+
+      <Show when={activityText()}>
+        <span class="text-11-regular text-text-weak truncate max-w-[160px] shrink-0">
+          {activityText()}
+        </span>
+      </Show>
+
+      <span class="text-11-regular text-text-weak shrink-0">
+        {relativeTime()}
+      </span>
+
+      <Button
+        variant={isRunning() ? "primary" : "secondary"}
+        size="small"
+        onClick={(e: MouseEvent) => {
+          e.stopPropagation()
+          if (isRunning()) {
+            ctx.openPod(props.pod.Name).catch(alertError)
+          } else {
+            ctx.startPod(props.pod.Name).catch(alertError)
+          }
+        }}
+      >
+        {isRunning() ? "Open" : "Start"}
+      </Button>
     </div>
   )
 }
@@ -159,6 +396,14 @@ function PodsPageContent() {
   const [focusedIdx, setFocusedIdx] = createSignal(-1)
   const [searchText, setSearchText] = createSignal("")
 
+  // View preference state (createStore per project convention)
+  const [viewPrefs, setViewPrefs] = createStore<ViewPrefs>(loadViewPrefs())
+
+  // Persist preference changes
+  createEffect(() => {
+    saveViewPrefs({ sortBy: viewPrefs.sortBy, groupBy: viewPrefs.groupBy, density: viewPrefs.density })
+  })
+
   // Derive completion status for a pod from agent status
   const podCompletionStatus = (podName: string) =>
     ctx.agentStatus[podName]?.completion_status ?? "active"
@@ -169,48 +414,35 @@ function PodsPageContent() {
   const isPodDone = (podName: string) =>
     podCompletionStatus(podName) === "done"
 
-  // Frecency-sorted, then filtered pods
+  // Sorted, then filtered pods
   const filteredPods = createMemo(() => {
-    const sorted = frecencySortPods(ctx.pods)
+    const sorted = sortPods(ctx.pods, viewPrefs.sortBy)
     const raw = searchText().trim()
     if (!raw) return sorted
-
     const query = parseSearchQuery(raw)
     return sorted.filter((p) =>
       podMatchesQuery(p, query, isPodDone(p.Name), isPodRunning(p), ctx.agentStatus[p.Name]?.title)
     )
   })
 
-  // Group filtered pods into time sections
-  const sectionedPods = createMemo(() => {
-    const pods = filteredPods()
-    const now = Date.now()
-    const sections: { section: TimeSection; pods: PodInfo[] }[] = []
-    const buckets = new Map<TimeSection, PodInfo[]>()
-
-    for (const pod of pods) {
-      const ts = effectiveTimestamp(pod)
-      const sec = timeSection(ts, now)
-      let list = buckets.get(sec)
-      if (!list) {
-        list = []
-        buckets.set(sec, list)
-      }
-      list.push(pod)
-    }
-
-    for (const sec of TIME_SECTION_ORDER) {
-      const list = buckets.get(sec)
-      if (list && list.length > 0) {
-        sections.push({ section: sec, pods: list })
-      }
-    }
-
-    return sections
+  // Group filtered pods into labeled sections
+  const groupedPods = createMemo(() => {
+    return groupPods(
+      filteredPods(),
+      viewPrefs.groupBy,
+      (name) => ctx.agentStatus[name],
+    )
   })
 
-  // Whether to show section dividers (only if more than one section)
-  const showDividers = createMemo(() => sectionedPods().length > 1)
+  // Show dividers when there are multiple groups. For non-time groupings,
+  // also show a divider for a single named group (e.g., one "Working" section).
+  // For time grouping, match the original behavior: dividers only with 2+ sections.
+  const showDividers = createMemo(() => {
+    const groups = groupedPods()
+    if (groups.length > 1) return true
+    if (groups.length === 1 && groups[0].label !== "" && viewPrefs.groupBy !== "time") return true
+    return false
+  })
 
   // Filter counts for the filter chips
   const filterCounts = createMemo(() => {
@@ -306,13 +538,13 @@ function PodsPageContent() {
     return query.status ?? "all"
   })
 
-  // Compute a flat index offset for each section so we can map
-  // section-local indexes to the flat focused index
+  // Compute a flat index offset for each group so we can map
+  // group-local indexes to the flat focused index
   function flatIndexOffset(sectionIdx: number): number {
     let offset = 0
-    const sections = sectionedPods()
+    const groups = groupedPods()
     for (let i = 0; i < sectionIdx; i++) {
-      offset += sections[i].pods.length
+      offset += groups[i].pods.length
     }
     return offset
   }
@@ -399,6 +631,18 @@ function PodsPageContent() {
         </div>
       </Show>
 
+      {/* View toolbar */}
+      <Show when={ctx.pods.length > 0}>
+        <ViewToolbar
+          sortBy={viewPrefs.sortBy}
+          groupBy={viewPrefs.groupBy}
+          density={viewPrefs.density}
+          onSortChange={(s) => setViewPrefs("sortBy", s)}
+          onGroupChange={(g) => setViewPrefs("groupBy", g)}
+          onDensityChange={(d) => setViewPrefs("density", d)}
+        />
+      </Show>
+
       {/* Advisor placeholder when no advisor pod exists */}
       <Show when={!ctx.hasAdvisor()}>
         <AdvisorPlaceholder />
@@ -435,21 +679,42 @@ function PodsPageContent() {
           }
         >
           <div class="flex flex-col gap-3">
-            <For each={sectionedPods()}>
-              {(section, sectionIdx) => {
-                const offset = () => flatIndexOffset(sectionIdx())
+            <For each={groupedPods()}>
+              {(group, groupIdx) => {
+                const offset = () => flatIndexOffset(groupIdx())
                 return (
                   <>
-                    <Show when={showDividers()}>
-                      <SectionDivider label={section.section} />
+                    <Show when={showDividers() && group.label}>
+                      <div class="flex items-center gap-3 my-2">
+                        <hr class="flex-1 border-t border-border-base" />
+                        <span class="text-11-regular text-text-weak shrink-0">
+                          {group.label}
+                          <Show when={group.pods.length > 1}>
+                            <span class="ml-1 opacity-60">({group.pods.length})</span>
+                          </Show>
+                        </span>
+                        <hr class="flex-1 border-t border-border-base" />
+                      </div>
                     </Show>
-                    <For each={section.pods}>
+                    <For each={group.pods}>
                       {(pod, podIdx) => (
-                        <PodCard
-                          pod={pod}
-                          focused={focusedIdx() === offset() + podIdx()}
-                          onFocus={() => setFocusedIdx(offset() + podIdx())}
-                        />
+                        <Show
+                          when={viewPrefs.density === "compact"}
+                          fallback={
+                            <PodCard
+                              pod={pod}
+                              focused={focusedIdx() === offset() + podIdx()}
+                              onFocus={() => setFocusedIdx(offset() + podIdx())}
+                            />
+                          }
+                        >
+                          <CompactPodCard
+                            pod={pod}
+                            focused={focusedIdx() === offset() + podIdx()}
+                            onFocus={() => setFocusedIdx(offset() + podIdx())}
+                            hideRepo={viewPrefs.groupBy === "repo"}
+                          />
+                        </Show>
                       )}
                     </For>
                   </>
@@ -468,6 +733,19 @@ function PodsPageContent() {
 // Launch form
 // ---------------------------------------------------------------------------
 
+/** Generate a short title from task text by taking the first ~50 chars at a word boundary. */
+function autoTitleFromTask(task: string): string {
+  const trimmed = task.trim().replace(/\s+/g, " ")
+  if (!trimmed) return ""
+  // Take the first sentence or line, whichever is shorter
+  const firstLine = trimmed.split(/[.\n]/)[0].trim()
+  if (firstLine.length <= 50) return firstLine
+  // Truncate at word boundary
+  const cut = firstLine.slice(0, 50)
+  const lastSpace = cut.lastIndexOf(" ")
+  return lastSpace > 20 ? cut.slice(0, lastSpace) : cut
+}
+
 function LaunchForm(props: { onClose: () => void }) {
   const ctx = useDevaipod()
 
@@ -481,6 +759,7 @@ function LaunchForm(props: { onClose: () => void }) {
   const [devcontainerJson, setDevcontainerJson] = createSignal("")
   const [useDefaultDevcontainer, setUseDefaultDevcontainer] = createSignal(false)
   const [autoApprove, setAutoApprove] = createSignal(true)
+  const [autoTitle, setAutoTitle] = createSignal(true)
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
 
@@ -525,6 +804,12 @@ function LaunchForm(props: { onClose: () => void }) {
       if (useDefaultDevcontainer()) params.use_default_devcontainer = true
       if (!autoApprove()) params.no_auto_approve = true
 
+      // Auto-generate title from task text if enabled
+      if (autoTitle() && t) {
+        const generated = autoTitleFromTask(t)
+        if (generated) params.title = generated
+      }
+
       await ctx.launchWorkspace(params)
       props.onClose()
     } catch (err) {
@@ -553,6 +838,18 @@ function LaunchForm(props: { onClose: () => void }) {
             onChange={setTask}
             multiline
           />
+
+          <Checkbox
+            checked={autoTitle()}
+            onChange={setAutoTitle}
+          >
+            Auto-generate title from task
+            <Show when={autoTitle() && task().trim()}>
+              <span class="ml-2 text-text-weak opacity-70">
+                — "{autoTitleFromTask(task())}"
+              </span>
+            </Show>
+          </Checkbox>
 
           <Collapsible variant="ghost">
             <Collapsible.Trigger class="flex items-center gap-2 text-12-regular text-text-weak cursor-pointer">
