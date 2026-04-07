@@ -342,6 +342,8 @@ struct CachedPodInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     containers: Option<Vec<UnifiedContainerInfo>>,
     needs_update: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<PodDiagnostics>,
 }
 
 /// Shared state for the web server
@@ -1927,6 +1929,9 @@ struct UnifiedPodInfo {
     last_active_ts: Option<i64>,
     /// Whether the pod's sidecar image is outdated
     needs_update: bool,
+    /// Diagnostic info for degraded pods (e.g. agent binary not found)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<PodDiagnostics>,
     /// Forwarded ports from devcontainer.json `forwardPorts`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     forwarded_ports: Vec<ForwardedPort>,
@@ -1945,6 +1950,23 @@ struct UnifiedContainerInfo {
     names: String,
     #[serde(rename = "Status")]
     status: String,
+    #[serde(rename = "ExitCode", skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i64>,
+}
+
+/// Diagnostic information for degraded or failed pods.
+///
+/// Populated when the backend detects a known failure mode (e.g. missing agent
+/// binary, exit code 42).  The frontend renders this as an actionable banner.
+#[derive(Debug, Clone, Serialize)]
+struct PodDiagnostics {
+    /// Machine-readable error code (e.g. "agent-binary-not-found")
+    code: String,
+    /// Human-readable message
+    message: String,
+    /// Suggested recovery action
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion: Option<String>,
 }
 
 /// Raw pod JSON from the podman REST API (`/v5.0.0/libpod/pods/json`).
@@ -2181,6 +2203,7 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
                 agent_status: final_agent_status,
                 last_active_ts,
                 needs_update: pod.needs_update,
+                diagnostics: pod.diagnostics,
                 forwarded_ports,
             });
         }
@@ -2290,6 +2313,16 @@ async fn refresh_pod_cache(
     let (all_pods, enrichment_map) =
         tokio::join!(fetch_podman_pods(socket_path), enrichment_future);
 
+    // Docker connection for inspecting exited agent containers (exit codes).
+    // This reuses the same socket but needs its own connection since the
+    // enrichment future consumed its one.
+    let inspect_docker = bollard::Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .ok();
+
     let mut pods: Vec<CachedPodInfo> = all_pods
         .into_iter()
         .filter(|p| p.name.starts_with("devaipod-"))
@@ -2300,6 +2333,7 @@ async fn refresh_pod_cache(
                     .map(|c| UnifiedContainerInfo {
                         names: c.names.clone().unwrap_or_default(),
                         status: c.status.clone().unwrap_or_default(),
+                        exit_code: None, // Populated below for exited containers
                     })
                     .collect()
             });
@@ -2310,9 +2344,49 @@ async fn refresh_pod_cache(
                 labels: pod.labels,
                 containers,
                 needs_update,
+                diagnostics: None, // Populated below for degraded pods
             }
         })
         .collect();
+
+    // Inspect exited agent containers to detect known failure modes.
+    // Only bother for non-running pods to avoid unnecessary API calls.
+    if let Some(ref docker) = inspect_docker {
+        for pod in pods.iter_mut() {
+            let dominated_by_exit = pod.status.eq_ignore_ascii_case("degraded")
+                || pod.status.eq_ignore_ascii_case("exited");
+            if !dominated_by_exit {
+                continue;
+            }
+            let agent_name = format!("{}-agent", pod.name);
+            if let Ok(info) = docker.inspect_container(&agent_name, None).await
+                && let Some(state) = &info.state
+                && let Some(exit_code) = state.exit_code
+            {
+                // Update the agent container's exit_code in the cached containers
+                if let Some(ref mut containers) = pod.containers {
+                    for c in containers.iter_mut() {
+                        if c.names == agent_name {
+                            c.exit_code = Some(exit_code);
+                        }
+                    }
+                }
+                // Exit code 42 = agent binary not found (devaipod-specific)
+                if exit_code == 42 {
+                    pod.diagnostics = Some(PodDiagnostics {
+                        code: "agent-binary-not-found".to_string(),
+                        message: "Agent binary not found in container image".to_string(),
+                        suggestion: Some(
+                            "Recreate this workspace with the 'Use dotfiles \
+                             devcontainer' option enabled, or specify a container \
+                             image that includes the agent binary"
+                                .to_string(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
 
     // Sort: advisor first, then running pods, then by creation date descending
     pods.sort_by(|a, b| {

@@ -23,6 +23,7 @@ interface RawUnifiedPod {
   last_active_ts?: number
   needs_update: boolean
   forwarded_ports?: ForwardedPort[]
+  diagnostics?: { code: string; message: string; suggestion?: string }
 }
 
 export interface PodInfo {
@@ -34,6 +35,8 @@ export interface PodInfo {
   ForwardedPorts?: Array<{ containerPort: number; hostPort: number }>
   /** Last time the agent was active (unix ms), from server cache. */
   LastActiveTs?: number
+  /** Diagnostic info for degraded pods (e.g. agent binary not found). */
+  Diagnostics?: { code: string; message: string; suggestion?: string }
 }
 
 export interface AgentStatus {
@@ -198,6 +201,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
             hostPort: fp.host_port,
           })),
           LastActiveTs: p.last_active_ts,
+          Diagnostics: p.diagnostics,
         }))
         // Extract agent status and enrichment from the same response
         const agentMap: Record<string, AgentStatus> = {}
