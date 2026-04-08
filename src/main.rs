@@ -5815,10 +5815,12 @@ fn cmd_opencode_status(pod_name: &str, json_output: bool) -> Result<()> {
 fn check_agent_health(pod_name: &str) -> Option<bool> {
     let workspace_container = format!("{}-workspace", pod_name);
 
-    // Use nc to check if the port is accepting connections.
-    // This is more reliable than HTTP health checks since opencode's
-    // endpoints may return errors during/after initialization.
-    let check_cmd = format!("nc -z localhost {} 2>/dev/null", pod::OPENCODE_PORT);
+    // Try nc first (fast port check), fall back to curl (more widely available).
+    // Custom/minimal container images may not have nc installed.
+    let check_cmd = format!(
+        "nc -z localhost {port} 2>/dev/null || curl -sf -o /dev/null http://localhost:{port}/session 2>/dev/null",
+        port = pod::OPENCODE_PORT,
+    );
     let result = podman_command()
         .args(["exec", &workspace_container, "/bin/sh", "-c", &check_cmd])
         .status();
