@@ -1463,6 +1463,8 @@ struct RunRequest {
     /// Disable auto-approve of tool permissions
     #[serde(default)]
     no_auto_approve: bool,
+    /// Human-readable title for the workspace session
+    title: Option<String>,
 }
 
 /// Response for run endpoint
@@ -1564,6 +1566,10 @@ async fn run_workspace(
 
     if req.no_auto_approve {
         cmd.arg("--no-auto-approve");
+    }
+
+    if let Some(ref title) = req.title {
+        cmd.args(["--title", title]);
     }
 
     // Prevent stdin reads from blocking the server process
@@ -4037,5 +4043,21 @@ mod tests {
         let json = r#"{"devaipod-x":{"last_active_ts":42,"unknown_field":"ok"}}"#;
         let map: HashMap<String, CachedPodState> = serde_json::from_str(json).unwrap();
         assert_eq!(map["devaipod-x"].last_active_ts, Some(42));
+    }
+
+    #[test]
+    fn test_run_request_deserializes_title() {
+        let json = r#"{"source":"https://github.com/org/repo","task":"fix bug","title":"Fix the login bug"}"#;
+        let req: RunRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.title.as_deref(), Some("Fix the login bug"));
+        assert_eq!(req.source.as_deref(), Some("https://github.com/org/repo"));
+        assert_eq!(req.task.as_deref(), Some("fix bug"));
+    }
+
+    #[test]
+    fn test_run_request_title_is_optional() {
+        let json = r#"{"source":"https://github.com/org/repo"}"#;
+        let req: RunRequest = serde_json::from_str(json).unwrap();
+        assert!(req.title.is_none());
     }
 }

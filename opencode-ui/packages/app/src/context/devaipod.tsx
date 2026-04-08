@@ -75,6 +75,7 @@ export interface LaunchWorkspaceParams {
   devcontainer_json?: string
   use_default_devcontainer?: boolean
   no_auto_approve?: boolean
+  title?: string
 }
 
 /** GitHub repo permission flags from the gator config */
@@ -119,6 +120,16 @@ const PROPOSAL_POLL_MS = 10_000
 
 export type TimeSection = "Active Today" | "This Week" | "This Month" | "Older"
 
+export type SortBy = "activity" | "repo" | "created"
+export type GroupBy = "time" | "repo" | "status" | "none"
+export type Density = "comfortable" | "compact"
+
+export interface PodGroup {
+  label: string
+  pods: PodInfo[]
+}
+
+const ADVISOR_POD_NAME = "devaipod-advisor"
 const MS_DAY = 86_400_000
 const MS_WEEK = 7 * MS_DAY
 const MS_MONTH = 30 * MS_DAY
@@ -148,8 +159,8 @@ export function effectiveTimestamp(pod: PodInfo): number {
 export function frecencySortPods(pods: PodInfo[]): PodInfo[] {
   return [...pods].sort((a, b) => {
     // Advisor always first
-    const aAdvisor = a.Name === "devaipod-advisor" ? 1 : 0
-    const bAdvisor = b.Name === "devaipod-advisor" ? 1 : 0
+    const aAdvisor = a.Name === ADVISOR_POD_NAME ? 1 : 0
+    const bAdvisor = b.Name === ADVISOR_POD_NAME ? 1 : 0
     if (aAdvisor !== bAdvisor) return bAdvisor - aAdvisor
 
     // Running before stopped
@@ -160,6 +171,139 @@ export function frecencySortPods(pods: PodInfo[]): PodInfo[] {
     // Within same status group: sort by effective timestamp descending
     return effectiveTimestamp(b) - effectiveTimestamp(a)
   })
+}
+
+/**
+ * Sort pods alphabetically by repo label, then by effective timestamp descending
+ * within each repo. Running pods sort above stopped within the same repo.
+ * Advisor pod always first.
+ */
+export function sortByRepo(pods: PodInfo[]): PodInfo[] {
+  return [...pods].sort((a, b) => {
+    const aAdvisor = a.Name === ADVISOR_POD_NAME ? 1 : 0
+    const bAdvisor = b.Name === ADVISOR_POD_NAME ? 1 : 0
+    if (aAdvisor !== bAdvisor) return bAdvisor - aAdvisor
+
+    const aRepo = (a.Labels?.["io.devaipod.repo"] ?? "").toLowerCase()
+    const bRepo = (b.Labels?.["io.devaipod.repo"] ?? "").toLowerCase()
+    if (aRepo !== bRepo) return aRepo.localeCompare(bRepo)
+
+    const aRunning = (a.Status ?? "").toLowerCase() === "running" ? 1 : 0
+    const bRunning = (b.Status ?? "").toLowerCase() === "running" ? 1 : 0
+    if (aRunning !== bRunning) return bRunning - aRunning
+
+    return effectiveTimestamp(b) - effectiveTimestamp(a)
+  })
+}
+
+/**
+ * Sort pods by Created timestamp descending. Advisor pod always first.
+ */
+export function sortByCreated(pods: PodInfo[]): PodInfo[] {
+  return [...pods].sort((a, b) => {
+    const aAdvisor = a.Name === ADVISOR_POD_NAME ? 1 : 0
+    const bAdvisor = b.Name === ADVISOR_POD_NAME ? 1 : 0
+    if (aAdvisor !== bAdvisor) return bAdvisor - aAdvisor
+
+    // Use Created directly (ignoring LastActiveTs), falling back to 0 for invalid dates
+    const aTime = new Date(a.Created).getTime()
+    const bTime = new Date(b.Created).getTime()
+    return (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime)
+  })
+}
+
+/** Dispatch to the correct sort function based on SortBy value. */
+export function sortPods(pods: PodInfo[], by: SortBy): PodInfo[] {
+  switch (by) {
+    case "activity": return frecencySortPods(pods)
+    case "repo": return sortByRepo(pods)
+    case "created": return sortByCreated(pods)
+  }
+}
+
+/**
+ * Group pods into labeled sections.
+ *
+ * @param pods - already sorted and filtered (group order preserves input sort order)
+ * @param by - grouping mode
+ * @param agentStatusLookup - function to get AgentStatus for a pod name
+ */
+export function groupPods(
+  pods: PodInfo[],
+  by: GroupBy,
+  agentStatusLookup: (name: string) => AgentStatus | undefined,
+): PodGroup[] {
+  if (by === "none") {
+    return pods.length > 0 ? [{ label: "", pods }] : []
+  }
+
+  if (by === "time") {
+    const now = Date.now()
+    const buckets = new Map<string, PodInfo[]>()
+    const order: TimeSection[] = ["Active Today", "This Week", "This Month", "Older"]
+    for (const pod of pods) {
+      const sec = timeSection(effectiveTimestamp(pod), now)
+      let list = buckets.get(sec)
+      if (!list) {
+        list = []
+        buckets.set(sec, list)
+      }
+      list.push(pod)
+    }
+    const groups: PodGroup[] = []
+    for (const sec of order) {
+      const list = buckets.get(sec)
+      if (list && list.length > 0) {
+        groups.push({ label: sec, pods: list })
+      }
+    }
+    return groups
+  }
+
+  if (by === "repo") {
+    const buckets = new Map<string, PodInfo[]>()
+    const order: string[] = []
+    for (const pod of pods) {
+      const repo = pod.Labels?.["io.devaipod.repo"] ?? ""
+      const key = repo || "Other"
+      let list = buckets.get(key)
+      if (!list) {
+        list = []
+        buckets.set(key, list)
+        order.push(key)
+      }
+      list.push(pod)
+    }
+    return order.map((key) => ({ label: key, pods: buckets.get(key)! }))
+  }
+
+  // by === "status"
+  // "Working" = autonomously active, no attention needed
+  // "Needs Attention" = running but idle/unknown, may need user input
+  // "Inactive" = stopped or marked done (even if still running)
+  const working: PodInfo[] = []
+  const needsAttention: PodInfo[] = []
+  const inactive: PodInfo[] = []
+
+  for (const pod of pods) {
+    const isRunning = (pod.Status ?? "").toLowerCase() === "running"
+    const status = agentStatusLookup(pod.Name)
+    const isDone = status?.completion_status === "done"
+
+    if (!isRunning || isDone) {
+      inactive.push(pod)
+    } else if (status?.activity === "Working") {
+      working.push(pod)
+    } else {
+      needsAttention.push(pod)
+    }
+  }
+
+  const groups: PodGroup[] = []
+  if (working.length > 0) groups.push({ label: "Working", pods: working })
+  if (needsAttention.length > 0) groups.push({ label: "Needs Attention", pods: needsAttention })
+  if (inactive.length > 0) groups.push({ label: "Inactive", pods: inactive })
+  return groups
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +606,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
 
     // -- Derived state ------------------------------------------------------
 
-    const hasAdvisor = createMemo(() => store.pods.some((p) => p.Name === "devaipod-advisor"))
+    const hasAdvisor = createMemo(() => store.pods.some((p) => p.Name === ADVISOR_POD_NAME))
 
     const hasActiveLaunches = createMemo(
       () => Object.values(store.launches).some((l) => l.state === "launching"),

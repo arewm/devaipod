@@ -807,6 +807,9 @@ enum HostCommand {
         /// interactive approval for tool usage.
         #[arg(long)]
         no_auto_approve: bool,
+        /// Human-readable title for this session (e.g. "refactoring auth")
+        #[arg(long, value_name = "TITLE")]
+        title: Option<String>,
     },
     /// Generate shell completions
     ///
@@ -1402,6 +1405,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             devcontainer_json,
             use_default_devcontainer,
             no_auto_approve,
+            title,
         } => {
             let source = resolve_source(source.as_deref(), &config)?;
 
@@ -1478,6 +1482,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 devcontainer_json.as_deref(),
                 use_default_devcontainer,
                 !no_auto_approve,
+                title.as_deref(),
             )
             .await?;
 
@@ -2594,11 +2599,12 @@ async fn cmd_run(
     devcontainer_json: Option<&str>,
     use_default_devcontainer: bool,
     auto_approve: bool,
+    title: Option<&str>,
 ) -> Result<String> {
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
         task: command.map(|s| s.to_string()),
-        title: None,
+        title: title.map(|s| s.to_string()),
         image: image.map(|s| s.to_string()),
         name: explicit_name.map(|s| s.to_string()),
         service_gator_scopes: service_gator_scopes.to_vec(),
@@ -3571,6 +3577,7 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
         None,  // no devcontainer override
         false, // don't override project devcontainer
         true,  // auto_approve
+        None,  // no title for advisor
     )
     .await?;
 
