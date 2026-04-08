@@ -614,3 +614,69 @@ fn test_harness_pod_state_cache_survives_stop() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_harness_pod_state_cache_survives_stop);
+
+/// Verify that a pod with a missing agent binary surfaces diagnostics.
+///
+/// Creates a pod WITHOUT mock-agent mode, so the agent container attempts to
+/// run the real `opencode` binary. Since the test image doesn't have it, the
+/// pre-flight check exits with code 42 and the backend should populate the
+/// `diagnostics` field in the unified pod list response.
+fn test_harness_missing_agent_binary_diagnostics() -> Result<()> {
+    let mut harness = DevaipodHarness::start_without_mock()?;
+    // Use a devcontainer image that has git (for init clone) but NOT opencode,
+    // so the agent pre-flight check fails with exit code 42.
+    let repo = TestRepo::new_with_devcontainer(
+        r#"{ "name": "no-agent-test", "image": "mcr.microsoft.com/devcontainers/base:ubuntu" }"#,
+    )?;
+
+    let pod_name = crate::unique_test_name("no-agent");
+    let short = crate::short_name(&pod_name);
+
+    let pod_json = harness.create_pod_expect_degraded(repo.repo_path.to_str().unwrap(), short)?;
+
+    // The diagnostics field should be present with the agent-binary-not-found code
+    let diagnostics = pod_json.get("diagnostics");
+    assert!(
+        diagnostics.is_some(),
+        "Degraded pod should have diagnostics field: {pod_json}"
+    );
+    let diag = diagnostics.unwrap();
+    assert_eq!(
+        diag.get("code").and_then(|v| v.as_str()),
+        Some("agent-binary-not-found"),
+        "Diagnostics code should be 'agent-binary-not-found': {diag}"
+    );
+    assert!(
+        diag.get("message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| !m.is_empty()),
+        "Diagnostics should have a non-empty message: {diag}"
+    );
+    assert!(
+        diag.get("suggestion")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "Diagnostics should have a non-empty suggestion: {diag}"
+    );
+
+    // Verify the agent container has exit code 42
+    let containers = pod_json.get("containers").and_then(|v| v.as_array());
+    if let Some(containers) = containers {
+        let agent = containers.iter().find(|c| {
+            c.get("Names")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| n.ends_with("-agent"))
+        });
+        if let Some(agent) = agent {
+            assert_eq!(
+                agent.get("ExitCode").and_then(|v| v.as_i64()),
+                Some(42),
+                "Agent container should have exit code 42: {agent}"
+            );
+        }
+    }
+
+    tracing::info!("Missing agent binary diagnostics test passed for pod '{pod_name}'");
+    Ok(())
+}
+podman_integration_test!(test_harness_missing_agent_binary_diagnostics);

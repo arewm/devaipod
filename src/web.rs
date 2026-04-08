@@ -2297,31 +2297,23 @@ async fn refresh_pod_cache(
     cache: &PodCache,
     pod_state_cache: Option<&PodStateCache>,
 ) {
+    // Single Docker connection shared by enrichment map and exit-code inspection.
+    let docker = bollard::Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .ok();
+
     let enrichment_future = async {
-        let docker = bollard::Docker::connect_with_unix(
-            &format!("unix://{}", socket_path.display()),
-            120,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .ok();
-        match docker {
-            Some(d) => compute_enrichment_map(&d, self_image_id).await,
+        match &docker {
+            Some(d) => compute_enrichment_map(d, self_image_id).await,
             None => HashMap::new(),
         }
     };
 
     let (all_pods, enrichment_map) =
         tokio::join!(fetch_podman_pods(socket_path), enrichment_future);
-
-    // Docker connection for inspecting exited agent containers (exit codes).
-    // This reuses the same socket but needs its own connection since the
-    // enrichment future consumed its one.
-    let inspect_docker = bollard::Docker::connect_with_unix(
-        &format!("unix://{}", socket_path.display()),
-        120,
-        bollard::API_DEFAULT_VERSION,
-    )
-    .ok();
 
     let mut pods: Vec<CachedPodInfo> = all_pods
         .into_iter()
@@ -2351,7 +2343,7 @@ async fn refresh_pod_cache(
 
     // Inspect exited agent containers to detect known failure modes.
     // Only bother for non-running pods to avoid unnecessary API calls.
-    if let Some(ref docker) = inspect_docker {
+    if let Some(ref docker) = docker {
         for pod in pods.iter_mut() {
             let dominated_by_exit = pod.status.eq_ignore_ascii_case("degraded")
                 || pod.status.eq_ignore_ascii_case("exited");

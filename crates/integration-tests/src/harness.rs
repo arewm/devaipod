@@ -46,7 +46,22 @@ impl DevaipodHarness {
     /// environment variables (`DEVAIPOD_INSTANCE`, `DEVAIPOD_HOST_MODE`).
     /// Blocks until the token is captured from stdout and the health endpoint
     /// responds with 200.
+    ///
+    /// Agent containers run in mock mode (`DEVAIPOD_MOCK_AGENT=1`) so no real
+    /// AI provider is needed.
     pub fn start() -> Result<Self> {
+        Self::start_inner(true)
+    }
+
+    /// Like [`start`] but without mock-agent mode.
+    ///
+    /// Agent containers will attempt to run the real agent binary. Useful for
+    /// testing failure modes like missing binaries (exit code 42).
+    pub fn start_without_mock() -> Result<Self> {
+        Self::start_inner(false)
+    }
+
+    fn start_inner(mock_agent: bool) -> Result<Self> {
         let port = find_free_port()?;
         let binary = std::env::var("DEVAIPOD_PATH").unwrap_or_else(|_| "devaipod".to_string());
 
@@ -54,13 +69,15 @@ impl DevaipodHarness {
         cmd.args(["web", "--port", &port.to_string()])
             .env("DEVAIPOD_INSTANCE", crate::INTEGRATION_TEST_INSTANCE)
             .env("DEVAIPOD_HOST_MODE", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if mock_agent {
             // When the web server spawns `devaipod run` to create pods, this
             // env var propagates to the child process, which passes it into
             // the agent container so it runs mock-opencode instead of the
             // real opencode server.
-            .env("DEVAIPOD_MOCK_AGENT", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            cmd.env("DEVAIPOD_MOCK_AGENT", "1");
+        }
         // Propagate DEVAIPOD_CONTAINER_IMAGE so `detect_self_image()` in the
         // web server uses the locally-built image instead of the published one.
         if let Ok(img) = std::env::var("DEVAIPOD_CONTAINER_IMAGE") {
@@ -230,6 +247,72 @@ impl DevaipodHarness {
             }
 
             #[allow(clippy::disallowed_methods)] // Intentional: poll interval
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// Create a pod and wait for it to become Degraded (some containers exited).
+    ///
+    /// Used to test failure modes like a missing agent binary: the workspace
+    /// and sidecar containers start, but the agent exits immediately, putting
+    /// the pod into Degraded state.
+    ///
+    /// Returns the pod's JSON from the unified pod list once it reaches
+    /// Degraded (or Exited) status.
+    pub fn create_pod_expect_degraded(
+        &mut self,
+        source: &str,
+        pod_name: &str,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "source": source,
+            "name": pod_name,
+        });
+
+        let (status, resp) = self.post("/api/devaipod/run", &body.to_string())?;
+        if status != 200 {
+            bail!("POST /api/devaipod/run returned {status}: {resp}");
+        }
+
+        let full_name = if pod_name.starts_with("devaipod-") {
+            pod_name.to_string()
+        } else {
+            format!("devaipod-{pod_name}")
+        };
+        self.track_pod(&full_name);
+
+        // Poll until the pod appears with Degraded or Exited status.
+        // This takes longer than Running because we need to wait for the
+        // agent container to start and then exit.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if Instant::now() > deadline {
+                let stderr = self.recent_stderr(30);
+                bail!(
+                    "Pod '{full_name}' did not become Degraded within 120s\n\
+                     === web stderr ===\n{stderr}"
+                );
+            }
+
+            if let Ok((200, body)) = self.get("/api/devaipod/pods")
+                && let Ok(pods) = serde_json::from_str::<Vec<serde_json::Value>>(&body)
+                && let Some(pod) = pods.iter().find(|p| {
+                    p.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| n == full_name)
+                        .unwrap_or(false)
+                })
+            {
+                let pod_status = pod.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                if pod_status.eq_ignore_ascii_case("degraded")
+                    || pod_status.eq_ignore_ascii_case("exited")
+                {
+                    tracing::info!("Pod '{full_name}' is {pod_status}");
+                    return Ok(pod.clone());
+                }
+            }
+
+            #[allow(clippy::disallowed_methods)]
             std::thread::sleep(Duration::from_secs(2));
         }
     }
