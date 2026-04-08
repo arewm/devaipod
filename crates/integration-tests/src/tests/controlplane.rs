@@ -623,7 +623,11 @@ podman_integration_test!(test_harness_pod_state_cache_survives_stop);
 /// `diagnostics` field in the unified pod list response.
 fn test_harness_missing_agent_binary_diagnostics() -> Result<()> {
     let mut harness = DevaipodHarness::start_without_mock()?;
-    let repo = TestRepo::new()?;
+    // Use a devcontainer image that has git (for init clone) but NOT opencode,
+    // so the agent pre-flight check fails with exit code 42.
+    let repo = TestRepo::new_with_devcontainer(
+        r#"{ "name": "no-agent-test", "image": "mcr.microsoft.com/devcontainers/base:ubuntu" }"#,
+    )?;
 
     let pod_name = crate::unique_test_name("no-agent");
     let short = crate::short_name(&pod_name);

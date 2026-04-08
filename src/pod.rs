@@ -2566,18 +2566,13 @@ exec sleep infinity
         let startup_script = format!(
             r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
 
-# Wait for devaipod to finish setup (dotfiles, task config) before starting
-# opencode.  The state file lives on the container overlay so it persists
-# across stop/start but is absent after a container rebuild.
-while [ ! -f {state} ]; do
-    sleep 0.1
-done
-
 # Mock mode: run inline mock server instead of the real opencode server.
 # Used by integration tests to avoid needing a real AI provider.
 # Uses Python3 (available in all devcontainer images) so no extra binary
 # is required in the agent container.
 if [ -n "${{DEVAIPOD_MOCK_AGENT}}" ]; then
+    # Wait for devaipod to finish setup before starting mock server.
+    while [ ! -f {state} ]; do sleep 0.1; done
     exec python3 -u -c "
 import json, http.server, socketserver
 
@@ -2604,12 +2599,19 @@ socketserver.TCPServer(('0.0.0.0',{opencode_port}),H).serve_forever()
 fi
 
 # Pre-flight: verify the agent binary is available in the container image.
-# Exit with devaipod-specific code 42 if missing, so the backend can surface
-# a diagnostic to the user instead of a generic "exited(127)" message.
+# Check before waiting for the state file so the pod enters Degraded state
+# immediately rather than blocking on setup that cannot succeed.
 if ! command -v {agent_binary} >/dev/null 2>&1; then
     echo "devaipod-error: agent-binary-not-found: {agent_binary}" >&2
     exit 42
 fi
+
+# Wait for devaipod to finish setup (dotfiles, task config) before starting
+# opencode.  The state file lives on the container overlay so it persists
+# across stop/start but is absent after a container rebuild.
+while [ ! -f {state} ]; do
+    sleep 0.1
+done
 
 # Run opencode serve, bound to 0.0.0.0 so it's accessible from the published port
 exec {agent_binary} serve --port {opencode_port} --hostname 0.0.0.0"#,
@@ -3058,6 +3060,12 @@ exec {agent_binary} serve --port {opencode_port} --hostname 0.0.0.0"#,
             r#"set -e
 mkdir -p {home}/.config {home}/.local/share {home}/.local/bin {home}/.cache
 
+# Pre-flight: verify the agent binary is available before waiting for setup.
+if ! command -v {agent_binary} >/dev/null 2>&1; then
+    echo "devaipod-error: agent-binary-not-found: {agent_binary}" >&2
+    exit 42
+fi
+
 # Wait for agent setup (dotfiles, task config) to complete before copying configs.
 # The state file is written by devaipod after install_dotfiles_agent().
 echo "Waiting for agent setup to complete..."
@@ -3088,12 +3096,6 @@ fi
 # Copy git identity
 if [ -f /mnt/agent-home/.gitconfig ]; then
     cp /mnt/agent-home/.gitconfig {home}/.gitconfig
-fi
-
-# Pre-flight: verify the agent binary is available
-if ! command -v {agent_binary} >/dev/null 2>&1; then
-    echo "devaipod-error: agent-binary-not-found: {agent_binary}" >&2
-    exit 42
 fi
 
 # Run opencode serve in foreground
