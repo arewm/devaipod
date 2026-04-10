@@ -63,7 +63,8 @@ impl DevaipodHarness {
 
     fn start_inner(mock_agent: bool) -> Result<Self> {
         let port = find_free_port()?;
-        let binary = std::env::var("DEVAIPOD_PATH").unwrap_or_else(|_| "devaipod".to_string());
+        let binary =
+            std::env::var("DEVAIPOD_PATH").unwrap_or_else(|_| "devaipod-server".to_string());
 
         let mut cmd = Command::new(&binary);
         cmd.args(["web", "--port", &port.to_string()])
@@ -240,8 +241,12 @@ impl DevaipodHarness {
                 })
             {
                 let status = pod.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                if status.eq_ignore_ascii_case("running") {
-                    tracing::info!("Pod '{full_name}' is Running");
+                // Accept both "Running" and "Degraded" — the latter happens when
+                // the service-gator container exits (expected for test repos with
+                // fake remote URLs), but the agent and api containers are healthy.
+                if status.eq_ignore_ascii_case("running") || status.eq_ignore_ascii_case("degraded")
+                {
+                    tracing::info!("Pod '{full_name}' is {status}");
                     return Ok(());
                 }
             }
@@ -321,6 +326,15 @@ impl DevaipodHarness {
 impl Drop for DevaipodHarness {
     fn drop(&mut self) {
         // Clean up tracked pods and their volumes.
+        // Compute workspace base dir for host-side cleanup
+        let ws_base = std::env::var("DEVAIPOD_HOST_WORKDIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".local/share/devaipod/workspaces"))
+            })
+            .ok();
+
         for pod in &self.pods {
             let _ = Command::new("podman")
                 .args(["pod", "rm", "-f", pod])
@@ -330,6 +344,17 @@ impl Drop for DevaipodHarness {
                 let _ = Command::new("podman")
                     .args(["volume", "rm", "-f", &vol])
                     .output();
+            }
+            // Remove host-side workspace directory.
+            // Use `podman unshare` because files are owned by container subuids.
+            if let Some(ref base) = ws_base {
+                let ws_dir = base.join(pod);
+                if ws_dir.exists() {
+                    let _ = Command::new("podman")
+                        .args(["unshare", "rm", "-rf"])
+                        .arg(&ws_dir)
+                        .output();
+                }
             }
         }
 

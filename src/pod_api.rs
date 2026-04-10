@@ -1534,7 +1534,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
     let session_count = sessions.len();
 
     if sessions.is_empty() {
-        let completion_status = read_completion_status(&state.workspace).await;
+        let (completion_status, _changed_at) = read_completion_status(&state.workspace).await;
         return Json(PodSummaryResponse {
             activity: "Idle".to_string(),
             status_line: Some("Waiting for input...".to_string()),
@@ -1580,7 +1580,38 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
     let (activity, status_line, current_tool, recent_output, last_message_ts) =
         derive_agent_status_from_messages(&messages);
 
-    let completion_status = read_completion_status(&state.workspace).await;
+    let (mut completion_status, changed_at) = read_completion_status(&state.workspace).await;
+
+    // Auto-detect completion: when the agent is idle after doing work,
+    // automatically transition to Done. This avoids requiring the user
+    // to manually click "Done" or run `devaipod done`.
+    //
+    // Grace period: skip auto-completion if the status was recently set
+    // to Active (e.g. after a review submission). This prevents the race
+    // where the agent hasn't started processing a new message yet but
+    // the poll sees the old "Idle" state.
+    let in_grace_period = if completion_status == CompletionStatus::Active {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        changed_at.is_some_and(|t| (now - t) < AUTO_COMPLETION_GRACE_SECS)
+    } else {
+        false
+    };
+
+    if activity == "Idle"
+        && completion_status == CompletionStatus::Active
+        && !messages.is_empty()
+        && !in_grace_period
+    {
+        if let Err(e) = write_completion_status(&state.workspace, CompletionStatus::Done).await {
+            tracing::warn!("Failed to auto-set completion status: {e}");
+        } else {
+            tracing::info!("Auto-detected agent completion (idle after work)");
+            completion_status = CompletionStatus::Done;
+        }
+    }
 
     Json(PodSummaryResponse {
         activity,
@@ -2133,7 +2164,20 @@ enum CompletionStatus {
 #[derive(Debug, Serialize, Deserialize)]
 struct CompletionStatusFile {
     status: CompletionStatus,
+    /// Unix timestamp (seconds) of the last status change. Used to suppress
+    /// auto-completion for a grace period after the status is reset to Active
+    /// (e.g. after a review submission), preventing the auto-completion
+    /// from immediately re-triggering before the agent processes new input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    changed_at: Option<i64>,
 }
+
+/// Duration (in seconds) after a status change to Active during which
+/// auto-completion is suppressed. This prevents the race where a review
+/// resets status to Active but the agent hasn't started processing the
+/// review message yet, so the next /summary poll would see "Idle" and
+/// immediately re-set Done.
+const AUTO_COMPLETION_GRACE_SECS: i64 = 60;
 
 /// Response for GET /completion-status.
 #[derive(Debug, Serialize)]
@@ -2182,15 +2226,41 @@ fn title_path() -> PathBuf {
     state_dir().join("title.txt")
 }
 
-/// Read the current completion status from disk.
-async fn read_completion_status(workspace: &std::path::Path) -> CompletionStatus {
+/// Read the current completion status and change timestamp from disk.
+async fn read_completion_status(workspace: &std::path::Path) -> (CompletionStatus, Option<i64>) {
     let path = completion_status_path(workspace);
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => serde_json::from_str::<CompletionStatusFile>(&content)
-            .map(|f| f.status)
+            .map(|f| (f.status, f.changed_at))
             .unwrap_or_default(),
-        Err(_) => CompletionStatus::default(),
+        Err(_) => Default::default(),
     }
+}
+
+/// Write the completion status to disk atomically (write-to-temp then rename).
+/// Records the current timestamp so auto-completion can be suppressed
+/// during the grace period after a reset to Active.
+async fn write_completion_status(
+    workspace: &std::path::Path,
+    status: CompletionStatus,
+) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let file = CompletionStatusFile {
+        status,
+        changed_at: Some(now),
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(|e| format!("serialize: {e}"))?;
+    let path = completion_status_path(workspace);
+    let temp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, &json)
+        .await
+        .map_err(|e| format!("write {temp_path:?}: {e}"))?;
+    tokio::fs::rename(&temp_path, &path)
+        .await
+        .map_err(|e| format!("rename {temp_path:?} -> {path:?}: {e}"))
 }
 
 /// `GET /gator/scopes` — read current service-gator scopes.
@@ -2313,7 +2383,7 @@ async fn update_gator_scopes(
 
 /// `GET /completion-status` — read current pod completion status.
 async fn get_completion_status(State(state): State<AppState>) -> Json<CompletionStatusResponse> {
-    let status = read_completion_status(&state.workspace).await;
+    let (status, _changed_at) = read_completion_status(&state.workspace).await;
     Json(CompletionStatusResponse { status })
 }
 
@@ -2343,41 +2413,16 @@ async fn update_completion_status(
     let req: CompletionStatusUpdateRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
-    let file = CompletionStatusFile {
-        status: req.status.clone(),
-    };
-    let json = serde_json::to_string_pretty(&file).map_err(|e| {
-        tracing::error!("Failed to serialize completion status: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    write_completion_status(&state.workspace, req.status.clone())
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to update completion status: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    let path = completion_status_path(&state.workspace);
-    // The state directory (/var/lib/devaipod/) is pre-created in the
-    // container image and also by load_or_generate_admin_token() at startup.
-    // We skip create_dir_all here because tokio::fs::create_dir_all triggers
-    // a capability check (mkdir syscall) that fails with EPERM when all
-    // capabilities are dropped, even when the directory already exists in
-    // some overlayfs configurations.
+    tracing::info!("Updated completion status to {:?}", req.status);
 
-    let temp_path = path.with_extension("json.tmp");
-    tokio::fs::write(&temp_path, &json).await.map_err(|e| {
-        tracing::error!(
-            "Failed to write completion status to {:?}: {}",
-            temp_path,
-            e
-        );
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    tokio::fs::rename(&temp_path, &path).await.map_err(|e| {
-        tracing::error!("Failed to rename {:?} -> {:?}: {}", temp_path, path, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    tracing::info!("Updated completion status to {:?}", file.status);
-
-    Ok(Json(CompletionStatusResponse {
-        status: file.status,
-    }))
+    Ok(Json(CompletionStatusResponse { status: req.status }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2547,6 +2592,201 @@ fn load_or_generate_admin_token() -> Result<String> {
     Ok(token)
 }
 
+// ---------------------------------------------------------------------------
+// Auto-start: read initial task from file, create session, send message
+// ---------------------------------------------------------------------------
+
+/// Path (relative to the workspace parent) where the initial task message is
+/// written by `write_task()` during pod creation. The pod-api reads this file,
+/// sends it to opencode, and marks it consumed so it doesn't repeat on restart.
+const INITIAL_TASK_RELATIVE: &str = ".devaipod/initial-task.md";
+
+/// Sentinel file written to the pod-api state dir after the initial task has
+/// been sent. Prevents re-sending on container restart.
+const INITIAL_TASK_DONE_FILE: &str = "initial-task-done";
+
+/// Resolve the initial task file path from the workspace path.
+///
+/// The file is stored at `<workspace>/.devaipod/initial-task.md`, alongside
+/// other pod metadata like the gator config.
+fn initial_task_path(workspace: &std::path::Path) -> PathBuf {
+    workspace.join(INITIAL_TASK_RELATIVE)
+}
+
+/// Check whether the initial task has already been consumed.
+fn initial_task_already_done() -> bool {
+    state_dir().join(INITIAL_TASK_DONE_FILE).exists()
+}
+
+/// Mark the initial task as consumed so it isn't re-sent on restart.
+async fn mark_initial_task_done() {
+    let path = state_dir().join(INITIAL_TASK_DONE_FILE);
+    if let Err(e) = tokio::fs::write(&path, "done").await {
+        tracing::warn!("Failed to write initial-task-done marker: {e}");
+    }
+}
+
+/// Background task: if an initial task file exists and no session has been
+/// started yet, wait for opencode to become reachable, create a session,
+/// and send the task as the first message.
+async fn maybe_auto_start_session(state: AppState) -> Result<()> {
+    tracing::info!("Checking for initial task to auto-start...");
+
+    // Already consumed (e.g. container restarted after initial send).
+    if initial_task_already_done() {
+        tracing::info!("Initial task already sent (done marker exists), skipping auto-start");
+        return Ok(());
+    }
+
+    // The initial task file is written by finalize_pod() AFTER the pod
+    // containers are already running, so it may not exist yet. Poll for
+    // up to 120s — this covers the time for dotfiles install, config
+    // writing, etc.
+    let task_path = initial_task_path(&state.workspace);
+    tracing::info!("Waiting for initial task at: {}", task_path.display());
+    let mut task_content = None;
+    for attempt in 1..=60 {
+        match tokio::fs::read_to_string(&task_path).await {
+            Ok(content) if !content.trim().is_empty() => {
+                task_content = Some(content);
+                break;
+            }
+            Ok(_) | Err(_) => {
+                if attempt == 60 {
+                    tracing::info!("No initial task file appeared after 120s, skipping auto-start");
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    let task_content = task_content.unwrap();
+
+    tracing::info!("Found initial task file, waiting for opencode to become ready...");
+
+    // Use a short timeout for polling/session creation but we'll need a
+    // longer one for the actual message send (the /message endpoint blocks
+    // until the LLM finishes).
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("Failed to build HTTP client")?;
+    let message_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .context("Failed to build message HTTP client")?;
+
+    let credentials = BASE64_STANDARD.encode(format!("opencode:{}", state.opencode_password));
+    let auth_value = format!("Basic {credentials}");
+    let base_url = format!("http://127.0.0.1:{}", state.opencode_port);
+
+    // Wait for the opencode server to be reachable (up to 120s).
+    let max_attempts = 60;
+    for attempt in 1..=max_attempts {
+        match client
+            .get(format!("{base_url}/session"))
+            .header(header::AUTHORIZATION, &auth_value)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                tracing::debug!("opencode reachable after {attempt} attempts");
+                // Check if there are already sessions — if so, someone else
+                // started one (e.g. a previous run that was interrupted).
+                if let Ok(sessions) = r.json::<Vec<serde_json::Value>>().await
+                    && !sessions.is_empty()
+                {
+                    tracing::info!(
+                        "opencode already has {} session(s), skipping auto-start",
+                        sessions.len()
+                    );
+                    mark_initial_task_done().await;
+                    return Ok(());
+                }
+                break;
+            }
+            Ok(r) => {
+                tracing::debug!(
+                    "opencode returned {} (attempt {}/{})",
+                    r.status(),
+                    attempt,
+                    max_attempts
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "opencode not reachable (attempt {}/{}): {}",
+                    attempt,
+                    max_attempts,
+                    e
+                );
+            }
+        }
+
+        if attempt == max_attempts {
+            tracing::warn!(
+                "opencode did not become reachable after {} attempts, giving up on auto-start",
+                max_attempts
+            );
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // Create a new session.
+    let session_resp = client
+        .post(format!("{base_url}/session"))
+        .header(header::AUTHORIZATION, &auth_value)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body("{}")
+        .send()
+        .await
+        .context("Failed to create session")?;
+
+    if !session_resp.status().is_success() {
+        let status = session_resp.status();
+        let body = session_resp.text().await.unwrap_or_default();
+        color_eyre::eyre::bail!("Failed to create session: HTTP {status}: {body}");
+    }
+
+    let session: serde_json::Value = session_resp
+        .json()
+        .await
+        .context("Failed to parse session response")?;
+    let session_id = session
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| color_eyre::eyre::eyre!("Session response missing 'id' field"))?;
+
+    tracing::info!("Created session {session_id}, sending initial task message...");
+
+    // Send the initial message.
+    let payload = serde_json::json!({
+        "parts": [{"type": "text", "text": task_content}]
+    });
+
+    let msg_resp = message_client
+        .post(format!("{base_url}/session/{session_id}/message"))
+        .header(header::AUTHORIZATION, &auth_value)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(payload.to_string())
+        .send()
+        .await
+        .context("Failed to send initial message")?;
+
+    if !msg_resp.status().is_success() {
+        let status = msg_resp.status();
+        let body = msg_resp.text().await.unwrap_or_default();
+        color_eyre::eyre::bail!("Failed to send initial message: HTTP {status}: {body}");
+    }
+
+    tracing::info!("Initial task message sent to session {session_id}");
+    mark_initial_task_done().await;
+
+    Ok(())
+}
+
 /// Run the pod-api HTTP server.
 pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
     let workspace = Arc::new(args.workspace.clone());
@@ -2563,6 +2803,15 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
         opencode_port: args.opencode_port,
         admin_token,
     };
+
+    // Spawn background auto-start task: reads the initial task file (if present)
+    // and sends it to opencode once the server is reachable.
+    let auto_start_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = maybe_auto_start_session(auto_start_state).await {
+            tracing::warn!("Auto-start session failed: {:#}", e);
+        }
+    });
 
     let app = build_router(state);
 

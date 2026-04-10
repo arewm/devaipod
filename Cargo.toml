@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/integration-tests"]
+members = [".", "crates/host-shim", "crates/integration-tests"]
 resolver = "3"
 
 [package]
@@ -12,6 +12,12 @@ readme = "README.md"
 keywords = ["devcontainer", "ai", "agents", "devpod", "containers"]
 categories = ["development-tools", "command-line-utilities"]
 license = "MIT OR Apache-2.0"
+
+# The server binary runs inside the container image; the host-side CLI
+# shim (crates/host-shim) produces the user-facing `devaipod` binary.
+[[bin]]
+name = "devaipod-server"
+path = "src/main.rs"
 
 [dependencies]
 bollard = "0.18"
