@@ -5178,11 +5178,19 @@ fn resolve_url_to_local_source(url: &str, config: &config::Config) -> Option<Pat
     }
 
     for resolved in config.resolve_sources() {
-        let source_path = &resolved.path;
-        for s in &suffixes {
-            let candidate = source_path.join(s);
-            if candidate.join(".git").exists() || candidate.join(".git").is_file() {
-                return Some(candidate);
+        // Check both the host-expanded path and the container mount point
+        // (/mnt/<name>). When running inside the container, the host path
+        // won't exist on disk but the mount point will.
+        let candidates_bases = [
+            resolved.path.clone(),
+            PathBuf::from(format!("/mnt/{}", resolved.name)),
+        ];
+        for base in &candidates_bases {
+            for s in &suffixes {
+                let candidate = base.join(s);
+                if candidate.join(".git").exists() || candidate.join(".git").is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }

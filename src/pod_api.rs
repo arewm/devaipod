@@ -1485,11 +1485,14 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
         match guard.as_ref() {
             Some(client) => {
                 let session_id = client.current_session_id().await;
+                let is_working = client.is_working();
                 crate::agent::AgentStatusSummary {
-                    activity: if session_id.is_some() {
-                        crate::agent::AgentActivity::Idle
-                    } else {
+                    activity: if session_id.is_none() {
                         crate::agent::AgentActivity::Unknown
+                    } else if is_working {
+                        crate::agent::AgentActivity::Working
+                    } else {
+                        crate::agent::AgentActivity::Idle
                     },
                     status_line: session_id.as_ref().map(|sid| format!("Session: {}", sid)),
                     current_tool: None,
@@ -1568,11 +1571,17 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
 /// 3. Spawns the ACP client with the wrapped command
 /// 4. Initializes the ACP connection
 async fn ensure_acp_client(state: &AppState) -> color_eyre::Result<()> {
-    // Check if client exists (quick lock)
+    // Check if a live client exists (quick lock).
+    // If the agent process has exited, clear the stale client so we
+    // respawn it below.
     {
-        let guard = state.acp_client.lock().await;
-        if guard.is_some() {
-            return Ok(());
+        let mut guard = state.acp_client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            if client.is_alive().await {
+                return Ok(());
+            }
+            tracing::info!("ACP agent process exited, clearing stale client");
+            *guard = None;
         }
     }
 
@@ -1764,6 +1773,14 @@ async fn handle_ws_command(text: &str, state: &AppState) {
                 let _ = state.acp_event_tx.send(AcpEvent::Error {
                     message: format!("Prompt failed: {}", e),
                 });
+            } else {
+                // New work started — reset completion status so the pod
+                // shows as active (not done) while the agent processes.
+                if let Err(e) =
+                    write_completion_status(&state.workspace, CompletionStatus::Active).await
+                {
+                    tracing::warn!("Failed to reset completion status: {e}");
+                }
             }
         }
         WsCommand::Cancel { session_id } => {
@@ -1781,10 +1798,8 @@ async fn handle_ws_command(text: &str, state: &AppState) {
             let cwd = state.workspace.to_string_lossy().to_string();
             match client.new_session(&cwd).await {
                 Ok(sid) => {
+                    // SessionCreated is already broadcast by AcpClient::new_session().
                     tracing::info!("Created new ACP session: {}", sid);
-                    let _ = state.acp_event_tx.send(AcpEvent::SessionCreated {
-                        session_id: sid,
-                    });
                 }
                 Err(e) => {
                     tracing::error!("Failed to create session: {}", e);
@@ -1871,7 +1886,7 @@ struct CompletionStatusFile {
 /// resets status to Active but the agent hasn't started processing the
 /// review message yet, so the next /summary poll would see "Idle" and
 /// immediately re-set Done.
-const AUTO_COMPLETION_GRACE_SECS: i64 = 60;
+const AUTO_COMPLETION_GRACE_SECS: i64 = 5;
 
 /// Response for GET /completion-status.
 #[derive(Debug, Serialize)]
@@ -2245,26 +2260,13 @@ async fn handle_agent_events_ws(mut socket: WebSocket, state: AppState) {
 
             match client.list_sessions().await {
                 Ok(sessions) => {
-                    // Send the session list event to the frontend.
+                    // Send the session list to the frontend. The frontend
+                    // decides which session to load (if any) — we don't
+                    // auto-load here to avoid duplicating messages when the
+                    // frontend also requests a load on reconnect.
                     let _ = state.acp_event_tx.send(AcpEvent::SessionList {
-                        sessions: sessions.clone(),
+                        sessions,
                     });
-
-                    // If there's exactly one session, auto-load it.
-                    if let Some(sessions_array) = sessions.get("sessions").and_then(|s| s.as_array())
-                    {
-                        if sessions_array.len() == 1 {
-                            if let Some(session_id) = sessions_array[0]
-                                .get("sessionId")
-                                .and_then(|s| s.as_str())
-                            {
-                                let cwd = state.workspace.to_string_lossy().to_string();
-                                if let Err(e) = client.load_session(session_id, &cwd).await {
-                                    tracing::error!("Failed to auto-load session: {}", e);
-                                }
-                            }
-                        }
-                    }
                 }
                 Err(e) => {
                     tracing::error!("Failed to list sessions on connect: {}", e);
@@ -2548,6 +2550,11 @@ async fn maybe_auto_start_session(state: AppState) -> Result<()> {
         .map_err(|e| color_eyre::eyre::eyre!("Failed to send initial prompt: {}", e))?;
 
     tracing::info!("Initial task sent to ACP session {session_id}");
+    // Set Active with a timestamp so the grace period protects against
+    // premature Done if the agent responds very quickly.
+    if let Err(e) = write_completion_status(&state.workspace, CompletionStatus::Active).await {
+        tracing::warn!("Failed to set completion status for auto-start: {e}");
+    }
     mark_initial_task_done(&state.workspace).await;
 
     Ok(())

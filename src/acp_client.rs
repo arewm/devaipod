@@ -132,6 +132,12 @@ pub(crate) enum AcpEvent {
         /// The newly created session's ID.
         #[serde(rename = "sessionId")]
         session_id: String,
+        /// Session mode state (current mode + available modes), if provided.
+        #[serde(rename = "modes", skip_serializing_if = "Option::is_none")]
+        modes: Option<serde_json::Value>,
+        /// Session config options, if provided.
+        #[serde(rename = "configOptions", skip_serializing_if = "Option::is_none")]
+        config_options: Option<serde_json::Value>,
     },
     /// A prompt completed.
     #[serde(rename = "prompt_response")]
@@ -184,6 +190,10 @@ pub(crate) struct AcpClient {
     session_id: Arc<Mutex<Option<String>>>,
     /// Known session IDs (prevent cross-talk from buggy agents).
     known_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Whether the agent is actively processing (producing output).
+    /// Set to `true` on session/update events (agent is streaming), cleared
+    /// when a prompt response arrives (agent turn ended).
+    agent_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for AcpClient {
@@ -202,11 +212,29 @@ impl Clone for AcpClient {
             child: self.child.as_ref().map(Arc::clone),
             session_id: Arc::clone(&self.session_id),
             known_sessions: Arc::clone(&self.known_sessions),
+            agent_active: Arc::clone(&self.agent_active),
         }
     }
 }
 
 impl AcpClient {
+    /// Check whether the underlying agent process is still running.
+    ///
+    /// Returns `false` if the process has exited (or there is no child
+    /// process, e.g. in test mode). This is used by `ensure_acp_client`
+    /// to detect a stale client whose process has exited.
+    pub(crate) async fn is_alive(&self) -> bool {
+        if let Some(child) = &self.child {
+            let mut guard = child.lock().await;
+            // `try_wait` returns Ok(Some(status)) if the child has exited,
+            // Ok(None) if it's still running, or Err on system error.
+            matches!(guard.try_wait(), Ok(None))
+        } else {
+            // No child handle (test/mock mode) — assume alive.
+            true
+        }
+    }
+
     /// Spawn an ACP agent process and start the stdout reader task.
     ///
     /// - `command`: the agent command (e.g. `["opencode", "acp"]`)
@@ -269,11 +297,14 @@ impl AcpClient {
         let known_sessions: Arc<Mutex<HashSet<String>>> =
             Arc::new(Mutex::new(HashSet::new()));
 
+        let agent_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Spawn the stdout reader task.
         let reader_pending = Arc::clone(&pending);
         let reader_event_tx = event_tx.clone();
         let reader_stdin = Arc::clone(&stdin_arc);
         let reader_known_sessions = Arc::clone(&known_sessions);
+        let reader_agent_active = Arc::clone(&agent_active);
 
         tokio::spawn(async move {
             let mut buf_reader = BufReader::new(reader);
@@ -299,6 +330,7 @@ impl AcpClient {
                             &reader_event_tx,
                             &reader_stdin,
                             &reader_known_sessions,
+                            &reader_agent_active,
                         )
                         .await;
                     }
@@ -321,6 +353,7 @@ impl AcpClient {
             child: None,
             session_id: Arc::new(Mutex::new(None)),
             known_sessions,
+            agent_active,
         }
     }
 
@@ -331,6 +364,7 @@ impl AcpClient {
         event_tx: &broadcast::Sender<AcpEvent>,
         stdin: &Mutex<BoxedWriter>,
         known_sessions: &Mutex<HashSet<String>>,
+        _agent_active: &std::sync::atomic::AtomicBool,
     ) {
         let msg: JsonRpcMessage = match serde_json::from_str(raw) {
             Ok(m) => m,
@@ -381,6 +415,35 @@ impl AcpClient {
                         if !is_known {
                             tracing::warn!(
                                 "Ignoring session/update for unknown session: {}",
+                                session_id
+                            );
+                            return;
+                        }
+
+                        let update = v.get("update").cloned().unwrap_or(serde_json::Value::Null);
+                        // Note: agent_active is managed by prompt() (set) and prompt
+                        // response handler (clear). We don't set it here to avoid
+                        // race conditions with late session/update notifications.
+                        let _ = event_tx.send(AcpEvent::SessionUpdate { session_id, update });
+                    }
+                }
+                // Forward session-scoped notifications as SessionUpdate events.
+                // The frontend handles these via the sessionUpdate discriminator.
+                "session/sessionInfoUpdate" | "session/configOptionUpdate" => {
+                    if let Some(params) = &msg.params
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(params.get())
+                    {
+                        let session_id = v
+                            .get("sessionId")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        let is_known = known_sessions.lock().await.contains(&session_id);
+                        if !is_known {
+                            tracing::warn!(
+                                "Ignoring {} for unknown session: {}",
+                                method,
                                 session_id
                             );
                             return;
@@ -451,6 +514,9 @@ impl AcpClient {
     }
 
     /// Send a permission response back to the agent.
+    ///
+    /// Uses the ACP `RequestPermissionResponse` format: the result contains
+    /// an `outcome` field tagged with `"selected"` and the chosen `optionId`.
     async fn send_permission_response(
         stdin: &Mutex<BoxedWriter>,
         request_id: i64,
@@ -460,8 +526,10 @@ impl AcpClient {
             "jsonrpc": "2.0",
             "id": request_id,
             "result": {
-                "selectedOption": option_id,
-                "outcome": "allowed"
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": option_id
+                }
             }
         });
         let mut line = serde_json::to_string(&resp).unwrap();
@@ -597,6 +665,9 @@ impl AcpClient {
             .unwrap_or("unknown")
             .to_string();
 
+        let modes = resp.get("modes").cloned();
+        let config_options = resp.get("configOptions").cloned();
+
         {
             let mut sid = self.session_id.lock().await;
             *sid = Some(session_id.clone());
@@ -609,6 +680,8 @@ impl AcpClient {
 
         let _ = self.event_tx.send(AcpEvent::SessionCreated {
             session_id: session_id.clone(),
+            modes,
+            config_options,
         });
 
         Ok(session_id)
@@ -654,6 +727,7 @@ impl AcpClient {
         // Spawn a task to handle the response asynchronously.
         let event_tx = self.event_tx.clone();
         let sid = session_id.to_string();
+        let prompt_flag = Arc::clone(&self.agent_active);
         tokio::spawn(async move {
             match rx.await {
                 Ok(Ok(raw)) => {
@@ -664,39 +738,53 @@ impl AcpClient {
                         .and_then(|s| s.as_str())
                         .unwrap_or("end_turn")
                         .to_string();
+                    prompt_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                     let _ = event_tx.send(AcpEvent::PromptCompleted {
                         session_id: sid,
                         stop_reason,
                     });
                 }
                 Ok(Err(e)) => {
+                    prompt_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                     tracing::error!("Prompt response error: {}", e);
                     let _ = event_tx.send(AcpEvent::Error {
                         message: format!("Prompt failed: {}", e),
                     });
                 }
                 Err(_) => {
+                    prompt_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                     tracing::error!("Prompt response channel closed");
                 }
             }
         });
 
+        // Mark active BEFORE writing so there's no window where the agent
+        // is processing but agent_active is false (the response handler on
+        // another task could clear it before we set it if we wrote first).
+        self.agent_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
         // Send the request (don't wait for response).
         {
             let mut stdin = self.stdin.lock().await;
-            stdin
-                .write_all(line.as_bytes())
-                .await
-                .map_err(|e| JsonRpcError {
+            if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                self.agent_active
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(JsonRpcError {
                     code: -32603,
                     message: format!("Failed to write to agent stdin: {}", e),
                     data: None,
-                })?;
-            stdin.flush().await.map_err(|e| JsonRpcError {
-                code: -32603,
-                message: format!("Failed to flush agent stdin: {}", e),
-                data: None,
-            })?;
+                });
+            }
+            if let Err(e) = stdin.flush().await {
+                self.agent_active
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(JsonRpcError {
+                    code: -32603,
+                    message: format!("Failed to flush agent stdin: {}", e),
+                    data: None,
+                });
+            }
         }
 
         Ok(())
@@ -731,6 +819,12 @@ impl AcpClient {
     /// Respond to a permission request from the agent.
     pub(crate) async fn respond_permission(&self, request_id: i64, option_id: &str) {
         Self::send_permission_response(&self.stdin, request_id, option_id).await;
+    }
+
+    /// Whether the agent is currently processing a prompt.
+    pub(crate) fn is_working(&self) -> bool {
+        self.agent_active
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the current session ID (if any).
@@ -809,18 +903,51 @@ impl AcpClient {
             pending.insert(id, tx);
         }
 
-        // Spawn a task to handle the response asynchronously (load doesn't
-        // emit a PromptCompleted event, so we just log success/error).
+        // Spawn a task to handle the response asynchronously. Unlike prompt(),
+        // load_session() doesn't emit a PromptCompleted event. It also shouldn't
+        // set agent_active (session/update events during replay are just history).
+        // Extract session metadata (modes, configOptions) if present and broadcast
+        // as SessionUpdate events so the frontend can populate UI controls.
+        let load_flag = Arc::clone(&self.agent_active);
+        let event_tx = self.event_tx.clone();
+        let load_sid = session_id.to_string();
         tokio::spawn(async move {
             match rx.await {
-                Ok(Ok(_)) => {
+                Ok(Ok(raw)) => {
                     tracing::debug!("Session load completed");
+                    // Ensure agent_active is cleared after load completes.
+                    load_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    // Extract modes and configOptions from the response.
+                    if let Ok(resp) =
+                        serde_json::from_str::<serde_json::Value>(raw.get())
+                    {
+                        if let Some(modes) = resp.get("modes") {
+                            let _ = event_tx.send(AcpEvent::SessionUpdate {
+                                session_id: load_sid.clone(),
+                                update: serde_json::json!({
+                                    "sessionUpdate": "current_mode_update",
+                                    "currentModeId": modes.get("currentModeId")
+                                }),
+                            });
+                        }
+                        if let Some(config_options) = resp.get("configOptions") {
+                            let _ = event_tx.send(AcpEvent::SessionUpdate {
+                                session_id: load_sid,
+                                update: serde_json::json!({
+                                    "sessionUpdate": "config_option_update",
+                                    "configOptions": config_options
+                                }),
+                            });
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Session load error: {}", e);
+                    load_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(_) => {
                     tracing::error!("Session load response channel closed");
+                    load_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         });
@@ -1134,7 +1261,7 @@ mod tests {
         let json = r#"{"type":"session_created","sessionId":"test-id"}"#;
         let event: AcpEvent = serde_json::from_str(json).unwrap();
         match event {
-            AcpEvent::SessionCreated { session_id } => assert_eq!(session_id, "test-id"),
+            AcpEvent::SessionCreated { session_id, .. } => assert_eq!(session_id, "test-id"),
             _ => panic!("expected SessionCreated"),
         }
     }
@@ -1190,6 +1317,8 @@ mod tests {
             },
             AcpEvent::SessionCreated {
                 session_id: "s1".to_string(),
+                modes: None,
+                config_options: None,
             },
             AcpEvent::PromptCompleted {
                 session_id: "s1".to_string(),
@@ -1294,7 +1423,7 @@ mod tests {
         // Verify SessionCreated event.
         let event = event_rx.recv().await.unwrap();
         match event {
-            AcpEvent::SessionCreated { session_id } => {
+            AcpEvent::SessionCreated { session_id, .. } => {
                 assert_eq!(session_id, "mock-session-1");
             }
             other => panic!("expected SessionCreated, got: {:?}", other),
@@ -1450,7 +1579,8 @@ mod tests {
 
         let resp: serde_json::Value = serde_json::from_str(response_line.trim()).unwrap();
         assert_eq!(resp["id"], 42);
-        assert_eq!(resp["result"]["selectedOption"], "deny");
+        assert_eq!(resp["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(resp["result"]["outcome"]["optionId"], "deny");
     }
 
     #[tokio::test]
@@ -1468,7 +1598,8 @@ mod tests {
 
         // Simulate receiving a response.
         let raw = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
-        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions).await;
+        let agent_active_flag = std::sync::atomic::AtomicBool::new(false);
+        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions, &agent_active_flag).await;
 
         let result = rx.await.unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(result.get()).unwrap();
@@ -1488,7 +1619,8 @@ mod tests {
 
         let raw =
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}"#;
-        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions).await;
+        let agent_active_flag = std::sync::atomic::AtomicBool::new(false);
+        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions, &agent_active_flag).await;
 
         let result = rx.await.unwrap();
         assert!(result.is_err());
@@ -1510,7 +1642,8 @@ mod tests {
 
         // Response with neither result nor error → should yield null.
         let raw = r#"{"jsonrpc":"2.0","id":5}"#;
-        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions).await;
+        let agent_active_flag = std::sync::atomic::AtomicBool::new(false);
+        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions, &agent_active_flag).await;
 
         let result = rx.await.unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(result.get()).unwrap();
@@ -1529,7 +1662,8 @@ mod tests {
         known_sessions.lock().await.insert("s42".to_string());
 
         let raw = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s42","update":{"type":"agent_message_chunk","text":"hi"}}}"#;
-        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions).await;
+        let agent_active_flag = std::sync::atomic::AtomicBool::new(false);
+        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions, &agent_active_flag).await;
 
         let event = event_rx.recv().await.unwrap();
         match event {
@@ -1552,7 +1686,8 @@ mod tests {
 
         // Don't add "s99" to known_sessions — it should be rejected.
         let raw = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s99","update":{"type":"agent_message_chunk","text":"malicious"}}}"#;
-        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions).await;
+        let agent_active_flag = std::sync::atomic::AtomicBool::new(false);
+        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions, &agent_active_flag).await;
 
         // The event should NOT be broadcast.
         match tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv()).await {
@@ -2245,5 +2380,262 @@ mod tests {
             Ok(_) => panic!("expected no event for malformed JSON"),
             Err(_) => {} // timeout is expected — no error event
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // is_working() state transition tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_is_working_before_prompt() {
+        let (client, mut event_rx, _handle) = MockAcpAgent::spawn_with_client();
+
+        client.initialize().await.unwrap();
+        let _init_event = event_rx.recv().await.unwrap();
+
+        let _session_id = client.new_session("/tmp").await.unwrap();
+        let _session_event = event_rx.recv().await.unwrap();
+
+        // is_working() should be false before any prompt is sent.
+        assert!(!client.is_working(), "agent should not be working before prompt");
+
+        client.kill().await;
+    }
+
+    #[tokio::test]
+    async fn test_is_working_during_prompt() {
+        let (client, mut event_rx, _handle) = MockAcpAgent::spawn_with_client();
+
+        client.initialize().await.unwrap();
+        let _init_event = event_rx.recv().await.unwrap();
+
+        let session_id = client.new_session("/tmp").await.unwrap();
+        let _session_event = event_rx.recv().await.unwrap();
+
+        // Send a prompt.
+        client.prompt(&session_id, "test").await.unwrap();
+
+        // is_working() should be true immediately after prompt is sent.
+        assert!(client.is_working(), "agent should be working after prompt sent");
+
+        // Drain events until PromptCompleted.
+        for _ in 0..4 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(event, AcpEvent::PromptCompleted { .. }) {
+                break;
+            }
+        }
+
+        client.kill().await;
+    }
+
+    #[tokio::test]
+    async fn test_is_working_after_prompt_completes() {
+        let (client, mut event_rx, _handle) = MockAcpAgent::spawn_with_client();
+
+        client.initialize().await.unwrap();
+        let _init_event = event_rx.recv().await.unwrap();
+
+        let session_id = client.new_session("/tmp").await.unwrap();
+        let _session_event = event_rx.recv().await.unwrap();
+
+        // Send a prompt.
+        client.prompt(&session_id, "test").await.unwrap();
+
+        // Drain all events (3 updates + 1 completed).
+        for _ in 0..4 {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        // Give the spawned task time to clear the flag.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // is_working() should be false after prompt completes.
+        assert!(!client.is_working(), "agent should not be working after prompt completes");
+
+        client.kill().await;
+    }
+
+    #[tokio::test]
+    async fn test_is_working_after_load_session() {
+        let (client, mut event_rx, _handle) = MockAcpAgent::spawn_with_client();
+
+        client.initialize().await.unwrap();
+        let _init_event = event_rx.recv().await.unwrap();
+
+        let session_id = client.new_session("/tmp").await.unwrap();
+        let _session_event = event_rx.recv().await.unwrap();
+
+        // Load a session (this replays history but shouldn't set agent_active).
+        client.load_session(&session_id, "/workspace").await.unwrap();
+
+        // Drain the SessionUpdate event from the replay.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, AcpEvent::SessionUpdate { .. }));
+
+        // Give the spawned load task time to complete and clear the flag.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // is_working() should be false after load completes (it's not a prompt).
+        assert!(!client.is_working(), "agent should not be working after load_session completes");
+
+        client.kill().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Notification forwarding and metadata tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_acp_session_info_update_forwarded() {
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (_reader, writer) = tokio::io::duplex(1024);
+        let stdin: Mutex<BoxedWriter> = Mutex::new(Box::new(writer));
+        let known_sessions: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+
+        known_sessions.lock().await.insert("s1".to_string());
+
+        let raw = r#"{"jsonrpc":"2.0","method":"session/sessionInfoUpdate","params":{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","title":"New title"}}}"#;
+        let agent_active_flag = std::sync::atomic::AtomicBool::new(false);
+        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions, &agent_active_flag).await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("recv error");
+
+        match event {
+            AcpEvent::SessionUpdate { session_id, update } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(update["sessionUpdate"], "session_info_update");
+                assert_eq!(update["title"], "New title");
+            }
+            other => panic!("expected SessionUpdate, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acp_config_option_update_forwarded() {
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (_reader, writer) = tokio::io::duplex(1024);
+        let stdin: Mutex<BoxedWriter> = Mutex::new(Box::new(writer));
+        let known_sessions: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+
+        known_sessions.lock().await.insert("s2".to_string());
+
+        let raw = r#"{"jsonrpc":"2.0","method":"session/configOptionUpdate","params":{"sessionId":"s2","update":{"sessionUpdate":"config_option_update","configOptions":[]}}}"#;
+        let agent_active_flag = std::sync::atomic::AtomicBool::new(false);
+        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions, &agent_active_flag).await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("recv error");
+
+        match event {
+            AcpEvent::SessionUpdate { session_id, update } => {
+                assert_eq!(session_id, "s2");
+                assert_eq!(update["sessionUpdate"], "config_option_update");
+            }
+            other => panic!("expected SessionUpdate, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acp_session_info_update_rejected_for_unknown_session() {
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let (_reader, writer) = tokio::io::duplex(1024);
+        let stdin: Mutex<BoxedWriter> = Mutex::new(Box::new(writer));
+        let known_sessions: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+
+        // Don't add "s99" to known_sessions.
+        let raw = r#"{"jsonrpc":"2.0","method":"session/sessionInfoUpdate","params":{"sessionId":"s99","update":{"title":"Hacked"}}}"#;
+        let agent_active_flag = std::sync::atomic::AtomicBool::new(false);
+        AcpClient::handle_message(raw, &pending, &event_tx, &stdin, &known_sessions, &agent_active_flag).await;
+
+        // No event should be broadcast.
+        match tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv()).await {
+            Ok(_) => panic!("expected no event for unknown session"),
+            Err(_) => {} // timeout expected
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acp_new_session_includes_metadata() {
+        // Verify that SessionCreated includes modes and configOptions.
+        let event = AcpEvent::SessionCreated {
+            session_id: "s1".to_string(),
+            modes: Some(serde_json::json!({
+                "currentModeId": "agentic",
+                "availableModes": [{"id": "agentic", "name": "Agentic"}]
+            })),
+            config_options: Some(serde_json::json!([{
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": "claude-sonnet",
+                "options": [{"value": "claude-sonnet", "name": "Sonnet"}]
+            }])),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"modes\""));
+        assert!(json.contains("\"configOptions\""));
+        assert!(json.contains("agentic"));
+
+        // Roundtrip.
+        let parsed: AcpEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AcpEvent::SessionCreated {
+                session_id,
+                modes,
+                config_options,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert!(modes.is_some());
+                assert!(config_options.is_some());
+                assert_eq!(modes.unwrap()["currentModeId"], "agentic");
+            }
+            other => panic!("expected SessionCreated, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acp_permission_response_format() {
+        // Verify the permission response uses the ACP RequestPermissionOutcome format.
+        let (agent_reader, client_writer) = tokio::io::duplex(8192);
+        let (client_reader, _agent_writer) = tokio::io::duplex(8192);
+
+        let (event_tx, _) = broadcast::channel(64);
+        let client = AcpClient::from_streams(Box::new(client_writer), client_reader, event_tx);
+
+        client.respond_permission(99, "allow_once").await;
+
+        let mut buf_reader = BufReader::new(agent_reader);
+        let mut response_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            buf_reader.read_line(&mut response_line),
+        )
+        .await
+        .expect("timed out")
+        .expect("read error");
+
+        let resp: serde_json::Value = serde_json::from_str(response_line.trim()).unwrap();
+        assert_eq!(resp["id"], 99);
+        assert_eq!(resp["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(resp["result"]["outcome"]["optionId"], "allow_once");
     }
 }

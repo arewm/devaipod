@@ -56,7 +56,6 @@ interface AcpSessionStore {
   connectionError: string | undefined
   /** Per-session data keyed by session ID. */
   sessionData: Record<string, SessionData>
-  yolo: boolean
   /** Panes with their tabs */
   panes: PaneState[]
   /** Currently focused pane (for keyboard routing). */
@@ -78,8 +77,6 @@ interface AcpSessionActions {
   respondPermission: (requestId: number | string, optionId: string) => void
   /** Cancel the current prompt turn. */
   cancelPrompt: () => void
-  /** Toggle YOLO (auto-approve) mode. */
-  toggleYolo: () => void
   /** Load a specific session by ID (adds as a tab to the active pane). */
   loadSession: (sessionId: string) => void
   /** Create a new session (adds tab to active pane). */
@@ -123,6 +120,28 @@ function contentText(block: ContentBlock): string {
   return ""
 }
 
+/** Factory for creating empty session data. */
+function emptySessionData(): SessionData {
+  return {
+    messages: [],
+    toolCalls: {},
+    pendingPermissions: [],
+    prompting: false,
+  }
+}
+
+/** Sort sessions by created date. */
+function sortSessionsByDate(
+  sessions: Array<{ id: string; title?: string; created?: string }>,
+  order: "asc" | "desc"
+): Array<{ id: string; title?: string; created?: string }> {
+  return [...sessions].sort((a, b) => {
+    const ta = a.created ? new Date(a.created).getTime() : 0
+    const tb = b.created ? new Date(b.created).getTime() : 0
+    return order === "asc" ? ta - tb : tb - ta
+  })
+}
+
 function toolContentText(items: Array<ToolCallContent | ToolCallDiff>): string {
   return items
     .map((item) => {
@@ -138,8 +157,6 @@ function toolContentText(items: Array<ToolCallContent | ToolCallDiff>): string {
 // Provider
 // ---------------------------------------------------------------------------
 
-let msgCounter = 0
-let paneCounter = 0
 
 interface SavedLayout {
   panes: Array<{
@@ -152,6 +169,10 @@ interface SavedLayout {
 }
 
 export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
+  // Module-level counters moved inside provider scope so they reset on remount.
+  let msgCounter = 0
+  let paneCounter = 0
+
   // Load hidden sessions from localStorage
   const hiddenKey = `devaipod-hidden-sessions-${props.podName}`
   const loadHidden = (): string[] => {
@@ -165,7 +186,6 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     connectionState: "connecting",
     connectionError: undefined,
     sessionData: {},
-    yolo: true,
     panes: [],
     activePaneId: undefined,
     hiddenSessions: loadHidden(),
@@ -228,12 +248,7 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
   function reloadSession(sessionId: string) {
     setStore(
       produce((s) => {
-        s.sessionData[sessionId] = {
-          messages: [],
-          toolCalls: {},
-          pendingPermissions: [],
-          prompting: false,
-        }
+        s.sessionData[sessionId] = emptySessionData()
       }),
     )
     sendWs({ type: "load_session", sessionId })
@@ -303,17 +318,14 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
         break
 
       case "prompt_response": {
-        // Clear prompting for the active pane's active tab
-        const activePane = store.panes.find((p) => p.id === store.activePaneId)
-        if (activePane) {
-          setStore(
-            produce((s) => {
-              if (s.sessionData[activePane.activeTab]) {
-                s.sessionData[activePane.activeTab].prompting = false
-              }
-            }),
-          )
-        }
+        // Clear prompting for the session identified in the response envelope.
+        setStore(
+          produce((s) => {
+            if (s.sessionData[envelope.sessionId]) {
+              s.sessionData[envelope.sessionId].prompting = false
+            }
+          }),
+        )
         break
       }
 
@@ -343,16 +355,8 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
             setStore("hiddenSessions", [])
             localStorage.removeItem(hiddenKey)
             // Re-run with no hidden filter
-            const allSorted = [...sessions].sort((a, b) => {
-              const ta = a.created ? new Date(a.created).getTime() : 0
-              const tb = b.created ? new Date(b.created).getTime() : 0
-              return ta - tb
-            })
-            const allNewest = [...sessions].sort((a, b) => {
-              const ta = a.created ? new Date(a.created).getTime() : 0
-              const tb = b.created ? new Date(b.created).getTime() : 0
-              return tb - ta
-            })[0]
+            const allSorted = sortSessionsByDate(sessions, "asc")
+            const allNewest = sortSessionsByDate(sessions, "desc")[0]
             const paneId = `pane-${++paneCounter}`
             setStore(
               produce((s) => {
@@ -407,16 +411,8 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
             }
           } else {
             // Create default layout: one pane with all visible sessions
-            const sorted = [...visible].sort((a, b) => {
-              const ta = a.created ? new Date(a.created).getTime() : 0
-              const tb = b.created ? new Date(b.created).getTime() : 0
-              return ta - tb
-            })
-            const newest = [...visible].sort((a, b) => {
-              const ta = a.created ? new Date(a.created).getTime() : 0
-              const tb = b.created ? new Date(b.created).getTime() : 0
-              return tb - ta
-            })[0]
+            const sorted = sortSessionsByDate(visible, "asc")
+            const newest = sortSessionsByDate(visible, "desc")[0]
             const paneId = `pane-${++paneCounter}`
             setStore(
               produce((s) => {
@@ -473,12 +469,7 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     setStore(
       produce((s) => {
         if (!s.sessionData[sessionId]) {
-          s.sessionData[sessionId] = {
-            messages: [],
-            toolCalls: {},
-            pendingPermissions: [],
-            prompting: false,
-          }
+          s.sessionData[sessionId] = emptySessionData()
         }
       }),
     )
@@ -573,12 +564,7 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     setStore(
       produce((s) => {
         if (!s.sessionData[sessionId]) {
-          s.sessionData[sessionId] = {
-            messages: [],
-            toolCalls: {},
-            pendingPermissions: [],
-            prompting: false,
-          }
+          s.sessionData[sessionId] = emptySessionData()
         }
         const messages = s.sessionData[sessionId].messages
         const last = messages[messages.length - 1]
@@ -598,21 +584,8 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
   }
 
   function handlePermissionRequest(request: PermissionRequest) {
-    if (store.yolo) {
-      // Auto-approve: find the first allow option
-      const allowOption = request.options.find(
-        (o) => o.kind === "allow_once" || o.kind === "allow_always",
-      )
-      if (allowOption) {
-        sendWs({
-          type: "permission_response",
-          requestId: request.requestId,
-          optionId: allowOption.optionId,
-        })
-        return
-      }
-    }
-
+    // Permission requests are handled by the backend's auto_approve AtomicBool.
+    // If they reach the frontend, they need manual approval.
     // Show in UI for manual approval - route to active pane's active tab
     const activePane = store.panes.find((p) => p.id === store.activePaneId)
     if (!activePane) return
@@ -621,12 +594,7 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     setStore(
       produce((s) => {
         if (!s.sessionData[sessionId]) {
-          s.sessionData[sessionId] = {
-            messages: [],
-            toolCalls: {},
-            pendingPermissions: [],
-            prompting: false,
-          }
+          s.sessionData[sessionId] = emptySessionData()
         }
         s.sessionData[sessionId].pendingPermissions.push(request)
       }),
@@ -650,12 +618,7 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     setStore(
       produce((s) => {
         if (!s.sessionData[sid!]) {
-          s.sessionData[sid!] = {
-            messages: [],
-            toolCalls: {},
-            pendingPermissions: [],
-            prompting: false,
-          }
+          s.sessionData[sid!] = emptySessionData()
         }
         s.sessionData[sid!].messages.push({
           id: `msg-${++msgCounter}`,
@@ -710,38 +673,6 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     }
   }
 
-  function toggleYolo() {
-    const newVal = !store.yolo
-    setStore("yolo", newVal)
-
-    // If turning YOLO on, auto-approve all pending permissions across all sessions
-    if (newVal) {
-      batch(() => {
-        for (const sessionId in store.sessionData) {
-          const sessionPerms = store.sessionData[sessionId].pendingPermissions
-          for (const req of sessionPerms) {
-            const allowOption = req.options.find(
-              (o) => o.kind === "allow_once" || o.kind === "allow_always",
-            )
-            if (allowOption) {
-              sendWs({
-                type: "permission_response",
-                requestId: req.requestId,
-                optionId: allowOption.optionId,
-              })
-            }
-          }
-        }
-        setStore(
-          produce((s) => {
-            for (const sessionId in s.sessionData) {
-              s.sessionData[sessionId].pendingPermissions = []
-            }
-          }),
-        )
-      })
-    }
-  }
 
   // Save layout whenever panes change
   createEffect(() => {
@@ -784,15 +715,9 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
           })
           s.activePaneId = paneId
         }
-        // Clear session data before loading
-        s.sessionData[sessionId] = {
-          messages: [],
-          toolCalls: {},
-          pendingPermissions: [],
-          prompting: false,
-        }
       }),
     )
+    // reloadSession clears sessionData, so don't clear it here (double-clear)
     reloadSession(sessionId)
   }
 
@@ -1004,12 +929,7 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
   }
 
   function getSessionData(sessionId: string): SessionData {
-    return store.sessionData[sessionId] || {
-      messages: [],
-      toolCalls: {},
-      pendingPermissions: [],
-      prompting: false,
-    }
+    return store.sessionData[sessionId] || emptySessionData()
   }
 
   function setPaneWidth(paneId: string, width: number) {
@@ -1027,7 +947,6 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     get connectionState() { return store.connectionState },
     get connectionError() { return store.connectionError },
     get sessionData() { return store.sessionData },
-    get yolo() { return store.yolo },
     get availableCommands() { return store.availableCommands },
     get sessionMode() { return store.sessionMode },
     get sessions() { return store.sessions },
@@ -1062,7 +981,6 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     sendPrompt,
     respondPermission,
     cancelPrompt,
-    toggleYolo,
     loadSession,
     newSession,
     setActiveTab,
