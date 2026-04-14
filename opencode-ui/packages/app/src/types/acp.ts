@@ -22,9 +22,41 @@ export interface ImageContent {
   type: "image"
   mimeType: string
   data: string
+  uri?: string
 }
 
-export type ContentBlock = TextContent | ImageContent
+export interface AudioContent {
+  type: "audio"
+  mimeType: string
+  data: string
+}
+
+export interface ResourceLinkContent {
+  type: "resource_link"
+  name: string
+  uri: string
+  description?: string
+  mimeType?: string
+  size?: number
+  title?: string
+}
+
+export interface EmbeddedResourceContent {
+  type: "resource"
+  resource: {
+    uri: string
+    mimeType?: string
+    text?: string
+    blob?: string
+  }
+}
+
+export type ContentBlock =
+  | TextContent
+  | ImageContent
+  | AudioContent
+  | ResourceLinkContent
+  | EmbeddedResourceContent
 
 // ---------------------------------------------------------------------------
 // Tool call types
@@ -39,6 +71,7 @@ export type ToolKind =
   | "execute"
   | "think"
   | "fetch"
+  | "switch_mode"
   | "other"
 
 export type ToolCallStatus =
@@ -60,6 +93,11 @@ export interface ToolCallDiff {
   newText: string
 }
 
+export interface ToolCallTerminal {
+  type: "terminal"
+  terminalId: string
+}
+
 export interface ToolCallLocation {
   path: string
   line?: number
@@ -70,7 +108,7 @@ export interface ToolCall {
   title: string
   kind?: ToolKind
   status: ToolCallStatus
-  content?: Array<ToolCallContent | ToolCallDiff>
+  content?: Array<ToolCallContent | ToolCallDiff | ToolCallTerminal>
   locations?: ToolCallLocation[]
   rawInput?: Record<string, unknown>
   rawOutput?: Record<string, unknown>
@@ -137,6 +175,47 @@ export interface SessionModeState {
 }
 
 // ---------------------------------------------------------------------------
+// Session config options
+// ---------------------------------------------------------------------------
+
+export interface SessionConfigSelectOption {
+  value: string
+  name: string
+  description?: string
+}
+
+export interface SessionConfigOption {
+  id: string
+  name: string
+  description?: string
+  category?: "mode" | "model" | "thought_level" | string
+  type: "select"
+  currentValue: string
+  options: SessionConfigSelectOption[] | Array<{ name: string; options: SessionConfigSelectOption[] }>
+}
+
+// ---------------------------------------------------------------------------
+// Agent capabilities and info
+// ---------------------------------------------------------------------------
+
+export interface AgentInfo {
+  name: string
+  title?: string
+  version: string
+}
+
+export interface AgentCapabilities {
+  loadSession: boolean
+  promptCapabilities: {
+    image: boolean
+    audio: boolean
+    embeddedContext: boolean
+  }
+  mcpCapabilities: Record<string, unknown>
+  sessionCapabilities: Record<string, unknown>
+}
+
+// ---------------------------------------------------------------------------
 // Session update union (from session/update notifications)
 // ---------------------------------------------------------------------------
 
@@ -151,7 +230,7 @@ export interface UserMessageChunk {
 }
 
 export interface ThoughtChunk {
-  sessionUpdate: "thought_chunk"
+  sessionUpdate: "agent_thought_chunk"
   content: ContentBlock
 }
 
@@ -161,7 +240,7 @@ export interface ToolCallUpdate {
   title: string
   kind?: ToolKind
   status?: ToolCallStatus
-  content?: Array<ToolCallContent | ToolCallDiff>
+  content?: Array<ToolCallContent | ToolCallDiff | ToolCallTerminal>
   locations?: ToolCallLocation[]
   rawInput?: Record<string, unknown>
 }
@@ -169,10 +248,12 @@ export interface ToolCallUpdate {
 export interface ToolCallStatusUpdate {
   sessionUpdate: "tool_call_update"
   toolCallId: string
+  kind?: ToolKind
   status?: ToolCallStatus
   title?: string
-  content?: Array<ToolCallContent | ToolCallDiff>
+  content?: Array<ToolCallContent | ToolCallDiff | ToolCallTerminal>
   locations?: ToolCallLocation[]
+  rawInput?: Record<string, unknown>
   rawOutput?: Record<string, unknown>
 }
 
@@ -190,7 +271,20 @@ export interface AvailableCommandsUpdate {
 /** Current mode update notification. */
 export interface CurrentModeUpdate {
   sessionUpdate: "current_mode_update"
-  modeId: string
+  currentModeId: string
+}
+
+/** Config option update notification. */
+export interface ConfigOptionUpdate {
+  sessionUpdate: "config_option_update"
+  configOptions: SessionConfigOption[]
+}
+
+/** Session info update notification (title changes, etc.). */
+export interface SessionInfoUpdate {
+  sessionUpdate: "session_info_update"
+  title?: string | null
+  updatedAt?: string | null
 }
 
 export type SessionUpdate =
@@ -202,6 +296,8 @@ export type SessionUpdate =
   | PlanUpdate
   | AvailableCommandsUpdate
   | CurrentModeUpdate
+  | ConfigOptionUpdate
+  | SessionInfoUpdate
 
 // ---------------------------------------------------------------------------
 // WebSocket envelope (pod-api → frontend)
@@ -219,10 +315,15 @@ export interface WsSessionUpdate {
   update: SessionUpdate
 }
 
-/** ACP permission request forwarded by pod-api. */
+/** ACP permission request forwarded by pod-api.
+ * Fields are flattened from AcpEvent::PermissionRequest (not nested in a `request` object).
+ */
 export interface WsPermissionRequest {
   type: "permission_request"
-  request: PermissionRequest
+  requestId: number | string
+  sessionId: string
+  toolCall: Record<string, unknown>
+  options: PermissionOption[] | Record<string, unknown>
 }
 
 /** Connection status change (pod-api → frontend). */
@@ -252,6 +353,15 @@ export interface WsSessionList {
 export interface WsSessionCreated {
   type: "session_created"
   sessionId: string
+  modes?: SessionModeState
+  configOptions?: SessionConfigOption[]
+}
+
+/** Agent initialization completed. */
+export interface WsInitialized {
+  type: "initialized"
+  agentInfo?: AgentInfo
+  capabilities?: AgentCapabilities
 }
 
 export type WsEnvelope =
@@ -262,6 +372,7 @@ export type WsEnvelope =
   | WsPromptResponse
   | WsSessionList
   | WsSessionCreated
+  | WsInitialized
 
 // ---------------------------------------------------------------------------
 // Frontend → pod-api commands (over the same WebSocket)
@@ -298,12 +409,18 @@ export interface WsLoadSession {
   sessionId: string
 }
 
+/** Create a new session. */
+export interface WsNewSession {
+  type: "new_session"
+}
+
 export type WsCommand =
   | WsSendPrompt
   | WsPermissionResponse
   | WsCancelPrompt
   | WsListSessions
   | WsLoadSession
+  | WsNewSession
 
 // ---------------------------------------------------------------------------
 // UI-level message model (accumulated from events)

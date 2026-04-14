@@ -7,6 +7,7 @@
  */
 import {
   createContext,
+  createSignal,
   useContext,
   onCleanup,
   type ParentProps,
@@ -25,8 +26,13 @@ import type {
   ToolCallStatus,
   ToolCallContent,
   ToolCallDiff,
+  ToolCallTerminal,
   SlashCommand,
   SessionModeState,
+  SessionConfigOption,
+  AgentInfo,
+  AgentCapabilities,
+  PlanEntry,
 } from "@/types/acp"
 
 // ---------------------------------------------------------------------------
@@ -35,12 +41,22 @@ import type {
 
 export type ConnectionState = "connecting" | "connected" | "disconnected" | "error"
 
+/** A timeline entry: either a message or a tool call, in arrival order. */
+export type TimelineEntry =
+  | { kind: "message"; id: string }
+  | { kind: "toolCall"; id: string }
+
 /** Per-session state (messages, tool calls, etc.) */
 export interface SessionData {
   messages: AcpMessage[]
   toolCalls: Record<string, ToolCall>
   pendingPermissions: PermissionRequest[]
   prompting: boolean
+  planEntries: PlanEntry[]
+  /** Ordered list of events for interleaved rendering. */
+  timeline: TimelineEntry[]
+  /** True while session history is being replayed (session/load). */
+  replaying: boolean
 }
 
 /** Per-pane state */
@@ -68,6 +84,12 @@ interface AcpSessionStore {
   hiddenSessions: string[]
   /** Available sessions from the agent. */
   sessions: Array<{ id: string; title?: string; created?: string }>
+  /** Agent implementation info (name, version). */
+  agentInfo: AgentInfo | null
+  /** Agent capabilities from initialization. */
+  agentCapabilities: AgentCapabilities | null
+  /** Session config options from the agent. */
+  configOptions: SessionConfigOption[]
 }
 
 interface AcpSessionActions {
@@ -99,6 +121,10 @@ interface AcpSessionActions {
   getSessionData: (sessionId: string) => SessionData
   /** Set pane width (percentage). */
   setPaneWidth: (paneId: string, width: number) => void
+  /** Whether a session is actively receiving streamed text. */
+  isSessionStreaming: (sessionId: string) => boolean
+  /** Whether a session is buffering inside an unclosed code fence. */
+  isSessionBufferingFence: (sessionId: string) => boolean
 }
 
 export type AcpSessionContext = AcpSessionStore & AcpSessionActions
@@ -117,7 +143,11 @@ export function useAcpSession(): AcpSessionContext {
 
 function contentText(block: ContentBlock): string {
   if (block.type === "text") return block.text
-  return ""
+  if (block.type === "image") return "[Image]"
+  if (block.type === "audio") return "[Audio]"
+  if (block.type === "resource_link") return `[Resource: ${block.name}]`
+  if (block.type === "resource") return `[Embedded resource: ${block.resource.uri}]`
+  return `[${(block as { type: string }).type}]`
 }
 
 /** Factory for creating empty session data. */
@@ -127,6 +157,9 @@ function emptySessionData(): SessionData {
     toolCalls: {},
     pendingPermissions: [],
     prompting: false,
+    planEntries: [],
+    timeline: [],
+    replaying: false,
   }
 }
 
@@ -142,16 +175,9 @@ function sortSessionsByDate(
   })
 }
 
-function toolContentText(items: Array<ToolCallContent | ToolCallDiff>): string {
-  return items
-    .map((item) => {
-      if (item.type === "content") return contentText(item.content)
-      if (item.type === "diff") return `diff ${item.path}`
-      return ""
-    })
-    .filter(Boolean)
-    .join("\n")
-}
+// toolContentText was previously used for flat text extraction from tool
+// content blocks. Rendering is now handled by the Diff and Markdown
+// shared components in agent.tsx.
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -173,6 +199,37 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
   let msgCounter = 0
   let paneCounter = 0
 
+  // ---------------------------------------------------------------------------
+  // User message persistence
+  // ---------------------------------------------------------------------------
+  // Agents don't echo user_message_chunk during session replay, so user
+  // messages are lost on page reload unless we persist them separately.
+
+  function userMsgKey(sessionId: string): string {
+    return `devaipod-user-msgs-${props.podName}-${sessionId}`
+  }
+
+  function saveUserMessage(sessionId: string, text: string) {
+    try {
+      const key = userMsgKey(sessionId)
+      const existing: Array<{ text: string; timestamp: number }> =
+        JSON.parse(sessionStorage.getItem(key) || "[]")
+      existing.push({ text, timestamp: Date.now() })
+      sessionStorage.setItem(key, JSON.stringify(existing))
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  function loadUserMessages(sessionId: string): Array<{ text: string; timestamp: number }> {
+    try {
+      const key = userMsgKey(sessionId)
+      return JSON.parse(sessionStorage.getItem(key) || "[]")
+    } catch {
+      return []
+    }
+  }
+
   // Load hidden sessions from localStorage
   const hiddenKey = `devaipod-hidden-sessions-${props.podName}`
   const loadHidden = (): string[] => {
@@ -192,6 +249,9 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     availableCommands: [],
     sessionMode: null,
     sessions: [],
+    agentInfo: null,
+    agentCapabilities: null,
+    configOptions: [],
   })
 
   // Track which pane a hidden session came from (for restore)
@@ -245,14 +305,42 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
   /** Clear session data and request a replay from the server.
    *  IMPORTANT: This must call sendWs(), NOT itself. A prior bug had
    *  this calling reloadSession() recursively (infinite recursion). */
+  // Queue of saved user messages to inject during session replay.
+  // Keyed by session ID. Each entry is consumed as agent messages stream in.
+  const replayUserMsgQueues: Record<string, Array<{ text: string; timestamp: number }>> = {}
+
   function reloadSession(sessionId: string) {
+    // Load persisted user messages into a queue. They'll be injected
+    // before the first agent_message_chunk of each turn during replay,
+    // so conversations display in the correct interleaved order.
+    replayUserMsgQueues[sessionId] = loadUserMessages(sessionId)
+    fenceCounts[sessionId] = 0
+    const data = emptySessionData()
+    data.replaying = true
     setStore(
       produce((s) => {
-        s.sessionData[sessionId] = emptySessionData()
+        s.sessionData[sessionId] = data
       }),
     )
     sendWs({ type: "load_session", sessionId })
+
+    // The ACP protocol has no "replay finished" signal. Use a debounce:
+    // after events stop arriving for this session, mark replay as done.
+    // Any new prompt from the user also clears the flag (see sendPrompt).
+    if (replayTimers[sessionId]) clearTimeout(replayTimers[sessionId])
+    replayTimers[sessionId] = setTimeout(() => {
+      setStore(
+        produce((s) => {
+          if (s.sessionData[sessionId]) {
+            s.sessionData[sessionId].replaying = false
+          }
+        }),
+      )
+    }, 500)
   }
+
+  // Debounce timers for detecting end of session replay.
+  const replayTimers: Record<string, ReturnType<typeof setTimeout>> = {}
 
   function connect() {
     if (ws) {
@@ -314,7 +402,12 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
         break
 
       case "permission_request":
-        handlePermissionRequest(envelope.request)
+        handlePermissionRequest({
+          requestId: envelope.requestId,
+          sessionId: envelope.sessionId,
+          toolCall: envelope.toolCall as Partial<ToolCall> & { toolCallId: string },
+          options: (Array.isArray(envelope.options) ? envelope.options : []) as PermissionRequest["options"],
+        })
         break
 
       case "prompt_response": {
@@ -455,10 +548,32 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
               })
               s.activePaneId = paneId
             }
+            // Store session metadata if provided
+            if (envelope.modes) {
+              s.sessionMode = envelope.modes
+            }
+            if (envelope.configOptions) {
+              s.configOptions = envelope.configOptions
+            }
           }),
         )
         // Refresh session list
         sendWs({ type: "list_sessions" })
+        break
+      }
+
+      case "initialized": {
+        // Store agent info and capabilities from the initialization handshake
+        setStore(
+          produce((s) => {
+            if (envelope.agentInfo) {
+              s.agentInfo = envelope.agentInfo
+            }
+            if (envelope.capabilities) {
+              s.agentCapabilities = envelope.capabilities
+            }
+          }),
+        )
         break
       }
     }
@@ -474,29 +589,71 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
       }),
     )
 
+    // During replay, reset the debounce timer on each event so we
+    // detect when the replay stream stops (no "replay done" signal in ACP).
+    if (store.sessionData[sessionId]?.replaying && replayTimers[sessionId]) {
+      clearTimeout(replayTimers[sessionId])
+      replayTimers[sessionId] = setTimeout(() => {
+        setStore(
+          produce((s) => {
+            if (s.sessionData[sessionId]) {
+              s.sessionData[sessionId].replaying = false
+            }
+          }),
+        )
+        // Reset fence counter after replay so it doesn't carry stale state.
+        fenceCounts[sessionId] = 0
+      }, 500)
+    }
+
+    // During replay, write directly to the store (no buffering/fence
+    // detection needed for historical content). This also prevents the
+    // fence counter from going odd and showing "Writing code..." flash.
+    const isReplaying = store.sessionData[sessionId]?.replaying ?? false
+
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         const text = contentText(update.content)
         if (!text) break
-        appendOrUpdateMessage(sessionId, "assistant", text)
+        if (isReplaying) {
+          appendMessageDirect(sessionId, "assistant", text)
+        } else {
+          appendOrUpdateMessage(sessionId, "assistant", text)
+        }
         break
       }
 
       case "user_message_chunk": {
         const text = contentText(update.content)
         if (!text) break
-        appendOrUpdateMessage(sessionId, "user", text)
+        if (isReplaying) {
+          appendMessageDirect(sessionId, "user", text)
+        } else {
+          appendOrUpdateMessage(sessionId, "user", text)
+        }
         break
       }
 
-      case "thought_chunk": {
+      case "agent_thought_chunk": {
         const text = contentText(update.content)
         if (!text) break
-        appendOrUpdateMessage(sessionId, "thought", text)
+        if (isReplaying) {
+          appendMessageDirect(sessionId, "thought", text)
+        } else {
+          appendOrUpdateMessage(sessionId, "thought", text)
+        }
         break
       }
 
       case "tool_call": {
+        // Force-flush buffered text before the tool call to keep timeline order.
+        if (chunkBuffers[sessionId]?.text) {
+          if (chunkTimers[sessionId]) {
+            clearTimeout(chunkTimers[sessionId])
+            delete chunkTimers[sessionId]
+          }
+          flushChunkBuffer(sessionId, true)
+        }
         setStore(
           produce((s) => {
             if (!s.sessionData[sessionId]) return
@@ -509,6 +666,15 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
               locations: update.locations,
               rawInput: update.rawInput,
             }
+            // Only add to timeline if this is a new tool call (not a duplicate)
+            if (!s.sessionData[sessionId].timeline.some(
+              (e) => e.kind === "toolCall" && e.id === update.toolCallId
+            )) {
+              s.sessionData[sessionId].timeline.push({
+                kind: "toolCall",
+                id: update.toolCallId,
+              })
+            }
           }),
         )
         break
@@ -520,10 +686,12 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
             if (!s.sessionData[sessionId]) return
             const existing = s.sessionData[sessionId].toolCalls[update.toolCallId]
             if (existing) {
+              if (update.kind) existing.kind = update.kind
               if (update.status) existing.status = update.status as ToolCallStatus
               if (update.title) existing.title = update.title
-              if (update.content) existing.content = update.content as Array<ToolCallContent | ToolCallDiff>
+              if (update.content) existing.content = update.content as Array<ToolCallContent | ToolCallDiff | ToolCallTerminal>
               if (update.locations) existing.locations = update.locations
+              if (update.rawInput) existing.rawInput = update.rawInput
               if (update.rawOutput) existing.rawOutput = update.rawOutput
             }
           }),
@@ -532,7 +700,12 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
       }
 
       case "plan":
-        // Plans are informational; could render them but keeping it simple
+        setStore(
+          produce((s) => {
+            if (!s.sessionData[sessionId]) return
+            s.sessionData[sessionId].planEntries = update.entries
+          }),
+        )
         break
 
       case "available_commands_update":
@@ -543,24 +716,190 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
         setStore(
           produce((s) => {
             if (s.sessionMode) {
-              s.sessionMode.currentModeId = update.modeId
+              s.sessionMode.currentModeId = update.currentModeId
             } else {
               s.sessionMode = {
-                currentModeId: update.modeId,
+                currentModeId: update.currentModeId,
                 availableModes: [],
               }
             }
           }),
         )
         break
+
+      case "config_option_update":
+        setStore("configOptions", update.configOptions)
+        break
+
+      case "session_info_update": {
+        // Update session title if provided
+        if (update.title !== undefined) {
+          setStore(
+            produce((s) => {
+              const session = s.sessions.find((ss) => ss.id === sessionId)
+              if (session) {
+                session.title = update.title ?? undefined
+              }
+            }),
+          )
+        }
+        break
+      }
     }
   }
 
   /**
    * Append text to the last message if it has the same role (streaming),
    * or create a new message.
+   *
+   * During session replay, agents don't echo user messages. Before starting
+   * a new assistant turn, inject the next saved user message from the
+   * replay queue so the conversation displays in the correct order.
+   *
+   * Streaming chunks are buffered and flushed to the store periodically
+   * (every CHUNK_FLUSH_MS) to reduce DOM thrashing from per-token updates.
    */
+  /**
+   * Streaming chunks are buffered and flushed to the store when the
+   * stream pauses for CHUNK_FLUSH_MS. This prevents partial markdown
+   * (e.g. half a code fence or diagram) from being rendered mid-stream.
+   *
+   * Uses path-based store setters for text updates to ensure SolidJS
+   * fine-grained reactivity triggers Markdown re-renders on flush.
+   */
+  /**
+   * Streaming chunks are buffered and flushed to the store. The buffer
+   * flushes when:
+   *   - Tokens stop for CHUNK_FLUSH_MS AND no unclosed code fence
+   *   - A tool call arrives (explicit flush)
+   *   - Role changes
+   *
+   * If the buffered text contains an unclosed code fence (odd number
+   * of ``` delimiters), flushing is suppressed until the fence closes
+   * or FENCE_FLUSH_MS elapses (safety valve to avoid infinite buffering).
+   */
+  const CHUNK_FLUSH_MS = 300       // Normal text: flush after 300ms pause
+  const FENCE_FLUSH_MS = 5000      // Inside code fence: hold until closed
+  const chunkBuffers: Record<string, { role: AcpMessage["role"]; text: string; startTime: number }> = {}
+  const chunkTimers: Record<string, ReturnType<typeof setTimeout>> = {}
+  // Track total fence count per session across all flushes.
+  // Odd = inside a fence, even = outside.
+  const fenceCounts: Record<string, number> = {}
+
+  // Reactive signal so the UI can show streaming/buffering indicators.
+  const [streamingSessionIds, setStreamingSessionIds] = createSignal<Set<string>>(new Set())
+  const [bufferingFenceSessionIds, setBufferingFenceSessionIds] = createSignal<Set<string>>(new Set())
+
+  function updateStreamingState(sessionId: string) {
+    const buf = chunkBuffers[sessionId]
+    const isStreaming = !!buf?.text
+    const isFence = isStreaming && isInsideFence(sessionId, buf!.text)
+
+    setStreamingSessionIds((prev) => {
+      const next = new Set(prev)
+      if (isStreaming) next.add(sessionId); else next.delete(sessionId)
+      return next
+    })
+    setBufferingFenceSessionIds((prev) => {
+      const next = new Set(prev)
+      if (isFence) next.add(sessionId); else next.delete(sessionId)
+      return next
+    })
+  }
+
+  /** Count ``` fence delimiters in a string.
+   *  A fence delimiter is ``` at the start of a line, optionally followed
+   *  by a language tag, with nothing else on the line. */
+  function countFences(text: string): number {
+    const matches = text.match(/^```[^\S\n]*\S*[^\S\n]*$/gm)
+    return matches ? matches.length : 0
+  }
+
+  /** Whether the session is currently inside an unclosed code fence.
+   *  Uses running counter from prior flushes + fences in current buffer. */
+  function isInsideFence(sessionId: string, bufferText: string): boolean {
+    const prior = fenceCounts[sessionId] || 0
+    const bufferFences = countFences(bufferText)
+    return (prior + bufferFences) % 2 !== 0
+  }
+
+  function flushChunkBuffer(sessionId: string, force?: boolean) {
+    const buf = chunkBuffers[sessionId]
+    if (!buf || !buf.text) return
+
+    const elapsed = Date.now() - buf.startTime
+    if (!force && isInsideFence(sessionId, buf.text) && elapsed < FENCE_FLUSH_MS) {
+      if (chunkTimers[sessionId]) clearTimeout(chunkTimers[sessionId])
+      chunkTimers[sessionId] = setTimeout(() => {
+        delete chunkTimers[sessionId]
+        flushChunkBuffer(sessionId)
+      }, CHUNK_FLUSH_MS)
+      updateStreamingState(sessionId)
+      return
+    }
+
+    const { role, text } = buf
+    // Update running fence count with fences in the flushed text.
+    fenceCounts[sessionId] = (fenceCounts[sessionId] || 0) + countFences(text)
+    buf.text = ""
+    buf.startTime = Date.now()
+    updateStreamingState(sessionId)
+
+    const sd = store.sessionData[sessionId]
+    if (!sd) return
+
+    const messages = sd.messages
+    const last = messages[messages.length - 1]
+    const timeline = sd.timeline
+    const lastTimelineEntry = timeline[timeline.length - 1]
+    const toolCallInterrupted = lastTimelineEntry?.kind === "toolCall"
+
+    if (last && last.role === role && !toolCallInterrupted) {
+      const idx = messages.length - 1
+      setStore("sessionData", sessionId, "messages", idx, "text", (prev) => prev + text)
+    } else {
+      const id = `msg-${++msgCounter}`
+      setStore(
+        produce((s) => {
+          s.sessionData[sessionId].messages.push({
+            id,
+            role,
+            text,
+            timestamp: Date.now(),
+          })
+          s.sessionData[sessionId].timeline.push({ kind: "message", id })
+        }),
+      )
+    }
+  }
+
+  /** Direct store append -- no buffering, no fence detection.
+   *  Used during replay where content is historical and complete. */
+  function appendMessageDirect(sessionId: string, role: AcpMessage["role"], text: string) {
+    const sd = store.sessionData[sessionId]
+    if (!sd) return
+    const messages = sd.messages
+    const last = messages[messages.length - 1]
+    const timeline = sd.timeline
+    const lastTimelineEntry = timeline[timeline.length - 1]
+    const toolCallInterrupted = lastTimelineEntry?.kind === "toolCall"
+
+    if (last && last.role === role && !toolCallInterrupted) {
+      const idx = messages.length - 1
+      setStore("sessionData", sessionId, "messages", idx, "text", (prev) => prev + text)
+    } else {
+      const id = `msg-${++msgCounter}`
+      setStore(
+        produce((s) => {
+          s.sessionData[sessionId].messages.push({ id, role, text, timestamp: Date.now() })
+          s.sessionData[sessionId].timeline.push({ kind: "message", id })
+        }),
+      )
+    }
+  }
+
   function appendOrUpdateMessage(sessionId: string, role: AcpMessage["role"], text: string) {
+    // Inject saved user messages synchronously (not buffered).
     setStore(
       produce((s) => {
         if (!s.sessionData[sessionId]) {
@@ -568,19 +907,51 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
         }
         const messages = s.sessionData[sessionId].messages
         const last = messages[messages.length - 1]
-        if (last && last.role === role) {
-          // Streaming: append to existing message
-          last.text += text
-        } else {
-          messages.push({
-            id: `msg-${++msgCounter}`,
-            role,
-            text,
-            timestamp: Date.now(),
-          })
+
+        if (role !== "user" && (!last || last.role !== role)) {
+          const queue = replayUserMsgQueues[sessionId]
+          if (queue && queue.length > 0) {
+            const saved = queue.shift()!
+            const savedId = `msg-${++msgCounter}`
+            messages.push({
+              id: savedId,
+              role: "user",
+              text: saved.text,
+              timestamp: saved.timestamp,
+            })
+            s.sessionData[sessionId].timeline.push({ kind: "message", id: savedId })
+          }
         }
       }),
     )
+
+    // Buffer chunks. Flush previous buffer if role changed.
+    const buf = chunkBuffers[sessionId]
+    if (buf && buf.role === role) {
+      buf.text += text
+      buf.startTime = Date.now()  // Reset so safety valve measures from last chunk
+    } else {
+      if (buf) flushChunkBuffer(sessionId, true)
+      chunkBuffers[sessionId] = { role, text, startTime: Date.now() }
+    }
+
+    // Debounce: reset timer on each chunk.
+    if (chunkTimers[sessionId]) clearTimeout(chunkTimers[sessionId])
+    chunkTimers[sessionId] = setTimeout(() => {
+      delete chunkTimers[sessionId]
+      flushChunkBuffer(sessionId)
+    }, CHUNK_FLUSH_MS)
+    updateStreamingState(sessionId)
+  }
+
+  /** Whether a session is actively receiving streamed text. */
+  function isSessionStreaming(sessionId: string): boolean {
+    return streamingSessionIds().has(sessionId)
+  }
+
+  /** Whether a session is buffering inside an unclosed code fence. */
+  function isSessionBufferingFence(sessionId: string): boolean {
+    return bufferingFenceSessionIds().has(sessionId)
   }
 
   function handlePermissionRequest(request: PermissionRequest) {
@@ -614,21 +985,41 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
       sid = activePane.activeTab
     }
 
-    // Add user message to local display
+    // Flush any remaining replay queue and mark replay as done
+    // (user is actively interacting).
+    delete replayUserMsgQueues[sid!]
+    fenceCounts[sid!] = 0
+    if (replayTimers[sid!]) {
+      clearTimeout(replayTimers[sid!])
+      delete replayTimers[sid!]
+    }
+    setStore(
+      produce((s) => {
+        if (s.sessionData[sid!]) {
+          s.sessionData[sid!].replaying = false
+        }
+      }),
+    )
+
+    // Add user message to local display and persist to sessionStorage
+    // so it survives session replay (agents don't echo user messages).
     setStore(
       produce((s) => {
         if (!s.sessionData[sid!]) {
           s.sessionData[sid!] = emptySessionData()
         }
+        const userMsgId = `msg-${++msgCounter}`
         s.sessionData[sid!].messages.push({
-          id: `msg-${++msgCounter}`,
+          id: userMsgId,
           role: "user",
           text,
           timestamp: Date.now(),
         })
+        s.sessionData[sid!].timeline.push({ kind: "message", id: userMsgId })
         s.sessionData[sid!].prompting = true
       }),
     )
+    saveUserMessage(sid!, text)
 
     sendWs({
       type: "send_prompt",
@@ -929,7 +1320,20 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
   }
 
   function getSessionData(sessionId: string): SessionData {
-    return store.sessionData[sessionId] || emptySessionData()
+    // Ensure session data lives in the store so SolidJS can track
+    // reactive updates. Returning a detached fallback object breaks
+    // reactivity because <For> sees a new array reference each call
+    // and never subscribes to the store path.
+    if (!store.sessionData[sessionId]) {
+      setStore(
+        produce((s) => {
+          if (!s.sessionData[sessionId]) {
+            s.sessionData[sessionId] = emptySessionData()
+          }
+        }),
+      )
+    }
+    return store.sessionData[sessionId]
   }
 
   function setPaneWidth(paneId: string, width: number) {
@@ -953,6 +1357,9 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     get panes() { return store.panes },
     get activePaneId() { return store.activePaneId },
     get hiddenSessions() { return store.hiddenSessions },
+    get agentInfo() { return store.agentInfo },
+    get agentCapabilities() { return store.agentCapabilities },
+    get configOptions() { return store.configOptions },
     // Backwards compat: getters that point to active pane's active tab's session data
     get messages() {
       const activePane = store.panes.find((p) => p.id === store.activePaneId)
@@ -992,6 +1399,8 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
     restoreSession,
     getSessionData,
     setPaneWidth,
+    isSessionStreaming,
+    isSessionBufferingFence,
   }
 
   return <AcpCtx.Provider value={value}>{props.children}</AcpCtx.Provider>

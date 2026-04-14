@@ -1,10 +1,13 @@
 import { createSignal, createEffect, createMemo, createResource, onCleanup, onMount, Show, For, Index } from "solid-js"
-import { Marked } from "marked"
 import { useParams, useNavigate, A } from "@solidjs/router"
 import { DevaipodProvider, useDevaipod } from "@/context/devaipod"
 import { AcpSessionProvider, useAcpSession, type ConnectionState, type PaneState } from "@/context/acp-session"
 import { apiFetch } from "@/utils/devaipod-api"
-import type { AcpMessage, ToolCall, PermissionRequest } from "@/types/acp"
+import type { AcpMessage, ToolCall, PermissionRequest, PlanEntry, ToolCallDiff } from "@/types/acp"
+import type { TimelineEntry } from "@/context/acp-session"
+import { Markdown } from "@opencode-ai/ui/markdown"
+import { Diff } from "@opencode-ai/ui/diff"
+import { BasicTool } from "@opencode-ai/ui/basic-tool"
 
 // ---------------------------------------------------------------------------
 // Page wrapper — provides context (standalone, outside the OpenCode stack)
@@ -440,6 +443,17 @@ function AcpContent() {
         data-testid="acp-status-bar"
       >
         <ConnectionIndicator state={acp.connectionState} />
+        <Show when={acp.agentInfo}>
+          {(info) => (
+            <span
+              class="text-text-dimmed font-mono"
+              data-testid="agent-info"
+              title={`Agent: ${info().name} v${info().version}`}
+            >
+              {info().name} <span class="opacity-50">v{info().version}</span>
+            </span>
+          )}
+        </Show>
         <Show when={acp.sessionMode}>
           {(mode) => (
             <span
@@ -891,59 +905,87 @@ function SessionPane(props: { sessionId: string; podName: string }) {
       {/* Scrollable message area */}
       <div
         ref={(el) => {
-          // Auto-scroll behavior per pane
-          let userHasScrolled = false
-          const mountTime = Date.now()
-          const FORCE_SCROLL_MS = 3000
+          let pinned = true
+          const THRESHOLD = 60
 
-          el.addEventListener("wheel", () => { userHasScrolled = true }, { passive: true })
-          el.addEventListener("touchmove", () => { userHasScrolled = true }, { passive: true })
+          function isNearBottom(): boolean {
+            return el.scrollHeight - el.scrollTop - el.clientHeight < THRESHOLD
+          }
 
+          // Track user scroll intent.
+          el.addEventListener("scroll", () => {
+            pinned = isNearBottom()
+          }, { passive: true })
+
+          // Auto-scroll on DOM changes when pinned.
           const observer = new MutationObserver(() => {
-            if (!userHasScrolled && Date.now() - mountTime < FORCE_SCROLL_MS) {
-              el.scrollTop = el.scrollHeight
-              return
-            }
-            const threshold = el.clientHeight * 0.5
-            const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-            if (distanceFromBottom < threshold) {
+            if (pinned) {
               el.scrollTop = el.scrollHeight
             }
           })
           observer.observe(el, { childList: true, subtree: true, characterData: true })
+
+          // Start at bottom.
           queueMicrotask(() => { el.scrollTop = el.scrollHeight })
         }}
-        class="flex-1 overflow-y-auto px-4 py-3 space-y-3"
+        class="flex-1 overflow-y-auto px-4 py-3"
         data-testid="pane-messages"
       >
+        <div class="space-y-3">
         <Show
-          when={sessionData().messages.length > 0 || Object.keys(sessionData().toolCalls).length > 0}
+          when={sessionData().timeline.length > 0 && !sessionData().replaying}
           fallback={
-            <div class="flex items-center justify-center h-full">
-              <div class="text-sm opacity-40">
-                {acp.connectionState === "connected"
-                  ? "Ready. Type a message to begin."
-                  : "Connecting to agent..."}
+            <Show when={!sessionData().replaying}>
+              <div class="flex items-center justify-center h-full">
+                <div class="text-sm opacity-40">
+                  {acp.connectionState === "connected"
+                    ? "Ready. Type a message to begin."
+                    : "Connecting to agent..."}
+                </div>
               </div>
-            </div>
+            </Show>
           }
         >
-          <For each={sessionData().messages}>
-            {(msg) => <MessageBubble message={msg} />}
-          </For>
+          {/* Plan display (always at top when present) */}
+          <PlanDisplay entries={sessionData().planEntries} />
 
-          {/* Render active tool calls after messages */}
-          <For
-            each={Object.values(sessionData().toolCalls).filter(
-              (tc) =>
-                tc.status === "pending" || tc.status === "in_progress",
+          {/* Interleaved timeline: messages and tool calls in arrival order */}
+          <For each={sessionData().timeline}>
+            {(entry: TimelineEntry) => (
+              <Show when={entry.kind === "message"} fallback={
+                <Show when={sessionData().toolCalls[entry.id]}>
+                  {(tc) => {
+                    const perm = () => sessionData().pendingPermissions.find(
+                      (p) => p.toolCall.toolCallId === entry.id
+                    )
+                    return (
+                      <ToolCallCard
+                        toolCall={tc()}
+                        pendingPermission={perm()}
+                        onRespondPermission={acp.respondPermission}
+                      />
+                    )
+                  }}
+                </Show>
+              }>
+                <Show when={sessionData().messages.find((m) => m.id === entry.id)}>
+                  {(msg) => <MessageBubble message={msg()} />}
+                </Show>
+              </Show>
             )}
-          >
-            {(tc) => <ToolCallCard toolCall={tc} />}
           </For>
 
-          {/* Permission requests */}
-          <For each={sessionData().pendingPermissions}>
+          {/* Show indicator only when buffering a code fence */}
+          <Show when={acp.isSessionBufferingFence(props.sessionId)}>
+            <div class="text-xs opacity-50 py-1 font-mono animate-pulse">
+              Writing code...
+            </div>
+          </Show>
+
+          {/* Orphan permission requests (not associated with a visible tool call) */}
+          <For each={sessionData().pendingPermissions.filter(
+            (p) => !sessionData().toolCalls[p.toolCall.toolCallId]
+          )}>
             {(perm) => (
               <PermissionCard
                 request={perm}
@@ -952,6 +994,7 @@ function SessionPane(props: { sessionId: string; podName: string }) {
             )}
           </For>
         </Show>
+        </div>
       </div>
 
       {/* Prompt input */}
@@ -961,6 +1004,7 @@ function SessionPane(props: { sessionId: string; podName: string }) {
         onCancel={acp.cancelPrompt}
         prompting={sessionData().prompting}
         disabled={acp.connectionState !== "connected"}
+        availableCommands={acp.availableCommands}
       />
     </div>
   )
@@ -1106,32 +1150,22 @@ function MessageBubble(props: { message: AcpMessage }) {
     }
   }
 
-  const rendered = createMemo(() => {
-    if (props.message.role === "user") return undefined
-    try {
-      const marked = new Marked()
-      return marked.parse(props.message.text) as string
-    } catch {
-      return undefined
-    }
-  })
-
   return (
     <div data-testid="acp-message" data-role={props.message.role} class={bubbleClass()}>
       <div class={`text-xs font-medium mb-1 ${labelClass()}`}>
         {roleLabel()}
       </div>
       <Show
-        when={rendered()}
+        when={props.message.role !== "user"}
         fallback={
           <div class="text-sm whitespace-pre-wrap break-words">
             {props.message.text}
           </div>
         }
       >
-        <div
-          class="text-sm break-words prose prose-invert prose-sm max-w-none font-mono"
-          innerHTML={rendered()!}
+        <Markdown
+          text={props.message.text}
+          class="text-sm break-words prose prose-invert prose-sm max-w-none"
         />
       </Show>
     </div>
@@ -1142,69 +1176,106 @@ function MessageBubble(props: { message: AcpMessage }) {
 // Tool call card
 // ---------------------------------------------------------------------------
 
-function toolStatusIcon(status: string): string {
-  switch (status) {
-    case "pending":
-      return "..."
-    case "in_progress":
-      return "~"
-    case "completed":
-      return "ok"
-    case "failed":
-      return "!!"
-    case "cancelled":
-      return "--"
-    default:
-      return "?"
+/** Map ACP tool kind to an appropriate icon name for BasicTool. */
+function toolKindIcon(kind?: string): string {
+  switch (kind) {
+    case "read": return "glasses"
+    case "edit": return "code-lines"
+    case "delete": return "trash"
+    case "move": return "arrow-right"
+    case "search": return "magnifying-glass"
+    case "execute": return "console"
+    case "think": return "brain"
+    case "fetch": return "link"
+    case "switch_mode": return "arrow-right"
+    default: return "mcp"
   }
 }
 
-function ToolCallCard(props: { toolCall: ToolCall }) {
+function ToolCallCard(props: {
+  toolCall: ToolCall
+  pendingPermission?: PermissionRequest
+  onRespondPermission?: (requestId: number | string, optionId: string) => void
+}) {
   const tc = () => props.toolCall
-  const statusColor = () => {
-    switch (tc().status) {
-      case "completed":
-        return "border-green-700"
-      case "failed":
-        return "border-red-700"
-      case "in_progress":
-        return "border-yellow-700"
-      default:
-        return "border-border-base"
-    }
-  }
-
   return (
-    <div
-      data-testid="tool-call-card"
-      class={`rounded-md border px-3 py-2 text-xs ${statusColor()}`}
-    >
-      <div class="flex items-center gap-2 mb-1">
-        <span class="font-mono font-semibold">
-          {tc().kind ?? "tool"}: {tc().title}
-        </span>
-        <span class="ml-auto opacity-60">
-          [{toolStatusIcon(tc().status)}]
-        </span>
-      </div>
-      <Show when={tc().content && tc().content!.length > 0}>
-        <div class="mt-1 text-xs opacity-70 whitespace-pre-wrap max-h-32 overflow-y-auto font-mono">
-          <For each={tc().content}>
-            {(item) => {
-              if (item.type === "content" && item.content.type === "text") {
-                return <span>{item.content.text}</span>
-              }
-              if (item.type === "diff") {
-                return (
-                  <span class="text-blue-300">
-                    diff {item.path}
-                  </span>
-                )
-              }
-              return null
-            }}
-          </For>
-        </div>
+    <div data-testid="tool-call-card">
+      <BasicTool
+        icon={toolKindIcon(tc().kind)}
+        trigger={{
+          title: tc().title,
+          subtitle: tc().kind ?? "tool",
+        }}
+        defaultOpen={false}
+        forceOpen={!!props.pendingPermission}
+      >
+        <Show when={tc().content && tc().content!.length > 0}>
+          <div class="space-y-2">
+            <For each={tc().content}>
+              {(item) => {
+                if (item.type === "diff") {
+                  const diffItem = item as ToolCallDiff
+                  return (
+                    <Diff
+                      before={{ name: diffItem.path, contents: diffItem.oldText ?? "" }}
+                      after={{ name: diffItem.path, contents: diffItem.newText }}
+                    />
+                  )
+                }
+                if (item.type === "content" && item.content.type === "text") {
+                  return (
+                    <div data-component="tool-output" data-scrollable class="max-h-64 overflow-y-auto">
+                      <Markdown text={item.content.text} class="text-xs" />
+                    </div>
+                  )
+                }
+                if (item.type === "terminal") {
+                  return (
+                    <div class="text-xs opacity-60 font-mono">
+                      Terminal: {(item as { terminalId: string }).terminalId}
+                    </div>
+                  )
+                }
+                return null
+              }}
+            </For>
+          </div>
+        </Show>
+        <Show when={tc().rawOutput}>
+          <div data-component="tool-output" data-scrollable class="max-h-64 overflow-y-auto mt-2">
+            <Markdown text={`\`\`\`json\n${JSON.stringify(tc().rawOutput, null, 2)}\n\`\`\``} class="text-xs" />
+          </div>
+        </Show>
+      </BasicTool>
+
+      {/* Inline permission prompt */}
+      <Show when={props.pendingPermission}>
+        {(perm) => (
+          <div class="mt-1 rounded-md border border-amber-700 bg-[rgba(217,119,6,0.08)] px-3 py-2 text-xs">
+            <div class="font-medium mb-1.5">Permission required</div>
+            <div class="flex gap-2 flex-wrap">
+              <For each={perm().options}>
+                {(opt) => {
+                  const isAllow = opt.kind === "allow_once" || opt.kind === "allow_always"
+                  return (
+                    <button
+                      type="button"
+                      data-testid={`perm-option-${opt.kind}`}
+                      class="px-2.5 py-1 rounded text-xs font-medium cursor-pointer border transition-colors"
+                      classList={{
+                        "bg-green-900 border-green-700 text-green-300 hover:bg-green-800": isAllow,
+                        "bg-red-900 border-red-700 text-red-300 hover:bg-red-800": !isAllow,
+                      }}
+                      onClick={() => props.onRespondPermission?.(perm().requestId, opt.optionId)}
+                    >
+                      {opt.name}
+                    </button>
+                  )
+                }}
+              </For>
+            </div>
+          </div>
+        )}
       </Show>
     </div>
   )
@@ -1214,6 +1285,7 @@ function ToolCallCard(props: { toolCall: ToolCall }) {
 // Permission request card
 // ---------------------------------------------------------------------------
 
+/** Standalone permission card for orphan permissions not associated with a visible tool call. */
 function PermissionCard(props: {
   request: PermissionRequest
   onRespond: (requestId: number | string, optionId: string) => void
@@ -1260,6 +1332,49 @@ function PermissionCard(props: {
 }
 
 // ---------------------------------------------------------------------------
+// Plan display
+// ---------------------------------------------------------------------------
+
+function PlanDisplay(props: { entries: PlanEntry[] }) {
+  return (
+    <Show when={props.entries.length > 0}>
+      <div class="rounded-md border border-border-base px-3 py-2 text-xs" data-testid="plan-display">
+        <div class="font-medium mb-1.5 text-text-strong">Plan</div>
+        <div class="space-y-1">
+          <For each={props.entries}>
+            {(entry) => {
+              const statusIcon = () => {
+                switch (entry.status) {
+                  case "completed": return "✓"
+                  case "in_progress": return "●"
+                  case "pending": return "○"
+                  default: return "○"
+                }
+              }
+              const statusColor = () => {
+                switch (entry.status) {
+                  case "completed": return "text-green-400"
+                  case "in_progress": return "text-yellow-400"
+                  default: return "text-text-weak"
+                }
+              }
+              return (
+                <div class="flex items-start gap-2">
+                  <span class={`font-mono ${statusColor()} shrink-0`}>{statusIcon()}</span>
+                  <span classList={{ "line-through opacity-50": entry.status === "completed" }}>
+                    {entry.content}
+                  </span>
+                </div>
+              )
+            }}
+          </For>
+        </div>
+      </div>
+    </Show>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Prompt input bar
 // ---------------------------------------------------------------------------
 
@@ -1269,66 +1384,204 @@ function PromptBar(props: {
   onCancel: () => void
   prompting: boolean
   disabled: boolean
+  availableCommands?: Array<{ name: string; description: string }>
 }) {
   const [text, setText] = createSignal("")
+  const [showSlashMenu, setShowSlashMenu] = createSignal(false)
+  const [selectedSlashIdx, setSelectedSlashIdx] = createSignal(0)
+  let textareaRef: HTMLTextAreaElement | undefined
 
-  function handleSubmit(e: Event) {
-    e.preventDefault()
-    const val = text().trim()
-    if (!val) return
-    props.onSend(val)
-    setText("")
+  // Prompt history -- persisted to localStorage so it survives page refresh.
+  const historyKey = `devaipod-prompt-history-${props.sessionId ?? "default"}`
+  const promptHistory: string[] = (() => {
+    try { return JSON.parse(localStorage.getItem(historyKey) || "[]") }
+    catch { return [] }
+  })()
+  let historyIdx = -1
+  let draftText = ""  // Preserves what was typed before entering history
+
+  function saveHistory() {
+    try {
+      // Keep last 100 entries.
+      localStorage.setItem(historyKey, JSON.stringify(promptHistory.slice(0, 100)))
+    } catch { /* ignore */ }
   }
 
-  function handleKeyDown(e: KeyboardEvent) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault()
-      handleSubmit(e)
+  const filteredCommands = createMemo(() => {
+    if (!showSlashMenu() || !props.availableCommands) return []
+    const input = text().slice(1).toLowerCase() // Remove leading /
+    return props.availableCommands.filter((cmd) =>
+      cmd.name.toLowerCase().includes(input)
+    )
+  })
+
+  function autoResize() {
+    if (textareaRef) {
+      textareaRef.style.height = "auto"
+      textareaRef.style.height = Math.min(textareaRef.scrollHeight, 200) + "px"
     }
   }
 
+  function handleSubmit(e?: Event) {
+    e?.preventDefault()
+    const val = text().trim()
+    if (!val) return
+    promptHistory.unshift(val)
+    historyIdx = -1
+    draftText = ""
+    saveHistory()
+    props.onSend(val)
+    setText("")
+    setShowSlashMenu(false)
+    if (textareaRef) {
+      textareaRef.style.height = "auto"
+    }
+  }
+
+  function handleInput(e: InputEvent) {
+    const val = (e.currentTarget as HTMLTextAreaElement).value
+    setText(val)
+    // Show slash command menu when text starts with /
+    if (val.startsWith("/") && !val.includes(" ")) {
+      setShowSlashMenu(true)
+      setSelectedSlashIdx(0)
+    } else {
+      setShowSlashMenu(false)
+    }
+    autoResize()
+  }
+
+  function handleKeyDown(e: KeyboardEvent) {
+    if (showSlashMenu() && filteredCommands().length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault()
+        setSelectedSlashIdx((idx) => Math.min(idx + 1, filteredCommands().length - 1))
+        return
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault()
+        setSelectedSlashIdx((idx) => Math.max(idx - 1, 0))
+        return
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault()
+        const cmd = filteredCommands()[selectedSlashIdx()]
+        if (cmd) {
+          setText(cmd.name + " ")
+          setShowSlashMenu(false)
+        }
+        return
+      }
+      if (e.key === "Escape") {
+        setShowSlashMenu(false)
+        return
+      }
+    }
+
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault()
+      handleSubmit()
+      return
+    }
+    // Prompt history navigation (only when cursor at start/end)
+    if (e.key === "ArrowUp" && promptHistory.length > 0) {
+      const textarea = e.currentTarget as HTMLTextAreaElement
+      if (textarea.selectionStart === 0 && textarea.selectionEnd === 0) {
+        e.preventDefault()
+        // Save draft before entering history
+        if (historyIdx === -1) {
+          draftText = text()
+        }
+        historyIdx = Math.min(historyIdx + 1, promptHistory.length - 1)
+        setText(promptHistory[historyIdx])
+        requestAnimationFrame(autoResize)
+      }
+    }
+    if (e.key === "ArrowDown" && historyIdx >= 0) {
+      e.preventDefault()
+      historyIdx--
+      if (historyIdx >= 0) {
+        setText(promptHistory[historyIdx])
+      } else {
+        // Back to draft
+        setText(draftText)
+      }
+      requestAnimationFrame(autoResize)
+    }
+  }
+
+  function selectSlashCommand(cmd: { name: string }) {
+    setText(cmd.name + " ")
+    setShowSlashMenu(false)
+    textareaRef?.focus()
+  }
+
   return (
-    <form
-      onSubmit={handleSubmit}
-      class="flex items-center gap-2 px-3 py-2 border-t border-border-base shrink-0"
-      data-testid="prompt-bar"
-    >
-      <input
-        type="text"
-        data-testid="prompt-input"
-        class="flex-1 bg-fill-element-base border border-border-base rounded-md px-3 py-2 text-sm text-text-strong outline-none focus:border-blue-500 transition-colors"
-        placeholder={
-          props.disabled
-            ? "Connecting..."
-            : "Type a message..."
-        }
-        disabled={props.disabled}
-        value={text()}
-        onInput={(e) => setText(e.currentTarget.value)}
-        onKeyDown={handleKeyDown}
-      />
-      <Show
-        when={!props.prompting}
-        fallback={
-          <button
-            type="button"
-            data-testid="cancel-btn"
-            class="px-3.5 py-2 rounded-md text-sm font-medium cursor-pointer border border-red-700 bg-red-900 text-red-300 hover:bg-red-800 transition-colors"
-            onClick={props.onCancel}
-          >
-            Cancel
-          </button>
-        }
-      >
-        <button
-          type="submit"
-          data-testid="send-btn"
-          class="px-3.5 py-2 rounded-md text-sm font-medium cursor-pointer border border-blue-700 bg-blue-900 text-blue-300 hover:bg-blue-800 transition-colors disabled:opacity-30 disabled:cursor-default"
-          disabled={props.disabled || !text().trim()}
-        >
-          Send
-        </button>
+    <div class="relative border-t border-border-base shrink-0" data-testid="prompt-bar">
+      {/* Slash command menu */}
+      <Show when={showSlashMenu() && filteredCommands().length > 0}>
+        <div class="absolute bottom-full left-3 right-3 mb-1 bg-surface-base border border-border-base rounded-md shadow-lg max-h-48 overflow-y-auto z-10">
+          <For each={filteredCommands()}>
+            {(cmd, idx) => (
+              <button
+                type="button"
+                class="w-full text-left px-3 py-1.5 text-sm hover:bg-fill-element-base transition-colors cursor-pointer"
+                classList={{ "bg-fill-element-base": idx() === selectedSlashIdx() }}
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  selectSlashCommand(cmd)
+                }}
+              >
+                <span class="font-mono text-blue-400">{cmd.name}</span>
+                <span class="ml-2 opacity-60">{cmd.description}</span>
+              </button>
+            )}
+          </For>
+        </div>
       </Show>
-    </form>
+
+      <form
+        onSubmit={handleSubmit}
+        class="flex items-end gap-2 px-3 py-2"
+      >
+        <textarea
+          ref={textareaRef}
+          data-testid="prompt-input"
+          class="flex-1 bg-fill-element-base border border-border-base rounded-md px-3 py-2 text-sm text-text-strong outline-none focus:border-blue-500 transition-colors resize-none min-h-[38px] max-h-[200px]"
+          placeholder={
+            props.disabled
+              ? "Connecting..."
+              : "Type a message... (Shift+Enter for newline, / for commands)"
+          }
+          disabled={props.disabled}
+          value={text()}
+          onInput={handleInput}
+          onKeyDown={handleKeyDown}
+          rows={1}
+        />
+        <Show
+          when={!props.prompting}
+          fallback={
+            <button
+              type="button"
+              data-testid="cancel-btn"
+              class="px-3.5 py-2 rounded-md text-sm font-medium cursor-pointer border border-red-700 bg-red-900 text-red-300 hover:bg-red-800 transition-colors"
+              onClick={props.onCancel}
+            >
+              Cancel
+            </button>
+          }
+        >
+          <button
+            type="submit"
+            data-testid="send-btn"
+            class="px-3.5 py-2 rounded-md text-sm font-medium cursor-pointer border border-blue-700 bg-blue-900 text-blue-300 hover:bg-blue-800 transition-colors disabled:opacity-30 disabled:cursor-default"
+            disabled={props.disabled || !text().trim()}
+          >
+            Send
+          </button>
+        </Show>
+      </form>
+    </div>
   )
 }
