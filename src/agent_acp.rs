@@ -364,7 +364,6 @@ mod tests {
         let backend = AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let env_config = AgentEnvConfig {
             agent_home: "/home/devenv".to_string(),
-            auto_approve: true,
             enable_gator: true,
             gator_port: 8765,
             enable_orchestration: false,
@@ -383,7 +382,6 @@ mod tests {
         let backend = AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let env_config = AgentEnvConfig {
             agent_home: "/home/devenv".to_string(),
-            auto_approve: true,
             enable_gator: true,
             gator_port: 8765,
             enable_orchestration: false,

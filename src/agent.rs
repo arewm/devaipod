@@ -88,8 +88,6 @@ impl Default for AgentStatusSummary {
 pub(crate) struct AgentEnvConfig {
     /// Home directory inside the agent container.
     pub(crate) agent_home: String,
-    /// Whether tool permissions should be auto-approved.
-    pub(crate) auto_approve: bool,
     /// Whether service-gator is enabled.
     pub(crate) enable_gator: bool,
     /// Port of the service-gator MCP server (if enabled).

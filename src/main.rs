@@ -530,13 +530,6 @@ struct UpOptions {
     /// settings (nested containers, lifecycle commands, etc.) always apply.
     #[arg(long)]
     use_default_devcontainer: bool,
-    /// Disable auto-approve of tool permissions
-    ///
-    /// By default, the agent container has all tool permissions set to "allow"
-    /// so it runs autonomously. Use this flag to disable that and require
-    /// interactive approval for tool usage.
-    #[arg(long)]
-    no_auto_approve: bool,
     /// Additional source directories to mount read-only in the agent container.
     ///
     /// Each directory is bind-mounted at /mnt/source/<dirname>/ (read-only).
@@ -580,8 +573,6 @@ struct CreateOptions {
     devcontainer_json: Option<String>,
     /// Use the devcontainer.json from dotfiles instead of the project's
     use_default_devcontainer: bool,
-    /// Whether to auto-approve all tool permissions (default: true)
-    auto_approve: bool,
     /// Additional source directories to mount read-only
     source_dirs: Vec<PathBuf>,
 }
@@ -602,7 +593,6 @@ impl CreateOptions {
             mcp_servers: opts.mcp_servers.clone(),
             devcontainer_json: opts.devcontainer_json.clone(),
             use_default_devcontainer: opts.use_default_devcontainer,
-            auto_approve: !opts.no_auto_approve,
             source_dirs: opts.source_dirs.clone(),
         }
     }
@@ -1012,13 +1002,6 @@ enum HostCommand {
         /// Use the devcontainer.json from your dotfiles repo instead of the project's
         #[arg(long)]
         use_default_devcontainer: bool,
-        /// Disable auto-approve of tool permissions
-        ///
-        /// By default, the agent container has all tool permissions set to "allow"
-        /// so it runs autonomously. Use this flag to disable that and require
-        /// interactive approval for tool usage.
-        #[arg(long)]
-        no_auto_approve: bool,
         /// Human-readable title for this session (e.g. "refactoring auth")
         #[arg(long, value_name = "TITLE")]
         title: Option<String>,
@@ -1835,7 +1818,6 @@ async fn run_host(cli: HostCli) -> Result<()> {
             mcp_servers,
             devcontainer_json,
             use_default_devcontainer,
-            no_auto_approve,
             title,
             source_dirs,
         } => {
@@ -1972,7 +1954,6 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 &mcp_servers,
                 devcontainer_json.as_deref(),
                 use_default_devcontainer,
-                !no_auto_approve,
                 title.as_deref(),
                 &source_dirs,
             )
@@ -2160,7 +2141,6 @@ async fn cmd_devcontainer_run(
         mcp_servers: vec![],
         devcontainer_json: devcontainer_json.map(|s| s.to_string()),
         use_default_devcontainer,
-        auto_approve: false,
         source_dirs: vec![],
     };
 
@@ -3363,7 +3343,6 @@ async fn create_workspace_from_local(
         opts.task.as_deref(),
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
-        opts.auto_approve,
         &source_dirs,
         backend.as_ref(),
     )
@@ -3464,7 +3443,6 @@ async fn create_workspace_without_source(
         opts.task.as_deref(),
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
-        opts.auto_approve,
         &source_dirs,
         backend.as_ref(),
     )
@@ -3671,7 +3649,6 @@ async fn create_workspace_from_remote(
         opts.task.as_deref(),
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
-        opts.auto_approve,
         &source_dirs,
         backend.as_ref(),
     )
@@ -3857,7 +3834,6 @@ async fn create_workspace_from_pr(
         opts.task.as_deref(),
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
-        opts.auto_approve,
         &source_dirs,
         backend.as_ref(),
     )
@@ -3941,7 +3917,6 @@ async fn cmd_run(
     mcp_servers: &[String],
     devcontainer_json: Option<&str>,
     use_default_devcontainer: bool,
-    auto_approve: bool,
     title: Option<&str>,
     source_dirs: &[PathBuf],
 ) -> Result<String> {
@@ -3958,7 +3933,6 @@ async fn cmd_run(
         mcp_servers: mcp_servers.to_vec(),
         devcontainer_json: devcontainer_json.map(|s| s.to_string()),
         use_default_devcontainer,
-        auto_approve,
         source_dirs: source_dirs.to_vec(),
     };
 
@@ -6336,7 +6310,6 @@ async fn create_advisor_pod(
         &[],   // no CLI mcp_servers — entry is already in the config
         None,  // no devcontainer override
         false, // don't override project devcontainer
-        true,  // auto_approve
         None,  // no title for advisor
         &canonicalize_source_dirs(source_dirs), // read-only source dirs
     )
@@ -8106,7 +8079,6 @@ async fn cmd_rebuild(
         None, // task - agent home volume persists with original task
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
-        true, // auto_approve: rebuilds keep default behavior
         &[],  // source_dirs: not supported for rebuild yet
         backend.as_ref(),
     )
@@ -8933,17 +8905,21 @@ fn cmd_opencode_status(pod_name: &str, json_output: bool) -> Result<()> {
 
 /// Check if the agent is listening on its port
 fn check_agent_health(pod_name: &str) -> Option<bool> {
-    let agent_container = format!("{}-agent", pod_name);
+    let api_container = format!("{}-api", pod_name);
 
-    // Use bash's built-in /dev/tcp to check if the port is accepting
-    // connections.  This avoids depending on `nc` which may not be
-    // installed (e.g. the devaipod image used for the advisor pod).
-    let check_cmd = format!(
-        "echo >/dev/tcp/localhost/{} 2>/dev/null",
-        pod::OPENCODE_PORT
-    );
+    // Check the pod-api sidecar's health endpoint. With ACP, the agent
+    // communicates via stdio (no HTTP port), so we check the sidecar
+    // that manages the agent lifecycle.
     let result = podman_command()
-        .args(["exec", &agent_container, "bash", "-c", &check_cmd])
+        .args([
+            "exec",
+            &api_container,
+            "curl",
+            "-sf",
+            &format!("http://localhost:{}/healthz", pod::POD_API_PORT),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
 
     match result {

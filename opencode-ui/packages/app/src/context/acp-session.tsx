@@ -955,8 +955,8 @@ export function AcpSessionProvider(props: ParentProps<{ podName: string }>) {
   }
 
   function handlePermissionRequest(request: PermissionRequest) {
-    // Permission requests are handled by the backend's auto_approve AtomicBool.
-    // If they reach the frontend, they need manual approval.
+    // With ACP, each agent handles permissions internally via its own headless/YOLO
+    // configuration. If permission requests reach the frontend, they need manual approval.
     // Show in UI for manual approval - route to active pane's active tab
     const activePane = store.panes.find((p) => p.id === store.activePaneId)
     if (!activePane) return

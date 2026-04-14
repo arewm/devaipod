@@ -521,7 +521,6 @@ impl DevaipodPod {
         task: Option<&str>,
         enable_orchestration: bool,
         worker_gator_mode: WorkerGatorMode,
-        auto_approve: bool,
         source_dirs: &[PathBuf],
         backend: &dyn crate::agent::AgentBackend,
     ) -> Result<Self> {
@@ -1228,7 +1227,6 @@ impl DevaipodPod {
             &agent_home_volume,
             worker_workspace_volume_name.as_deref(),
             global_config,
-            auto_approve,
             &source_mounts,
         );
         podman
@@ -3087,7 +3085,6 @@ exec sleep infinity
         agent_home_volume: &str,
         worker_workspace_volume: Option<&str>,
         global_config: &crate::config::Config,
-        auto_approve: bool,
         source_mounts: &[(PathBuf, String, bool)],
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
@@ -3280,7 +3277,6 @@ exec sleep infinity
         // Delegate agent-specific env vars to the backend
         let env_config = crate::agent::AgentEnvConfig {
             agent_home: AGENT_HOME_PATH.to_string(),
-            auto_approve,
             enable_gator,
             gator_port: GATOR_PORT,
             enable_orchestration,
@@ -4072,7 +4068,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -4116,8 +4111,8 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_container_config_auto_approve_disabled() {
-        // ACP backend doesn't set OPENCODE_PERMISSION regardless of auto_approve
+    fn test_agent_container_config_acp_no_legacy_env() {
+        // ACP backend doesn't set OPENCODE_PERMISSION (permissions are per-agent)
         let project_path = Path::new("/home/user/myproject");
         let workspace_folder = "/workspaces/myproject";
         let bind_home = BindHomeConfig::default();
@@ -4140,7 +4135,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            false, // auto_approve disabled
             &[],   // source_mounts
         );
 
@@ -4175,7 +4169,6 @@ mod tests {
             "test-agent-home",
             Some("test-worker-workspace"), // worker_workspace_volume
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -4237,7 +4230,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -4277,7 +4269,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -4767,7 +4758,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -5447,7 +5437,6 @@ mod tests {
             "test-agent-home-vol",
             None, // worker_workspace_volume
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -5626,7 +5615,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -5703,7 +5691,6 @@ mod tests {
             "test-agent-home",
             None,
             &global_config,
-            true,
             &source_mounts,
         );
 

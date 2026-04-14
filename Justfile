@@ -72,11 +72,12 @@ run *ARGS: build-release
 # Build and install the host CLI shim to ~/.local/bin, build the
 # container image, and start the server. This is the one-stop
 # "get me running" target for local development.
-install: container-build
+install: container-build install-server
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p devaipod-host
-    install -D -m 0755 target/release/devaipod ~/.local/bin/devaipod
+    mkdir -p ~/.local/bin
+    install -m 0755 target/release/devaipod ~/.local/bin/devaipod
     echo "Installed devaipod to ~/.local/bin/devaipod"
     echo "Make sure ~/.local/bin is on your PATH."
     echo ""
