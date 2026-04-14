@@ -199,7 +199,7 @@ git merge worker/main --no-edit
 git log --oneline -5  # Show recent commits
 ```
 "#,
-        worker_port = crate::agent_opencode::WORKER_PORT,
+        worker_port = crate::pod::WORKER_PORT,
         agent_home = AGENT_HOME_PATH,
     )
 }
@@ -323,7 +323,7 @@ mod tests {
     fn test_orchestration_instructions_contains_worker_port() {
         let instructions = orchestration_instructions();
         assert!(
-            instructions.contains(&format!("localhost:{}", crate::agent_opencode::WORKER_PORT)),
+            instructions.contains(&format!("localhost:{}", crate::pod::WORKER_PORT)),
             "Should contain worker port"
         );
     }

@@ -9,7 +9,6 @@
 //! standardizes communication between frontends and coding agents. See
 //! <https://agentclientprotocol.com> for the specification.
 
-use color_eyre::eyre::Result;
 
 use crate::agent::{
     AgentActivity, AgentBackend, AgentEnvConfig, AgentStartupConfig, AgentStatusSummary,
@@ -62,13 +61,99 @@ impl AgentBackend for AcpBackend {
         // started on-demand by pod-api via `podman exec -i`, not as a
         // long-running server. The container just needs to stay alive so
         // pod-api can exec into it.
+        //
+        // Pre-flight check: verify the agent binary exists before waiting
+        // for setup. This allows the control plane to detect missing binaries
+        // and enter Degraded state with diagnostic information.
+        let agent_binary_check = if !self.command.is_empty() {
+            let binary = &self.command[0];
+            format!(
+                r#"
+# Pre-flight: verify the agent binary is available before waiting for setup.
+# Skip in mock mode — the mock agent doesn't need the real binary.
+if [ -z "${{DEVAIPOD_MOCK_AGENT}}" ] && ! command -v {binary} >/dev/null 2>&1; then
+    echo "devaipod-error: agent-binary-not-found: {binary}" >&2
+    exit 42
+fi
+"#
+            )
+        } else {
+            String::new()
+        };
+
         let startup_script = format!(
             r#"mkdir -p {home}/.config {home}/.local/share {home}/.local/bin {home}/.cache
-
+{binary_check}
 # Wait for devaipod to finish setup (dotfiles, task config).
 while [ ! -f {state} ]; do
     sleep 0.1
 done
+
+# Mock ACP mode: when DEVAIPOD_MOCK_AGENT is set, install a Python script
+# that responds to ACP JSON-RPC on stdio. Pod-api will exec into this
+# container to start the mock agent.
+if [ -n "${{DEVAIPOD_MOCK_AGENT}}" ]; then
+    mkdir -p {home}/.local/bin
+    cat > {home}/.local/bin/mock-acp-agent << 'MOCK_SCRIPT'
+#!/usr/bin/env python3
+"""Minimal ACP mock agent for integration testing."""
+import sys, json
+
+def respond(id, result):
+    msg = json.dumps({{"jsonrpc": "2.0", "id": id, "result": result}})
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+def notify(method, params):
+    msg = json.dumps({{"jsonrpc": "2.0", "method": method, "params": params}})
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = req.get("method", "")
+    rid = req.get("id")
+    if method == "initialize":
+        respond(rid, {{
+            "protocolVersion": 1,
+            "agentCapabilities": {{"loadSession": True}},
+            "agentInfo": {{"name": "MockAgent", "version": "1.0.0"}}
+        }})
+    elif method == "session/new":
+        sid = "mock-session-001"
+        respond(rid, {{"sessionId": sid, "modes": {{}}}})
+    elif method == "session/list":
+        respond(rid, {{"sessions": [{{"sessionId": "mock-session-001", "title": "Mock session"}}]}})
+    elif method == "session/load":
+        notify("session/update", {{
+            "sessionId": req.get("params", {{}}).get("sessionId", ""),
+            "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "Mock session loaded."}}}}
+        }})
+        respond(rid, {{}})
+    elif method == "session/prompt":
+        sid = req.get("params", {{}}).get("sessionId", "")
+        notify("session/update", {{
+            "sessionId": sid,
+            "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "Mock response."}}}}
+        }})
+        respond(rid, {{"stopReason": "end_turn"}})
+    elif method == "session/cancel":
+        if rid:
+            respond(rid, {{}})
+    elif method == "initialized":
+        pass  # notification, no response needed
+    else:
+        if rid:
+            respond(rid, {{}})
+MOCK_SCRIPT
+    chmod +x {home}/.local/bin/mock-acp-agent
+fi
 
 # Keep the container alive. Pod-api will start the ACP session on-demand
 # via `podman exec -i <agent-container> <agent-command>`.
@@ -77,6 +162,7 @@ while true; do
 done"#,
             home = agent_home,
             state = state_path,
+            binary_check = agent_binary_check,
         );
 
         AgentStartupConfig {
@@ -89,14 +175,33 @@ done"#,
     fn container_env(&self, config: &AgentEnvConfig) -> Vec<(String, String)> {
         // ACP backends configure tool permissions through the ACP protocol
         // (session/request_permission), not through environment variables.
-        // However, agents still need MCP server config and internal YOLO
-        // settings so they don't double-prompt.
+        // However, agents still need MCP server config so they can access
+        // MCP tools like service-gator.
         //
-        // The specific env vars depend on which agent binary is being used.
-        // For now (Phase 1 stub), we produce nothing. Phase 2 will add
-        // per-agent-profile env var generation.
-        let _ = config;
-        vec![]
+        // Generate OPENCODE_CONFIG_CONTENT from the MCP servers list.
+        // This is the same format used by the old OpenCode HTTP backend.
+        let mut env = vec![];
+
+        if !config.mcp_servers.is_empty() {
+            let mut mcp_servers_map = serde_json::Map::new();
+
+            // mcp_servers is Vec<(String, serde_json::Value)>
+            // where the tuple is (name, server_config_json)
+            for (name, server_json) in &config.mcp_servers {
+                mcp_servers_map.insert(name.clone(), server_json.clone());
+            }
+
+            let mcp_config = serde_json::json!({
+                "mcp": mcp_servers_map
+            });
+
+            env.push((
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                mcp_config.to_string(),
+            ));
+        }
+
+        env
     }
 
     fn mock_config(&self, port: u16) -> MockServerConfig {
@@ -105,15 +210,6 @@ done"#,
             // ACP uses stdio, not HTTP. The mock will be a stdio-based
             // JSON-RPC server in Phase 2.
             is_http: false,
-        }
-    }
-
-    async fn run_mock_server(&self, _port: u16) -> Result<()> {
-        // Stub: Phase 2 will implement a mock ACP server over stdio.
-        tracing::warn!("ACP mock server not yet implemented");
-        // Sleep indefinitely to keep the process alive (matches mock server behavior).
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     }
 
@@ -141,9 +237,15 @@ mod tests {
             config.startup_script.contains("while true"),
             "startup script should keep container alive with infinite loop"
         );
+        // The startup script now includes "command -v opencode" for the pre-flight
+        // check, but should not run "opencode serve" or "exec opencode".
         assert!(
-            !config.startup_script.contains("opencode"),
-            "agent command should not be in startup script (run via podman exec instead)"
+            config.startup_script.contains("command -v opencode"),
+            "startup script should check for opencode binary"
+        );
+        assert!(
+            !config.startup_script.contains("exec opencode"),
+            "startup script should not exec opencode (run via podman exec instead)"
         );
     }
 
@@ -159,10 +261,32 @@ mod tests {
             !config.startup_script.contains("opencode"),
             "agent command should not be in startup script (run via podman exec instead)"
         );
+        assert!(
+            !config.startup_script.contains("command -v"),
+            "empty command vec should not generate binary check"
+        );
     }
 
     #[test]
-    fn test_acp_backend_container_env_is_empty() {
+    fn test_acp_backend_startup_command_with_binary_check() {
+        let backend = AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let config = backend.startup_command("/home/devenv", "/var/lib/state.json");
+        assert!(
+            config.startup_script.contains("command -v opencode"),
+            "should check for opencode binary"
+        );
+        assert!(
+            config.startup_script.contains("devaipod-error: agent-binary-not-found: opencode"),
+            "should print diagnostic message on missing binary"
+        );
+        assert!(
+            config.startup_script.contains("exit 42"),
+            "should exit with code 42 on missing binary"
+        );
+    }
+
+    #[test]
+    fn test_acp_backend_container_env_empty_when_no_mcp_servers() {
         let backend = AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let env_config = AgentEnvConfig {
             agent_home: "/home/devenv".to_string(),
@@ -174,7 +298,39 @@ mod tests {
             mcp_servers: vec![],
         };
         let env = backend.container_env(&env_config);
-        assert!(env.is_empty(), "ACP stub should not produce env vars yet");
+        assert!(env.is_empty(), "No MCP servers means no OPENCODE_CONFIG_CONTENT");
+    }
+
+    #[test]
+    fn test_acp_backend_container_env_with_mcp_servers() {
+        let backend = AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let env_config = AgentEnvConfig {
+            agent_home: "/home/devenv".to_string(),
+            auto_approve: true,
+            enable_gator: true,
+            gator_port: 8765,
+            enable_orchestration: false,
+            worker_port: 4098,
+            mcp_servers: vec![(
+                "service-gator".to_string(),
+                serde_json::json!({
+                    "type": "remote",
+                    "url": "http://localhost:8765/mcp",
+                    "enabled": true
+                }),
+            )],
+        };
+        let env = backend.container_env(&env_config);
+        assert_eq!(env.len(), 1, "Should have OPENCODE_CONFIG_CONTENT");
+
+        let (key, value) = &env[0];
+        assert_eq!(key, "OPENCODE_CONFIG_CONTENT");
+        assert!(value.contains("service-gator"), "Config should reference service-gator");
+        assert!(value.contains("http://localhost:8765/mcp"), "Config should have gator URL");
+
+        // Verify it's valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(value).expect("should be valid JSON");
+        assert!(parsed.get("mcp").is_some(), "Should have 'mcp' field");
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Agent backend trait and shared types.
 //!
-//! Abstracts what devaipod needs from an agent backend. Implementations
-//! exist for:
-//! - OpenCode HTTP API (legacy, `agent_opencode.rs`)
+//! Abstracts what devaipod needs from an agent backend.
+//!
+//! Current implementation:
 //! - ACP (Agent Client Protocol) over stdio (`agent_acp.rs`)
 //!
 //! The trait is object-safe so it can be used as `Box<dyn AgentBackend>`.
@@ -84,9 +84,9 @@ impl Default for AgentStatusSummary {
 /// Passed to [`AgentBackend::container_env`] so the backend can produce
 /// agent-specific env vars without reaching into global config itself.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields are set by pod.rs, read by backend implementations
 pub(crate) struct AgentEnvConfig {
     /// Home directory inside the agent container.
-    #[allow(dead_code)] // Available for backends that need it
     pub(crate) agent_home: String,
     /// Whether tool permissions should be auto-approved.
     pub(crate) auto_approve: bool,
@@ -138,8 +138,7 @@ pub(crate) struct MockServerConfig {
 
 /// Trait abstracting what devaipod needs from an agent backend.
 ///
-/// Implementations exist for:
-/// - OpenCode HTTP API (legacy) — [`crate::agent_opencode::OpenCodeBackend`]
+/// Current implementation:
 /// - ACP (Agent Client Protocol) over stdio — [`crate::agent_acp::AcpBackend`]
 ///
 /// The trait is object-safe: `Box<dyn AgentBackend>` compiles.
@@ -176,12 +175,6 @@ pub(crate) trait AgentBackend: Send + Sync + std::fmt::Debug {
     /// Used in integration tests to provide a test double.
     #[allow(dead_code)] // Will be used by integration test harness
     fn mock_config(&self, port: u16) -> MockServerConfig;
-
-    /// Run the mock agent server for integration testing.
-    ///
-    /// Starts a mock server that responds to the same protocol as the
-    /// real agent, making the agent appear idle.
-    async fn run_mock_server(&self, port: u16) -> color_eyre::Result<()>;
 
     /// Returns the agent's display name (e.g. "opencode", "acp").
     #[allow(dead_code)] // Used by logging and display

@@ -847,6 +847,7 @@ impl AcpClient {
     }
 
     /// Kill the child process (no-op for test clients without a child).
+    #[allow(dead_code)] // Used in integration tests
     pub(crate) async fn kill(&self) {
         if let Some(child) = &self.child {
             let mut child = child.lock().await;
@@ -1028,6 +1029,50 @@ mod tests {
                 }
                 "session/cancel" => {
                     // Notification — no response.
+                }
+                "session/list" => {
+                    let resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "sessions": [
+                                {
+                                    "sessionId": "mock-001",
+                                    "title": "Test session",
+                                    "updatedAt": "2026-01-01T00:00:00Z"
+                                }
+                            ]
+                        }
+                    });
+                    Self::write_line(writer, &resp).await;
+                }
+                "session/load" => {
+                    let session_id = msg
+                        .pointer("/params/sessionId")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+
+                    // Send a session/update notification (replayed message).
+                    let update = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "type": "agent_message_chunk",
+                                "text": "Replayed message from history"
+                            }
+                        }
+                    });
+                    Self::write_line(writer, &update).await;
+
+                    // Respond with empty result.
+                    let resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {}
+                    });
+                    Self::write_line(writer, &resp).await;
                 }
                 _ => {
                     // Unknown method — return error.
@@ -2059,5 +2104,146 @@ mod tests {
                 .unwrap()
                 .contains("unknownMethod")
         );
+    }
+
+    #[tokio::test]
+    async fn test_acp_list_sessions() {
+        let (client, mut event_rx, _handle) = MockAcpAgent::spawn_with_client();
+
+        client.initialize().await.unwrap();
+        let _init_event = event_rx.recv().await.unwrap();
+
+        let session_id = client.new_session("/tmp").await.unwrap();
+        let _session_event = event_rx.recv().await.unwrap();
+
+        // Call list_sessions.
+        let result = client.list_sessions().await;
+        assert!(result.is_ok(), "list_sessions() failed: {:?}", result.err());
+
+        let resp = result.unwrap();
+        let sessions = resp.get("sessions").and_then(|s| s.as_array()).unwrap();
+        assert_eq!(sessions.len(), 1, "expected 1 session in list");
+        assert_eq!(sessions[0]["sessionId"], "mock-001");
+        assert_eq!(sessions[0]["title"], "Test session");
+        assert_eq!(sessions[0]["updatedAt"], "2026-01-01T00:00:00Z");
+
+        // Verify known_sessions includes the listed session ID.
+        let known = client.known_sessions.lock().await;
+        assert!(known.contains("mock-001"), "mock-001 should be in known_sessions");
+        assert!(known.contains(&session_id), "created session should be in known_sessions");
+
+        client.kill().await;
+    }
+
+    #[tokio::test]
+    async fn test_acp_load_session() {
+        let (client, mut event_rx, _handle) = MockAcpAgent::spawn_with_client();
+
+        client.initialize().await.unwrap();
+        let _init_event = event_rx.recv().await.unwrap();
+
+        let session_id = client.new_session("/tmp").await.unwrap();
+        let _session_event = event_rx.recv().await.unwrap();
+
+        // Call load_session.
+        let result = client.load_session(&session_id, "/workspace").await;
+        assert!(result.is_ok(), "load_session() failed: {:?}", result.err());
+
+        // Verify a SessionUpdate event is received (replayed message).
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timed out waiting for SessionUpdate")
+            .expect("recv error");
+
+        match event {
+            AcpEvent::SessionUpdate { session_id: sid, update } => {
+                assert_eq!(sid, session_id);
+                assert_eq!(update["type"], "agent_message_chunk");
+                assert_eq!(update["text"], "Replayed message from history");
+            }
+            other => panic!("expected SessionUpdate, got: {:?}", other),
+        }
+
+        client.kill().await;
+    }
+
+    #[tokio::test]
+    async fn test_acp_agent_stdout_close() {
+        // Create client with duplex pipe, then drop the write end to simulate agent crash.
+        let (client_reader, agent_writer) = tokio::io::duplex(8192);
+        let (agent_reader, client_writer) = tokio::io::duplex(8192);
+
+        let (event_tx, mut event_rx) = broadcast::channel(64);
+        let _client = AcpClient::from_streams(Box::new(client_writer), client_reader, event_tx);
+
+        // Drop the agent_writer to close stdout from the agent's side.
+        drop(agent_writer);
+        drop(agent_reader);
+
+        // Verify AcpEvent::Error with "Agent process exited" is received.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timed out waiting for Error event")
+            .expect("recv error");
+
+        match event {
+            AcpEvent::Error { message } => {
+                assert_eq!(message, "Agent process exited");
+            }
+            other => panic!("expected AcpEvent::Error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acp_malformed_json_on_stdout() {
+        // Create client with duplex pipe.
+        let (client_reader, mut agent_writer) = tokio::io::duplex(8192);
+        let (_agent_reader, client_writer) = tokio::io::duplex(8192);
+
+        let (event_tx, mut event_rx) = broadcast::channel(64);
+        let _client = AcpClient::from_streams(Box::new(client_writer), client_reader, event_tx);
+
+        // Write garbage text followed by a valid JSON-RPC message.
+        agent_writer.write_all(b"This is not JSON!\n").await.unwrap();
+        agent_writer.flush().await.unwrap();
+
+        // Give the reader task time to process the garbage (it should log a warning and skip it).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Now write a valid initialize response.
+        let valid_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "agentInfo": {"name": "test", "version": "1.0.0"}
+            }
+        });
+        let mut line = serde_json::to_string(&valid_msg).unwrap();
+        line.push('\n');
+        agent_writer.write_all(line.as_bytes()).await.unwrap();
+        agent_writer.flush().await.unwrap();
+
+        // The client should process the valid message correctly.
+        // To verify, we need to have a pending request with id=1.
+        let (tx, rx) = oneshot::channel();
+        _client.pending.lock().await.insert(1, tx);
+
+        // Wait for the response to be routed to the pending slot.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("timed out waiting for response")
+            .expect("channel closed");
+
+        assert!(result.is_ok(), "expected successful response");
+        let raw = result.unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw.get()).unwrap();
+        assert_eq!(v["agentInfo"]["name"], "test");
+
+        // Verify no Error event was broadcast (garbage was silently skipped).
+        match tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv()).await {
+            Ok(_) => panic!("expected no event for malformed JSON"),
+            Err(_) => {} // timeout is expected — no error event
+        }
     }
 }

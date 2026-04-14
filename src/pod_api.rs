@@ -1617,8 +1617,13 @@ async fn ensure_acp_client(state: &AppState) -> color_eyre::Result<()> {
     // Add container name
     podman_command.push(state.agent_container.clone());
 
-    // Add agent command
-    podman_command.extend(profile.command.clone());
+    // Add agent command. In mock mode, use the mock ACP agent script
+    // installed by the agent container startup script.
+    if std::env::var("DEVAIPOD_MOCK_AGENT").is_ok() {
+        podman_command.push("/home/devenv/.local/bin/mock-acp-agent".to_string());
+    } else {
+        podman_command.extend(profile.command.clone());
+    }
 
     tracing::debug!("Spawning ACP client with command: {:?}", podman_command);
 
@@ -2172,6 +2177,16 @@ pub(crate) struct PodApiArgs {
     /// Name of the agent container to exec into for agent PTY sessions.
     #[arg(long)]
     agent_container: Option<String>,
+    /// Password for authenticating to the opencode server (Basic auth).
+    /// Legacy: unused with ACP transport, but accepted for CLI compatibility.
+    #[arg(long, default_value = "")]
+    #[allow(dead_code)]
+    opencode_password: String,
+    /// Port of the opencode server to connect to.
+    /// Legacy: unused with ACP transport, but accepted for CLI compatibility.
+    #[arg(long, default_value_t = 4096)]
+    #[allow(dead_code)]
+    opencode_port: u16,
 }
 
 /// Liveness/readiness probe for container healthchecks.
